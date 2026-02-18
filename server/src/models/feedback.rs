@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Feedback {
     pub id: Uuid,
     pub customer_id: Uuid,
@@ -19,6 +20,7 @@ pub struct Feedback {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Survey {
     pub id: Uuid,
     pub title: String,
@@ -30,6 +32,7 @@ pub struct Survey {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct SurveyResponse {
     pub id: Uuid,
     pub survey_id: Uuid,

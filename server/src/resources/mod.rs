@@ -36,11 +36,14 @@ impl CxpServer {
             .await
             .map_err(|e| format!("Database error: {e}"))?;
 
+        let total_tickets = tickets.len();
         let open_tickets = tickets.iter().filter(|t| t.status == "open").count();
-        let in_progress = tickets
+        let in_progress_tickets = tickets
             .iter()
             .filter(|t| t.status == "in_progress")
             .count();
+        let resolved_tickets = tickets.iter().filter(|t| t.status == "resolved").count();
+        let closed_tickets = tickets.iter().filter(|t| t.status == "closed").count();
 
         let feedback = self
             .feedback
@@ -50,20 +53,20 @@ impl CxpServer {
 
         let ratings: Vec<i32> = feedback.iter().filter_map(|f| f.rating).collect();
         let csat = crate::analysis::calculate_csat(&ratings);
+        let avg_rating = if ratings.is_empty() {
+            None
+        } else {
+            Some(ratings.iter().sum::<i32>() as f64 / ratings.len() as f64)
+        };
 
         let dashboard = json!({
-            "tickets": {
-                "total": tickets.len(),
-                "open": open_tickets,
-                "in_progress": in_progress,
-            },
-            "feedback": {
-                "total": feedback.len(),
-                "csat": csat,
-                "avg_rating": if ratings.is_empty() { None } else {
-                    Some(ratings.iter().sum::<i32>() as f64 / ratings.len() as f64)
-                },
-            },
+            "totalTickets": total_tickets,
+            "openTickets": open_tickets,
+            "inProgressTickets": in_progress_tickets,
+            "resolvedTickets": resolved_tickets,
+            "closedTickets": closed_tickets,
+            "csatScore": csat,
+            "averageRating": avg_rating,
         });
 
         Ok(serde_json::to_string_pretty(&dashboard).unwrap())

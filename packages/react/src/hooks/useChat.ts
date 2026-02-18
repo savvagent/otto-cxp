@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type { ChatMessage } from "@cxp/sdk";
 import { useCxp } from "../context/CxpProvider.js";
 
@@ -14,8 +14,30 @@ import { useCxp } from "../context/CxpProvider.js";
 export function useChat(sessionId: string) {
   const cxp = useCxp();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    cxp.support
+      .getChatMessages(sessionId)
+      .then((history) => {
+        if (!cancelled) {
+          setMessages(history);
+          setLoading(false);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err as Error);
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cxp, sessionId]);
 
   const sendMessage = useCallback(
     async (role: string, content: string) => {

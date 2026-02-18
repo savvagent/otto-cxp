@@ -27,13 +27,18 @@ impl FeedbackDb {
         subject: Option<&str>,
         body: Option<&str>,
         rating: Option<i32>,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
     ) -> Result<Feedback, sqlx::Error> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
 
         let sql = format!(
-            "INSERT INTO feedback (id, customer_id, feedback_type, subject, body, rating, metadata, created_at)
-             VALUES ($1, $2, $3::feedback_type, $4, $5, $6, '{{}}', $7)
+            "INSERT INTO feedback (id, customer_id, feedback_type, subject, body, rating, metadata,
+                                   experience_id, application_id, page_id, component_id, created_at)
+             VALUES ($1, $2, $3::feedback_type, $4, $5, $6, '{{}}', $7, $8, $9, $10, $11)
              RETURNING {FEEDBACK_COLS}"
         );
 
@@ -44,6 +49,10 @@ impl FeedbackDb {
             .bind(subject)
             .bind(body)
             .bind(rating)
+            .bind(experience_id)
+            .bind(application_id)
+            .bind(page_id)
+            .bind(component_id)
             .bind(now)
             .fetch_one(&self.pool)
             .await

@@ -127,6 +127,13 @@ export class SupportDomain {
   }
 
   /**
+   * Get all messages in a chat session
+   */
+  async getChatMessages(sessionId: string): Promise<ChatMessage[]> {
+    return this.call("get_chat_messages", { session_id: sessionId });
+  }
+
+  /**
    * End a chat session
    */
   async endChatSession(sessionId: string): Promise<ChatSession> {

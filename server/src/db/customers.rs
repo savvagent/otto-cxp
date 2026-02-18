@@ -8,6 +8,7 @@ use crate::models::interaction::Interaction;
 use crate::models::ticket::Ticket;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Customer360 {
     pub customer: Customer,
     pub recent_tickets: Vec<Ticket>,

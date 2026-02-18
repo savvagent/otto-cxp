@@ -151,6 +151,14 @@ struct SubmitFeedbackParams {
     body: Option<String>,
     #[serde(default)]
     rating: Option<i32>,
+    #[serde(default)]
+    experience_id: Option<String>,
+    #[serde(default)]
+    application_id: Option<String>,
+    #[serde(default)]
+    page_id: Option<String>,
+    #[serde(default)]
+    component_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -187,6 +195,11 @@ struct ChatMessageParams {
     session_id: String,
     role: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionIdParam {
+    session_id: String,
 }
 
 #[derive(Clone)]
@@ -576,6 +589,21 @@ impl CxpServer {
         }
     }
 
+    #[tool(description = "Get all messages in a chat session")]
+    async fn get_chat_messages(
+        &self,
+        Parameters(params): Parameters<SessionIdParam>,
+    ) -> String {
+        let uuid = match parse_uuid(&params.session_id) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        match self.chat.get_messages(uuid).await {
+            Ok(messages) => serde_json::to_string_pretty(&messages).unwrap(),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
     #[tool(description = "End an active chat session")]
     async fn end_chat_session(
         &self,
@@ -701,9 +729,39 @@ impl CxpServer {
             Ok(u) => u,
             Err(e) => return e,
         };
+        let experience_id = match params.experience_id.as_deref().map(parse_uuid) {
+            Some(Ok(u)) => Some(u),
+            Some(Err(e)) => return e,
+            None => None,
+        };
+        let application_id = match params.application_id.as_deref().map(parse_uuid) {
+            Some(Ok(u)) => Some(u),
+            Some(Err(e)) => return e,
+            None => None,
+        };
+        let page_id = match params.page_id.as_deref().map(parse_uuid) {
+            Some(Ok(u)) => Some(u),
+            Some(Err(e)) => return e,
+            None => None,
+        };
+        let component_id = match params.component_id.as_deref().map(parse_uuid) {
+            Some(Ok(u)) => Some(u),
+            Some(Err(e)) => return e,
+            None => None,
+        };
         match self
             .feedback
-            .submit_feedback(uuid, &params.feedback_type, params.subject.as_deref(), params.body.as_deref(), params.rating)
+            .submit_feedback(
+                uuid,
+                &params.feedback_type,
+                params.subject.as_deref(),
+                params.body.as_deref(),
+                params.rating,
+                experience_id,
+                application_id,
+                page_id,
+                component_id,
+            )
             .await
         {
             Ok(f) => serde_json::to_string_pretty(&f).unwrap(),
@@ -750,10 +808,19 @@ impl CxpServer {
         let scores: Vec<i32> = responses
             .iter()
             .filter_map(|r| {
-                r.answers
-                    .get("score")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32)
+                // Answers may be stored as an array of {questionId, value} objects
+                // or as an object with a "score" key. Handle both formats.
+                if let Some(arr) = r.answers.as_array() {
+                    arr.first()
+                        .and_then(|a| a.get("value"))
+                        .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
+                        .map(|v| v as i32)
+                } else {
+                    r.answers
+                        .get("score")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32)
+                }
             })
             .collect();
         match crate::analysis::calculate_nps(&scores) {

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatSession {
     pub id: Uuid,
     pub customer_id: Uuid,
@@ -13,6 +14,7 @@ pub struct ChatSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: Uuid,
     pub session_id: Uuid,
