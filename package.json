@@ -1,0 +1,16 @@
+{
+  "name": "cxp",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @cxp/react dev",
+    "dev:web": "pnpm --filter @cxp/web dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

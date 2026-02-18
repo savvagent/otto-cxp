@@ -1,0 +1,15 @@
+# Use with: podman-compose up -d
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: cxp
+      POSTGRES_PASSWORD: cxp_dev
+      POSTGRES_DB: cxp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

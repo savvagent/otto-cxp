@@ -1,0 +1,4 @@
+packages:
+  - "sdk/typescript"
+  - "packages/react"
+  - "apps/web"
