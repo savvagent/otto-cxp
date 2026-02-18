@@ -24,6 +24,17 @@ const DEFAULT_SURVEY_LABELS: Required<SurveyRendererLabels> = {
   submitting: "Submitting...",
 };
 
+export interface SurveyQuestionOverride {
+  text?: string;
+  options?: string[];
+}
+
+export interface SurveyContentOverrides {
+  title?: string;
+  description?: string;
+  questions?: Record<string, SurveyQuestionOverride>;
+}
+
 export interface SurveyRendererProps {
   surveyId?: string;
   customerId?: string;
@@ -33,6 +44,7 @@ export interface SurveyRendererProps {
   page?: string;
   component?: string;
   labels?: SurveyRendererLabels;
+  content?: SurveyContentOverrides;
 }
 
 const DEMO_SURVEY: Survey = {
@@ -85,6 +97,7 @@ export function SurveyRenderer({
   customerId = "demo-customer",
   onComplete,
   labels: labelOverrides,
+  content,
 }: SurveyRendererProps) {
   const l = { ...DEFAULT_SURVEY_LABELS, ...labelOverrides };
   const cxp = useCxpOptional();
@@ -155,7 +168,18 @@ export function SurveyRenderer({
     }
   };
 
+  const resolveQuestion = (question: SurveyQuestion): SurveyQuestion => {
+    const overrides = content?.questions?.[question.id];
+    if (!overrides) return question;
+    return {
+      ...question,
+      ...(overrides.text !== undefined && { text: overrides.text }),
+      ...(overrides.options !== undefined && { options: overrides.options }),
+    };
+  };
+
   const renderQuestion = (question: SurveyQuestion) => {
+    question = resolveQuestion(question);
     switch (question.questionType) {
       case "rating":
         return (
@@ -346,11 +370,11 @@ export function SurveyRenderer({
   return (
     <div style={{ maxWidth: "700px", padding: "20px" }}>
       <h2 style={{ fontSize: "28px", fontWeight: "600", marginBottom: "8px" }}>
-        {survey.title}
+        {content?.title ?? survey.title}
       </h2>
-      {survey.description && (
+      {(content?.description ?? survey.description) && (
         <p style={{ fontSize: "16px", color: "#666", marginBottom: "32px" }}>
-          {survey.description}
+          {content?.description ?? survey.description}
         </p>
       )}
 

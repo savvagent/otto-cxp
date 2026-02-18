@@ -4,4 +4,6 @@ export {
   SurveyRenderer,
   type SurveyRendererProps,
   type SurveyRendererLabels,
+  type SurveyContentOverrides,
+  type SurveyQuestionOverride,
 } from "./SurveyRenderer.js";

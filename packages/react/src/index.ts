@@ -19,4 +19,6 @@ export {
   type FeedbackFormLabels,
   type SurveyRendererProps,
   type SurveyRendererLabels,
+  type SurveyContentOverrides,
+  type SurveyQuestionOverride,
 } from "./components/index.js";
