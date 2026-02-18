@@ -18,25 +18,6 @@ const demos = [
 
 type Demo = (typeof demos)[number];
 
-const idRequirements: Record<Demo, string[]> = {
-  ChatWidget: ["Session ID"],
-  FeedbackForm: ["Customer ID"],
-  SurveyRenderer: ["Survey ID", "Customer ID"],
-};
-
-function MissingId({ fields }: { fields: string[] }) {
-  return (
-    <div style={{ padding: 40, color: "#757575", fontFamily: "system-ui, sans-serif" }}>
-      <p style={{ margin: "0 0 8px", fontWeight: 500 }}>
-        {fields.join(" and ")} required.
-      </p>
-      <p style={{ margin: 0, fontSize: 14 }}>
-        Click <strong>Seed Mock Data</strong> or paste {fields.length > 1 ? "IDs" : "an ID"} in the sidebar.
-      </p>
-    </div>
-  );
-}
-
 function DemoContent({
   active,
   customerId,
@@ -48,31 +29,21 @@ function DemoContent({
   surveyId: string;
   sessionId: string;
 }) {
-  const ids: Record<string, string> = {
-    "Customer ID": customerId,
-    "Survey ID": surveyId,
-    "Session ID": sessionId,
-  };
-  const missing = idRequirements[active].filter((f) => !ids[f]);
-  if (missing.length > 0) {
-    return <MissingId fields={missing} />;
-  }
-
   switch (active) {
     case "ChatWidget":
-      return <ChatWidget sessionId={sessionId} />;
+      return <ChatWidget sessionId={sessionId || undefined} />;
     case "FeedbackForm":
       return (
         <FeedbackForm
-          customerId={customerId}
+          customerId={customerId || undefined}
           onSubmit={(fb) => console.log("Feedback submitted:", fb)}
         />
       );
     case "SurveyRenderer":
       return (
         <SurveyRenderer
-          surveyId={surveyId}
-          customerId={customerId}
+          surveyId={surveyId || undefined}
+          customerId={customerId || undefined}
           onComplete={() => console.log("Survey completed")}
         />
       );
@@ -82,7 +53,9 @@ function DemoContent({
 export default function App() {
   const [active, setActive] = useState<Demo>("ChatWidget");
   const [cxpClient, setCxpClient] = useState<CxpClient | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<
+    "connecting" | "connected" | "failed"
+  >("connecting");
 
   const [customerId, setCustomerId] = useState("");
   const [surveyId, setSurveyId] = useState("");
@@ -108,9 +81,10 @@ export default function App() {
 
         const client = new CxpClient({ client: mcpClient });
         setCxpClient(client);
-      } catch (err) {
+        setConnectionStatus("connected");
+      } catch {
         if (!cancelled) {
-          setError((err as Error).message);
+          setConnectionStatus("failed");
         }
       }
     }
@@ -121,71 +95,72 @@ export default function App() {
     };
   }, []);
 
-  if (error) {
-    return (
-      <div
-        style={{
-          padding: 40,
-          fontFamily: "system-ui, sans-serif",
-          color: "#d32f2f",
-        }}
-      >
-        <h2>Connection Error</h2>
-        <p>{error}</p>
-        <p style={{ color: "#666" }}>
-          Make sure the CXP server is running:{" "}
-          <code>TRANSPORT=http cargo run -p cxp-server</code>
-        </p>
-      </div>
-    );
-  }
+  const isDemo = connectionStatus !== "connected";
 
-  if (!cxpClient) {
-    return (
-      <div
+  const content = (
+    <div
+      style={{
+        display: "flex",
+        minHeight: "100vh",
+        fontFamily: "system-ui, -apple-system, sans-serif",
+      }}
+    >
+      {/* Sidebar */}
+      <nav
         style={{
-          padding: 40,
-          fontFamily: "system-ui, sans-serif",
-          color: "#666",
-        }}
-      >
-        Connecting to CXP server...
-      </div>
-    );
-  }
-
-  return (
-    <CxpProvider client={cxpClient}>
-      <div
-        style={{
+          width: 240,
+          flexShrink: 0,
+          borderRight: "1px solid #e0e0e0",
+          backgroundColor: "#fafafa",
+          padding: "20px 0",
           display: "flex",
-          minHeight: "100vh",
-          fontFamily: "system-ui, -apple-system, sans-serif",
+          flexDirection: "column",
         }}
       >
-        {/* Sidebar */}
-        <nav
+        <h1
           style={{
-            width: 240,
-            flexShrink: 0,
-            borderRight: "1px solid #e0e0e0",
-            backgroundColor: "#fafafa",
-            padding: "20px 0",
+            fontSize: 18,
+            fontWeight: 700,
+            padding: "0 16px 16px",
+            margin: 0,
+            borderBottom: "1px solid #e0e0e0",
           }}
         >
-          <h1
-            style={{
-              fontSize: 18,
-              fontWeight: 700,
-              padding: "0 16px 16px",
-              margin: 0,
-              borderBottom: "1px solid #e0e0e0",
-            }}
-          >
-            CXP Components
-          </h1>
+          CXP Components
+        </h1>
 
-          {/* Seed mock data */}
+        {/* Connection status */}
+        <div
+          style={{
+            padding: "8px 16px",
+            borderBottom: "1px solid #e0e0e0",
+            fontSize: 12,
+          }}
+        >
+          <span
+            style={{
+              display: "inline-block",
+              width: 8,
+              height: 8,
+              borderRadius: "50%",
+              marginRight: 6,
+              backgroundColor:
+                connectionStatus === "connected"
+                  ? "#4caf50"
+                  : connectionStatus === "connecting"
+                    ? "#ff9800"
+                    : "#9e9e9e",
+            }}
+          />
+          {connectionStatus === "connected"
+            ? "Connected to server"
+            : connectionStatus === "connecting"
+              ? "Connecting..."
+              : "Demo mode (no server)"}
+        </div>
+
+        {/* Seed mock data — only when connected */}
+        {connectionStatus === "connected" && cxpClient && (
           <div
             style={{
               padding: "12px 16px",
@@ -228,8 +203,10 @@ export default function App() {
               </div>
             )}
           </div>
+        )}
 
-          {/* ID inputs */}
+        {/* ID inputs — only when connected */}
+        {connectionStatus === "connected" && (
           <div
             style={{
               padding: "12px 16px",
@@ -298,45 +275,52 @@ export default function App() {
               />
             </label>
           </div>
+        )}
 
-          <ul style={{ listStyle: "none", margin: 0, padding: "8px 0" }}>
-            {demos.map((name) => (
-              <li key={name}>
-                <button
-                  onClick={() => setActive(name)}
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    padding: "10px 16px",
-                    border: "none",
-                    background:
-                      active === name ? "#e3f2fd" : "transparent",
-                    color: active === name ? "#1565c0" : "#424242",
-                    fontWeight: active === name ? 600 : 400,
-                    fontSize: 14,
-                    textAlign: "left",
-                    cursor: "pointer",
-                  }}
-                >
-                  {name}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </nav>
+        <ul style={{ listStyle: "none", margin: 0, padding: "8px 0" }}>
+          {demos.map((name) => (
+            <li key={name}>
+              <button
+                onClick={() => setActive(name)}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  padding: "10px 16px",
+                  border: "none",
+                  background:
+                    active === name ? "#e3f2fd" : "transparent",
+                  color: active === name ? "#1565c0" : "#424242",
+                  fontWeight: active === name ? 600 : 400,
+                  fontSize: 14,
+                  textAlign: "left",
+                  cursor: "pointer",
+                }}
+              >
+                {name}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </nav>
 
-        {/* Main content */}
-        <main
-          style={{ flex: 1, backgroundColor: "#f5f5f5", overflow: "auto" }}
-        >
-          <DemoContent
-            active={active}
-            customerId={customerId}
-            surveyId={surveyId}
-            sessionId={sessionId}
-          />
-        </main>
-      </div>
-    </CxpProvider>
+      {/* Main content */}
+      <main
+        style={{ flex: 1, backgroundColor: "#f5f5f5", overflow: "auto" }}
+      >
+        <DemoContent
+          active={active}
+          customerId={customerId}
+          surveyId={surveyId}
+          sessionId={sessionId}
+        />
+      </main>
+    </div>
   );
+
+  // Wrap in CxpProvider only when connected
+  if (cxpClient) {
+    return <CxpProvider client={cxpClient}>{content}</CxpProvider>;
+  }
+
+  return content;
 }

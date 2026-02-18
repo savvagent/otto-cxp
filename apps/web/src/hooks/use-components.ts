@@ -36,7 +36,7 @@ export function useCreateComponent() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      page_id: string;
+      page_id?: string;
       name: string;
       component_type?: string;
       description?: string;

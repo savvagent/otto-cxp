@@ -15,7 +15,7 @@ impl ApplicationDb {
 
     pub async fn create(
         &self,
-        experience_id: Uuid,
+        experience_id: Option<Uuid>,
         name: &str,
         description: Option<&str>,
         platform: Option<&str>,

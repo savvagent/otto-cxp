@@ -10,7 +10,7 @@ use crate::models::Page;
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePageBody {
-    pub application_id: Uuid,
+    pub application_id: Option<Uuid>,
     pub name: String,
     pub path: Option<String>,
     pub description: Option<String>,

@@ -205,7 +205,7 @@ export function FeedbackPage() {
                       <RatingStars rating={item.rating} />
                     </TableCell>
                     <TableCell className="font-mono text-xs">
-                      {item.customer_id.slice(0, 8)}
+                      {item.customer_id?.slice(0, 8) ?? "—"}
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
                       {new Date(item.created_at).toLocaleDateString()}

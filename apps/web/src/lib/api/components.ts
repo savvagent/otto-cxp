@@ -15,7 +15,7 @@ export const componentsApi = {
   get: (id: string) => apiFetch<Component>(`/components/${id}`),
 
   create: (data: {
-    page_id: string;
+    page_id?: string;
     name: string;
     component_type?: string;
     description?: string;

@@ -36,7 +36,7 @@ export function useCreatePage() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      application_id: string;
+      application_id?: string;
       name: string;
       path?: string;
       description?: string;

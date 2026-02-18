@@ -10,7 +10,7 @@ use crate::models::Component;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateComponentBody {
-    pub page_id: Uuid,
+    pub page_id: Option<Uuid>,
     pub name: String,
     pub component_type: Option<String>,
     pub description: Option<String>,

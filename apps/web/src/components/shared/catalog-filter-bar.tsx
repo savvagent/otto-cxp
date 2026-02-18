@@ -26,18 +26,9 @@ interface CatalogFilterBarProps {
 
 export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
   const { data: experiencesData } = useExperiences({ limit: 200 });
-  const { data: applicationsData } = useApplications({
-    limit: 200,
-    experience_id: value.experience_id,
-  });
-  const { data: pagesData } = usePages({
-    limit: 200,
-    application_id: value.application_id,
-  });
-  const { data: componentsData } = useComponents({
-    limit: 200,
-    page_id: value.page_id,
-  });
+  const { data: applicationsData } = useApplications({ limit: 200 });
+  const { data: pagesData } = usePages({ limit: 200 });
+  const { data: componentsData } = useComponents({ limit: 200 });
 
   const experiences = experiencesData?.data ?? [];
   const applications = applicationsData?.data ?? [];
@@ -52,22 +43,7 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
   );
 
   function setFilter(key: keyof CatalogFilterValues, val: string | undefined) {
-    const next = { ...value };
-    next[key] = val;
-
-    // Cascade: clearing a parent clears children
-    if (key === "experience_id") {
-      next.application_id = undefined;
-      next.page_id = undefined;
-      next.component_id = undefined;
-    } else if (key === "application_id") {
-      next.page_id = undefined;
-      next.component_id = undefined;
-    } else if (key === "page_id") {
-      next.component_id = undefined;
-    }
-
-    onChange(next);
+    onChange({ ...value, [key]: val });
   }
 
   function clearAll() {

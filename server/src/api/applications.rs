@@ -10,7 +10,7 @@ use crate::models::Application;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApplicationBody {
-    pub experience_id: Uuid,
+    pub experience_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub platform: Option<String>,

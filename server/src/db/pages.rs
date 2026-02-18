@@ -15,7 +15,7 @@ impl PageDb {
 
     pub async fn create(
         &self,
-        application_id: Uuid,
+        application_id: Option<Uuid>,
         name: &str,
         path: Option<&str>,
         description: Option<&str>,

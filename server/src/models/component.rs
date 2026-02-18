@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct Component {
     pub id: Uuid,
-    pub page_id: Uuid,
+    pub page_id: Option<Uuid>,
     pub name: String,
     pub component_type: Option<String>,
     pub description: Option<String>,

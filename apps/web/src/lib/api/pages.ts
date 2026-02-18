@@ -20,7 +20,7 @@ export const pagesApi = {
   get: (id: string) => apiFetch<Page>(`/pages/${id}`),
 
   create: (data: {
-    application_id: string;
+    application_id?: string;
     name: string;
     path?: string;
     description?: string;

@@ -36,7 +36,7 @@ export function useCreateApplication() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      experience_id: string;
+      experience_id?: string;
       name: string;
       description?: string;
       platform?: string;

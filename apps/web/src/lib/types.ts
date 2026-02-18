@@ -83,7 +83,7 @@ export interface Experience {
 
 export interface Application {
   id: string;
-  experience_id: string;
+  experience_id: string | null;
   name: string;
   description: string | null;
   platform: string | null;
@@ -94,7 +94,7 @@ export interface Application {
 
 export interface Page {
   id: string;
-  application_id: string;
+  application_id: string | null;
   name: string;
   path: string | null;
   description: string | null;
@@ -105,7 +105,7 @@ export interface Page {
 
 export interface Component {
   id: string;
-  page_id: string;
+  page_id: string | null;
   name: string;
   component_type: string | null;
   description: string | null;

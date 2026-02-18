@@ -15,7 +15,7 @@ impl ComponentDb {
 
     pub async fn create(
         &self,
-        page_id: Uuid,
+        page_id: Option<Uuid>,
         name: &str,
         component_type: Option<&str>,
         description: Option<&str>,

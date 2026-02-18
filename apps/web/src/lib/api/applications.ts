@@ -20,7 +20,7 @@ export const applicationsApi = {
   get: (id: string) => apiFetch<Application>(`/applications/${id}`),
 
   create: (data: {
-    experience_id: string;
+    experience_id?: string;
     name: string;
     description?: string;
     platform?: string;

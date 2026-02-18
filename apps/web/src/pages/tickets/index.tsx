@@ -385,7 +385,7 @@ export function TicketsPage() {
                     <PriorityBadge priority={ticket.priority} />
                   </TableCell>
                   <TableCell className="hidden sm:table-cell font-mono text-xs text-muted-foreground">
-                    {ticket.customer_id.slice(0, 8)}
+                    {ticket.customer_id?.slice(0, 8) ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-muted-foreground capitalize">
                     {ticket.channel ?? "-"}
