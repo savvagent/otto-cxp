@@ -2,7 +2,6 @@ import type { CxpClient } from "@cxp/sdk";
 
 export interface SeededIds {
   customerId: string;
-  ticketId: string;
   surveyId: string;
   sessionId: string;
 }
@@ -176,7 +175,6 @@ export async function seedMockData(cxp: CxpClient): Promise<SeededIds> {
 
   return {
     customerId: customer.id,
-    ticketId: ticket1.id,
     surveyId: survey.id,
     sessionId: session.id,
   };

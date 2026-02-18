@@ -4,42 +4,24 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { CxpClient } from "@cxp/sdk";
 import { CxpProvider } from "@cxp/react";
 import {
-  TicketList,
-  TicketDetail,
-  CustomerCard,
-  Customer360,
   ChatWidget,
   FeedbackForm,
   SurveyRenderer,
-  NpsGauge,
-  MetricsDashboard,
 } from "@cxp/react";
 import { seedMockData } from "./mockData";
 
 const demos = [
-  "MetricsDashboard",
-  "TicketList",
-  "TicketDetail",
-  "CustomerCard",
-  "Customer360",
   "ChatWidget",
   "FeedbackForm",
   "SurveyRenderer",
-  "NpsGauge",
 ] as const;
 
 type Demo = (typeof demos)[number];
 
 const idRequirements: Record<Demo, string[]> = {
-  MetricsDashboard: [],
-  TicketList: [],
-  TicketDetail: ["Ticket ID"],
-  CustomerCard: ["Customer ID"],
-  Customer360: ["Customer ID"],
   ChatWidget: ["Session ID"],
   FeedbackForm: ["Customer ID"],
   SurveyRenderer: ["Survey ID", "Customer ID"],
-  NpsGauge: ["Survey ID"],
 };
 
 function MissingId({ fields }: { fields: string[] }) {
@@ -58,19 +40,16 @@ function MissingId({ fields }: { fields: string[] }) {
 function DemoContent({
   active,
   customerId,
-  ticketId,
   surveyId,
   sessionId,
 }: {
   active: Demo;
   customerId: string;
-  ticketId: string;
   surveyId: string;
   sessionId: string;
 }) {
   const ids: Record<string, string> = {
     "Customer ID": customerId,
-    "Ticket ID": ticketId,
     "Survey ID": surveyId,
     "Session ID": sessionId,
   };
@@ -80,16 +59,6 @@ function DemoContent({
   }
 
   switch (active) {
-    case "MetricsDashboard":
-      return <MetricsDashboard />;
-    case "TicketList":
-      return <TicketList customerId={customerId} />;
-    case "TicketDetail":
-      return <TicketDetail ticketId={ticketId} />;
-    case "CustomerCard":
-      return <CustomerCard customerId={customerId} />;
-    case "Customer360":
-      return <Customer360 customerId={customerId} />;
     case "ChatWidget":
       return <ChatWidget sessionId={sessionId} />;
     case "FeedbackForm":
@@ -107,19 +76,15 @@ function DemoContent({
           onComplete={() => console.log("Survey completed")}
         />
       );
-    case "NpsGauge":
-      return <NpsGauge surveyId={surveyId} />;
   }
 }
 
 export default function App() {
-  const [active, setActive] = useState<Demo>("MetricsDashboard");
+  const [active, setActive] = useState<Demo>("ChatWidget");
   const [cxpClient, setCxpClient] = useState<CxpClient | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // IDs for demo - user can change customerId
   const [customerId, setCustomerId] = useState("");
-  const [ticketId, setTicketId] = useState("");
   const [surveyId, setSurveyId] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [seeding, setSeeding] = useState(false);
@@ -234,7 +199,6 @@ export default function App() {
                 try {
                   const ids = await seedMockData(cxpClient);
                   setCustomerId(ids.customerId);
-                  setTicketId(ids.ticketId);
                   setSurveyId(ids.surveyId);
                   setSessionId(ids.sessionId);
                 } catch (err) {
@@ -282,25 +246,6 @@ export default function App() {
                 type="text"
                 value={customerId}
                 onChange={(e) => setCustomerId(e.target.value)}
-                placeholder="paste UUID"
-                style={{
-                  display: "block",
-                  width: "100%",
-                  padding: "4px 6px",
-                  fontSize: 11,
-                  border: "1px solid #ccc",
-                  borderRadius: 3,
-                  marginTop: 2,
-                  boxSizing: "border-box",
-                }}
-              />
-            </label>
-            <label>
-              Ticket ID
-              <input
-                type="text"
-                value={ticketId}
-                onChange={(e) => setTicketId(e.target.value)}
                 placeholder="paste UUID"
                 style={{
                   display: "block",
@@ -387,7 +332,6 @@ export default function App() {
           <DemoContent
             active={active}
             customerId={customerId}
-            ticketId={ticketId}
             surveyId={surveyId}
             sessionId={sessionId}
           />
