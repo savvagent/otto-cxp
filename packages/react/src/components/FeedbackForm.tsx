@@ -193,6 +193,7 @@ export function FeedbackForm({
             required
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "10px",
               border: "1px solid #e0e0e0",
               borderRadius: "4px",
@@ -229,6 +230,7 @@ export function FeedbackForm({
             required
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "10px",
               border: "1px solid #e0e0e0",
               borderRadius: "4px",
@@ -259,6 +261,7 @@ export function FeedbackForm({
             rows={6}
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "10px",
               border: "1px solid #e0e0e0",
               borderRadius: "4px",
@@ -289,6 +292,7 @@ export function FeedbackForm({
             required
             style={{
               width: "100%",
+              boxSizing: "border-box",
               padding: "10px",
               border: "1px solid #e0e0e0",
               borderRadius: "4px",

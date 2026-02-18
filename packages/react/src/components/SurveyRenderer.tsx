@@ -231,6 +231,7 @@ export function SurveyRenderer({
               rows={4}
               style={{
                 width: "100%",
+                boxSizing: "border-box",
                 padding: "10px",
                 border: "1px solid #e0e0e0",
                 borderRadius: "4px",
