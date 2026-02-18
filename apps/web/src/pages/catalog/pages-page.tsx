@@ -14,6 +14,7 @@ import {
 } from "@/hooks/use-pages";
 import { useApplications } from "@/hooks/use-applications";
 import { PageHeader } from "@/components/shared/page-header";
+import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { EmptyState } from "@/components/shared/empty-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -48,7 +49,7 @@ import type { Page } from "@/lib/types";
 const PAGE_SIZE = 20;
 
 const pageSchema = z.object({
-  application_id: z.string().min(1, "Application is required"),
+  application_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   path: z.string().optional(),
   description: z.string().optional(),
@@ -82,7 +83,7 @@ function PageDialog({
     resolver: zodResolver(pageSchema),
     values: editing
       ? {
-          application_id: editing.application_id,
+          application_id: editing.application_id ?? undefined,
           name: editing.name,
           path: editing.path ?? "",
           description: editing.description ?? "",
@@ -114,7 +115,7 @@ function PageDialog({
     } else {
       createPage.mutate(
         {
-          application_id: values.application_id,
+          application_id: values.application_id || undefined,
           name: values.name,
           path: values.path || undefined,
           description: values.description || undefined,
@@ -141,18 +142,18 @@ function PageDialog({
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="page-application">
-              Application <span className="text-destructive">*</span>
-            </Label>
+            <Label htmlFor="page-application">Application</Label>
             <Select
-              value={applicationId ?? ""}
-              onValueChange={(v) => setValue("application_id", v)}
-              disabled={isEdit}
+              value={applicationId ?? "_none"}
+              onValueChange={(v) =>
+                setValue("application_id", v === "_none" ? "" : v)
+              }
             >
               <SelectTrigger id="page-application">
-                <SelectValue placeholder="Select an application" />
+                <SelectValue placeholder="None" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="_none">None</SelectItem>
                 {applications.map((app) => (
                   <SelectItem key={app.id} value={app.id}>
                     {app.name}
@@ -160,11 +161,6 @@ function PageDialog({
                 ))}
               </SelectContent>
             </Select>
-            {errors.application_id && (
-              <p className="text-xs text-destructive">
-                {errors.application_id.message}
-              </p>
-            )}
           </div>
 
           <div className="space-y-1.5">
@@ -318,6 +314,7 @@ export function PagesPage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden sm:table-cell">Path</TableHead>
                 <TableHead className="hidden sm:table-cell">Application</TableHead>
@@ -329,12 +326,13 @@ export function PagesPage() {
             <TableBody>
               {items.map((pg) => (
                 <TableRow key={pg.id}>
+                  <TableCell><CopyableId value={pg.id} /></TableCell>
                   <TableCell className="font-medium">{pg.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm font-mono text-muted-foreground">
                     {pg.path ?? "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {applicationName(pg.application_id)}
+                    {pg.application_id ? applicationName(pg.application_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {pg.description ?? "—"}

@@ -14,6 +14,7 @@ import {
 } from "@/hooks/use-components";
 import { usePages } from "@/hooks/use-pages";
 import { PageHeader } from "@/components/shared/page-header";
+import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { EmptyState } from "@/components/shared/empty-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -48,7 +49,7 @@ import type { Component } from "@/lib/types";
 const PAGE_SIZE = 20;
 
 const componentSchema = z.object({
-  page_id: z.string().min(1, "Page is required"),
+  page_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   component_type: z.string().optional(),
   description: z.string().optional(),
@@ -82,7 +83,7 @@ function ComponentDialog({
     resolver: zodResolver(componentSchema),
     values: editing
       ? {
-          page_id: editing.page_id,
+          page_id: editing.page_id ?? undefined,
           name: editing.name,
           component_type: editing.component_type ?? "",
           description: editing.description ?? "",
@@ -114,7 +115,7 @@ function ComponentDialog({
     } else {
       createComponent.mutate(
         {
-          page_id: values.page_id,
+          page_id: values.page_id || undefined,
           name: values.name,
           component_type: values.component_type || undefined,
           description: values.description || undefined,
@@ -143,18 +144,18 @@ function ComponentDialog({
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="comp-page">
-              Page <span className="text-destructive">*</span>
-            </Label>
+            <Label htmlFor="comp-page">Page</Label>
             <Select
-              value={pageId ?? ""}
-              onValueChange={(v) => setValue("page_id", v)}
-              disabled={isEdit}
+              value={pageId ?? "_none"}
+              onValueChange={(v) =>
+                setValue("page_id", v === "_none" ? "" : v)
+              }
             >
               <SelectTrigger id="comp-page">
-                <SelectValue placeholder="Select a page" />
+                <SelectValue placeholder="None" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="_none">None</SelectItem>
                 {pages.map((pg) => (
                   <SelectItem key={pg.id} value={pg.id}>
                     {pg.name}
@@ -167,11 +168,6 @@ function ComponentDialog({
                 ))}
               </SelectContent>
             </Select>
-            {errors.page_id && (
-              <p className="text-xs text-destructive">
-                {errors.page_id.message}
-              </p>
-            )}
           </div>
 
           <div className="space-y-1.5">
@@ -331,6 +327,7 @@ export function ComponentsPage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden sm:table-cell">Component Type</TableHead>
                 <TableHead className="hidden sm:table-cell">Page</TableHead>
@@ -342,12 +339,13 @@ export function ComponentsPage() {
             <TableBody>
               {items.map((comp) => (
                 <TableRow key={comp.id}>
+                  <TableCell><CopyableId value={comp.id} /></TableCell>
                   <TableCell className="font-medium">{comp.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                     {comp.component_type ?? "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {pageName(comp.page_id)}
+                    {comp.page_id ? pageName(comp.page_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {comp.description ?? "—"}

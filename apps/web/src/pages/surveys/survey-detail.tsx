@@ -1,8 +1,15 @@
+import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router";
-import { useSurvey, useSurveyResponses } from "@/hooks/use-surveys";
+import { toast } from "sonner";
+import { useSurvey, useSurveyResponses, useUpdateSurvey } from "@/hooks/use-surveys";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LoadingTable } from "@/components/shared/loading-state";
+import { CopyableId } from "@/components/shared/copyable-id";
 import { EmptyState } from "@/components/shared/empty-state";
 import {
   Table,
@@ -19,7 +26,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { ArrowLeft, ClipboardList, ListOrdered } from "lucide-react";
+import { ArrowLeft, ClipboardList, ListOrdered, Pencil, Save, X } from "lucide-react";
 
 function QuestionsList({ questions }: { questions: unknown }) {
   let items: Array<Record<string, unknown>> = [];
@@ -67,19 +74,110 @@ export function SurveyDetailPage() {
   const { data: survey, isLoading: surveyLoading } = useSurvey(id);
   const { data: responsesData, isLoading: responsesLoading } =
     useSurveyResponses(id);
+  const updateSurvey = useUpdateSurvey();
+
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [active, setActive] = useState(true);
+  const [questionsRaw, setQuestionsRaw] = useState("");
+
+  // Sync form state when survey loads or edit mode is entered
+  useEffect(() => {
+    if (survey && editing) {
+      setTitle(survey.title);
+      setDescription(survey.description ?? "");
+      setActive(survey.active);
+      setQuestionsRaw(JSON.stringify(survey.questions, null, 2));
+    }
+  }, [survey, editing]);
+
+  function handleSave() {
+    if (!id) return;
+    if (!title.trim()) {
+      toast.error("Title is required");
+      return;
+    }
+
+    let questions: unknown;
+    if (questionsRaw.trim()) {
+      try {
+        questions = JSON.parse(questionsRaw);
+      } catch {
+        toast.error("Questions must be valid JSON");
+        return;
+      }
+    } else {
+      questions = [];
+    }
+
+    updateSurvey.mutate(
+      {
+        id,
+        data: {
+          title: title.trim(),
+          description: description.trim() || undefined,
+          questions,
+          active,
+        },
+      },
+      {
+        onSuccess: () => {
+          toast.success("Survey updated");
+          setEditing(false);
+        },
+        onError: (err) => {
+          toast.error(`Failed to update survey: ${err.message}`);
+        },
+      },
+    );
+  }
+
+  function handleCancel() {
+    setEditing(false);
+  }
 
   const responses = responsesData ?? [];
 
   return (
     <div className="space-y-6">
       {/* Back link */}
-      <Link
-        to="/surveys"
-        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <ArrowLeft className="h-4 w-4" />
-        Back to Surveys
-      </Link>
+      <div className="flex items-center justify-between">
+        <Link
+          to="/surveys"
+          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to Surveys
+        </Link>
+        {survey && !surveyLoading && !editing && (
+          <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+            <Pencil className="h-3.5 w-3.5 mr-1.5" />
+            Edit
+          </Button>
+        )}
+        {editing && (
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleCancel}
+              disabled={updateSurvey.isPending}
+            >
+              <X className="h-3.5 w-3.5 mr-1.5" />
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={handleSave}
+              disabled={updateSurvey.isPending}
+            >
+              <Save className="h-3.5 w-3.5 mr-1.5" />
+              {updateSurvey.isPending ? "Saving..." : "Save"}
+            </Button>
+          </div>
+        )}
+      </div>
 
       {/* Survey info */}
       <Card>
@@ -90,27 +188,71 @@ export function SurveyDetailPage() {
               <Skeleton className="h-4 w-40" />
             </div>
           ) : survey ? (
-            <>
-              <div className="flex items-center justify-between gap-4 flex-wrap">
-                <CardTitle className="text-xl">{survey.title}</CardTitle>
-                <Badge
-                  variant={survey.active ? "default" : "secondary"}
-                  className={
-                    survey.active
-                      ? "bg-green-100 text-green-800 border-green-200 hover:bg-green-100"
-                      : ""
-                  }
-                >
-                  {survey.active ? "Active" : "Inactive"}
-                </Badge>
+            editing ? (
+              <div className="space-y-4">
+                <div className="space-y-1.5">
+                  <Label htmlFor="edit-title">
+                    Title <span className="text-destructive">*</span>
+                  </Label>
+                  <Input
+                    id="edit-title"
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="Survey title"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="edit-description">Description</Label>
+                  <Textarea
+                    id="edit-description"
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    placeholder="Optional description..."
+                    rows={3}
+                  />
+                </div>
+                <div className="flex items-center gap-3">
+                  <Label htmlFor="edit-active">Status</Label>
+                  <Button
+                    id="edit-active"
+                    type="button"
+                    variant={active ? "default" : "secondary"}
+                    size="sm"
+                    className={
+                      active
+                        ? "bg-green-100 text-green-800 border-green-200 hover:bg-green-200"
+                        : ""
+                    }
+                    onClick={() => setActive(!active)}
+                  >
+                    {active ? "Active" : "Inactive"}
+                  </Button>
+                </div>
               </div>
-              {survey.description && (
-                <CardDescription>{survey.description}</CardDescription>
-              )}
-              <p className="text-xs text-muted-foreground">
-                Created {new Date(survey.created_at).toLocaleDateString()}
-              </p>
-            </>
+            ) : (
+              <>
+                <div className="flex items-center justify-between gap-4 flex-wrap">
+                  <CardTitle className="text-xl">{survey.title}</CardTitle>
+                  <Badge
+                    variant={survey.active ? "default" : "secondary"}
+                    className={
+                      survey.active
+                        ? "bg-green-100 text-green-800 border-green-200 hover:bg-green-100"
+                        : ""
+                    }
+                  >
+                    {survey.active ? "Active" : "Inactive"}
+                  </Badge>
+                </div>
+                {survey.description && (
+                  <CardDescription>{survey.description}</CardDescription>
+                )}
+                <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                  <CopyableId value={survey.id} />
+                  <span>Created {new Date(survey.created_at).toLocaleDateString()}</span>
+                </div>
+              </>
+            )
           ) : (
             <CardTitle>Survey not found</CardTitle>
           )}
@@ -131,6 +273,19 @@ export function SurveyDetailPage() {
               {[1, 2, 3].map((i) => (
                 <Skeleton key={i} className="h-6 w-full" />
               ))}
+            </div>
+          ) : editing ? (
+            <div className="space-y-1.5">
+              <Textarea
+                value={questionsRaw}
+                onChange={(e) => setQuestionsRaw(e.target.value)}
+                placeholder='[{"id": "q1", "text": "How satisfied are you?", "type": "rating"}]'
+                rows={10}
+                className="font-mono text-xs"
+              />
+              <p className="text-xs text-muted-foreground">
+                JSON array of question objects.
+              </p>
             </div>
           ) : (
             <QuestionsList questions={survey?.questions} />
@@ -169,7 +324,7 @@ export function SurveyDetailPage() {
                   return (
                     <TableRow key={response.id}>
                       <TableCell className="font-mono text-xs">
-                        {response.customer_id.slice(0, 8)}
+                        {response.customer_id?.slice(0, 8) ?? "—"}
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {response.completed_at

@@ -12,6 +12,7 @@ import {
   useDeleteExperience,
 } from "@/hooks/use-experiences";
 import { PageHeader } from "@/components/shared/page-header";
+import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { EmptyState } from "@/components/shared/empty-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -197,6 +198,7 @@ export function ExperiencesPage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden sm:table-cell">Description</TableHead>
                 <TableHead className="hidden md:table-cell">Created At</TableHead>
@@ -206,6 +208,7 @@ export function ExperiencesPage() {
             <TableBody>
               {items.map((exp) => (
                 <TableRow key={exp.id}>
+                  <TableCell><CopyableId value={exp.id} /></TableCell>
                   <TableCell className="font-medium">{exp.name}</TableCell>
                   <TableCell className="hidden sm:table-cell max-w-[300px] truncate text-muted-foreground text-sm">
                     {exp.description ?? "—"}

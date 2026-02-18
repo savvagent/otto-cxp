@@ -14,6 +14,7 @@ import {
 } from "@/hooks/use-applications";
 import { useExperiences } from "@/hooks/use-experiences";
 import { PageHeader } from "@/components/shared/page-header";
+import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { EmptyState } from "@/components/shared/empty-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
@@ -48,7 +49,7 @@ import type { Application } from "@/lib/types";
 const PAGE_SIZE = 20;
 
 const applicationSchema = z.object({
-  experience_id: z.string().min(1, "Experience is required"),
+  experience_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   description: z.string().optional(),
   platform: z.string().optional(),
@@ -82,7 +83,7 @@ function ApplicationDialog({
     resolver: zodResolver(applicationSchema),
     values: editing
       ? {
-          experience_id: editing.experience_id,
+          experience_id: editing.experience_id ?? undefined,
           name: editing.name,
           description: editing.description ?? "",
           platform: editing.platform ?? "",
@@ -114,7 +115,7 @@ function ApplicationDialog({
     } else {
       createApplication.mutate(
         {
-          experience_id: values.experience_id,
+          experience_id: values.experience_id || undefined,
           name: values.name,
           description: values.description || undefined,
           platform: values.platform || undefined,
@@ -143,18 +144,18 @@ function ApplicationDialog({
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="app-experience">
-              Experience <span className="text-destructive">*</span>
-            </Label>
+            <Label htmlFor="app-experience">Experience</Label>
             <Select
-              value={experienceId ?? ""}
-              onValueChange={(v) => setValue("experience_id", v)}
-              disabled={isEdit}
+              value={experienceId ?? "_none"}
+              onValueChange={(v) =>
+                setValue("experience_id", v === "_none" ? "" : v)
+              }
             >
               <SelectTrigger id="app-experience">
-                <SelectValue placeholder="Select an experience" />
+                <SelectValue placeholder="None" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="_none">None</SelectItem>
                 {experiences.map((exp) => (
                   <SelectItem key={exp.id} value={exp.id}>
                     {exp.name}
@@ -162,11 +163,6 @@ function ApplicationDialog({
                 ))}
               </SelectContent>
             </Select>
-            {errors.experience_id && (
-              <p className="text-xs text-destructive">
-                {errors.experience_id.message}
-              </p>
-            )}
           </div>
 
           <div className="space-y-1.5">
@@ -320,6 +316,7 @@ export function ApplicationsPage() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden sm:table-cell">Platform</TableHead>
                 <TableHead className="hidden sm:table-cell">Experience</TableHead>
@@ -331,12 +328,13 @@ export function ApplicationsPage() {
             <TableBody>
               {items.map((app) => (
                 <TableRow key={app.id}>
+                  <TableCell><CopyableId value={app.id} /></TableCell>
                   <TableCell className="font-medium">{app.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                     {app.platform ?? "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {experienceName(app.experience_id)}
+                    {app.experience_id ? experienceName(app.experience_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {app.description ?? "—"}
