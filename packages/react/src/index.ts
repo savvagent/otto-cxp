@@ -1,5 +1,5 @@
 // Context
-export { CxpProvider, useCxp } from "./context/CxpProvider.js";
+export { CxpProvider, useCxp, useCxpOptional } from "./context/CxpProvider.js";
 
 // Hooks
 export {
@@ -14,6 +14,9 @@ export {
   FeedbackForm,
   SurveyRenderer,
   type ChatWidgetProps,
+  type ChatWidgetLabels,
   type FeedbackFormProps,
+  type FeedbackFormLabels,
   type SurveyRendererProps,
+  type SurveyRendererLabels,
 } from "./components/index.js";

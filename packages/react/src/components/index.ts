@@ -1,6 +1,7 @@
-export { ChatWidget, type ChatWidgetProps } from "./ChatWidget.js";
-export { FeedbackForm, type FeedbackFormProps } from "./FeedbackForm.js";
+export { ChatWidget, type ChatWidgetProps, type ChatWidgetLabels } from "./ChatWidget.js";
+export { FeedbackForm, type FeedbackFormProps, type FeedbackFormLabels } from "./FeedbackForm.js";
 export {
   SurveyRenderer,
   type SurveyRendererProps,
+  type SurveyRendererLabels,
 } from "./SurveyRenderer.js";

@@ -1,28 +1,86 @@
 import React, { useState } from "react";
 import type { Feedback } from "@cxp/sdk";
-import { useCxp } from "../context/CxpProvider.js";
+import { useCxpOptional } from "../context/CxpProvider.js";
+
+export interface FeedbackFormLabels {
+  title?: string;
+  feedbackType?: string;
+  subject?: string;
+  description?: string;
+  rating?: string;
+  submit?: string;
+  submitting?: string;
+  success?: string;
+  errorPrefix?: string;
+  typeBugReport?: string;
+  typeFeatureRequest?: string;
+  typeComplaint?: string;
+  typePraise?: string;
+  typeSuggestion?: string;
+  rating1?: string;
+  rating2?: string;
+  rating3?: string;
+  rating4?: string;
+  rating5?: string;
+}
+
+const DEFAULT_FEEDBACK_LABELS: Required<FeedbackFormLabels> = {
+  title: "Submit Feedback",
+  feedbackType: "Feedback Type",
+  subject: "Subject",
+  description: "Description",
+  rating: "Rating (1-5)",
+  submit: "Submit Feedback",
+  submitting: "Submitting...",
+  success: "Feedback submitted successfully!",
+  errorPrefix: "Error:",
+  typeBugReport: "Bug Report",
+  typeFeatureRequest: "Feature Request",
+  typeComplaint: "Complaint",
+  typePraise: "Praise",
+  typeSuggestion: "Suggestion",
+  rating1: "1 - Poor",
+  rating2: "2 - Fair",
+  rating3: "3 - Good",
+  rating4: "4 - Very Good",
+  rating5: "5 - Excellent",
+};
 
 export interface FeedbackFormProps {
-  customerId: string;
+  customerId?: string;
   experience?: string;
   application?: string;
   page?: string;
   component?: string;
+  labels?: FeedbackFormLabels;
   onSubmit?: (feedback: Feedback) => void;
 }
 
 /**
- * Component for submitting customer feedback
+ * Component for submitting customer feedback.
+ * Works standalone with demo behavior when no CxpProvider is present.
+ *
  * @example
- * <FeedbackForm
- *   customerId="cust_123"
- *   application="Dashboard"
- *   page="/settings"
- *   onSubmit={(feedback) => console.log("Submitted:", feedback)}
- * />
+ * // Standalone demo mode
+ * <FeedbackForm onSubmit={(fb) => console.log(fb)} />
+ *
+ * @example
+ * // Connected to CXP backend
+ * <CxpProvider client={cxpClient}>
+ *   <FeedbackForm customerId="cust_123" />
+ * </CxpProvider>
  */
-export function FeedbackForm({ customerId, experience, application, page, component, onSubmit }: FeedbackFormProps) {
-  const cxp = useCxp();
+export function FeedbackForm({
+  customerId = "demo-customer",
+  experience,
+  application,
+  page,
+  component,
+  labels: labelOverrides,
+  onSubmit,
+}: FeedbackFormProps) {
+  const l = { ...DEFAULT_FEEDBACK_LABELS, ...labelOverrides };
+  const cxp = useCxpOptional();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [success, setSuccess] = useState(false);
@@ -53,10 +111,29 @@ export function FeedbackForm({ customerId, experience, application, page, compon
     setSuccess(false);
 
     try {
-      const feedback = await cxp.feedback.submitFeedback(
-        customerId,
-        formData.feedbackType,
-        {
+      let feedback: Feedback;
+
+      if (cxp) {
+        feedback = await cxp.feedback.submitFeedback(
+          customerId,
+          formData.feedbackType,
+          {
+            subject: formData.subject,
+            body: formData.body,
+            rating: formData.rating,
+            experience,
+            application,
+            page,
+            component,
+          },
+        );
+      } else {
+        // Demo mode: simulate a brief delay and return mock data
+        await new Promise((r) => setTimeout(r, 600));
+        feedback = {
+          id: `demo-fb-${Date.now()}`,
+          customerId,
+          feedbackType: formData.feedbackType,
           subject: formData.subject,
           body: formData.body,
           rating: formData.rating,
@@ -64,8 +141,10 @@ export function FeedbackForm({ customerId, experience, application, page, compon
           application,
           page,
           component,
-        },
-      );
+          metadata: {},
+          createdAt: new Date().toISOString(),
+        };
+      }
 
       setSuccess(true);
       setFormData({
@@ -86,7 +165,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
   return (
     <div style={{ maxWidth: "600px", padding: "20px" }}>
       <h2 style={{ fontSize: "24px", fontWeight: "600", marginBottom: "24px" }}>
-        Submit Feedback
+        {l.title}
       </h2>
 
       <form
@@ -104,7 +183,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Feedback Type
+            {l.feedbackType}
           </label>
           <select
             id="feedbackType"
@@ -120,11 +199,11 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            <option value="bug_report">Bug Report</option>
-            <option value="feature_request">Feature Request</option>
-            <option value="complaint">Complaint</option>
-            <option value="praise">Praise</option>
-            <option value="suggestion">Suggestion</option>
+            <option value="bug_report">{l.typeBugReport}</option>
+            <option value="feature_request">{l.typeFeatureRequest}</option>
+            <option value="complaint">{l.typeComplaint}</option>
+            <option value="praise">{l.typePraise}</option>
+            <option value="suggestion">{l.typeSuggestion}</option>
           </select>
         </div>
 
@@ -139,7 +218,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Subject
+            {l.subject}
           </label>
           <input
             type="text"
@@ -169,7 +248,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Description
+            {l.description}
           </label>
           <textarea
             id="body"
@@ -200,7 +279,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Rating (1-5)
+            {l.rating}
           </label>
           <select
             id="rating"
@@ -216,11 +295,11 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            <option value={1}>1 - Poor</option>
-            <option value={2}>2 - Fair</option>
-            <option value={3}>3 - Good</option>
-            <option value={4}>4 - Very Good</option>
-            <option value={5}>5 - Excellent</option>
+            <option value={1}>{l.rating1}</option>
+            <option value={2}>{l.rating2}</option>
+            <option value={3}>{l.rating3}</option>
+            <option value={4}>{l.rating4}</option>
+            <option value={5}>{l.rating5}</option>
           </select>
         </div>
 
@@ -239,7 +318,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
             cursor: loading ? "not-allowed" : "pointer",
           }}
         >
-          {loading ? "Submitting..." : "Submit Feedback"}
+          {loading ? l.submitting : l.submit}
         </button>
 
         {/* Success Message */}
@@ -253,7 +332,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Feedback submitted successfully!
+            {l.success}
           </div>
         )}
 
@@ -268,7 +347,7 @@ export function FeedbackForm({ customerId, experience, application, page, compon
               fontSize: "14px",
             }}
           >
-            Error: {error.message}
+            {l.errorPrefix} {error.message}
           </div>
         )}
       </form>

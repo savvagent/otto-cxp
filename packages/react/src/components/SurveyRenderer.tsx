@@ -1,38 +1,108 @@
 import React, { useState, useEffect } from "react";
 import type { Survey, SurveyQuestion } from "@cxp/sdk";
-import { useCxp } from "../context/CxpProvider.js";
+import { useCxpOptional } from "../context/CxpProvider.js";
 
-export interface SurveyRendererProps {
-  surveyId: string;
-  customerId: string;
-  onComplete?: () => void;
+export interface SurveyRendererLabels {
+  loading?: string;
+  errorPrefix?: string;
+  noSurvey?: string;
+  notFound?: string;
+  thankYouTitle?: string;
+  thankYouMessage?: string;
+  submit?: string;
+  submitting?: string;
 }
 
+const DEFAULT_SURVEY_LABELS: Required<SurveyRendererLabels> = {
+  loading: "Loading survey...",
+  errorPrefix: "Error:",
+  noSurvey: "Provide a survey ID or seed mock data to view a survey.",
+  notFound: "Survey not found.",
+  thankYouTitle: "Thank you!",
+  thankYouMessage: "Your survey response has been submitted successfully.",
+  submit: "Submit Survey",
+  submitting: "Submitting...",
+};
+
+export interface SurveyRendererProps {
+  surveyId?: string;
+  customerId?: string;
+  onComplete?: () => void;
+  experience?: string;
+  application?: string;
+  page?: string;
+  component?: string;
+  labels?: SurveyRendererLabels;
+}
+
+const DEMO_SURVEY: Survey = {
+  id: "demo-survey",
+  title: "Customer Satisfaction Survey",
+  description:
+    "We'd love to hear about your experience. Your feedback helps us improve!",
+  active: true,
+  questions: [
+    {
+      id: "q1",
+      text: "How would you rate your overall experience?",
+      questionType: "rating",
+      required: true,
+    },
+    {
+      id: "q2",
+      text: "Which feature do you use most often?",
+      questionType: "multiple_choice",
+      options: ["Dashboard", "Reports", "Settings", "Integrations"],
+      required: true,
+    },
+    {
+      id: "q3",
+      text: "What could we do to improve your experience?",
+      questionType: "text",
+      required: false,
+    },
+  ],
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
+
 /**
- * Component for rendering and completing surveys
+ * Component for rendering and completing surveys.
+ * Works standalone with a demo survey when no CxpProvider is present.
+ *
  * @example
- * <SurveyRenderer
- *   surveyId="survey_123"
- *   customerId="cust_123"
- *   onComplete={() => console.log("Survey completed!")}
- * />
+ * // Standalone demo mode
+ * <SurveyRenderer onComplete={() => alert("Done!")} />
+ *
+ * @example
+ * // Connected to CXP backend
+ * <CxpProvider client={cxpClient}>
+ *   <SurveyRenderer surveyId="survey_123" customerId="cust_123" />
+ * </CxpProvider>
  */
 export function SurveyRenderer({
-  surveyId,
-  customerId,
+  surveyId = "demo-survey",
+  customerId = "demo-customer",
   onComplete,
+  labels: labelOverrides,
 }: SurveyRendererProps) {
-  const cxp = useCxp();
-  const [survey, setSurvey] = useState<Survey | null>(null);
-  const [loading, setLoading] = useState(true);
+  const l = { ...DEFAULT_SURVEY_LABELS, ...labelOverrides };
+  const cxp = useCxpOptional();
+  const isDemo = !cxp;
+  const hasValidId = surveyId !== "demo-survey" && surveyId !== "";
+
+  const [survey, setSurvey] = useState<Survey | null>(isDemo ? DEMO_SURVEY : null);
+  const [loading, setLoading] = useState(!isDemo && hasValidId);
   const [error, setError] = useState<Error | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
   const [answers, setAnswers] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    if (isDemo || !hasValidId) return;
     let cancelled = false;
     setLoading(true);
-    cxp.feedback
+    cxp!.feedback
       .getSurvey(surveyId)
       .then((data) => {
         if (!cancelled) {
@@ -49,7 +119,7 @@ export function SurveyRenderer({
     return () => {
       cancelled = true;
     };
-  }, [cxp, surveyId]);
+  }, [cxp, surveyId, isDemo, hasValidId]);
 
   const handleAnswerChange = (questionId: string, value: string) => {
     setAnswers((prev) => ({ ...prev, [questionId]: value }));
@@ -63,15 +133,20 @@ export function SurveyRenderer({
     setError(null);
 
     try {
-      const surveyAnswers = Object.entries(answers).map(
-        ([questionId, value]) => ({ questionId, value })
-      );
-
-      await cxp.feedback.submitSurveyResponse({
-        surveyId,
-        customerId,
-        answers: surveyAnswers,
-      });
+      if (cxp) {
+        const surveyAnswers = Object.entries(answers).map(
+          ([questionId, value]) => ({ questionId, value })
+        );
+        await cxp.feedback.submitSurveyResponse({
+          surveyId,
+          customerId,
+          answers: surveyAnswers,
+        });
+      } else {
+        // Demo mode: simulate submission delay
+        await new Promise((r) => setTimeout(r, 600));
+      }
+      setSubmitted(true);
       onComplete?.();
     } catch (err) {
       setError(err as Error);
@@ -222,19 +297,49 @@ export function SurveyRenderer({
   };
 
   if (loading) {
-    return <div style={{ padding: "20px" }}>Loading survey...</div>;
+    return <div style={{ padding: "20px" }}>{l.loading}</div>;
   }
 
   if (error) {
     return (
       <div style={{ padding: "20px", color: "#d32f2f" }}>
-        Error: {error.message}
+        {l.errorPrefix} {error.message}
+      </div>
+    );
+  }
+
+  if (!isDemo && !hasValidId) {
+    return (
+      <div style={{ padding: "20px", color: "#757575" }}>
+        {l.noSurvey}
       </div>
     );
   }
 
   if (!survey) {
-    return <div style={{ padding: "20px" }}>Survey not found.</div>;
+    return <div style={{ padding: "20px" }}>{l.notFound}</div>;
+  }
+
+  if (submitted) {
+    return (
+      <div style={{ maxWidth: "700px", padding: "20px", textAlign: "center" }}>
+        <div
+          style={{
+            padding: "24px",
+            backgroundColor: "#e8f5e9",
+            borderRadius: "8px",
+            marginBottom: "16px",
+          }}
+        >
+          <h3 style={{ color: "#2e7d32", fontSize: "20px", margin: "0 0 8px" }}>
+            {l.thankYouTitle}
+          </h3>
+          <p style={{ color: "#388e3c", fontSize: "16px", margin: 0 }}>
+            {l.thankYouMessage}
+          </p>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -266,7 +371,7 @@ export function SurveyRenderer({
             marginTop: "24px",
           }}
         >
-          {submitting ? "Submitting..." : "Submit Survey"}
+          {submitting ? l.submitting : l.submit}
         </button>
 
       </form>

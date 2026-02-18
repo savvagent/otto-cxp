@@ -18,3 +18,11 @@ export function useCxp(): CxpClient {
   if (!ctx) throw new Error("useCxp must be used within a CxpProvider");
   return ctx;
 }
+
+/**
+ * Returns the CxpClient if inside a CxpProvider, or null otherwise.
+ * Useful for components that support a standalone demo mode.
+ */
+export function useCxpOptional(): CxpClient | null {
+  return useContext(CxpContext);
+}
