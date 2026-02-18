@@ -12,6 +12,10 @@ pub struct Customer {
     pub company: Option<String>,
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
+    pub experience_id: Option<Uuid>,
+    pub application_id: Option<Uuid>,
+    pub page_id: Option<Uuid>,
+    pub component_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

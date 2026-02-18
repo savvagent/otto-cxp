@@ -11,8 +11,8 @@
  * - Per-row dropdown with Delete action + ConfirmDialog
  */
 
-import { useState, useMemo } from "react";
-import { useNavigate } from "react-router";
+import { useState, useMemo, useCallback } from "react";
+import { useNavigate, useSearchParams } from "react-router";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -64,6 +64,10 @@ import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import {
+  CatalogFilterBar,
+  type CatalogFilterValues,
+} from "@/components/shared/catalog-filter-bar";
 
 const PAGE_SIZE = 50;
 
@@ -298,13 +302,46 @@ function CustomerRowActions({ customer }: { customer: Customer }) {
 
 export function CustomersPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [newDialogOpen, setNewDialogOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
 
+  const catalogFilters: CatalogFilterValues = {
+    experience_id: searchParams.get("experience_id") ?? undefined,
+    application_id: searchParams.get("application_id") ?? undefined,
+    page_id: searchParams.get("page_id") ?? undefined,
+    component_id: searchParams.get("component_id") ?? undefined,
+  };
+
+  const handleCatalogChange = useCallback(
+    (values: CatalogFilterValues) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        const keys = [
+          "experience_id",
+          "application_id",
+          "page_id",
+          "component_id",
+        ] as const;
+        for (const key of keys) {
+          if (values[key]) {
+            next.set(key, values[key]);
+          } else {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+      setOffset(0);
+    },
+    [setSearchParams],
+  );
+
   const { data, isLoading, isError } = useCustomers({
     limit: PAGE_SIZE,
     offset,
+    ...catalogFilters,
   });
 
   // Client-side search filter applied on top of paginated results.
@@ -346,6 +383,12 @@ export function CustomersPage() {
         description="Browse and manage customer profiles"
         action="New Customer"
         onAction={() => setNewDialogOpen(true)}
+      />
+
+      {/* Catalog filters */}
+      <CatalogFilterBar
+        value={catalogFilters}
+        onChange={handleCatalogChange}
       />
 
       {/* Search */}

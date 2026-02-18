@@ -300,7 +300,7 @@ impl CxpServer {
     ) -> String {
         let limit = params.limit.unwrap_or(50);
         let offset = params.offset.unwrap_or(0);
-        match self.customers.list(limit, offset).await {
+        match self.customers.list(None, None, None, None, limit, offset).await {
             Ok(customers) => serde_json::to_string_pretty(&customers).unwrap(),
             Err(e) => format!("Error: {e}"),
         }
@@ -524,7 +524,7 @@ impl CxpServer {
         let offset = params.offset.unwrap_or(0);
         match self
             .tickets
-            .list(cid, params.status.as_deref(), params.priority.as_deref(), limit, offset)
+            .list(cid, params.status.as_deref(), params.priority.as_deref(), None, None, None, None, limit, offset)
             .await
         {
             Ok(tickets) => serde_json::to_string_pretty(&tickets).unwrap(),

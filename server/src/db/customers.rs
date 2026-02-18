@@ -102,10 +102,27 @@ impl CustomerDb {
         .await
     }
 
-    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<Customer>, sqlx::Error> {
+    pub async fn list(
+        &self,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Customer>, sqlx::Error> {
         sqlx::query_as::<_, Customer>(
-            r#"SELECT * FROM customers ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
+            r#"SELECT * FROM customers
+             WHERE ($1::uuid IS NULL OR experience_id = $1)
+               AND ($2::uuid IS NULL OR application_id = $2)
+               AND ($3::uuid IS NULL OR page_id = $3)
+               AND ($4::uuid IS NULL OR component_id = $4)
+             ORDER BY created_at DESC LIMIT $5 OFFSET $6"#,
         )
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -129,10 +146,26 @@ impl CustomerDb {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn count(&self) -> Result<i64, sqlx::Error> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customers")
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn count(
+        &self,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM customers
+             WHERE ($1::uuid IS NULL OR experience_id = $1)
+               AND ($2::uuid IS NULL OR application_id = $2)
+               AND ($3::uuid IS NULL OR page_id = $3)
+               AND ($4::uuid IS NULL OR component_id = $4)",
+        )
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 
@@ -174,7 +207,9 @@ impl CustomerDb {
             r#"
             SELECT id, customer_id, subject, description,
                    status::text as status, priority::text as priority, channel::text as channel,
-                   assigned_to, tags, metadata, resolved_at, created_at, updated_at
+                   assigned_to, tags, metadata,
+                   experience_id, application_id, page_id, component_id,
+                   resolved_at, created_at, updated_at
             FROM tickets
             WHERE customer_id = $1
             ORDER BY created_at DESC

@@ -11,7 +11,14 @@ export const customerKeys = {
   detail: (id: string) => [...customerKeys.details(), id] as const,
 };
 
-export function useCustomers(params?: { limit?: number; offset?: number }) {
+export function useCustomers(params?: {
+  limit?: number;
+  offset?: number;
+  experience_id?: string;
+  application_id?: string;
+  page_id?: string;
+  component_id?: string;
+}) {
   return useQuery({
     queryKey: customerKeys.list(params ?? {}),
     queryFn: () => customersApi.list(params),

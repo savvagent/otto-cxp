@@ -119,11 +119,24 @@ impl FeedbackDb {
     pub async fn count_feedback(
         &self,
         feedback_type: Option<&str>,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
     ) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM feedback WHERE ($1::text IS NULL OR feedback_type = $1::feedback_type)",
+            "SELECT COUNT(*) FROM feedback
+             WHERE ($1::text IS NULL OR feedback_type = $1::feedback_type)
+               AND ($2::uuid IS NULL OR experience_id = $2)
+               AND ($3::uuid IS NULL OR application_id = $3)
+               AND ($4::uuid IS NULL OR page_id = $4)
+               AND ($5::uuid IS NULL OR component_id = $5)",
         )
         .bind(feedback_type)
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -208,22 +221,51 @@ impl FeedbackDb {
 
     pub async fn list_surveys(
         &self,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Survey>, sqlx::Error> {
         sqlx::query_as::<_, Survey>(
-            "SELECT * FROM surveys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT * FROM surveys
+             WHERE ($1::uuid IS NULL OR experience_id = $1)
+               AND ($2::uuid IS NULL OR application_id = $2)
+               AND ($3::uuid IS NULL OR page_id = $3)
+               AND ($4::uuid IS NULL OR component_id = $4)
+             ORDER BY created_at DESC LIMIT $5 OFFSET $6",
         )
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn count_surveys(&self) -> Result<i64, sqlx::Error> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM surveys")
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn count_surveys(
+        &self,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM surveys
+             WHERE ($1::uuid IS NULL OR experience_id = $1)
+               AND ($2::uuid IS NULL OR application_id = $2)
+               AND ($3::uuid IS NULL OR page_id = $3)
+               AND ($4::uuid IS NULL OR component_id = $4)",
+        )
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.0)
     }
 

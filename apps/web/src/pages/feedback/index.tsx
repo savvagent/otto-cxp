@@ -21,7 +21,11 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { MessageSquare, Star } from "lucide-react";
-import { useState } from "react";
+import { useState, useCallback } from "react";
+import {
+  CatalogFilterBar,
+  type CatalogFilterValues,
+} from "@/components/shared/catalog-filter-bar";
 
 const PAGE_SIZE = 20;
 
@@ -71,10 +75,42 @@ export function FeedbackPage() {
 
   const feedbackType = searchParams.get("feedback_type") ?? undefined;
 
+  const catalogFilters: CatalogFilterValues = {
+    experience_id: searchParams.get("experience_id") ?? undefined,
+    application_id: searchParams.get("application_id") ?? undefined,
+    page_id: searchParams.get("page_id") ?? undefined,
+    component_id: searchParams.get("component_id") ?? undefined,
+  };
+
+  const handleCatalogChange = useCallback(
+    (values: CatalogFilterValues) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        const keys = [
+          "experience_id",
+          "application_id",
+          "page_id",
+          "component_id",
+        ] as const;
+        for (const key of keys) {
+          if (values[key]) {
+            next.set(key, values[key]);
+          } else {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+      setPage(0);
+    },
+    [setSearchParams],
+  );
+
   const { data, isLoading } = useFeedback({
     feedback_type: feedbackType,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
+    ...catalogFilters,
   });
 
   const items = data?.data ?? [];
@@ -126,6 +162,12 @@ export function FeedbackPage() {
           </Button>
         )}
       </div>
+
+      {/* Catalog filters */}
+      <CatalogFilterBar
+        value={catalogFilters}
+        onChange={handleCatalogChange}
+      />
 
       {isLoading ? (
         <LoadingTable />

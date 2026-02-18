@@ -12,7 +12,14 @@ export const surveyKeys = {
   responses: (id: string) => [...surveyKeys.detail(id), "responses"] as const,
 };
 
-export function useSurveys(params?: { limit?: number; offset?: number }) {
+export function useSurveys(params?: {
+  limit?: number;
+  offset?: number;
+  experience_id?: string;
+  application_id?: string;
+  page_id?: string;
+  component_id?: string;
+}) {
   return useQuery({
     queryKey: surveyKeys.list(params ?? {}),
     queryFn: () => surveysApi.list(params),

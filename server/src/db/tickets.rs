@@ -6,7 +6,9 @@ use crate::models::ticket::Ticket;
 const TICKET_COLS: &str = r#"
     id, customer_id, subject, description,
     status::text as status, priority::text as priority, channel::text as channel,
-    assigned_to, tags, metadata, resolved_at, created_at, updated_at
+    assigned_to, tags, metadata,
+    experience_id, application_id, page_id, component_id,
+    resolved_at, created_at, updated_at
 "#;
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,10 @@ impl TicketDb {
         customer_id: Option<Uuid>,
         status: Option<&str>,
         priority: Option<&str>,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Ticket>, sqlx::Error> {
@@ -99,14 +105,22 @@ impl TicketDb {
              WHERE ($1::uuid IS NULL OR customer_id = $1)
                AND ($2::text IS NULL OR status = $2::ticket_status)
                AND ($3::text IS NULL OR priority = $3::ticket_priority)
+               AND ($4::uuid IS NULL OR experience_id = $4)
+               AND ($5::uuid IS NULL OR application_id = $5)
+               AND ($6::uuid IS NULL OR page_id = $6)
+               AND ($7::uuid IS NULL OR component_id = $7)
              ORDER BY created_at DESC
-             LIMIT $4 OFFSET $5"
+             LIMIT $8 OFFSET $9"
         );
 
         sqlx::query_as::<_, Ticket>(&sql)
             .bind(customer_id)
             .bind(status)
             .bind(priority)
+            .bind(experience_id)
+            .bind(application_id)
+            .bind(page_id)
+            .bind(component_id)
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -125,12 +139,26 @@ impl TicketDb {
         &self,
         status: Option<&str>,
         priority: Option<&str>,
+        experience_id: Option<Uuid>,
+        application_id: Option<Uuid>,
+        page_id: Option<Uuid>,
+        component_id: Option<Uuid>,
     ) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM tickets WHERE ($1::text IS NULL OR status = $1::ticket_status) AND ($2::text IS NULL OR priority = $2::ticket_priority)",
+            "SELECT COUNT(*) FROM tickets
+             WHERE ($1::text IS NULL OR status = $1::ticket_status)
+               AND ($2::text IS NULL OR priority = $2::ticket_priority)
+               AND ($3::uuid IS NULL OR experience_id = $3)
+               AND ($4::uuid IS NULL OR application_id = $4)
+               AND ($5::uuid IS NULL OR page_id = $5)
+               AND ($6::uuid IS NULL OR component_id = $6)",
         )
         .bind(status)
         .bind(priority)
+        .bind(experience_id)
+        .bind(application_id)
+        .bind(page_id)
+        .bind(component_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)

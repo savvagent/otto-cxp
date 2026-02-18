@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate } from "react-router";
+import { useState, useCallback } from "react";
+import { useNavigate, useSearchParams } from "react-router";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -36,6 +36,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { Survey } from "@/lib/types";
+import {
+  CatalogFilterBar,
+  type CatalogFilterValues,
+} from "@/components/shared/catalog-filter-bar";
 
 const PAGE_SIZE = 20;
 
@@ -159,13 +163,45 @@ function CreateSurveyDialog({
 
 export function SurveysPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [page] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Survey | null>(null);
 
+  const catalogFilters: CatalogFilterValues = {
+    experience_id: searchParams.get("experience_id") ?? undefined,
+    application_id: searchParams.get("application_id") ?? undefined,
+    page_id: searchParams.get("page_id") ?? undefined,
+    component_id: searchParams.get("component_id") ?? undefined,
+  };
+
+  const handleCatalogChange = useCallback(
+    (values: CatalogFilterValues) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        const keys = [
+          "experience_id",
+          "application_id",
+          "page_id",
+          "component_id",
+        ] as const;
+        for (const key of keys) {
+          if (values[key]) {
+            next.set(key, values[key]);
+          } else {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+    },
+    [setSearchParams],
+  );
+
   const { data, isLoading } = useSurveys({
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
+    ...catalogFilters,
   });
 
   const deleteSurvey = useDeleteSurvey();
@@ -197,6 +233,12 @@ export function SurveysPage() {
         title="Surveys"
         action="New Survey"
         onAction={() => setCreateOpen(true)}
+      />
+
+      {/* Catalog filters */}
+      <CatalogFilterBar
+        value={catalogFilters}
+        onChange={handleCatalogChange}
       />
 
       {isLoading ? (

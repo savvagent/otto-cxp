@@ -45,7 +45,13 @@ pub async fn list(
         .await?;
     let total = state
         .feedback
-        .count_feedback(params.feedback_type.as_deref())
+        .count_feedback(
+            params.feedback_type.as_deref(),
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+        )
         .await?;
     Ok(Json(PaginatedResponse {
         data,

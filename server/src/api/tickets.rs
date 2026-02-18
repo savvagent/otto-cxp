@@ -41,6 +41,10 @@ pub struct TicketFilterParams {
     pub status: Option<String>,
     pub priority: Option<String>,
     pub customer_id: Option<Uuid>,
+    pub experience_id: Option<Uuid>,
+    pub application_id: Option<Uuid>,
+    pub page_id: Option<Uuid>,
+    pub component_id: Option<Uuid>,
 }
 
 fn default_limit() -> i64 {
@@ -57,13 +61,24 @@ pub async fn list(
             params.customer_id,
             params.status.as_deref(),
             params.priority.as_deref(),
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
             params.limit,
             params.offset,
         )
         .await?;
     let total = state
         .tickets
-        .count(params.status.as_deref(), params.priority.as_deref())
+        .count(
+            params.status.as_deref(),
+            params.priority.as_deref(),
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+        )
         .await?;
     Ok(Json(PaginatedResponse {
         data,

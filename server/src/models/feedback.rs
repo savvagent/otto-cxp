@@ -27,6 +27,10 @@ pub struct Survey {
     pub description: Option<String>,
     pub questions: serde_json::Value,
     pub active: bool,
+    pub experience_id: Option<Uuid>,
+    pub application_id: Option<Uuid>,
+    pub page_id: Option<Uuid>,
+    pub component_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

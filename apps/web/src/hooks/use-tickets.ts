@@ -8,6 +8,10 @@ type TicketListParams = {
   status?: string;
   priority?: string;
   customer_id?: string;
+  experience_id?: string;
+  application_id?: string;
+  page_id?: string;
+  component_id?: string;
 };
 
 export const ticketKeys = {

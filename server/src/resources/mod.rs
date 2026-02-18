@@ -32,7 +32,7 @@ impl CxpServer {
         // Aggregate basic metrics
         let tickets = self
             .tickets
-            .list(None, None, None, 0, 0)
+            .list(None, None, None, None, None, None, None, 0, 0)
             .await
             .map_err(|e| format!("Database error: {e}"))?;
 

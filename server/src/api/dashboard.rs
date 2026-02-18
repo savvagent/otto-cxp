@@ -18,11 +18,11 @@ pub struct DashboardMetrics {
 pub async fn metrics(
     State(state): State<ApiState>,
 ) -> Result<Json<DashboardMetrics>, ApiError> {
-    let total_customers = state.customers.count().await?;
-    let total_tickets = state.tickets.count(None, None).await?;
-    let open_tickets = state.tickets.count(Some("open"), None).await?;
-    let total_feedback = state.feedback.count_feedback(None).await?;
-    let total_surveys = state.feedback.count_surveys().await?;
+    let total_customers = state.customers.count(None, None, None, None).await?;
+    let total_tickets = state.tickets.count(None, None, None, None, None, None).await?;
+    let open_tickets = state.tickets.count(Some("open"), None, None, None, None, None).await?;
+    let total_feedback = state.feedback.count_feedback(None, None, None, None, None).await?;
+    let total_surveys = state.feedback.count_surveys(None, None, None, None).await?;
     let total_experiences = state.experiences.count().await?;
 
     Ok(Json(DashboardMetrics {

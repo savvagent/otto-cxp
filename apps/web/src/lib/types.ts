@@ -6,6 +6,10 @@ export interface Customer {
   company: string | null;
   metadata: Record<string, unknown>;
   tags: string[];
+  experience_id: string | null;
+  application_id: string | null;
+  page_id: string | null;
+  component_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -21,6 +25,10 @@ export interface Ticket {
   assigned_to: string | null;
   tags: string[];
   metadata: Record<string, unknown>;
+  experience_id: string | null;
+  application_id: string | null;
+  page_id: string | null;
+  component_id: string | null;
   resolved_at: string | null;
   created_at: string;
   updated_at: string;
@@ -47,6 +55,10 @@ export interface Survey {
   description: string | null;
   questions: unknown;
   active: boolean;
+  experience_id: string | null;
+  application_id: string | null;
+  page_id: string | null;
+  component_id: string | null;
   created_at: string;
   updated_at: string;
 }

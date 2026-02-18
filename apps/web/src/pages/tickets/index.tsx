@@ -5,7 +5,7 @@
  *   <Route path="tickets" element={<TicketsPage />} />
  */
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -25,6 +25,10 @@ import { PriorityBadge } from "@/components/shared/priority-badge";
 import { EmptyState } from "@/components/shared/empty-state";
 import { LoadingTable } from "@/components/shared/loading-state";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import {
+  CatalogFilterBar,
+  type CatalogFilterValues,
+} from "@/components/shared/catalog-filter-bar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -108,6 +112,37 @@ export function TicketsPage() {
   const page = parseInt(searchParams.get("page") ?? "0", 10);
   const offset = page * PAGE_SIZE;
 
+  const catalogFilters: CatalogFilterValues = {
+    experience_id: searchParams.get("experience_id") ?? undefined,
+    application_id: searchParams.get("application_id") ?? undefined,
+    page_id: searchParams.get("page_id") ?? undefined,
+    component_id: searchParams.get("component_id") ?? undefined,
+  };
+
+  const handleCatalogChange = useCallback(
+    (values: CatalogFilterValues) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        const keys = [
+          "experience_id",
+          "application_id",
+          "page_id",
+          "component_id",
+        ] as const;
+        for (const key of keys) {
+          if (values[key]) {
+            next.set(key, values[key]);
+          } else {
+            next.delete(key);
+          }
+        }
+        next.delete("page");
+        return next;
+      });
+    },
+    [setSearchParams],
+  );
+
   // Dialog state
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Ticket | null>(null);
@@ -118,6 +153,7 @@ export function TicketsPage() {
     offset,
     status: statusFilter || undefined,
     priority: priorityFilter || undefined,
+    ...catalogFilters,
   });
 
   const createTicket = useCreateTicket();
@@ -206,7 +242,14 @@ export function TicketsPage() {
 
   const tickets = data?.data ?? [];
   const total = data?.total ?? 0;
-  const hasFilters = !!(statusFilter || priorityFilter);
+  const hasFilters = !!(
+    statusFilter ||
+    priorityFilter ||
+    catalogFilters.experience_id ||
+    catalogFilters.application_id ||
+    catalogFilters.page_id ||
+    catalogFilters.component_id
+  );
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const hasPrev = page > 0;
   const hasNext = page < totalPages - 1;
@@ -281,6 +324,12 @@ export function TicketsPage() {
           </span>
         )}
       </div>
+
+      {/* Catalog filters */}
+      <CatalogFilterBar
+        value={catalogFilters}
+        onChange={handleCatalogChange}
+      />
 
       {/* Table */}
       {isLoading ? (

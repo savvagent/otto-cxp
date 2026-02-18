@@ -4,7 +4,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::error::ApiError;
-use super::pagination::{PaginatedResponse, PaginationParams};
+use super::pagination::PaginatedResponse;
 use super::state::ApiState;
 use crate::models::feedback::{Survey, SurveyResponse};
 
@@ -23,12 +23,46 @@ pub struct UpdateSurveyBody {
     pub active: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SurveyFilterParams {
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub experience_id: Option<Uuid>,
+    pub application_id: Option<Uuid>,
+    pub page_id: Option<Uuid>,
+    pub component_id: Option<Uuid>,
+}
+
+fn default_limit() -> i64 {
+    50
+}
+
 pub async fn list(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<SurveyFilterParams>,
 ) -> Result<Json<PaginatedResponse<Survey>>, ApiError> {
-    let data = state.feedback.list_surveys(params.limit, params.offset).await?;
-    let total = state.feedback.count_surveys().await?;
+    let data = state
+        .feedback
+        .list_surveys(
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+            params.limit,
+            params.offset,
+        )
+        .await?;
+    let total = state
+        .feedback
+        .count_surveys(
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+        )
+        .await?;
     Ok(Json(PaginatedResponse {
         data,
         total,

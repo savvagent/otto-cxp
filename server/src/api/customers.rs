@@ -4,7 +4,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::error::ApiError;
-use super::pagination::{PaginatedResponse, PaginationParams};
+use super::pagination::PaginatedResponse;
 use super::state::ApiState;
 use crate::db::customers::Customer360;
 use crate::models::Customer;
@@ -32,16 +32,50 @@ pub struct UpdateCustomerBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CustomerFilterParams {
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub experience_id: Option<Uuid>,
+    pub application_id: Option<Uuid>,
+    pub page_id: Option<Uuid>,
+    pub component_id: Option<Uuid>,
+}
+
+fn default_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SearchParams {
     pub q: String,
 }
 
 pub async fn list(
     State(state): State<ApiState>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<CustomerFilterParams>,
 ) -> Result<Json<PaginatedResponse<Customer>>, ApiError> {
-    let data = state.customers.list(params.limit, params.offset).await?;
-    let total = state.customers.count().await?;
+    let data = state
+        .customers
+        .list(
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+            params.limit,
+            params.offset,
+        )
+        .await?;
+    let total = state
+        .customers
+        .count(
+            params.experience_id,
+            params.application_id,
+            params.page_id,
+            params.component_id,
+        )
+        .await?;
     Ok(Json(PaginatedResponse {
         data,
         total,
