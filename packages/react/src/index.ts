@@ -26,7 +26,4 @@ export {
   type SurveyRendererLabels,
   type SurveyContentOverrides,
   type SurveyQuestionOverride,
-  TeamsPage,
-  type TeamsPageProps,
-  type TeamsPageLabels,
 } from "./components/index.js";

@@ -13,6 +13,7 @@ pub mod pages;
 pub mod pagination;
 pub mod state;
 pub mod surveys;
+pub mod teams;
 pub mod tickets;
 
 pub use state::ApiState;
@@ -95,6 +96,14 @@ pub fn router(state: ApiState) -> Router {
             get(components::get)
                 .put(components::update)
                 .delete(components::delete),
+        )
+        // Teams
+        .route("/teams", get(teams::list).post(teams::create))
+        .route(
+            "/teams/{id}",
+            get(teams::get)
+                .put(teams::update)
+                .delete(teams::delete),
         );
 
     Router::new()

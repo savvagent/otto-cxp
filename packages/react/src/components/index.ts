@@ -8,4 +8,3 @@ export {
   type SurveyContentOverrides,
   type SurveyQuestionOverride,
 } from "./SurveyRenderer.js";
-export { TeamsPage, type TeamsPageProps, type TeamsPageLabels } from "./TeamsPage.js";

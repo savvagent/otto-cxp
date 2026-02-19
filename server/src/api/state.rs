@@ -14,6 +14,7 @@ pub struct ApiState {
     pub applications: db::ApplicationDb,
     pub pages: db::PageDb,
     pub components: db::ComponentDb,
+    pub teams: db::TeamDb,
 }
 
 impl ApiState {
@@ -28,7 +29,8 @@ impl ApiState {
             experiences: db::ExperienceDb::new(pool.clone()),
             applications: db::ApplicationDb::new(pool.clone()),
             pages: db::PageDb::new(pool.clone()),
-            components: db::ComponentDb::new(pool),
+            components: db::ComponentDb::new(pool.clone()),
+            teams: db::TeamDb::new(pool),
         }
     }
 }

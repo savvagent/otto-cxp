@@ -129,6 +129,16 @@ export interface Interaction {
   created_at: string;
 }
 
+export interface Team {
+  id: string;
+  name: string;
+  description: string | null;
+  owner: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface DashboardMetrics {
   total_customers: number;
   total_tickets: number;
