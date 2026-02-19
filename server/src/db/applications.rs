@@ -19,6 +19,7 @@ impl ApplicationDb {
         name: &str,
         description: Option<&str>,
         platform: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: serde_json::Value,
     ) -> Result<Application, sqlx::Error> {
         let id = Uuid::new_v4();
@@ -26,8 +27,8 @@ impl ApplicationDb {
 
         sqlx::query_as::<_, Application>(
             r#"
-            INSERT INTO applications (id, experience_id, name, description, platform, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO applications (id, experience_id, name, description, platform, team_id, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -36,6 +37,7 @@ impl ApplicationDb {
         .bind(name)
         .bind(description)
         .bind(platform)
+        .bind(team_id)
         .bind(&metadata)
         .bind(now)
         .bind(now)
@@ -92,6 +94,7 @@ impl ApplicationDb {
         name: Option<&str>,
         description: Option<&str>,
         platform: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> Result<Option<Application>, sqlx::Error> {
         sqlx::query_as::<_, Application>(
@@ -100,7 +103,8 @@ impl ApplicationDb {
             SET name = COALESCE($2, name),
                 description = COALESCE($3, description),
                 platform = COALESCE($4, platform),
-                metadata = COALESCE($5, metadata),
+                team_id = COALESCE($5, team_id),
+                metadata = COALESCE($6, metadata),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -110,6 +114,7 @@ impl ApplicationDb {
         .bind(name)
         .bind(description)
         .bind(platform)
+        .bind(team_id)
         .bind(metadata)
         .fetch_optional(&self.pool)
         .await

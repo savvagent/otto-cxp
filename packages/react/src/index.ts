@@ -5,7 +5,9 @@ export { CxpProvider, useCxp, useCxpOptional } from "./context/CxpProvider.js";
 export {
   useFeedback,
   useChat,
+  useTeams,
   type UseFeedbackOptions,
+  type UseTeamsOptions,
 } from "./hooks/index.js";
 
 // Components
@@ -24,4 +26,7 @@ export {
   type SurveyRendererLabels,
   type SurveyContentOverrides,
   type SurveyQuestionOverride,
+  TeamsPage,
+  type TeamsPageProps,
+  type TeamsPageLabels,
 } from "./components/index.js";

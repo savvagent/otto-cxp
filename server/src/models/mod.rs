@@ -8,6 +8,7 @@ pub mod interaction;
 pub mod knowledge;
 pub mod page;
 pub mod segment;
+pub mod team;
 pub mod ticket;
 
 pub use application::Application;
@@ -20,4 +21,5 @@ pub use interaction::Interaction;
 pub use knowledge::KnowledgeArticle;
 pub use page::Page;
 pub use segment::Segment;
+pub use team::Team;
 pub use ticket::Ticket;

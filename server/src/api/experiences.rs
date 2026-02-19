@@ -12,6 +12,7 @@ use crate::models::Experience;
 pub struct CreateExperienceBody {
     pub name: String,
     pub description: Option<String>,
+    pub team_id: Option<Uuid>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 }
@@ -20,6 +21,7 @@ pub struct CreateExperienceBody {
 pub struct UpdateExperienceBody {
     pub name: Option<String>,
     pub description: Option<String>,
+    pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -56,7 +58,7 @@ pub async fn create(
     let metadata = body.metadata.unwrap_or(serde_json::Value::Object(Default::default()));
     let experience = state
         .experiences
-        .create(&body.name, body.description.as_deref(), metadata)
+        .create(&body.name, body.description.as_deref(), body.team_id, metadata)
         .await?;
     Ok(Json(experience))
 }
@@ -68,7 +70,7 @@ pub async fn update(
 ) -> Result<Json<Experience>, ApiError> {
     state
         .experiences
-        .update(id, body.name.as_deref(), body.description.as_deref(), body.metadata)
+        .update(id, body.name.as_deref(), body.description.as_deref(), body.team_id, body.metadata)
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("Experience not found".into()))

@@ -19,6 +19,7 @@ impl ComponentDb {
         name: &str,
         component_type: Option<&str>,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: serde_json::Value,
     ) -> Result<Component, sqlx::Error> {
         let id = Uuid::new_v4();
@@ -26,8 +27,8 @@ impl ComponentDb {
 
         sqlx::query_as::<_, Component>(
             r#"
-            INSERT INTO components (id, page_id, name, component_type, description, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO components (id, page_id, name, component_type, description, team_id, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -36,6 +37,7 @@ impl ComponentDb {
         .bind(name)
         .bind(component_type)
         .bind(description)
+        .bind(team_id)
         .bind(&metadata)
         .bind(now)
         .bind(now)
@@ -92,6 +94,7 @@ impl ComponentDb {
         name: Option<&str>,
         component_type: Option<&str>,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> Result<Option<Component>, sqlx::Error> {
         sqlx::query_as::<_, Component>(
@@ -100,7 +103,8 @@ impl ComponentDb {
             SET name = COALESCE($2, name),
                 component_type = COALESCE($3, component_type),
                 description = COALESCE($4, description),
-                metadata = COALESCE($5, metadata),
+                team_id = COALESCE($5, team_id),
+                metadata = COALESCE($6, metadata),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -110,6 +114,7 @@ impl ComponentDb {
         .bind(name)
         .bind(component_type)
         .bind(description)
+        .bind(team_id)
         .bind(metadata)
         .fetch_optional(&self.pool)
         .await

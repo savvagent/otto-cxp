@@ -6,6 +6,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SupportDomain } from "./domains/support.js";
 import { FeedbackDomain } from "./domains/feedback.js";
 import { CdpDomain } from "./domains/cdp.js";
+import { TeamsDomain } from "./domains/teams.js";
 
 export interface CxpClientOptions {
   /**
@@ -63,11 +64,17 @@ export class CxpClient {
    */
   public readonly cdp: CdpDomain;
 
+  /**
+   * Teams domain - team management
+   */
+  public readonly teams: TeamsDomain;
+
   constructor(options: CxpClientOptions) {
     this.client = options.client;
     this.support = new SupportDomain(this.client);
     this.feedback = new FeedbackDomain(this.client);
     this.cdp = new CdpDomain(this.client);
+    this.teams = new TeamsDomain(this.client);
   }
 
   /**

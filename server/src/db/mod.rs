@@ -9,6 +9,7 @@ pub mod knowledge;
 pub mod pages;
 pub mod pool;
 pub mod segments;
+pub mod teams;
 pub mod tickets;
 
 pub use applications::ApplicationDb;
@@ -22,4 +23,5 @@ pub use knowledge::KnowledgeDb;
 pub use pages::PageDb;
 pub use pool::create_pool;
 pub use segments::SegmentDb;
+pub use teams::TeamDb;
 pub use tickets::TicketDb;

@@ -10,6 +10,7 @@ pub struct Component {
     pub name: String,
     pub component_type: Option<String>,
     pub description: Option<String>,
+    pub team_id: Option<Uuid>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

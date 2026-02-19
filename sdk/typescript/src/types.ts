@@ -219,3 +219,16 @@ export interface NpsResult {
 export interface CsatResult {
   score: number;
 }
+
+/**
+ * Team entity
+ */
+export interface Team {
+  id: string;
+  name: string;
+  description?: string;
+  owner?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}

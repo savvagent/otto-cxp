@@ -14,6 +14,7 @@ pub struct CreatePageBody {
     pub name: String,
     pub path: Option<String>,
     pub description: Option<String>,
+    pub team_id: Option<Uuid>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 }
@@ -23,6 +24,7 @@ pub struct UpdatePageBody {
     pub name: Option<String>,
     pub path: Option<String>,
     pub description: Option<String>,
+    pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -84,6 +86,7 @@ pub async fn create(
             &body.name,
             body.path.as_deref(),
             body.description.as_deref(),
+            body.team_id,
             metadata,
         )
         .await?;
@@ -102,6 +105,7 @@ pub async fn update(
             body.name.as_deref(),
             body.path.as_deref(),
             body.description.as_deref(),
+            body.team_id,
             body.metadata,
         )
         .await?

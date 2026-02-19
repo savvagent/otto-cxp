@@ -21,3 +21,10 @@ export type {
   UpdateCustomerOptions,
   CreateSegmentOptions,
 } from "./cdp.js";
+
+export { TeamsDomain } from "./teams.js";
+export type {
+  CreateTeamOptions,
+  UpdateTeamOptions,
+  ListTeamsOptions,
+} from "./teams.js";

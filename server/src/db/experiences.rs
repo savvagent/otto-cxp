@@ -17,6 +17,7 @@ impl ExperienceDb {
         &self,
         name: &str,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: serde_json::Value,
     ) -> Result<Experience, sqlx::Error> {
         let id = Uuid::new_v4();
@@ -24,14 +25,15 @@ impl ExperienceDb {
 
         sqlx::query_as::<_, Experience>(
             r#"
-            INSERT INTO experiences (id, name, description, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO experiences (id, name, description, team_id, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING *
             "#,
         )
         .bind(id)
         .bind(name)
         .bind(description)
+        .bind(team_id)
         .bind(&metadata)
         .bind(now)
         .bind(now)
@@ -68,6 +70,7 @@ impl ExperienceDb {
         id: Uuid,
         name: Option<&str>,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> Result<Option<Experience>, sqlx::Error> {
         sqlx::query_as::<_, Experience>(
@@ -75,7 +78,8 @@ impl ExperienceDb {
             UPDATE experiences
             SET name = COALESCE($2, name),
                 description = COALESCE($3, description),
-                metadata = COALESCE($4, metadata),
+                team_id = COALESCE($4, team_id),
+                metadata = COALESCE($5, metadata),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -84,6 +88,7 @@ impl ExperienceDb {
         .bind(id)
         .bind(name)
         .bind(description)
+        .bind(team_id)
         .bind(metadata)
         .fetch_optional(&self.pool)
         .await

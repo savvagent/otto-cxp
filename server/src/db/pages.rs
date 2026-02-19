@@ -19,6 +19,7 @@ impl PageDb {
         name: &str,
         path: Option<&str>,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: serde_json::Value,
     ) -> Result<Page, sqlx::Error> {
         let id = Uuid::new_v4();
@@ -26,8 +27,8 @@ impl PageDb {
 
         sqlx::query_as::<_, Page>(
             r#"
-            INSERT INTO pages (id, application_id, name, path, description, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO pages (id, application_id, name, path, description, team_id, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -36,6 +37,7 @@ impl PageDb {
         .bind(name)
         .bind(path)
         .bind(description)
+        .bind(team_id)
         .bind(&metadata)
         .bind(now)
         .bind(now)
@@ -92,6 +94,7 @@ impl PageDb {
         name: Option<&str>,
         path: Option<&str>,
         description: Option<&str>,
+        team_id: Option<Uuid>,
         metadata: Option<serde_json::Value>,
     ) -> Result<Option<Page>, sqlx::Error> {
         sqlx::query_as::<_, Page>(
@@ -100,7 +103,8 @@ impl PageDb {
             SET name = COALESCE($2, name),
                 path = COALESCE($3, path),
                 description = COALESCE($4, description),
-                metadata = COALESCE($5, metadata),
+                team_id = COALESCE($5, team_id),
+                metadata = COALESCE($6, metadata),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -110,6 +114,7 @@ impl PageDb {
         .bind(name)
         .bind(path)
         .bind(description)
+        .bind(team_id)
         .bind(metadata)
         .fetch_optional(&self.pool)
         .await

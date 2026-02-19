@@ -13,6 +13,7 @@ export {
   SupportDomain,
   FeedbackDomain,
   CdpDomain,
+  TeamsDomain,
 } from "./domains/index.js";
 
 export type {
@@ -24,6 +25,9 @@ export type {
   CreateCustomerOptions,
   UpdateCustomerOptions,
   CreateSegmentOptions,
+  CreateTeamOptions,
+  UpdateTeamOptions,
+  ListTeamsOptions,
 } from "./domains/index.js";
 
 // Core types
@@ -46,6 +50,7 @@ export type {
   FeedbackContext,
   NpsResult,
   CsatResult,
+  Team,
 } from "./types.js";
 
 // Type utilities

@@ -191,6 +191,38 @@ struct ListCustomersParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CreateTeamParams {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    metadata: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UpdateTeamParams {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    metadata: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListTeamsParams {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ChatMessageParams {
     session_id: String,
     role: String,
@@ -211,6 +243,7 @@ pub struct CxpServer {
     pub interactions: db::interactions::InteractionDb,
     pub segments: db::segments::SegmentDb,
     pub chat: db::chat::ChatDb,
+    pub teams: db::teams::TeamDb,
     tool_router: ToolRouter<Self>,
 }
 
@@ -223,7 +256,8 @@ impl CxpServer {
             knowledge: db::knowledge::KnowledgeDb::new(pool.clone()),
             interactions: db::interactions::InteractionDb::new(pool.clone()),
             segments: db::segments::SegmentDb::new(pool.clone()),
-            chat: db::chat::ChatDb::new(pool),
+            chat: db::chat::ChatDb::new(pool.clone()),
+            teams: db::teams::TeamDb::new(pool),
             tool_router: Self::tool_router(),
         }
     }
@@ -875,6 +909,102 @@ impl CxpServer {
     ) -> String {
         let result = crate::analysis::analyze_sentiment(&params.text);
         serde_json::to_string_pretty(&result).unwrap()
+    }
+
+    // ─── Team Tools ─────────────────────────────────────────────────────
+
+    #[tool(description = "Create a new team")]
+    async fn create_team(
+        &self,
+        Parameters(params): Parameters<CreateTeamParams>,
+    ) -> String {
+        let meta = match params.metadata {
+            Some(ref s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => return format!("Invalid metadata JSON: {e}"),
+            },
+            None => serde_json::Value::Object(Default::default()),
+        };
+        match self
+            .teams
+            .create(&params.name, params.description.as_deref(), params.owner.as_deref(), meta)
+            .await
+        {
+            Ok(t) => serde_json::to_string_pretty(&t).unwrap(),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Get a team by ID")]
+    async fn get_team(
+        &self,
+        Parameters(params): Parameters<IdParam>,
+    ) -> String {
+        let uuid = match parse_uuid(&params.id) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        match self.teams.get(uuid).await {
+            Ok(Some(t)) => serde_json::to_string_pretty(&t).unwrap(),
+            Ok(None) => format!("Team not found: {}", params.id),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "List teams with optional pagination")]
+    async fn list_teams(
+        &self,
+        Parameters(params): Parameters<ListTeamsParams>,
+    ) -> String {
+        let limit = params.limit.unwrap_or(50);
+        let offset = params.offset.unwrap_or(0);
+        match self.teams.list(limit, offset).await {
+            Ok(teams) => serde_json::to_string_pretty(&teams).unwrap(),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Update an existing team")]
+    async fn update_team(
+        &self,
+        Parameters(params): Parameters<UpdateTeamParams>,
+    ) -> String {
+        let uuid = match parse_uuid(&params.id) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        let meta = match params.metadata {
+            Some(ref s) => match serde_json::from_str(s) {
+                Ok(v) => Some(v),
+                Err(e) => return format!("Invalid metadata JSON: {e}"),
+            },
+            None => None,
+        };
+        match self
+            .teams
+            .update(uuid, params.name.as_deref(), params.description.as_deref(), params.owner.as_deref(), meta)
+            .await
+        {
+            Ok(Some(t)) => serde_json::to_string_pretty(&t).unwrap(),
+            Ok(None) => format!("Team not found: {}", params.id),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Delete a team by ID")]
+    async fn delete_team(
+        &self,
+        Parameters(params): Parameters<IdParam>,
+    ) -> String {
+        let uuid = match parse_uuid(&params.id) {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        match self.teams.delete(uuid).await {
+            Ok(true) => format!("Team deleted: {}", params.id),
+            Ok(false) => format!("Team not found: {}", params.id),
+            Err(e) => format!("Error: {e}"),
+        }
     }
 }
 
