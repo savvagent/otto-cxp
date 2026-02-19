@@ -13,6 +13,7 @@ import {
   useDeleteApplication,
 } from "@/hooks/use-applications";
 import { useExperiences } from "@/hooks/use-experiences";
+import { useTeams } from "@/hooks/use-teams";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -50,6 +51,7 @@ const PAGE_SIZE = 20;
 
 const applicationSchema = z.object({
   experience_id: z.string().optional(),
+  team_id: z.string().min(1, "Team is required"),
   name: z.string().min(1, "Name is required"),
   description: z.string().optional(),
   platform: z.string().optional(),
@@ -70,6 +72,8 @@ function ApplicationDialog({
   const updateApplication = useUpdateApplication();
   const { data: experiencesData } = useExperiences({ limit: 200 });
   const experiences = experiencesData?.data ?? [];
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
   const isEdit = !!editing;
 
   const {
@@ -84,6 +88,7 @@ function ApplicationDialog({
     values: editing
       ? {
           experience_id: editing.experience_id ?? undefined,
+          team_id: editing.team_id ?? "",
           name: editing.name,
           description: editing.description ?? "",
           platform: editing.platform ?? "",
@@ -92,6 +97,7 @@ function ApplicationDialog({
   });
 
   const experienceId = watch("experience_id");
+  const teamId = watch("team_id");
 
   function onSubmit(values: ApplicationForm) {
     if (isEdit && editing) {
@@ -102,6 +108,7 @@ function ApplicationDialog({
             name: values.name,
             description: values.description || undefined,
             platform: values.platform || undefined,
+            team_id: values.team_id,
           },
         },
         {
@@ -116,6 +123,7 @@ function ApplicationDialog({
       createApplication.mutate(
         {
           experience_id: values.experience_id || undefined,
+          team_id: values.team_id,
           name: values.name,
           description: values.description || undefined,
           platform: values.platform || undefined,
@@ -143,6 +151,33 @@ function ApplicationDialog({
           </DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="app-team">
+              Team <span className="text-destructive">*</span>
+            </Label>
+            <Select
+              value={teamId || "_none"}
+              onValueChange={(v) =>
+                setValue("team_id", v === "_none" ? "" : v, { shouldValidate: true })
+              }
+            >
+              <SelectTrigger id="app-team">
+                <SelectValue placeholder="Select a team" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                {teams.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>
+                    {t.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.team_id && (
+              <p className="text-xs text-destructive">{errors.team_id.message}</p>
+            )}
+          </div>
+
           <div className="space-y-1.5">
             <Label htmlFor="app-experience">Experience</Label>
             <Select
@@ -234,6 +269,9 @@ export function ApplicationsPage() {
   const { data: experiencesData } = useExperiences({ limit: 200 });
   const experiences = experiencesData?.data ?? [];
 
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
+
   const deleteApplication = useDeleteApplication();
   const items = data?.data ?? [];
   const total = data?.total ?? 0;
@@ -260,6 +298,10 @@ export function ApplicationsPage() {
 
   function experienceName(id: string) {
     return experiences.find((e) => e.id === id)?.name ?? id.slice(0, 8);
+  }
+
+  function teamName(id: string) {
+    return teams.find((t) => t.id === id)?.name ?? id.slice(0, 8);
   }
 
   return (
@@ -318,8 +360,9 @@ export function ApplicationsPage() {
               <TableRow>
                 <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
+                <TableHead className="hidden sm:table-cell">Team</TableHead>
                 <TableHead className="hidden sm:table-cell">Platform</TableHead>
-                <TableHead className="hidden sm:table-cell">Experience</TableHead>
+                <TableHead className="hidden md:table-cell">Experience</TableHead>
                 <TableHead className="hidden lg:table-cell">Description</TableHead>
                 <TableHead className="hidden md:table-cell">Created At</TableHead>
                 <TableHead className="w-[100px]" />
@@ -330,10 +373,13 @@ export function ApplicationsPage() {
                 <TableRow key={app.id}>
                   <TableCell><CopyableId value={app.id} /></TableCell>
                   <TableCell className="font-medium">{app.name}</TableCell>
+                  <TableCell className="hidden sm:table-cell text-sm">
+                    {app.team_id ? teamName(app.team_id) : "—"}
+                  </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                     {app.platform ?? "—"}
                   </TableCell>
-                  <TableCell className="hidden sm:table-cell text-sm">
+                  <TableCell className="hidden md:table-cell text-sm">
                     {app.experience_id ? experienceName(app.experience_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">

@@ -37,6 +37,7 @@ export function useCreatePage() {
   return useMutation({
     mutationFn: (data: {
       application_id?: string;
+      team_id: string;
       name: string;
       path?: string;
       description?: string;
@@ -55,7 +56,7 @@ export function useUpdatePage() {
       data,
     }: {
       id: string;
-      data: { name?: string; path?: string; description?: string };
+      data: { name?: string; path?: string; description?: string; team_id?: string };
     }) => pagesApi.update(id, data),
     onSuccess: (updatedPage: Page) => {
       queryClient.invalidateQueries({ queryKey: pageKeys.lists() });

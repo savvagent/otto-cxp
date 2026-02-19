@@ -13,6 +13,7 @@ import {
   useDeletePage,
 } from "@/hooks/use-pages";
 import { useApplications } from "@/hooks/use-applications";
+import { useTeams } from "@/hooks/use-teams";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -50,6 +51,7 @@ const PAGE_SIZE = 20;
 
 const pageSchema = z.object({
   application_id: z.string().optional(),
+  team_id: z.string().min(1, "Team is required"),
   name: z.string().min(1, "Name is required"),
   path: z.string().optional(),
   description: z.string().optional(),
@@ -70,6 +72,8 @@ function PageDialog({
   const updatePage = useUpdatePage();
   const { data: appsData } = useApplications({ limit: 200 });
   const applications = appsData?.data ?? [];
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
   const isEdit = !!editing;
 
   const {
@@ -84,6 +88,7 @@ function PageDialog({
     values: editing
       ? {
           application_id: editing.application_id ?? undefined,
+          team_id: editing.team_id ?? "",
           name: editing.name,
           path: editing.path ?? "",
           description: editing.description ?? "",
@@ -92,6 +97,7 @@ function PageDialog({
   });
 
   const applicationId = watch("application_id");
+  const teamId = watch("team_id");
 
   function onSubmit(values: PageFormValues) {
     if (isEdit && editing) {
@@ -102,6 +108,7 @@ function PageDialog({
             name: values.name,
             path: values.path || undefined,
             description: values.description || undefined,
+            team_id: values.team_id,
           },
         },
         {
@@ -116,6 +123,7 @@ function PageDialog({
       createPage.mutate(
         {
           application_id: values.application_id || undefined,
+          team_id: values.team_id,
           name: values.name,
           path: values.path || undefined,
           description: values.description || undefined,
@@ -141,6 +149,33 @@ function PageDialog({
           <DialogTitle>{isEdit ? "Edit Page" : "New Page"}</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="page-team">
+              Team <span className="text-destructive">*</span>
+            </Label>
+            <Select
+              value={teamId || "_none"}
+              onValueChange={(v) =>
+                setValue("team_id", v === "_none" ? "" : v, { shouldValidate: true })
+              }
+            >
+              <SelectTrigger id="page-team">
+                <SelectValue placeholder="Select a team" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                {teams.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>
+                    {t.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.team_id && (
+              <p className="text-xs text-destructive">{errors.team_id.message}</p>
+            )}
+          </div>
+
           <div className="space-y-1.5">
             <Label htmlFor="page-application">Application</Label>
             <Select
@@ -232,6 +267,9 @@ export function PagesPage() {
   const { data: appsData } = useApplications({ limit: 200 });
   const applications = appsData?.data ?? [];
 
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
+
   const deletePage = useDeletePage();
   const items = data?.data ?? [];
   const total = data?.total ?? 0;
@@ -258,6 +296,10 @@ export function PagesPage() {
 
   function applicationName(id: string) {
     return applications.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  }
+
+  function teamName(id: string) {
+    return teams.find((t) => t.id === id)?.name ?? id.slice(0, 8);
   }
 
   return (
@@ -316,8 +358,9 @@ export function PagesPage() {
               <TableRow>
                 <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
+                <TableHead className="hidden sm:table-cell">Team</TableHead>
                 <TableHead className="hidden sm:table-cell">Path</TableHead>
-                <TableHead className="hidden sm:table-cell">Application</TableHead>
+                <TableHead className="hidden md:table-cell">Application</TableHead>
                 <TableHead className="hidden lg:table-cell">Description</TableHead>
                 <TableHead className="hidden md:table-cell">Created At</TableHead>
                 <TableHead className="w-[100px]" />
@@ -328,10 +371,13 @@ export function PagesPage() {
                 <TableRow key={pg.id}>
                   <TableCell><CopyableId value={pg.id} /></TableCell>
                   <TableCell className="font-medium">{pg.name}</TableCell>
+                  <TableCell className="hidden sm:table-cell text-sm">
+                    {pg.team_id ? teamName(pg.team_id) : "—"}
+                  </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm font-mono text-muted-foreground">
                     {pg.path ?? "—"}
                   </TableCell>
-                  <TableCell className="hidden sm:table-cell text-sm">
+                  <TableCell className="hidden md:table-cell text-sm">
                     {pg.application_id ? applicationName(pg.application_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">

@@ -13,6 +13,7 @@ import {
   useDeleteComponent,
 } from "@/hooks/use-components";
 import { usePages } from "@/hooks/use-pages";
+import { useTeams } from "@/hooks/use-teams";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -50,6 +51,7 @@ const PAGE_SIZE = 20;
 
 const componentSchema = z.object({
   page_id: z.string().optional(),
+  team_id: z.string().min(1, "Team is required"),
   name: z.string().min(1, "Name is required"),
   component_type: z.string().optional(),
   description: z.string().optional(),
@@ -70,6 +72,8 @@ function ComponentDialog({
   const updateComponent = useUpdateComponent();
   const { data: pagesData } = usePages({ limit: 200 });
   const pages = pagesData?.data ?? [];
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
   const isEdit = !!editing;
 
   const {
@@ -84,6 +88,7 @@ function ComponentDialog({
     values: editing
       ? {
           page_id: editing.page_id ?? undefined,
+          team_id: editing.team_id ?? "",
           name: editing.name,
           component_type: editing.component_type ?? "",
           description: editing.description ?? "",
@@ -92,6 +97,7 @@ function ComponentDialog({
   });
 
   const pageId = watch("page_id");
+  const teamId = watch("team_id");
 
   function onSubmit(values: ComponentForm) {
     if (isEdit && editing) {
@@ -102,6 +108,7 @@ function ComponentDialog({
             name: values.name,
             component_type: values.component_type || undefined,
             description: values.description || undefined,
+            team_id: values.team_id,
           },
         },
         {
@@ -116,6 +123,7 @@ function ComponentDialog({
       createComponent.mutate(
         {
           page_id: values.page_id || undefined,
+          team_id: values.team_id,
           name: values.name,
           component_type: values.component_type || undefined,
           description: values.description || undefined,
@@ -143,6 +151,33 @@ function ComponentDialog({
           </DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="comp-team">
+              Team <span className="text-destructive">*</span>
+            </Label>
+            <Select
+              value={teamId || "_none"}
+              onValueChange={(v) =>
+                setValue("team_id", v === "_none" ? "" : v, { shouldValidate: true })
+              }
+            >
+              <SelectTrigger id="comp-team">
+                <SelectValue placeholder="Select a team" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                {teams.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>
+                    {t.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.team_id && (
+              <p className="text-xs text-destructive">{errors.team_id.message}</p>
+            )}
+          </div>
+
           <div className="space-y-1.5">
             <Label htmlFor="comp-page">Page</Label>
             <Select
@@ -239,6 +274,9 @@ export function ComponentsPage() {
   const { data: pagesData } = usePages({ limit: 200 });
   const pages = pagesData?.data ?? [];
 
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
+
   const deleteComponent = useDeleteComponent();
   const items = data?.data ?? [];
   const total = data?.total ?? 0;
@@ -266,6 +304,10 @@ export function ComponentsPage() {
   function pageName(id: string) {
     const pg = pages.find((p) => p.id === id);
     return pg ? `${pg.name}${pg.path ? ` (${pg.path})` : ""}` : id.slice(0, 8);
+  }
+
+  function teamName(id: string) {
+    return teams.find((t) => t.id === id)?.name ?? id.slice(0, 8);
   }
 
   return (
@@ -329,8 +371,9 @@ export function ComponentsPage() {
               <TableRow>
                 <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
+                <TableHead className="hidden sm:table-cell">Team</TableHead>
                 <TableHead className="hidden sm:table-cell">Component Type</TableHead>
-                <TableHead className="hidden sm:table-cell">Page</TableHead>
+                <TableHead className="hidden md:table-cell">Page</TableHead>
                 <TableHead className="hidden lg:table-cell">Description</TableHead>
                 <TableHead className="hidden md:table-cell">Created At</TableHead>
                 <TableHead className="w-[100px]" />
@@ -341,10 +384,13 @@ export function ComponentsPage() {
                 <TableRow key={comp.id}>
                   <TableCell><CopyableId value={comp.id} /></TableCell>
                   <TableCell className="font-medium">{comp.name}</TableCell>
+                  <TableCell className="hidden sm:table-cell text-sm">
+                    {comp.team_id ? teamName(comp.team_id) : "—"}
+                  </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                     {comp.component_type ?? "—"}
                   </TableCell>
-                  <TableCell className="hidden sm:table-cell text-sm">
+                  <TableCell className="hidden md:table-cell text-sm">
                     {comp.page_id ? pageName(comp.page_id) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">

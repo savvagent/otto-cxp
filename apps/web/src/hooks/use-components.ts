@@ -37,6 +37,7 @@ export function useCreateComponent() {
   return useMutation({
     mutationFn: (data: {
       page_id?: string;
+      team_id: string;
       name: string;
       component_type?: string;
       description?: string;
@@ -55,7 +56,7 @@ export function useUpdateComponent() {
       data,
     }: {
       id: string;
-      data: { name?: string; component_type?: string; description?: string };
+      data: { name?: string; component_type?: string; description?: string; team_id?: string };
     }) => componentsApi.update(id, data),
     onSuccess: (updatedComponent: Component) => {
       queryClient.invalidateQueries({ queryKey: componentKeys.lists() });

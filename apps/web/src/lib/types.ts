@@ -76,6 +76,7 @@ export interface Experience {
   id: string;
   name: string;
   description: string | null;
+  team_id: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -84,6 +85,7 @@ export interface Experience {
 export interface Application {
   id: string;
   experience_id: string | null;
+  team_id: string | null;
   name: string;
   description: string | null;
   platform: string | null;
@@ -95,6 +97,7 @@ export interface Application {
 export interface Page {
   id: string;
   application_id: string | null;
+  team_id: string | null;
   name: string;
   path: string | null;
   description: string | null;
@@ -106,6 +109,7 @@ export interface Page {
 export interface Component {
   id: string;
   page_id: string | null;
+  team_id: string | null;
   name: string;
   component_type: string | null;
   description: string | null;

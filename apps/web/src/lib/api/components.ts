@@ -16,6 +16,7 @@ export const componentsApi = {
 
   create: (data: {
     page_id?: string;
+    team_id: string;
     name: string;
     component_type?: string;
     description?: string;
@@ -27,7 +28,7 @@ export const componentsApi = {
 
   update: (
     id: string,
-    data: { name?: string; component_type?: string; description?: string },
+    data: { name?: string; component_type?: string; description?: string; team_id?: string },
   ) =>
     apiFetch<Component>(`/components/${id}`, {
       method: "PUT",

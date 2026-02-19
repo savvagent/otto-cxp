@@ -11,6 +11,7 @@ import {
   useUpdateExperience,
   useDeleteExperience,
 } from "@/hooks/use-experiences";
+import { useTeams } from "@/hooks/use-teams";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -20,6 +21,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -42,6 +50,7 @@ const PAGE_SIZE = 20;
 const experienceSchema = z.object({
   name: z.string().min(1, "Name is required"),
   description: z.string().optional(),
+  team_id: z.string().min(1, "Team is required"),
 });
 
 type ExperienceForm = z.infer<typeof experienceSchema>;
@@ -57,33 +66,35 @@ function ExperienceDialog({
 }) {
   const createExperience = useCreateExperience();
   const updateExperience = useUpdateExperience();
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
   const isEdit = !!editing;
 
   const {
     register,
     handleSubmit,
     reset,
+    setValue,
+    watch,
     formState: { errors },
   } = useForm<ExperienceForm>({
     resolver: zodResolver(experienceSchema),
     defaultValues: {
       name: editing?.name ?? "",
       description: editing?.description ?? "",
+      team_id: editing?.team_id ?? "",
     },
     values: editing
-      ? { name: editing.name, description: editing.description ?? "" }
+      ? { name: editing.name, description: editing.description ?? "", team_id: editing.team_id ?? "" }
       : undefined,
   });
 
-  function onSubmit(values: ExperienceForm) {
-    const payload = {
-      name: values.name,
-      description: values.description || undefined,
-    };
+  const teamId = watch("team_id");
 
+  function onSubmit(values: ExperienceForm) {
     if (isEdit && editing) {
       updateExperience.mutate(
-        { id: editing.id, data: payload },
+        { id: editing.id, data: { name: values.name, description: values.description || undefined, team_id: values.team_id } },
         {
           onSuccess: () => {
             toast.success("Experience updated");
@@ -93,7 +104,7 @@ function ExperienceDialog({
         }
       );
     } else {
-      createExperience.mutate(payload, {
+      createExperience.mutate({ name: values.name, description: values.description || undefined, team_id: values.team_id }, {
         onSuccess: () => {
           toast.success("Experience created");
           reset();
@@ -113,6 +124,33 @@ function ExperienceDialog({
           <DialogTitle>{isEdit ? "Edit Experience" : "New Experience"}</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="exp-team">
+              Team <span className="text-destructive">*</span>
+            </Label>
+            <Select
+              value={teamId || "_none"}
+              onValueChange={(v) =>
+                setValue("team_id", v === "_none" ? "" : v, { shouldValidate: true })
+              }
+            >
+              <SelectTrigger id="exp-team">
+                <SelectValue placeholder="Select a team" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                {teams.map((t) => (
+                  <SelectItem key={t.id} value={t.id}>
+                    {t.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errors.team_id && (
+              <p className="text-xs text-destructive">{errors.team_id.message}</p>
+            )}
+          </div>
+
           <div className="space-y-1.5">
             <Label htmlFor="exp-name">
               Name <span className="text-destructive">*</span>
@@ -160,9 +198,16 @@ export function ExperiencesPage() {
     offset: page * PAGE_SIZE,
   });
 
+  const { data: teamsData } = useTeams({ limit: 200 });
+  const teams = teamsData?.data ?? [];
+
   const deleteExperience = useDeleteExperience();
   const items = data?.data ?? [];
   const total = data?.total ?? 0;
+
+  function teamName(id: string) {
+    return teams.find((t) => t.id === id)?.name ?? id.slice(0, 8);
+  }
 
   function handleDelete() {
     if (!deleteTarget) return;
@@ -200,7 +245,8 @@ export function ExperiencesPage() {
               <TableRow>
                 <TableHead className="w-[100px]">ID</TableHead>
                 <TableHead>Name</TableHead>
-                <TableHead className="hidden sm:table-cell">Description</TableHead>
+                <TableHead className="hidden sm:table-cell">Team</TableHead>
+                <TableHead className="hidden md:table-cell">Description</TableHead>
                 <TableHead className="hidden md:table-cell">Created At</TableHead>
                 <TableHead className="w-[100px]" />
               </TableRow>
@@ -210,7 +256,10 @@ export function ExperiencesPage() {
                 <TableRow key={exp.id}>
                   <TableCell><CopyableId value={exp.id} /></TableCell>
                   <TableCell className="font-medium">{exp.name}</TableCell>
-                  <TableCell className="hidden sm:table-cell max-w-[300px] truncate text-muted-foreground text-sm">
+                  <TableCell className="hidden sm:table-cell text-sm">
+                    {exp.team_id ? teamName(exp.team_id) : "—"}
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell max-w-[300px] truncate text-muted-foreground text-sm">
                     {exp.description ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">

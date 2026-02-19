@@ -37,6 +37,7 @@ export function useCreateApplication() {
   return useMutation({
     mutationFn: (data: {
       experience_id?: string;
+      team_id: string;
       name: string;
       description?: string;
       platform?: string;
@@ -55,7 +56,7 @@ export function useUpdateApplication() {
       data,
     }: {
       id: string;
-      data: { name?: string; description?: string; platform?: string };
+      data: { name?: string; description?: string; platform?: string; team_id?: string };
     }) => applicationsApi.update(id, data),
     onSuccess: (updatedApplication: Application) => {
       queryClient.invalidateQueries({ queryKey: applicationKeys.lists() });

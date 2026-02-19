@@ -21,6 +21,7 @@ export const pagesApi = {
 
   create: (data: {
     application_id?: string;
+    team_id: string;
     name: string;
     path?: string;
     description?: string;
@@ -32,7 +33,7 @@ export const pagesApi = {
 
   update: (
     id: string,
-    data: { name?: string; path?: string; description?: string },
+    data: { name?: string; path?: string; description?: string; team_id?: string },
   ) =>
     apiFetch<Page>(`/pages/${id}`, {
       method: "PUT",
