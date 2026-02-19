@@ -6,6 +6,7 @@ import { CxpProvider } from "@cxp/react";
 import {
   ChatWidget,
   FeedbackForm,
+  QuickRating,
   SurveyRenderer,
 } from "@cxp/react";
 import { seedMockData } from "./mockData";
@@ -13,6 +14,7 @@ import { seedMockData } from "./mockData";
 const demos = [
   "ChatWidget",
   "FeedbackForm",
+  "QuickRating",
   "SurveyRenderer",
 ] as const;
 
@@ -37,6 +39,13 @@ function DemoContent({
         <FeedbackForm
           customerId={customerId || undefined}
           onSubmit={(fb) => console.log("Feedback submitted:", fb)}
+        />
+      );
+    case "QuickRating":
+      return (
+        <QuickRating
+          customerId={customerId || undefined}
+          onSubmit={(rating) => console.log("Quick rating:", rating)}
         />
       );
     case "SurveyRenderer":
