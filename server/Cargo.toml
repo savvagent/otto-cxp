@@ -2,6 +2,7 @@
 name = "cxp-server"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 rmcp = { version = "0.15", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
