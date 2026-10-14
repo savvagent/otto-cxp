@@ -1,4 +1,4 @@
-//! Usage metering (story S4): the `BILLABLE` tools, the `Meter` that charges
+//! Usage metering: the `BILLABLE` tools, the `Meter` that charges
 //! one `usage_outbox` row in the tool's own transaction (with optional quota
 //! enforcement) and reports the org's usage, and the shipper (`ship_once`,
 //! `run`) that drains the outbox to the platform.
@@ -15,8 +15,8 @@
 //!   the platform cannot answer, the call is allowed and still recorded.
 //!
 //! Only the four [`BILLABLE`] tools are recorded. Everything else is free and
-//! records nothing; [`Meter::charge`] refuses any other name, so a free tool
-//! cannot be metered by mistake.
+//! records nothing; [`Meter::charge`] refuses any other name as an internal
+//! error, so a free tool cannot be metered by mistake.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -88,15 +88,16 @@ impl Meter {
     }
 
     /// Record one call of a [`BILLABLE`] tool in `tx`, or refuse it if the org
-    /// is out of budget. Any other tool name is a caller bug and is refused
-    /// with [`Error::Invalid`] without recording anything.
+    /// is out of budget. Any other tool name is a programming error in the
+    /// caller, not the agent's request: it is refused with [`Error::Internal`]
+    /// without recording anything.
     ///
     /// The quota is soft at the boundary: concurrent calls can each see the
     /// same count before either commits, so an org can end a few calls over.
     pub async fn charge(&self, tx: &mut Tx<'_>, user: UserId, tool: &str) -> Result<()> {
         if !is_billable(tool) {
             tracing::error!(tool, "refusing to meter a tool that is not billable");
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "{tool} is not a billable tool; only {} are metered",
                 BILLABLE.join(", ")
             )));
@@ -283,7 +284,7 @@ pub async fn ship_once(
                 next_attempt_at = now() + make_interval(secs => $2) \
          WHERE id IN ( \
              SELECT id FROM usage_outbox WHERE next_attempt_at <= now() \
-             ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED) \
+             ORDER BY next_attempt_at, id LIMIT $1 FOR UPDATE SKIP LOCKED) \
          RETURNING id, event_id, org_id, user_id, tool, billable, occurred_at",
     )
     .bind(cfg.batch as i64)

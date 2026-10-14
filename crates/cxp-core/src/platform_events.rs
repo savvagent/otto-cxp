@@ -1,4 +1,4 @@
-//! The otto platform's lifecycle events (story S4): `begin_live`, the
+//! The otto platform's lifecycle events: `begin_live`, the
 //! transaction every request path opens (refusing deleted orgs and removed
 //! members), `apply` for the signed `org.deleted`, `member.removed`, and
 //! `team.deleted` webhooks (idempotent on `event_id`), and the retention
@@ -14,7 +14,7 @@
 //!
 //! | Event | Effect |
 //! |---|---|
-//! | `org.deleted` | Every row this database holds for the org is deleted and its tokens are refused. Only the dedupe marker, the tombstone, and usage the platform already refused (`usage_outbox_rejected`) survive. |
+//! | `org.deleted` | Its tokens are refused (tombstone first), then every row this database holds for the org is deleted, in short transactions of at most [`PURGE_BATCH`] rows per table. Only the dedupe marker (written after the last batch), the tombstone, and usage the platform already refused (`usage_outbox_rejected`, swept after [`REJECTED_USAGE_KEEP_DAYS`]) survive. |
 //! | `member.removed` | The user's cached token is refused for a few minutes, until the platform's own introspection stops vouching for it. What they created stays. |
 //! | `team.deleted` | Catalog entities (experiences, applications, pages, components) owned by the team keep existing with `team_id` nulled. |
 //!
@@ -80,6 +80,16 @@ pub const PURGED_TABLES: &[&str] = &[
     "usage_outbox",
 ];
 
+/// The most rows one `org.deleted` purge transaction deletes from any one
+/// table. The purge runs as a series of short transactions, so a large org
+/// neither holds its lifecycle lock (and every request to it) nor bloats one
+/// transaction for the whole purge.
+pub const PURGE_BATCH: i64 = 5000;
+
+/// How long a `usage_outbox_rejected` row (usage the platform refused) is
+/// kept for inspection before the sweep forgets it.
+pub const REJECTED_USAGE_KEEP_DAYS: i32 = 90;
+
 /// The catalog tables whose `team_id` a `team.deleted` nulls.
 const TEAM_OWNED_TABLES: &[&str] = &["experiences", "applications", "pages", "components"];
 
@@ -135,10 +145,12 @@ async fn exclude_requests(tx: &mut Tx<'_>, org: OrgId) -> Result<()> {
     Ok(())
 }
 
-/// Housekeeping: forget dedupe markers older than `keep_days` and expired
-/// removed-member tombstones. Unpinned, in a maintenance transaction
-/// (`crate::maintenance`), which `platform_events`' retention policies
-/// require. Returns how many rows were deleted.
+/// Housekeeping: forget dedupe markers older than `keep_days`, removed-member
+/// tombstones past twice their [`REMOVED_MEMBER_TTL_SECS`] window, and refused
+/// usage older than [`REJECTED_USAGE_KEEP_DAYS`]. Unpinned, in a maintenance
+/// transaction (`crate::maintenance`), which the unpinned policies on
+/// `platform_events` and `usage_outbox_rejected` require. Returns how many
+/// rows were deleted.
 pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
     let mut tx = crate::maintenance::begin(db).await?;
     let events = sqlx::query(
@@ -148,15 +160,21 @@ pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    let tombstones = sqlx::query(
-        "DELETE FROM removed_members WHERE removed_at < now() - make_interval(secs => $1)",
+    // otto_app may not DELETE tombstones; this database function deletes
+    // only expired ones (twice REMOVED_MEMBER_TTL_SECS, fixed in the
+    // migration).
+    let tombstones: i64 = sqlx::query_scalar("SELECT expire_removed_members()")
+        .fetch_one(&mut *tx)
+        .await?;
+    let rejected = sqlx::query(
+        "DELETE FROM usage_outbox_rejected WHERE rejected_at < now() - make_interval(days => $1)",
     )
-    .bind((REMOVED_MEMBER_TTL_SECS * 2) as f64)
+    .bind(REJECTED_USAGE_KEEP_DAYS)
     .execute(&mut *tx)
     .await?
     .rows_affected();
     tx.commit().await?;
-    Ok(events + tombstones)
+    Ok(events + tombstones as u64 + rejected)
 }
 
 /// Apply one verified delivery.
@@ -201,23 +219,51 @@ async fn org_deleted(db: &Db, event: &WebhookEvent, org: OrgId) -> Result<Outcom
         .execute(db.pool())
         .await?;
 
-    let mut tx = db.begin(org).await?;
-    exclude_requests(&mut tx, org).await?;
-    let first = first_delivery(&mut tx, event, "org.deleted").await?;
-
-    // Re-run on a duplicate too: it is idempotent, and catches anything that
-    // raced an earlier run. Every statement names the org in addition to the
-    // pinned policy.
-    let mut deleted = serde_json::Map::new();
-    for table in PURGED_TABLES {
-        let n = sqlx::query(&format!("DELETE FROM {table} WHERE org_id = $1"))
+    // Then the purge, in short transactions: each takes the lifecycle lock
+    // exclusively (so the first waits out any request already in flight;
+    // later ones are refused by the tombstone) and deletes at most
+    // PURGE_BATCH rows per table, children first. A table that still has rows
+    // ends the transaction before its parents are touched, so nothing is
+    // deleted by cascade and every row is counted where it lived.
+    //
+    // The dedupe marker is written only in the last transaction, the one
+    // that finds every table empty: a crash part-way leaves no marker, so the
+    // platform's redelivery runs the purge again. A duplicate re-runs it too
+    // (it is idempotent, and catches anything that raced an earlier run).
+    // Every statement names the org in addition to the pinned policy.
+    let mut deleted: Vec<u64> = vec![0; PURGED_TABLES.len()];
+    let first = loop {
+        let mut tx = db.begin(org).await?;
+        exclude_requests(&mut tx, org).await?;
+        let mut drained = true;
+        for (i, table) in PURGED_TABLES.iter().enumerate() {
+            let n = sqlx::query(&format!(
+                "DELETE FROM {table} WHERE org_id = $1 AND ctid = ANY(ARRAY( \
+                   SELECT ctid FROM {table} WHERE org_id = $1 LIMIT $2))"
+            ))
             .bind(org)
+            .bind(PURGE_BATCH)
             .execute(tx.conn())
             .await?
             .rows_affected();
-        deleted.insert((*table).to_string(), n.into());
-    }
-    tx.commit().await?;
+            deleted[i] += n;
+            if n as i64 >= PURGE_BATCH {
+                drained = false;
+                break;
+            }
+        }
+        if drained {
+            let first = first_delivery(&mut tx, event, "org.deleted").await?;
+            tx.commit().await?;
+            break first;
+        }
+        tx.commit().await?;
+    };
+    let deleted: serde_json::Map<String, serde_json::Value> = PURGED_TABLES
+        .iter()
+        .zip(deleted)
+        .map(|(table, n)| ((*table).to_string(), n.into()))
+        .collect();
 
     tracing::info!(org = %org, event_id = %event.id, first, ?deleted, "purged a deleted org's data");
     Ok(if first {

@@ -1,4 +1,4 @@
-//! The experience catalog (story S8): `CatalogExt` on `otto_tenant::Tx` —
+//! The experience catalog: `CatalogExt` on `otto_tenant::Tx` —
 //! experiences, applications, pages, and components, each optionally owned by
 //! a platform team (`team_id`) — with its model structs.
 //!
@@ -7,52 +7,35 @@
 //! them. Rows elsewhere (tickets, feedback, ...) that pointed at a deleted
 //! entity keep existing with the reference nulled by the database.
 //!
-//! `team_id` is an opaque platform team id. This module only stores it; the
-//! API layer verifies it at the platform before calling in. On update the team
-//! is a [`TeamChange`]: leave it, clear it, or set it.
+//! `team_id` is an opaque platform team id. Writes take a [`VerifiedTeam`],
+//! which only [`verify_team`] can make, so no path can store a team id the
+//! platform has not vouched for in the caller's org. Verify before opening
+//! the transaction, so no pooled connection waits on the platform. On update
+//! the team is a [`TeamChange`]: leave it, clear it, or set it.
 
 use chrono::{DateTime, Utc};
+use otto_resource::PlatformClient;
+use otto_tenant::ids::{OrgId, TeamId};
 use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::future::Future;
 use uuid::Uuid;
 
-use crate::error::{Error, Result};
+use crate::error::{map_fk, Error, Result};
 use crate::paging;
 
 // Inserts and updates stamp created_at/updated_at with clock_timestamp(), not the column
 // default now(): now() is the transaction start, so rows written in one transaction would
 // tie and updated_at could not advance.
 
-/// The parent kind a foreign-key violation on `constraint` names, by the exact
-/// generated constraint names of the catalog's parent links. `None` for any
-/// other name.
-fn fk_kind(constraint: &str) -> Option<&'static str> {
-    Some(match constraint {
-        "applications_org_id_experience_id_fkey" => "experience",
-        "pages_org_id_application_id_fkey" => "application",
-        "components_org_id_page_id_fkey" => "page",
-        _ => return None,
-    })
-}
-
-/// A foreign-key violation is `NotFound` of the parent kind its constraint
-/// names (another org's parent is refused exactly like a missing one); one
-/// this module does not recognise is an internal `Database` error, never a
-/// guessed kind. The constraint name is never shown.
-fn map_fk(e: sqlx::Error) -> Error {
-    let kind = match &e {
-        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
-            db.constraint().and_then(fk_kind)
-        }
-        _ => None,
-    };
-    match kind {
-        Some(kind) => Error::NotFound { kind },
-        None => Error::Database(e),
-    }
-}
+/// The parent kind a foreign-key violation names, by the exact generated
+/// constraint names of the catalog's parent links (see [`map_fk`]).
+const FK_KINDS: &[(&str, &str)] = &[
+    ("applications_org_id_experience_id_fkey", "experience"),
+    ("pages_org_id_application_id_fkey", "application"),
+    ("components_org_id_page_id_fkey", "page"),
+];
 
 /// A name must have something in it besides whitespace.
 fn check_name(name: &str) -> Result<()> {
@@ -66,6 +49,42 @@ fn check_name_opt(name: &Option<String>) -> Result<()> {
     name.as_deref().map_or(Ok(()), check_name)
 }
 
+/// A platform team id the platform has confirmed belongs to the org it was
+/// verified for. The field is private: [`verify_team`] is the only way to
+/// make one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedTeam(TeamId);
+
+impl VerifiedTeam {
+    pub fn id(&self) -> Uuid {
+        self.0.as_uuid()
+    }
+}
+
+/// Ask the platform whether `team_id` is a team of `org`. A team it does not
+/// know, or one in another org, is [`Error::UnknownTeam`]; a platform that
+/// cannot answer is [`Error::Platform`] (`unavailable`).
+///
+/// A team deleted between this check and the write's commit can still be
+/// stored; readers treat a team id the platform no longer knows as unowned
+/// (see `platform_events`' `team.deleted`).
+pub async fn verify_team(
+    platform: &PlatformClient,
+    org: OrgId,
+    team_id: Uuid,
+) -> Result<VerifiedTeam> {
+    match platform.team(org.as_uuid(), team_id).await? {
+        Some(team) if team.org_id == org.as_uuid() && team.id == team_id => {
+            Ok(VerifiedTeam(TeamId(team_id)))
+        }
+        _ => Err(Error::UnknownTeam),
+    }
+}
+
+fn team_id(team: Option<VerifiedTeam>) -> Option<Uuid> {
+    team.map(|t| t.id())
+}
+
 /// What an update does to an entity's `team_id`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TeamChange {
@@ -74,27 +93,17 @@ pub enum TeamChange {
     Keep,
     /// Remove the team (the field was an explicit null).
     Clear,
-    /// Own the entity by this platform team.
-    Set(Uuid),
+    /// Own the entity by this verified platform team.
+    Set(VerifiedTeam),
 }
 
 impl TeamChange {
-    /// Build from a deserialized `Option<Option<Uuid>>`: absent is `None`,
-    /// explicit null `Some(None)`, an id `Some(Some(id))`.
-    pub fn from_nested(v: Option<Option<Uuid>>) -> Self {
-        match v {
-            None => TeamChange::Keep,
-            Some(None) => TeamChange::Clear,
-            Some(Some(id)) => TeamChange::Set(id),
-        }
-    }
-
     /// `(change_team, new_value)` as bound into `SET team_id = CASE WHEN $a THEN $b ELSE team_id END`.
     fn binds(self) -> (bool, Option<Uuid>) {
         match self {
             TeamChange::Keep => (false, None),
             TeamChange::Clear => (true, None),
-            TeamChange::Set(id) => (true, Some(id)),
+            TeamChange::Set(team) => (true, Some(team.id())),
         }
     }
 }
@@ -122,7 +131,7 @@ const EXPERIENCE_COLS: &str = "id, name, description, team_id, metadata, created
 pub struct NewExperience {
     pub name: String,
     pub description: Option<String>,
-    pub team_id: Option<Uuid>,
+    pub team: Option<VerifiedTeam>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -164,7 +173,7 @@ pub struct NewApplication {
     pub name: String,
     pub platform: Option<String>,
     pub description: Option<String>,
-    pub team_id: Option<Uuid>,
+    pub team: Option<VerifiedTeam>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -213,7 +222,7 @@ pub struct NewPage {
     pub name: String,
     pub path: Option<String>,
     pub description: Option<String>,
-    pub team_id: Option<Uuid>,
+    pub team: Option<VerifiedTeam>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -262,7 +271,7 @@ pub struct NewComponent {
     pub name: String,
     pub component_type: Option<String>,
     pub description: Option<String>,
-    pub team_id: Option<Uuid>,
+    pub team: Option<VerifiedTeam>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -404,7 +413,7 @@ impl CatalogExt for Tx<'_> {
         .bind(org)
         .bind(&new.name)
         .bind(&new.description)
-        .bind(new.team_id)
+        .bind(team_id(new.team))
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
@@ -493,11 +502,11 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.platform)
         .bind(&new.description)
-        .bind(new.team_id)
+        .bind(team_id(new.team))
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
-        .map_err(map_fk)
+        .map_err(|e| map_fk(e, FK_KINDS))
     }
 
     async fn get_application(&mut self, id: Uuid) -> Result<Application> {
@@ -593,11 +602,11 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.path)
         .bind(&new.description)
-        .bind(new.team_id)
+        .bind(team_id(new.team))
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
-        .map_err(map_fk)
+        .map_err(|e| map_fk(e, FK_KINDS))
     }
 
     async fn get_page(&mut self, id: Uuid) -> Result<Page> {
@@ -684,11 +693,11 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.component_type)
         .bind(&new.description)
-        .bind(new.team_id)
+        .bind(team_id(new.team))
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
-        .map_err(map_fk)
+        .map_err(|e| map_fk(e, FK_KINDS))
     }
 
     async fn get_component(&mut self, id: Uuid) -> Result<Component> {
@@ -767,71 +776,10 @@ impl CatalogExt for Tx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
-
-    #[derive(Debug)]
-    struct Fk(Option<&'static str>);
-
-    impl std::fmt::Display for Fk {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("foreign key violation")
-        }
-    }
-    impl std::error::Error for Fk {}
-    impl sqlx::error::DatabaseError for Fk {
-        fn message(&self) -> &str {
-            "foreign key violation"
-        }
-        fn code(&self) -> Option<Cow<'_, str>> {
-            Some(Cow::Borrowed("23503"))
-        }
-        fn constraint(&self) -> Option<&str> {
-            self.0
-        }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::ForeignKeyViolation
-        }
-    }
-
-    fn fk(name: Option<&'static str>) -> sqlx::Error {
-        sqlx::Error::Database(Box::new(Fk(name)))
-    }
 
     #[test]
-    fn known_constraints_name_their_parent_kind() {
-        for (name, kind) in [
-            ("applications_org_id_experience_id_fkey", "experience"),
-            ("pages_org_id_application_id_fkey", "application"),
-            ("components_org_id_page_id_fkey", "page"),
-        ] {
-            let e = map_fk(fk(Some(name)));
-            assert!(
-                matches!(&e, Error::NotFound { kind: k } if *k == kind),
-                "{e:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_or_missing_constraint_is_internal_never_a_guessed_kind() {
-        for name in [Some("some_other_fkey"), None] {
-            let e = map_fk(fk(name));
-            assert!(matches!(e, Error::Database(_)), "{e:?}");
-            assert_eq!(e.code(), "internal");
-        }
-        assert!(matches!(
-            map_fk(sqlx::Error::PoolClosed),
-            Error::Database(_)
-        ));
+    fn every_listed_constraint_names_its_kind() {
+        crate::error::fake::assert_kinds(FK_KINDS);
     }
 
     #[test]

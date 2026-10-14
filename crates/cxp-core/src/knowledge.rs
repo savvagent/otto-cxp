@@ -1,10 +1,11 @@
-//! The knowledge base (story S6): `KnowledgeExt` on `otto_tenant::Tx` —
+//! The knowledge base: `KnowledgeExt` on `otto_tenant::Tx` —
 //! articles and their full-text search — with its model structs.
 
 use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::contains_pattern;
 use crate::error::{Error, Result};
 use crate::paging::Page;
 
@@ -53,18 +54,6 @@ pub struct ArticleUpdate {
     pub published: Option<bool>,
 }
 
-/// Escape `\`, `%` and `_` so user text is matched literally by `ILIKE`.
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 pub trait KnowledgeExt {
     fn create_article(
         &mut self,
@@ -80,7 +69,9 @@ pub trait KnowledgeExt {
 
     /// Full-text search over published articles, best match first, at most
     /// [`SEARCH_LIMIT`]. An empty query, or one over [`MAX_QUERY_CHARS`], is
-    /// `Invalid`.
+    /// `Invalid`. Matches and ranks the stored `search_tsv`; `@@` is not
+    /// leakproof, so under row-level security this reads the org's published
+    /// articles rather than a full-text index (#17).
     fn search_articles(
         &mut self,
         query: &str,
@@ -145,16 +136,14 @@ impl KnowledgeExt for Tx<'_> {
         Ok(sqlx::query_as(&format!(
             "SELECT {ARTICLE_COLS} FROM knowledge_articles \
              WHERE org_id = $1 AND published = true \
-               AND (to_tsvector('english', title || ' ' || content) \
-                      @@ plainto_tsquery('english', $2) \
-                    OR title ILIKE '%' || $3 || '%') \
-             ORDER BY ts_rank(to_tsvector('english', title || ' ' || content), \
-                              plainto_tsquery('english', $2)) DESC, created_at DESC, id \
+               AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
+             ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, \
+                      created_at DESC, id \
              LIMIT $4"
         ))
         .bind(org)
         .bind(query)
-        .bind(escape_like(query))
+        .bind(contains_pattern(query))
         .bind(SEARCH_LIMIT)
         .fetch_all(self.conn())
         .await?)

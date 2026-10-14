@@ -366,10 +366,13 @@ async fn the_platform_events_sweep_needs_the_maintenance_marker(pool: PgPool) {
     app_db.pool().close().await;
 }
 
-/// The usage outbox is written pinned and drained unpinned: a pinned
-/// transaction sees its own org's rows only, an unpinned one sees every org's.
+/// The usage outbox is written pinned and drained unpinned under the
+/// maintenance marker: a pinned transaction sees its own org's rows only, a
+/// marked unpinned one (the shipper, the sweep) every org's, and an unmarked
+/// unpinned one (a request path that forgot to pin) sees, changes, deletes,
+/// and writes nothing.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn the_usage_outbox_is_drained_across_orgs(pool: PgPool) {
+async fn the_usage_outbox_is_drained_across_orgs_only_under_the_marker(pool: PgPool) {
     let admin = db(pool.clone());
     let (a, b) = (org(), org());
     seed(&admin, a).await;
@@ -377,12 +380,61 @@ async fn the_usage_outbox_is_drained_across_orgs(pool: PgPool) {
 
     for table in ["usage_outbox", "usage_outbox_rejected"] {
         assert_eq!(count(&admin, a, table).await, 1);
+
         let mut tx = as_app_unpinned(&pool).await;
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&mut *tx)
             .await
             .unwrap();
-        assert_eq!(n, 2, "the shipper reads {table} across orgs");
+        assert_eq!(n, 0, "{table} is readable unpinned without the marker");
+        let changed = sqlx::query(&format!("UPDATE {table} SET tool = tool"))
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "{table}: an unmarked unpinned UPDATE");
+        let deleted = sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(deleted, 0, "{table}: an unmarked unpinned DELETE");
+        tx.rollback().await.unwrap();
+
+        let mut tx = as_app_unpinned(&pool).await;
+        let err = sqlx::query(&format!(
+            "INSERT INTO {table} (event_id, org_id, tool, billable, occurred_at{reason_col}) \
+             VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(){reason_val})",
+            reason_col = if table == "usage_outbox" {
+                ""
+            } else {
+                ", reason"
+            },
+            reason_val = if table == "usage_outbox" { "" } else { ", 'x'" },
+        ))
+        .bind(a)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            sqlstate(&err),
+            "42501",
+            "{table}: an unmarked unpinned INSERT"
+        );
+        tx.rollback().await.unwrap();
+
+        let mut tx = as_app_maintenance(&pool).await;
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "the marked shipper reads {table} across orgs");
+        let deleted = sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(deleted, 2, "the marked shipper deletes from {table}");
         tx.rollback().await.unwrap();
     }
 }
@@ -683,25 +735,75 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
         assert!(org_not_null, "{table}.org_id is nullable");
     }
 
-    for table in DOMAIN_TABLES
+    // otto_app's grants, privilege by privilege (`has_table_privilege` with
+    // a list answers whether ANY is held, so each is asked alone).
+    let all = ["SELECT", "INSERT", "UPDATE", "DELETE"];
+    let mut expected: Vec<(&str, &[&str])> = DOMAIN_TABLES
         .iter()
         .chain(BOOKKEEPING_TABLES.iter())
-        .chain(["deleted_orgs", "removed_members"].iter())
-    {
-        let ok: bool = sqlx::query_scalar(
-            "SELECT has_table_privilege('otto_app', $1, 'SELECT, INSERT, UPDATE, DELETE')",
-        )
-        .bind(table)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(ok, "otto_app lacks privileges on {table}");
+        .map(|t| (*t, &all[..]))
+        .collect();
+    // Tombstones are permanent; removed members expire only through
+    // expire_removed_members(); the migrator's ledger is not the app's.
+    expected.push(("deleted_orgs", &["SELECT", "INSERT"]));
+    expected.push(("removed_members", &["SELECT", "INSERT", "UPDATE"]));
+    expected.push(("_sqlx_migrations", &[]));
+    for (table, granted) in expected {
+        for privilege in all {
+            let has: bool = sqlx::query_scalar("SELECT has_table_privilege('otto_app', $1, $2)")
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                has,
+                granted.contains(&privilege),
+                "otto_app {privilege} on {table}"
+            );
+        }
     }
+
+    // Every foreign key is covered: its columns, in order, lead some index
+    // on its table, so deleting a parent (or the org.deleted purge) never
+    // scans the child.
+    let uncovered: Vec<String> = sqlx::query_scalar(
+        "SELECT c.conname::text FROM pg_constraint c \
+         JOIN pg_namespace n ON n.oid = c.connamespace \
+         WHERE c.contype = 'f' AND n.nspname = 'public' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_index i \
+             WHERE i.indrelid = c.conrelid \
+               AND (i.indkey::int2[])[0:cardinality(c.conkey) - 1] = c.conkey) \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        uncovered.is_empty(),
+        "foreign keys with no covering index: {uncovered:?}"
+    );
+
+    // No GIN index: under FORCE ROW LEVEL SECURITY its non-leakproof
+    // operators can never be index conditions for a tenant query.
+    let gin: Vec<String> = sqlx::query_scalar(
+        "SELECT ic.relname::text FROM pg_index i \
+         JOIN pg_class ic ON ic.oid = i.indexrelid \
+         JOIN pg_am am ON am.oid = ic.relam \
+         JOIN pg_namespace n ON n.oid = ic.relnamespace \
+         WHERE n.nspname = 'public' AND am.amname <> 'btree' ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(gin.is_empty(), "non-btree indexes: {gin:?}");
 
     let gone: Vec<String> = sqlx::query_scalar(
         "SELECT relname::text FROM pg_class \
          WHERE relname IN ('teams', 'feedback_embeddings') \
-         UNION ALL SELECT extname::text FROM pg_extension WHERE extname IN ('vector', 'uuid-ossp') \
+         UNION ALL SELECT extname::text FROM pg_extension \
+           WHERE extname IN ('vector', 'uuid-ossp', 'pgcrypto') \
          UNION ALL SELECT attname::text FROM pg_attribute \
            WHERE attrelid = 'feedback'::regclass AND attnum > 0 AND NOT attisdropped \
              AND attname IN ('experience', 'application', 'page', 'component')",

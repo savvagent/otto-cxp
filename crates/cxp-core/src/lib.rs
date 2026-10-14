@@ -37,3 +37,34 @@ pub mod usage;
 pub use error::{Error, Result};
 pub use migrate::{migrate, MIGRATOR};
 pub use paging::Page;
+
+/// Whether the database answers a trivial query: the readiness probe. Touches
+/// no tenant table, so it needs no org.
+pub async fn ping(db: &otto_tenant::Db) -> Result<()> {
+    sqlx::query("SELECT 1").execute(db.pool()).await?;
+    Ok(())
+}
+
+/// A `LIKE`/`ILIKE` pattern matching `q` anywhere, with `q`'s own `\`, `%`,
+/// and `_` escaped (Postgres' default `LIKE` escape is `\`).
+pub(crate) fn contains_pattern(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 2);
+    out.push('%');
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn contains_pattern_escapes_wildcards() {
+        assert_eq!(super::contains_pattern("a%b_c\\d"), "%a\\%b\\_c\\\\d%");
+        assert_eq!(super::contains_pattern("plain"), "%plain%");
+    }
+}

@@ -1,4 +1,4 @@
-//! Authentication of `/mcp` and `/api` callers (story S4): the `Principal` a
+//! Authentication of `/mcp` and `/api` callers: the `Principal` a
 //! platform-introspected bearer token resolves to and its `cxp:read` /
 //! `cxp:write` checks, `AuthFailure`, `authenticate()`, the
 //! `WWW-Authenticate` challenge, and the OAuth protected-resource metadata.
@@ -70,7 +70,7 @@ impl From<TokenClaims> for Principal {
 /// A token that lacks the scope a tool or route needs. Answered `403`
 /// (`insufficient_scope`), not `401`: the token is fine, its grant is not.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("this token lacks the {0} scope; obtain a token that grants it")]
+#[error("this token lacks the {0} scope; re-authorize this server requesting it")]
 pub struct MissingScope(pub &'static str);
 
 impl Principal {
@@ -356,6 +356,15 @@ mod tests {
         let none = principal(&["flags:write"]);
         assert_eq!(none.require_read(), Err(MissingScope("cxp:read")));
         assert_eq!(none.require_write(), Err(MissingScope("cxp:write")));
+    }
+
+    /// One instruction, worded as the MCP surface words it.
+    #[test]
+    fn missing_scope_says_to_re_authorize() {
+        assert_eq!(
+            MissingScope("cxp:write").to_string(),
+            "this token lacks the cxp:write scope; re-authorize this server requesting it"
+        );
     }
 
     #[test]

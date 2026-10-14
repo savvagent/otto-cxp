@@ -1,11 +1,11 @@
-//! Support tickets (story S6): `TicketsExt` on `otto_tenant::Tx`, with its
+//! Support tickets: `TicketsExt` on `otto_tenant::Tx`, with its
 //! model structs.
 
 use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{Error, Result};
+use crate::error::{map_fk, Error, Result};
 use crate::paging::Page;
 
 /// Valid `ticket_status` values.
@@ -84,33 +84,15 @@ pub struct TicketFilter {
     pub component_id: Option<Uuid>,
 }
 
-/// The row kind a foreign-key violation on `constraint` names, by the exact generated constraint names of `tickets`. `None` for any other name.
-fn fk_kind(constraint: &str) -> Option<&'static str> {
-    Some(match constraint {
-        "tickets_org_id_customer_id_fkey" => "customer",
-        "tickets_org_id_experience_id_fkey" => "experience",
-        "tickets_org_id_application_id_fkey" => "application",
-        "tickets_org_id_page_id_fkey" => "page",
-        "tickets_org_id_component_id_fkey" => "component",
-        _ => return None,
-    })
-}
-
-/// A foreign-key violation is `NotFound` of the kind its constraint names; one
-/// this module does not recognise is an internal `Database` error, never a
-/// guessed kind. The constraint name is never shown.
-fn map_fk(e: sqlx::Error) -> Error {
-    let kind = match &e {
-        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
-            db.constraint().and_then(fk_kind)
-        }
-        _ => None,
-    };
-    match kind {
-        Some(kind) => Error::NotFound { kind },
-        None => Error::Database(e),
-    }
-}
+/// The row kind a foreign-key violation names, by the exact generated
+/// constraint names of `tickets` (see [`map_fk`]).
+const FK_KINDS: &[(&str, &str)] = &[
+    ("tickets_org_id_customer_id_fkey", "customer"),
+    ("tickets_org_id_experience_id_fkey", "experience"),
+    ("tickets_org_id_application_id_fkey", "application"),
+    ("tickets_org_id_page_id_fkey", "page"),
+    ("tickets_org_id_component_id_fkey", "component"),
+];
 
 fn check_enum(what: &str, value: &str, allowed: &[&str]) -> Result<()> {
     if allowed.contains(&value) {
@@ -189,7 +171,7 @@ impl TicketsExt for Tx<'_> {
         .bind(&new.channel)
         .fetch_one(self.conn())
         .await
-        .map_err(map_fk)
+        .map_err(|e| map_fk(e, FK_KINDS))
     }
 
     async fn get_ticket(&mut self, id: Uuid) -> Result<Ticket> {
@@ -307,68 +289,9 @@ impl TicketsExt for Tx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
-
-    #[derive(Debug)]
-    struct Fk(Option<&'static str>);
-
-    impl std::fmt::Display for Fk {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("foreign key violation")
-        }
-    }
-    impl std::error::Error for Fk {}
-    impl sqlx::error::DatabaseError for Fk {
-        fn message(&self) -> &str {
-            "foreign key violation"
-        }
-        fn code(&self) -> Option<Cow<'_, str>> {
-            Some(Cow::Borrowed("23503"))
-        }
-        fn constraint(&self) -> Option<&str> {
-            self.0
-        }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::ForeignKeyViolation
-        }
-    }
-
-    fn fk(name: Option<&'static str>) -> sqlx::Error {
-        sqlx::Error::Database(Box::new(Fk(name)))
-    }
 
     #[test]
-    fn known_constraints_name_their_kind() {
-        for (name, kind) in [
-            ("tickets_org_id_customer_id_fkey", "customer"),
-            ("tickets_org_id_experience_id_fkey", "experience"),
-            ("tickets_org_id_application_id_fkey", "application"),
-            ("tickets_org_id_page_id_fkey", "page"),
-            ("tickets_org_id_component_id_fkey", "component"),
-        ] {
-            let e = map_fk(fk(Some(name)));
-            assert!(
-                matches!(e, Error::NotFound { kind: k } if k == kind),
-                "{e:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_or_missing_constraint_is_internal_never_a_guessed_kind() {
-        for name in [Some("some_other_fkey"), None] {
-            let e = map_fk(fk(name));
-            assert!(matches!(e, Error::Database(_)), "{e:?}");
-            assert_eq!(e.code(), "internal");
-        }
+    fn every_listed_constraint_names_its_kind() {
+        crate::error::fake::assert_kinds(FK_KINDS);
     }
 }

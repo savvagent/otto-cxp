@@ -462,6 +462,156 @@ async fn org_deleted_purges_every_tenant_table_once_and_spares_other_orgs(pool: 
     }
 }
 
+/// A purge larger than one batch runs as several short transactions and
+/// still deletes every row, counts each where it lived, and is idempotent.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn org_deleted_purges_more_than_one_batch(pool: PgPool) {
+    let db = db(pool.clone());
+    let (doomed, other) = (org(), org());
+    let team = Uuid::new_v4();
+    seed(&db, doomed, team).await;
+    seed(&db, other, team).await;
+    let extra = 2 * platform_events::PURGE_BATCH + 7;
+    sqlx::query(
+        "INSERT INTO interactions (org_id, customer_id, interaction_type) \
+         SELECT org_id, id, 'page_view' FROM customers, generate_series(1, $2) \
+         WHERE org_id = $1",
+    )
+    .bind(doomed)
+    .bind(extra)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count(&pool, "interactions", doomed).await, extra + 1);
+
+    let delivery = org_deleted(doomed);
+    let Outcome::Applied { detail } = platform_events::apply(&db, &delivery).await.unwrap() else {
+        panic!("the first delivery applies");
+    };
+    assert_eq!(detail["interactions"], extra + 1, "{detail}");
+    for table in TENANT_TABLES {
+        assert_eq!(count(&pool, table, doomed).await, 0, "{table}");
+        assert_eq!(count(&pool, table, other).await, 1, "{table}");
+        if table != "interactions" {
+            assert_eq!(detail[table], 1, "{table}: {detail}");
+        }
+    }
+    assert_eq!(count(&pool, "platform_events", doomed).await, 1);
+    assert_eq!(
+        platform_events::apply(&db, &delivery).await.unwrap(),
+        Outcome::Duplicate
+    );
+}
+
+/// The marker is written only after the last batch: a purge interrupted
+/// part-way (here, simulated by rows left behind with no marker) is applied
+/// in full by the redelivery, not acknowledged as a duplicate.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_interrupted_purge_is_finished_by_the_redelivery(pool: PgPool) {
+    let db = db(pool.clone());
+    let doomed = org();
+    seed(&db, doomed, Uuid::new_v4()).await;
+    // What a first attempt that crashed after its first batch leaves: the
+    // tombstone, the leading (child) tables emptied, and no marker.
+    sqlx::query("INSERT INTO deleted_orgs (org_id) VALUES ($1)")
+        .bind(doomed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in &PURGED_TABLES[..3] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE org_id = $1"))
+            .bind(doomed)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        platform_events::apply(&db, &org_deleted(doomed))
+            .await
+            .unwrap(),
+        Outcome::Applied { .. }
+    ));
+    for table in TENANT_TABLES {
+        assert_eq!(count(&pool, table, doomed).await, 0, "{table}");
+    }
+}
+
+/// A request transaction already in flight (it holds the org's lifecycle
+/// lock shared) finishes before the purge runs, and what it wrote is purged
+/// with the rest; afterwards the org is refused.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn org_deleted_waits_for_an_in_flight_request_and_purges_its_writes(pool: PgPool) {
+    let db = db(pool.clone());
+    let o = org();
+    let mut tx = begin_live(&db, o, None).await.unwrap();
+    sqlx::query("INSERT INTO customers (org_id, email) VALUES ($1, 'late@example.com')")
+        .bind(o)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+
+    let purge = {
+        let db = db.clone();
+        tokio::spawn(async move { platform_events::apply(&db, &org_deleted(o)).await })
+    };
+    let mut purge = std::pin::pin!(purge);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut purge)
+            .await
+            .is_err(),
+        "the purge ran while a request held the org's lifecycle lock"
+    );
+    tx.commit().await.unwrap();
+    let outcome = purge.await.unwrap().unwrap();
+    assert!(matches!(outcome, Outcome::Applied { .. }), "{outcome:?}");
+
+    assert_eq!(count(&pool, "customers", o).await, 0);
+    let err = begin_live(&db, o, None)
+        .await
+        .err()
+        .expect("must be refused");
+    assert!(matches!(err, Error::AccessRevoked), "{err:?}");
+}
+
+/// Likewise for team.deleted: a team id an in-flight request writes is
+/// nulled once that request commits.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn team_deleted_waits_for_an_in_flight_request_and_nulls_its_team(pool: PgPool) {
+    let db = db(pool.clone());
+    let (o, team) = (org(), Uuid::new_v4());
+    let mut tx = begin_live(&db, o, None).await.unwrap();
+    let exp: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiences (org_id, name, team_id) VALUES ($1, 'Late', $2) RETURNING id",
+    )
+    .bind(o)
+    .bind(team)
+    .fetch_one(tx.conn())
+    .await
+    .unwrap();
+
+    let nulling = {
+        let db = db.clone();
+        tokio::spawn(async move { platform_events::apply(&db, &team_deleted(o, team)).await })
+    };
+    let mut nulling = std::pin::pin!(nulling);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut nulling)
+            .await
+            .is_err(),
+        "team.deleted ran while a request held the org's lifecycle lock"
+    );
+    tx.commit().await.unwrap();
+    let outcome = nulling.await.unwrap().unwrap();
+    assert!(matches!(outcome, Outcome::Applied { .. }), "{outcome:?}");
+
+    let team_id: Option<Uuid> = sqlx::query_scalar("SELECT team_id FROM experiences WHERE id = $1")
+        .bind(exp)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(team_id, None);
+}
+
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn member_removed_applies_once(pool: PgPool) {
     let db = db(pool.clone());
@@ -622,6 +772,35 @@ async fn the_sweep_deletes_old_rows_as_otto_app(pool: PgPool) {
     }
 }
 
+/// The sweep forgets refused usage after REJECTED_USAGE_KEEP_DAYS, across
+/// orgs, as otto_app under the maintenance marker; newer rows stay.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_sweep_forgets_old_rejected_usage(pool: PgPool) {
+    let (a, b) = (org(), org());
+    let keep = platform_events::REJECTED_USAGE_KEEP_DAYS;
+    for o in [a, b] {
+        for days in [keep + 1, keep - 1] {
+            sqlx::query(
+                "INSERT INTO usage_outbox_rejected \
+                   (event_id, org_id, tool, billable, occurred_at, reason, rejected_at) \
+                 VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(), 'test', \
+                         now() - make_interval(days => $2))",
+            )
+            .bind(o)
+            .bind(days)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+    let app_db = otto_app_db(&pool).await;
+    assert_eq!(platform_events::sweep(&app_db, 30).await.unwrap(), 2);
+    app_db.pool().close().await;
+    for o in [a, b] {
+        assert_eq!(count(&pool, "usage_outbox_rejected", o).await, 1);
+    }
+}
+
 // --------------------------------------------------------------------- usage
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -636,8 +815,11 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
         meter.charge(&mut tx, u, tool).await.unwrap();
     }
     for free in ["whoami", "usage", "create_customer", "list_feedback", ""] {
+        // Metering a free tool is the server's bug, not the agent's request.
         let err = meter.charge(&mut tx, u, free).await.unwrap_err();
-        assert_eq!(err.code(), "invalid_argument", "{free}: {err}");
+        assert!(matches!(err, Error::Internal(_)), "{free}: {err:?}");
+        assert_eq!(err.code(), "internal", "{free}: {err}");
+        assert!(err.is_internal() && !err.retriable(), "{free}");
     }
     tx.commit().await.unwrap();
 

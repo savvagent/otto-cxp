@@ -43,12 +43,9 @@ async fn healthz() -> Response {
 
 /// `GET /readyz` — this replica can serve a request that needs the database.
 async fn readyz(State(db): State<Db>) -> Response {
-    // Deliberately *not* `Db::begin`: that needs an `OrgId`, and there is no
-    // org here. This is the one place a bare pool query is the right thing,
-    // because it touches no tenant table — it is asking about the connection,
-    // not about anyone's data.
-    let probe =
-        tokio::time::timeout(READY_TIMEOUT, sqlx::query("SELECT 1").execute(db.pool())).await;
+    // `cxp_core::ping` touches no tenant table, so it needs no org: it asks
+    // about the connection, not about anyone's data.
+    let probe = tokio::time::timeout(READY_TIMEOUT, cxp_core::ping(&db)).await;
 
     match probe {
         Ok(Ok(_)) => (
@@ -62,7 +59,7 @@ async fn readyz(State(db): State<Db>) -> Response {
         // connection is a database that is down, a timeout is usually a pool
         // with every connection checked out, and those have different fixes.
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "readiness check failed");
+            tracing::warn!(error = ?e, "readiness check failed");
             unready("the database rejected a probe query")
         }
         Err(_) => {

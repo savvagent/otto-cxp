@@ -83,3 +83,93 @@ pub fn sqlstate(err: &sqlx::Error) -> String {
         .map(|c| c.into_owned())
         .unwrap_or_else(|| format!("not a database error: {err}"))
 }
+
+// -------------------------------------------------------- stub team platform
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use cxp_core::catalog::{verify_team, VerifiedTeam};
+use otto_resource::{ClientConfig, PlatformClient, TeamInfo};
+use uuid::Uuid;
+
+#[derive(Default)]
+struct Teams {
+    /// team -> the org it belongs to
+    teams: Mutex<HashMap<Uuid, Uuid>>,
+    /// Answer every team lookup with a 503.
+    down: AtomicBool,
+}
+
+/// A stub otto platform answering `GET /internal/orgs/{org}/teams/{team}`
+/// for the teams added to it, so tests can obtain [`VerifiedTeam`]s the only
+/// way there is: [`verify_team`].
+pub struct TeamPlatform {
+    pub client: Arc<PlatformClient>,
+    state: Arc<Teams>,
+}
+
+/// Like the real platform's, but it answers a known team whatever org the
+/// path names, so a cross-org lookup exercises the org check in
+/// `verify_team` itself.
+async fn team_lookup(
+    State(t): State<Arc<Teams>>,
+    Path((_org, team)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TeamInfo>, StatusCode> {
+    if t.down.load(Ordering::SeqCst) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match t.teams.lock().unwrap().get(&team) {
+        Some(org) => Ok(Json(TeamInfo {
+            id: team,
+            org_id: *org,
+            slug: "team".into(),
+            name: "Team".into(),
+        })),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+pub async fn team_platform() -> TeamPlatform {
+    let state: Arc<Teams> = Arc::default();
+    let app = Router::new()
+        .route("/internal/orgs/{org}/teams/{team}", get(team_lookup))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = PlatformClient::new(ClientConfig::new(
+        format!("http://{addr}"),
+        "https://cxp.example.com/mcp",
+        "otto_rs_test",
+    ))
+    .unwrap();
+    TeamPlatform {
+        client: Arc::new(client),
+        state,
+    }
+}
+
+impl TeamPlatform {
+    /// A new team of `org`, known to the platform.
+    pub fn add(&self, org: OrgId) -> Uuid {
+        let team = Uuid::new_v4();
+        self.state.teams.lock().unwrap().insert(team, org.as_uuid());
+        team
+    }
+
+    /// A new team of `org`, verified.
+    pub async fn team(&self, org: OrgId) -> VerifiedTeam {
+        let id = self.add(org);
+        verify_team(&self.client, org, id).await.unwrap()
+    }
+
+    pub fn set_down(&self, down: bool) {
+        self.state.down.store(down, Ordering::SeqCst);
+    }
+}

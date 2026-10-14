@@ -1,4 +1,4 @@
-//! Customer interactions and journeys (story S5): `InteractionsExt` on
+//! Customer interactions and journeys: `InteractionsExt` on
 //! `otto_tenant::Tx`, with its model structs.
 
 use std::future::Future;

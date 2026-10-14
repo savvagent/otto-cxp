@@ -1,4 +1,4 @@
-//! Customer segments and their members (story S5): `SegmentsExt` on
+//! Customer segments and their members: `SegmentsExt` on
 //! `otto_tenant::Tx`, with its model structs.
 //!
 //! A `static` segment's members are the rows in `segment_members`. A `dynamic`

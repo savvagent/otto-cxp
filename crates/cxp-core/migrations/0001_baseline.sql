@@ -28,9 +28,19 @@
 -- Nullable references to the catalog from customers, tickets, feedback, and
 -- surveys use `ON DELETE SET NULL (x_id)` (Postgres 15+), which nulls only the
 -- reference and leaves the NOT NULL `org_id` alone; owned children, including
--- each catalog level under its parent, use `ON DELETE CASCADE`. Indexes lead with `org_id` (except the
--- GIN indexes, which cannot without btree_gin; RLS's `org_id` predicate is
--- combined with them through the `(org_id, ...)` btree indexes).
+-- each catalog level under its parent, use `ON DELETE CASCADE`.
+--
+-- Indexes: every index a tenant query uses leads with `org_id` (only the
+-- cross-org background queues, `usage_outbox_due_idx` and
+-- `platform_events_received_idx`, do not), and every foreign key's columns are
+-- the leading columns of some index (so a parent delete or the org.deleted
+-- purge never scans a child table). Under FORCE ROW LEVEL SECURITY the
+-- planner only pushes LEAKPROOF operators into an index condition below the
+-- policy's `org_id = current_org()`; the jsonb, array, trigram, and full-text
+-- operators are not leakproof, so a GIN index on them could never be used by
+-- a tenant query and would only slow writes. There are none. Search inside an
+-- org (customers' substring and fuzzy match, knowledge full text) scans that
+-- org's rows through `(org_id, ...)` indexes (#17).
 --
 -- Append-only from here. sqlx checksums applied migrations; editing this file
 -- after a deployment has run it stops that deployment from booting. CI enforces
@@ -68,10 +78,9 @@ BEGIN
   END;
 END $$;
 
--- Both are stock contrib extensions (and trusted, so a database owner can
--- create them on managed Postgres): gen_random_uuid() and customer-name
--- similarity search.
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- A stock, trusted contrib extension (a database owner can create it on
+-- managed Postgres): customer-name similarity search (`%`, `similarity()`).
+-- gen_random_uuid() is built in (Postgres 13+), so pgcrypto is not needed.
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 CREATE OR REPLACE FUNCTION current_org() RETURNS uuid AS $$
@@ -195,6 +204,10 @@ CREATE TABLE customers (
   component_id   uuid,
   created_at     timestamptz NOT NULL DEFAULT now(),
   updated_at     timestamptz NOT NULL DEFAULT now(),
+  -- Stored so resolve_customer's exact, case-insensitive name match is a
+  -- btree equality (`name_lower = lower($2)`; text `=` is leakproof, so it is
+  -- an index condition under RLS).
+  name_lower     text GENERATED ALWAYS AS (lower(name)) STORED,
   UNIQUE (org_id, id),
   UNIQUE (org_id, email),
   FOREIGN KEY (org_id, experience_id) REFERENCES experiences (org_id, id)
@@ -212,12 +225,10 @@ CREATE INDEX customers_org_experience_idx ON customers (org_id, experience_id);
 CREATE INDEX customers_org_application_idx ON customers (org_id, application_id);
 CREATE INDEX customers_org_page_idx ON customers (org_id, page_id);
 CREATE INDEX customers_org_component_idx ON customers (org_id, component_id);
-CREATE INDEX customers_metadata_idx ON customers USING GIN (metadata);
-CREATE INDEX customers_tags_idx ON customers USING GIN (tags);
--- Customer search: the trigram operator `name % $q` and the substring matches
--- `name ILIKE` / `email ILIKE '%…%'` (a plain `similarity()` call cannot use these).
-CREATE INDEX customers_name_trgm_idx ON customers USING GIN (name gin_trgm_ops);
-CREATE INDEX customers_email_trgm_idx ON customers USING GIN (email gin_trgm_ops);
+CREATE INDEX customers_org_name_lower_idx ON customers (org_id, name_lower);
+-- No trigram index: search_customers' `ILIKE '%…%'` and `name % $q` are not
+-- leakproof, so under RLS they filter the org's rows rather than drive an
+-- index; that search scans the org (#17).
 
 -- A customer's journey: page views, purchases, logins, and so on.
 CREATE TABLE interactions (
@@ -233,8 +244,6 @@ CREATE TABLE interactions (
 
 CREATE INDEX interactions_org_created_idx ON interactions (org_id, created_at DESC);
 CREATE INDEX interactions_org_customer_idx ON interactions (org_id, customer_id, created_at DESC);
-CREATE INDEX interactions_org_type_idx ON interactions (org_id, interaction_type);
-CREATE INDEX interactions_metadata_idx ON interactions USING GIN (metadata);
 
 -- Customer segments; `criteria` describes membership, `segment_members` holds
 -- the evaluated members.
@@ -251,8 +260,6 @@ CREATE TABLE segments (
 );
 
 CREATE INDEX segments_org_created_idx ON segments (org_id, created_at DESC);
-CREATE INDEX segments_org_type_idx ON segments (org_id, segment_type);
-CREATE INDEX segments_criteria_idx ON segments USING GIN (criteria);
 
 -- A junction table: keyed by its pair, so it has no `id` of its own.
 CREATE TABLE segment_members (
@@ -301,16 +308,12 @@ CREATE TABLE tickets (
 );
 
 CREATE INDEX tickets_org_created_idx ON tickets (org_id, created_at DESC);
-CREATE INDEX tickets_org_customer_idx ON tickets (org_id, customer_id);
--- The dashboard's count-by-status aggregate and status/priority filters.
-CREATE INDEX tickets_org_status_idx ON tickets (org_id, status);
-CREATE INDEX tickets_org_priority_idx ON tickets (org_id, priority);
+-- A customer's tickets, newest first (the 360 view), and the FK's cover.
+CREATE INDEX tickets_org_customer_idx ON tickets (org_id, customer_id, created_at DESC);
 CREATE INDEX tickets_org_experience_idx ON tickets (org_id, experience_id);
 CREATE INDEX tickets_org_application_idx ON tickets (org_id, application_id);
 CREATE INDEX tickets_org_page_idx ON tickets (org_id, page_id);
 CREATE INDEX tickets_org_component_idx ON tickets (org_id, component_id);
-CREATE INDEX tickets_metadata_idx ON tickets USING GIN (metadata);
-CREATE INDEX tickets_tags_idx ON tickets USING GIN (tags);
 
 CREATE TABLE knowledge_articles (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -323,20 +326,20 @@ CREATE TABLE knowledge_articles (
   published  boolean     NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
+  -- The search document, computed once on write so search_articles matches
+  -- and ranks it without re-parsing every article per query. Deliberately no
+  -- GIN index: `@@` is not leakproof, so under RLS it filters the org's
+  -- published articles instead of driving an index (#17).
+  search_tsv tsvector GENERATED ALWAYS AS
+    (to_tsvector('english', title || ' ' || content)) STORED,
   UNIQUE (org_id, id)
 );
 
--- Listing (newest first) and filtering lead with org_id; full-text search uses
--- the GIN expression index, whose expression search queries must repeat
--- exactly: to_tsvector('english', title || ' ' || content).
+-- Listing, newest first, optionally only published (search reads the org's
+-- published articles through the second).
 CREATE INDEX knowledge_articles_org_created_idx ON knowledge_articles (org_id, created_at DESC);
-CREATE INDEX knowledge_articles_org_category_idx ON knowledge_articles (org_id, category);
 CREATE INDEX knowledge_articles_org_published_idx
   ON knowledge_articles (org_id, published, created_at DESC);
-CREATE INDEX knowledge_articles_fts_idx
-  ON knowledge_articles USING GIN (to_tsvector('english', title || ' ' || content));
-CREATE INDEX knowledge_articles_tags_idx ON knowledge_articles USING GIN (tags);
-CREATE INDEX knowledge_articles_metadata_idx ON knowledge_articles USING GIN (metadata);
 
 CREATE TABLE chat_sessions (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -352,7 +355,6 @@ CREATE TABLE chat_sessions (
 
 CREATE INDEX chat_sessions_org_customer_idx ON chat_sessions (org_id, customer_id);
 CREATE INDEX chat_sessions_org_started_idx ON chat_sessions (org_id, started_at DESC);
-CREATE INDEX chat_sessions_metadata_idx ON chat_sessions USING GIN (metadata);
 
 CREATE TABLE chat_messages (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -368,7 +370,6 @@ CREATE TABLE chat_messages (
 
 -- A session's transcript, oldest first.
 CREATE INDEX chat_messages_org_session_idx ON chat_messages (org_id, session_id, created_at);
-CREATE INDEX chat_messages_metadata_idx ON chat_messages USING GIN (metadata);
 
 -- ------------------------------------------------------------------- feedback
 
@@ -399,13 +400,12 @@ CREATE TABLE feedback (
 );
 
 CREATE INDEX feedback_org_created_idx ON feedback (org_id, created_at DESC);
-CREATE INDEX feedback_org_customer_idx ON feedback (org_id, customer_id);
-CREATE INDEX feedback_org_type_idx ON feedback (org_id, feedback_type);
+-- A customer's feedback, newest first (the 360 view), and the FK's cover.
+CREATE INDEX feedback_org_customer_idx ON feedback (org_id, customer_id, created_at DESC);
 CREATE INDEX feedback_org_experience_idx ON feedback (org_id, experience_id);
 CREATE INDEX feedback_org_application_idx ON feedback (org_id, application_id);
 CREATE INDEX feedback_org_page_idx ON feedback (org_id, page_id);
 CREATE INDEX feedback_org_component_idx ON feedback (org_id, component_id);
-CREATE INDEX feedback_metadata_idx ON feedback USING GIN (metadata);
 
 CREATE TABLE surveys (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -594,23 +594,43 @@ CREATE POLICY platform_events_maintenance_delete ON platform_events
   AS RESTRICTIVE FOR DELETE
   USING (current_org() IS NOT NULL OR current_setting('app.maintenance', true) = 'on');
 
--- Written by pinned transactions, drained by a background shipper that serves
--- every org. A pinned transaction sees and writes only its own org's rows; any
--- unpinned transaction (current_org() IS NULL) can read and write every org's
--- rows. No marker guards this: request paths always pin (they open their
--- transactions with `platform_events::begin_live`), and only the usage
--- shipper runs unpinned against these tables.
+-- Written by pinned transactions, drained (and, for the rejected log, swept)
+-- by background maintenance that serves every org. A pinned transaction sees
+-- and writes only its own org's rows. An unpinned one reaches every org's
+-- rows only with the maintenance marker, exactly as on platform_events: a
+-- request path that forgot to pin sees, changes, and deletes nothing.
 ALTER TABLE usage_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_outbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY usage_outbox_tenant_isolation ON usage_outbox
-  USING (org_id = current_org() OR current_org() IS NULL)
-  WITH CHECK (org_id = current_org() OR current_org() IS NULL);
+  USING (org_id = current_org()
+         OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'))
+  WITH CHECK (org_id = current_org()
+              OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'));
 
 ALTER TABLE usage_outbox_rejected ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_outbox_rejected FORCE ROW LEVEL SECURITY;
 CREATE POLICY usage_outbox_rejected_tenant_isolation ON usage_outbox_rejected
-  USING (org_id = current_org() OR current_org() IS NULL)
-  WITH CHECK (org_id = current_org() OR current_org() IS NULL);
+  USING (org_id = current_org()
+         OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'))
+  WITH CHECK (org_id = current_org()
+              OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'));
+
+-- Expire removed-member tombstones past twice their refusal window
+-- (`platform_events::REMOVED_MEMBER_TTL_SECS` is 300 s). otto_app may not
+-- DELETE from removed_members (grants below), so the retention sweep, which
+-- may run as otto_app, deletes through this function, which can only ever
+-- remove expired rows: a live tombstone, one still refusing a removed
+-- member's cached token, cannot be deleted through it.
+CREATE FUNCTION expire_removed_members() RETURNS bigint
+  LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+  WITH gone AS (
+    DELETE FROM public.removed_members
+    WHERE removed_at < now() - make_interval(secs => 600)
+    RETURNING 1
+  )
+  SELECT count(*) FROM gone;
+$$;
+REVOKE ALL ON FUNCTION expire_removed_members() FROM PUBLIC;
 
 -- ---------------------------------------------------------------------- grants
 
@@ -635,5 +655,23 @@ BEGIN
             'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO otto_app';
     EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public '
             'GRANT USAGE, SELECT ON SEQUENCES TO otto_app';
+
+    -- Narrower than the blanket grant above, where a tenant transaction has
+    -- no business:
+    -- - deleted_orgs is permanent. Tenant transactions read it (begin_live);
+    --   the tombstone is written by the org.deleted handler as the
+    --   connecting role, and nothing ever changes or removes one.
+    -- - removed_members is read by begin_live and upserted by member.removed
+    --   (INSERT ... ON CONFLICT DO UPDATE, pinned, as otto_app); expiry goes
+    --   through expire_removed_members(), never a direct DELETE.
+    -- - _sqlx_migrations is the migrator's bookkeeping, written by the
+    --   connecting role at boot. sqlx creates it before running any
+    --   migration, so it exists here; the guard only keeps this file
+    --   runnable by hand on a database that lacks it.
+    EXECUTE 'REVOKE UPDATE, DELETE ON deleted_orgs FROM otto_app';
+    EXECUTE 'REVOKE DELETE ON removed_members FROM otto_app';
+    IF to_regclass('public._sqlx_migrations') IS NOT NULL THEN
+      EXECUTE 'REVOKE ALL ON public._sqlx_migrations FROM otto_app';
+    END IF;
   END IF;
 END $$;

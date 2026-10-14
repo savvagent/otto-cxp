@@ -1,4 +1,4 @@
-//! Dashboard metrics (story S8): `DashboardExt` on `otto_tenant::Tx`,
+//! Dashboard metrics: `DashboardExt` on `otto_tenant::Tx`,
 //! computed as SQL aggregates, with its model structs.
 //!
 //! Nothing here lists rows in Rust: each method is one statement over the

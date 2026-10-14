@@ -5,9 +5,9 @@
 //! camelCase (#15), `teamId` too (sending both is a `400`). On create, absent
 //! or `null` means no team. On update, absent keeps the team, an explicit
 //! `null` clears it, and an id sets it. Any id is verified at the platform
-//! (`PlatformClient::team`) before the transaction opens: a team the platform
-//! does not know in the caller's org is `400 unknown_team`, and a platform
-//! that cannot answer is `503`.
+//! (`cxp_core::catalog::verify_team`) before the transaction opens: a team the
+//! platform does not know in the caller's org is `400 unknown_team`, and a
+//! platform that cannot answer is `503`.
 
 use axum::extract::State;
 use axum::{Extension, Json};
@@ -15,7 +15,7 @@ use cxp_core::auth::Principal;
 use cxp_core::catalog::{
     Application, ApplicationFilter, ApplicationUpdate, CatalogExt, Component, ComponentFilter,
     ComponentUpdate, Experience, ExperienceUpdate, NewApplication, NewComponent, NewExperience,
-    NewPage, Page, PageFilter, PageUpdate, TeamChange,
+    NewPage, Page, PageFilter, PageUpdate, TeamChange, VerifiedTeam,
 };
 use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
@@ -35,23 +35,36 @@ where
     T::deserialize(d).map(Some)
 }
 
-/// Refuse a team id the platform does not know in the caller's org. Called
+/// A create body's team, verified at the platform in the caller's org. Called
 /// before the transaction opens, so no pooled connection waits on the
 /// platform.
-async fn verify_team(state: &AppState, caller: &Principal, team: Option<Uuid>) -> ApiResult<()> {
-    let Some(team) = team else { return Ok(()) };
-    let org = caller.org_id.as_uuid();
-    match state.platform.team(org, team).await? {
-        Some(t) if t.org_id == org => Ok(()),
-        _ => Err(cxp_core::Error::UnknownTeam.into()),
+async fn new_team(
+    state: &AppState,
+    caller: &Principal,
+    team: Option<Uuid>,
+) -> ApiResult<Option<VerifiedTeam>> {
+    match team {
+        None => Ok(None),
+        Some(id) => Ok(Some(
+            cxp_core::catalog::verify_team(&state.platform, caller.org_id, id).await?,
+        )),
     }
 }
 
-fn team_to_verify(change: TeamChange) -> Option<Uuid> {
-    match change {
-        TeamChange::Set(id) => Some(id),
-        TeamChange::Keep | TeamChange::Clear => None,
-    }
+/// An update body's team: absent keeps it, an explicit `null` clears it, an
+/// id (verified, as for [`new_team`]) sets it.
+async fn team_change(
+    state: &AppState,
+    caller: &Principal,
+    team: Option<Option<Uuid>>,
+) -> ApiResult<TeamChange> {
+    Ok(match team {
+        None => TeamChange::Keep,
+        Some(None) => TeamChange::Clear,
+        Some(Some(id)) => TeamChange::Set(
+            cxp_core::catalog::verify_team(&state.platform, caller.org_id, id).await?,
+        ),
+    })
 }
 
 // ---------------------------------------------------------------- experiences
@@ -105,11 +118,11 @@ pub async fn create_experience(
     ApiJson(body): ApiJson<CreateExperienceBody>,
 ) -> ApiResult<Json<Experience>> {
     caller.require_write()?;
-    verify_team(&state, &caller, body.team_id).await?;
+    let team = new_team(&state, &caller, body.team_id).await?;
     let new = NewExperience {
         name: body.name,
         description: body.description,
-        team_id: body.team_id,
+        team,
         metadata: body.metadata,
     };
     let mut tx = state.begin(&caller).await?;
@@ -125,8 +138,7 @@ pub async fn update_experience(
     ApiJson(body): ApiJson<UpdateExperienceBody>,
 ) -> ApiResult<Json<Experience>> {
     caller.require_write()?;
-    let team = TeamChange::from_nested(body.team_id);
-    verify_team(&state, &caller, team_to_verify(team)).await?;
+    let team = team_change(&state, &caller, body.team_id).await?;
     let update = ExperienceUpdate {
         name: body.name,
         description: body.description,
@@ -215,13 +227,13 @@ pub async fn create_application(
     ApiJson(body): ApiJson<CreateApplicationBody>,
 ) -> ApiResult<Json<Application>> {
     caller.require_write()?;
-    verify_team(&state, &caller, body.team_id).await?;
+    let team = new_team(&state, &caller, body.team_id).await?;
     let new = NewApplication {
         experience_id: body.experience_id,
         name: body.name,
         platform: body.platform,
         description: body.description,
-        team_id: body.team_id,
+        team,
         metadata: body.metadata,
     };
     let mut tx = state.begin(&caller).await?;
@@ -237,8 +249,7 @@ pub async fn update_application(
     ApiJson(body): ApiJson<UpdateApplicationBody>,
 ) -> ApiResult<Json<Application>> {
     caller.require_write()?;
-    let team = TeamChange::from_nested(body.team_id);
-    verify_team(&state, &caller, team_to_verify(team)).await?;
+    let team = team_change(&state, &caller, body.team_id).await?;
     let update = ApplicationUpdate {
         name: body.name,
         platform: body.platform,
@@ -328,13 +339,13 @@ pub async fn create_page(
     ApiJson(body): ApiJson<CreatePageBody>,
 ) -> ApiResult<Json<Page>> {
     caller.require_write()?;
-    verify_team(&state, &caller, body.team_id).await?;
+    let team = new_team(&state, &caller, body.team_id).await?;
     let new = NewPage {
         application_id: body.application_id,
         name: body.name,
         path: body.path,
         description: body.description,
-        team_id: body.team_id,
+        team,
         metadata: body.metadata,
     };
     let mut tx = state.begin(&caller).await?;
@@ -350,8 +361,7 @@ pub async fn update_page(
     ApiJson(body): ApiJson<UpdatePageBody>,
 ) -> ApiResult<Json<Page>> {
     caller.require_write()?;
-    let team = TeamChange::from_nested(body.team_id);
-    verify_team(&state, &caller, team_to_verify(team)).await?;
+    let team = team_change(&state, &caller, body.team_id).await?;
     let update = PageUpdate {
         name: body.name,
         path: body.path,
@@ -439,13 +449,13 @@ pub async fn create_component(
     ApiJson(body): ApiJson<CreateComponentBody>,
 ) -> ApiResult<Json<Component>> {
     caller.require_write()?;
-    verify_team(&state, &caller, body.team_id).await?;
+    let team = new_team(&state, &caller, body.team_id).await?;
     let new = NewComponent {
         page_id: body.page_id,
         name: body.name,
         component_type: body.component_type,
         description: body.description,
-        team_id: body.team_id,
+        team,
         metadata: body.metadata,
     };
     let mut tx = state.begin(&caller).await?;
@@ -461,8 +471,7 @@ pub async fn update_component(
     ApiJson(body): ApiJson<UpdateComponentBody>,
 ) -> ApiResult<Json<Component>> {
     caller.require_write()?;
-    let team = TeamChange::from_nested(body.team_id);
-    verify_team(&state, &caller, team_to_verify(team)).await?;
+    let team = team_change(&state, &caller, body.team_id).await?;
     let update = ComponentUpdate {
         name: body.name,
         component_type: body.component_type,
@@ -492,24 +501,25 @@ pub async fn delete_component(
 mod tests {
     use super::*;
 
-    fn team_of(json: &str) -> Result<TeamChange, serde_json::Error> {
-        serde_json::from_str::<UpdateExperienceBody>(json)
-            .map(|b| TeamChange::from_nested(b.team_id))
+    /// The update body's team field: `None` absent (keep), `Some(None)`
+    /// explicit null (clear), `Some(Some(id))` set.
+    fn team_of(json: &str) -> Result<Option<Option<Uuid>>, serde_json::Error> {
+        serde_json::from_str::<UpdateExperienceBody>(json).map(|b| b.team_id)
     }
 
     #[test]
     fn the_team_field_tells_absent_from_null_and_accepts_both_spellings() {
         let id = Uuid::new_v4();
-        assert_eq!(team_of("{}").unwrap(), TeamChange::Keep);
-        assert_eq!(team_of(r#"{"team_id": null}"#).unwrap(), TeamChange::Clear);
-        assert_eq!(team_of(r#"{"teamId": null}"#).unwrap(), TeamChange::Clear);
+        assert_eq!(team_of("{}").unwrap(), None);
+        assert_eq!(team_of(r#"{"team_id": null}"#).unwrap(), Some(None));
+        assert_eq!(team_of(r#"{"teamId": null}"#).unwrap(), Some(None));
         assert_eq!(
             team_of(&format!(r#"{{"team_id": "{id}"}}"#)).unwrap(),
-            TeamChange::Set(id)
+            Some(Some(id))
         );
         assert_eq!(
             team_of(&format!(r#"{{"teamId": "{id}"}}"#)).unwrap(),
-            TeamChange::Set(id)
+            Some(Some(id))
         );
         assert!(team_of(&format!(r#"{{"teamId": "{id}", "team_id": null}}"#)).is_err());
         assert!(team_of(r#"{"team_id": "not-a-uuid"}"#).is_err());
