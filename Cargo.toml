@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/cxp-core",
+  "crates/cxp-http",
   "crates/cxp-mcp",
   "crates/cxp-api",
   "crates/cxp-server",
@@ -15,6 +16,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 cxp-core = { path = "crates/cxp-core" }
+cxp-http = { path = "crates/cxp-http" }
 cxp-mcp = { path = "crates/cxp-mcp" }
 cxp-api = { path = "crates/cxp-api" }
 

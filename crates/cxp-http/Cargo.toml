@@ -1,0 +1,18 @@
+[package]
+name = "cxp-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cxp-core.workspace = true
+otto-tenant.workspace = true
+otto-resource.workspace = true
+axum.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true, features = ["util"] }
+serde_json.workspace = true

@@ -370,6 +370,7 @@ dependencies = [
  "axum",
  "chrono",
  "cxp-core",
+ "cxp-http",
  "http",
  "otto-resource",
  "otto-tenant",
@@ -402,12 +403,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cxp-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cxp-core",
+ "http",
+ "otto-resource",
+ "otto-tenant",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "cxp-mcp"
 version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
  "cxp-core",
+ "cxp-http",
  "http",
  "otto-resource",
  "otto-tenant",
@@ -433,6 +449,7 @@ dependencies = [
  "chrono",
  "cxp-api",
  "cxp-core",
+ "cxp-http",
  "cxp-mcp",
  "dotenvy",
  "http",

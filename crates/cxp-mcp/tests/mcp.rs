@@ -178,8 +178,6 @@ async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
         meter,
         Config {
             public_url: PUBLIC_URL.into(),
-            resource_uri: RESOURCE.into(),
-            platform_url: base,
             allowed_hosts: vec![HOST.into()],
             allowed_origins: vec![],
         },
@@ -275,18 +273,20 @@ async fn no_token_is_a_401_naming_the_metadata_document(pool: PgPool) {
     );
     assert!(!challenge.contains("error="), "{challenge}");
     assert_eq!(v["error"], "unauthenticated");
+}
 
-    // The metadata document itself is open.
-    let (status, _, doc) = h
-        .send(
-            Request::get("/.well-known/oauth-protected-resource")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["resource"], RESOURCE);
-    assert_eq!(doc["scopes_supported"], json!(["cxp:read", "cxp:write"]));
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_cookie_alone_is_not_a_credential_on_mcp(pool: PgPool) {
+    let h = harness(pool).await;
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (s0, h0, v0) = h.send(Harness::post(None, body.clone())).await;
+    let mut req = Harness::post(None, body);
+    req.headers_mut()
+        .insert("cookie", "session=abc; otto_session=abc".parse().unwrap());
+    let (status, headers, v) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!((status, &v), (s0, &v0));
+    assert_eq!(headers["www-authenticate"], h0["www-authenticate"]);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -838,8 +838,6 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
             meter,
             Config {
                 public_url: PUBLIC_URL.into(),
-                resource_uri: RESOURCE.into(),
-                platform_url: base.clone(),
                 allowed_hosts: hosts.clone(),
                 allowed_origins: vec![],
             },

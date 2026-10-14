@@ -1,6 +1,6 @@
 name: CI
 
-# The server: crates/ (cxp-core, cxp-mcp, cxp-api, cxp-server). The TypeScript
+# The server: crates/ (cxp-core, cxp-http, cxp-mcp, cxp-api, cxp-server). The TypeScript
 # SDK, React package, and web app: sdk/typescript, packages/react, apps/web.
 on:
   push:

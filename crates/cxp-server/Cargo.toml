@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 cxp-core.workspace = true
+cxp-http.workspace = true
 cxp-mcp.workspace = true
 cxp-api.workspace = true
 otto-tenant.workspace = true

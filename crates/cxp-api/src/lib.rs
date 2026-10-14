@@ -26,7 +26,6 @@
 //! deliberately no CORS layer: `/api` is called with bearer tokens or from the
 //! same origin.
 
-mod auth;
 mod error;
 mod extract;
 mod routes;
@@ -216,8 +215,15 @@ pub fn router(state: AppState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_bearer,
+            // A handler's `401` is `access_revoked`; it carries the same
+            // challenge as a revoked token.
+            cxp_http::Authenticator::new(
+                state.db.clone(),
+                state.platform.clone(),
+                state.config.public_url.clone(),
+            )
+            .challenge_handler_401(),
+            cxp_http::require_bearer,
         ));
 
     Router::new()

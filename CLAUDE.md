@@ -39,11 +39,16 @@ One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api
   (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
   `begin_live`), `usage` (metering, outbox shipper), `maintenance` (the only cross-org access).
-- `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` and metadata routes.
-  Holds no SQL.
+- `cxp-http` - the axum side of auth, shared by `/mcp` and `/api/v1`: `Authenticator`, `require_bearer`,
+  `refuse`, and the `/.well-known/oauth-protected-resource` router. Holds no SQL. A new credential
+  source (the console session cookie) is opt-in per surface: `/api` only, same-origin check on
+  writes; `/mcp` stays bearer-only.
+- `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` route behind
+  `cxp_http::require_bearer`. Holds no SQL.
 - `cxp-api` - REST `/api/v1` and `/platform/webhooks`. Holds no SQL.
 - `cxp-server` - the binary: `config.rs`, boot sequence (migrate, verify tenant isolation, check the
-  platform credential, spawn the usage shipper and sweeper), health routes, router, `tests/e2e.rs`.
+  platform credential, spawn the usage shipper and sweeper), health routes, router (mounts
+  `/.well-known/oauth-protected-resource`), `tests/e2e.rs`.
 
 **SDKs:**
 - `sdk/typescript/` - `@cxp/sdk` (MIT): `connectCxp({ url, token | authProvider })` returns `{ cxp }` with
