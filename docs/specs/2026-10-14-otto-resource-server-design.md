@@ -206,7 +206,9 @@ Every tenant table: `org_id uuid NOT NULL`, `id uuid PRIMARY KEY DEFAULT gen_ran
 `UNIQUE (org_id, id)`; every reference to another tenant table is a composite
 `FOREIGN KEY (org_id, x_id) REFERENCES x (org_id, id)`. Nullable references use
 `ON DELETE SET NULL (x_id)` (Postgres 15+ column list, so `org_id` is not nulled); owned children
-use `ON DELETE CASCADE`. Indexes lead with `org_id`.
+use `ON DELETE CASCADE`. Exception kept from the legacy schema: the catalog parent links
+(`applications.experience_id`, `pages.application_id`, `components.page_id`) are nullable but
+`ON DELETE CASCADE`, so deleting a catalog parent still deletes its children. Indexes lead with `org_id`.
 
 | Table | From | Changes beyond org_id/composite FKs |
 |---|---|---|
