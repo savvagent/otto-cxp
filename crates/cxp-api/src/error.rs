@@ -82,6 +82,7 @@ fn status_for(e: &cxp_core::Error) -> StatusCode {
         Error::AccessRevoked => StatusCode::UNAUTHORIZED,
         Error::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
         Error::Unavailable | Error::Platform(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         Error::Tenant(_) | Error::Database(_) => {
             if e.code() == "invalid_argument" {
                 StatusCode::BAD_REQUEST
