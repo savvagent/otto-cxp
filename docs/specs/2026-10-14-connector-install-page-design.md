@@ -53,10 +53,18 @@ Acceptance criteria:
 - **Copy buttons are progressive enhancement:** rendered `hidden`, unhidden by the script. Without
   JavaScript the address is still selectable text.
 - **Two copy targets:** the connector address and the Claude Code command; each has its own
-  `role="status"` region.
+  `role="status"` region. A click clears the region, then writes the target element's trimmed
+  `textContent` with `navigator.clipboard.writeText`; on success the region reads `Copied.`; if
+  the clipboard is missing or refuses (a rejected promise or a thrown error), the script selects
+  the target's text with a DOM `Range` and the region reads `Selected. Press Ctrl+C to copy.`
+  Both messages live in the one hashed script; selection by script needs no CSP allowance.
 - **Hashes are hard-coded in the CSP constant** and proven by a unit test (as the brief asks), not
-  computed at boot. `sha2` and `base64` become dev-dependencies of `cxp-server` only; both are
-  already in `Cargo.lock` through other crates.
+  computed at boot. `sha2 = "0.10"` and `base64 = "0.22"` are added to the root
+  `[workspace.dependencies]` (the versions already locked through other crates, 0.10.9 and
+  0.22.1) and used as dev-dependencies of `cxp-server` only; the small `Cargo.lock` change is
+  committed with them.
+- **The connector address is shown exactly as configured** (`CXP_RESOURCE_URI`, trailing slash
+  and all): it is the token audience, so the page must not normalise it.
 - Run Profile: every value came from the Development Workflow section; nothing assumed.
 
 ## Goal & Success Criteria
@@ -88,7 +96,7 @@ i18n; any new config key.
   contain no placeholder, so their hashes are constant whatever the config.
 - `pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'sha256-…';
   script-src 'sha256-…'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"`.
-- `pub struct InstallPage { html: Bytes }`, `Clone`.
+- `pub struct InstallPage { html: axum::body::Bytes }`, `Clone` (no new `bytes` dependency).
   `InstallPage::new(resource_uri: &str, platform_url: &str) -> anyhow::Result<Self>` parses
   `platform_url` with `url::Url`, takes `origin().ascii_serialization()`, HTML-escapes
   (`& < > " '`) the connector URL and both link URLs, and substitutes them. Fails only on an
@@ -136,7 +144,8 @@ None.
 
 ## Out-of-band
 
-None: no secret, config key, scope, or registration. Deploy is `ci-auto`; verification is the
+None: no secret, config key, scope, or registration. Recurring cost: none (no new app, machine,
+volume, or service). Deploy is `ci-auto`; verification is the
 `curl` pair in the AC plus the section's `Ship > verify` steps.
 
 ## Error Handling & Edge Cases
@@ -157,8 +166,11 @@ clippy `-D warnings`, `cargo fmt --check`, the migrations extra (prints nothing)
 - Unit tests in `install_page.rs`: CSP hashes recomputed from `TEMPLATE`'s `<style>` and
   `<script>` contents equal the ones in `CONTENT_SECURITY_POLICY`; exactly one `<style>` and one
   `<script>` and no inline event handler attribute or `style=` attribute; render substitutes and
-  escapes and leaves no `{{`; `wants_page` truth table above; the script contains no placeholder.
-- Router tests in `lib.rs`'s `tests` module: browser Accept → 200 with every header and the
+  escapes and leaves no `{{`; `wants_page` truth table above; the script contains no placeholder
+  and contains both status messages (`Copied.`, `Selected. Press Ctrl+C to copy.`).
+- Router tests in `lib.rs`'s `tests` module, through a new raw helper
+  `send_raw(app, req) -> (StatusCode, HeaderMap, Bytes)` (the existing `send_to` parses JSON and
+  defaults on failure, so it cannot check HTML or exact bytes): browser Accept → 200 with every header and the
   configured address (using a config whose `resource_uri` differs from the default to prove it is
   read from config); `*/*`, `application/json`, HTML + `Authorization` → JSON 404 whose body bytes
   equal the existing `not_found` body for `/`; `HEAD /` HTML → 200, empty body;
