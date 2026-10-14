@@ -1,7 +1,11 @@
 //! Pure customer-experience analytics: Net Promoter Score, Customer
-//! Satisfaction, and keyword sentiment. No database access; callers fetch
-//! the scores (bounded, or as SQL aggregates) and pass them in. Moved
-//! unchanged from the pre-platform `server/src/analysis`.
+//! Satisfaction, and keyword sentiment, with no database access.
+//!
+//! The `calculate_nps` and `calculate_csat` tools do not call these: they
+//! count in SQL (`FeedbackExt::survey_nps_counts`, `csat_counts`), so no
+//! list of scores is ever loaded. [`calculate_nps`] and [`calculate_csat`]
+//! are the reference formulas those counts' `nps()`/`csat()` reproduce.
+//! [`analyze_sentiment`] backs the `analyze_sentiment` tool directly.
 
 pub mod sentiment;
 

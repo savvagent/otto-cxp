@@ -34,7 +34,15 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(format: LogFormat) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // An unset RUST_LOG means "info"; a set but unreadable one is a mistake
+    // worth saying so, on stderr since there is no subscriber yet.
+    let filter = match std::env::var(EnvFilter::DEFAULT_ENV) {
+        Err(_) => EnvFilter::new("info"),
+        Ok(spec) => EnvFilter::try_new(&spec).unwrap_or_else(|e| {
+            eprintln!("RUST_LOG={spec:?} is not a valid filter ({e}); logging at info instead");
+            EnvFilter::new("info")
+        }),
+    };
     let registry = tracing_subscriber::registry().with(filter);
     match format {
         LogFormat::Json => registry

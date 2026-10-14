@@ -1,8 +1,8 @@
 //! The tool surface, split by domain. `rmcp`'s [`ToolRouter`] adds, so the
 //! per-file routers are combined in [`router`].
 //!
-//! Tool names and input field names are the pre-platform server's, minus its
-//! five team tools (teams belong to the platform now). Paged tools take an
+//! Tool names and input field names are a stable contract with agents.
+//! There are no team tools: teams belong to the platform. Paged tools take an
 //! optional `limit` and `offset`; every list tool returns
 //! `{"items": [...], "total": n}` (see [`out::List`]).
 //!
@@ -93,7 +93,17 @@ pub const UNSCOPED: &[&str] = &["whoami", "usage"];
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IdParam {
-    /// The id. Tools that take a customer also accept an exact email or a name.
+    /// The UUID of the record the tool names.
+    pub id: String,
+}
+
+/// A customer, named however the agent knows them. The field is `id`, as in
+/// [`IdParam`], so the wire shape is unchanged.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CustomerIdParam {
+    /// The customer: a UUID, an exact email, or a name (matched exactly,
+    /// case-insensitively, else by a unique partial match of the name or
+    /// email; several matches are refused, and search_customers lists them).
     pub id: String,
 }
 
@@ -318,6 +328,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn create_survey_documents_the_question_shape_the_console_renders() {
+        let tool = router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "create_survey")
+            .unwrap();
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains(crate::prompts::SURVEY_QUESTIONS_EXAMPLE),
+            "{description}"
+        );
+        assert!(!description.contains("\"type\""), "{description}");
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(schema.contains("questionType"), "{schema}");
+        assert!(!schema.contains("\\\"type\\\": \\\"nps"), "{schema}");
     }
 
     #[test]

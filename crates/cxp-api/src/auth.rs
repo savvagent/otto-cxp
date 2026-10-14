@@ -3,7 +3,9 @@
 //! `cxp_core::auth::authenticate` decides; this maps its answer to HTTP:
 //! `Missing`, `Inactive`, and `Revoked` are `401` with `WWW-Authenticate`
 //! pointing at the protected-resource metadata, `Unavailable` is `503` with
-//! `Retry-After` (an outage must never send a client to re-authenticate). On
+//! `Retry-After` (an outage must never send a client to re-authenticate),
+//! and `Internal` (the platform refused this service's own credential) is
+//! `500`. On
 //! success the [`Principal`] goes into the request's extensions for handlers.
 
 use axum::extract::{Request, State};

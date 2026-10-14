@@ -114,7 +114,10 @@ pub async fn check_platform(platform: &PlatformClient, config: &Config) -> Platf
 /// An error before serving is a refusal to start. An error after is a
 /// background task (the server, the usage shipper, the sweeper) that ended
 /// on its own: the process should exit non-zero so the machine restarts,
-/// rather than serve on without shipping usage or sweeping.
+/// rather than serve on without shipping usage or sweeping. So is a shutdown
+/// that did not finish cleanly: in-flight requests dropped at the drain
+/// deadline, or a final usage flush that failed or ran out of time (its rows
+/// stay in the outbox for the next start).
 pub async fn run<F>(config: Config, listener: TcpListener, shutdown: F) -> Result<Boot>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -166,6 +169,7 @@ where
         platform.clone(),
         meter(platform.clone(), &config),
         &config,
+        check.clone(),
     )?;
 
     let (stop, stopped) = watch::channel(false);
@@ -199,7 +203,7 @@ where
     // life of the process ends on its own.
     let (mut server_done, mut shipper_done) = (false, false);
     tokio::pin!(shutdown);
-    let failure = tokio::select! {
+    let mut failure = tokio::select! {
         _ = &mut shutdown => None,
         r = &mut server => {
             server_done = true;
@@ -207,7 +211,7 @@ where
         }
         r = &mut shipper => {
             shipper_done = true;
-            Some(ended("the usage shipper", r.map(Ok)))
+            Some(ended("the usage shipper", r.map(|r| r.map_err(anyhow::Error::from))))
         }
         r = &mut sweeper => Some(ended("the platform-event sweeper", r.map(Ok))),
     };
@@ -215,17 +219,20 @@ where
     // Drain: stop accepting, let in-flight requests finish, within bounds.
     let _ = drain.send(true);
     if !server_done {
-        match tokio::time::timeout(DRAIN_TIMEOUT, &mut server).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "the server stopped with an error"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "the server task did not stop cleanly"),
+        let drained = match tokio::time::timeout(DRAIN_TIMEOUT, &mut server).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(format!("the server stopped with an error: {e}")),
+            Ok(Err(e)) => Err(format!("the server task did not stop cleanly: {e}")),
             Err(_) => {
-                tracing::warn!(
-                    timeout = ?DRAIN_TIMEOUT,
-                    "in-flight requests did not finish in time; dropping them"
-                );
                 server.abort();
+                Err(format!(
+                    "in-flight requests did not finish within {DRAIN_TIMEOUT:?} and were dropped"
+                ))
             }
+        };
+        if let Err(why) = drained {
+            tracing::error!(reason = %why, "the drain failed");
+            failure.get_or_insert(anyhow!("{why}"));
         }
     }
 
@@ -233,17 +240,22 @@ where
     tracing::info!("flushing usage");
     let _ = stop.send(true);
     if !shipper_done {
-        match tokio::time::timeout(FLUSH_TIMEOUT, &mut shipper).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "the usage shipper did not stop cleanly"),
+        let flushed = match tokio::time::timeout(FLUSH_TIMEOUT, &mut shipper).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            // Logged by the shipper itself.
+            Ok(Ok(Err(e))) => Err(format!("the final usage flush failed: {e}")),
+            Ok(Err(e)) => Err(format!("the usage shipper did not stop cleanly: {e}")),
             Err(_) => {
-                tracing::warn!(
-                    timeout = ?FLUSH_TIMEOUT,
-                    "the final usage flush did not finish in time; unshipped rows stay in the \
-                     outbox for the next start"
-                );
                 shipper.abort();
+                Err(format!(
+                    "the final usage flush did not finish within {FLUSH_TIMEOUT:?}"
+                ))
             }
+        };
+        if let Err(why) = flushed {
+            tracing::error!(reason = %why,
+                "usage was not fully flushed; unshipped rows stay in the outbox for the next start");
+            failure.get_or_insert(anyhow!("{why}"));
         }
     }
     sweeper.abort();
@@ -271,15 +283,16 @@ fn ended(what: &str, result: std::result::Result<Result<()>, JoinError>) -> anyh
     anyhow!("{what} ended while serving: {why}")
 }
 
-/// Hourly retention: old platform-event markers and expired removed-member
-/// tombstones.
+/// Hourly retention ([`cxp_core::platform_events::sweep`]): old
+/// platform-event markers, expired removed-member tombstones, and rejected
+/// usage past `REJECTED_USAGE_KEEP_DAYS`.
 async fn sweep_loop(db: Db, mut shutdown: watch::Receiver<bool>) {
     loop {
         match cxp_core::platform_events::sweep(&db, PLATFORM_EVENT_RETENTION_DAYS).await {
             Ok(0) => {}
             Ok(n) => tracing::info!(rows = n, "swept old platform-event records"),
-            Err(e) => tracing::warn!(error = %e, source = ?std::error::Error::source(&e),
-                "platform-event sweep failed"),
+            Err(e) => tracing::warn!(error = %e.log_detail(),
+                source = ?std::error::Error::source(&e), "retention sweep failed"),
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => {}

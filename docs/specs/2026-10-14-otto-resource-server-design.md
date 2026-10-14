@@ -152,8 +152,9 @@ knowledge.rs        S6   KnowledgeExt
 chat.rs             S6   ChatExt
 feedback.rs         S7   FeedbackExt (feedback, surveys, survey responses)
 catalog.rs          S8   CatalogExt (experiences, applications, pages, components); VerifiedTeam,
-                         made only by verify_team(&PlatformClient, OrgId, Uuid); New*.team and
-                         TeamChange::Set take a VerifiedTeam
+                         made only by verify_team(&PlatformClient, OrgId, Uuid), carries the org
+                         it was verified for; New*.team and TeamChange::Set take a VerifiedTeam,
+                         and a write in any other org refuses it (unknown_team)
 dashboard.rs        S8   DashboardExt (metrics, incl. ticket counts by status as one SQL aggregate)
 ```
 
@@ -216,12 +217,15 @@ use `ON DELETE CASCADE`. Exception kept from the legacy schema: the catalog pare
 (`applications.experience_id`, `pages.application_id`, `components.page_id`) are nullable but
 `ON DELETE CASCADE`, so deleting a catalog parent still deletes its children.
 
-Indexes: btree only, leading with `org_id`, and every foreign key's columns lead some index (a
-test checks both). Under FORCE ROW LEVEL SECURITY the planner only uses LEAKPROOF operators as
-index conditions beneath the policy's `org_id = current_org()`; the jsonb, array, trigram, and
-full-text operators are not leakproof, so GIN indexes on them (metadata, tags, criteria,
-trigram, full-text) and the `(org_id, status|priority|type|category)` btrees no query used were
-dropped: they could never serve a tenant query and only cost writes. Customer substring/fuzzy
+Indexes: btree only; every non-unique index leads with `org_id` except the two cross-org
+background queues (`usage_outbox_due_idx`, `platform_events_received_idx`); every foreign key's
+columns lead some index. `tests/db.rs` checks all three. Under FORCE ROW LEVEL SECURITY the
+planner only uses LEAKPROOF operators as index conditions beneath the policy's
+`org_id = current_org()`; the jsonb, array, trigram, and full-text operators are not leakproof,
+so GIN indexes on them (metadata, tags, criteria, trigram, full-text) and the
+`(org_id, priority|type|category)` btrees no query used were dropped: they could never serve a
+tenant query and only cost writes. `tickets (org_id, status)` is kept: not as a filter (enum `=`
+is not leakproof either) but so the dashboard's count-by-status runs as an index-only scan. Customer substring/fuzzy
 search and knowledge full-text search therefore scan the org's rows (#17).
 
 | Table | From | Changes beyond org_id/composite FKs |
@@ -250,11 +254,12 @@ Service bookkeeping (copy otto-flags' definitions and policies):
 | Table | RLS | Purpose |
 |---|---|---|
 | usage_outbox, usage_outbox_rejected | `org_id = current_org() OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on')`: an unpinned transaction without the maintenance marker sees, changes, and deletes nothing, as on `platform_events` | metering |
-| platform_events | tenant, keyed by `event_id`, **plus** otto-flags' `0003_unpinned_sweep_reads.sql` policies folded in: `platform_events_retention_read` (`current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'`), the restrictive `platform_events_maintenance_delete`, and the delete-retention policy, so the sweep deletes as `otto_app` | webhook dedupe |
+| platform_events | tenant, keyed by `event_id`, **plus** otto-flags' `0003_unpinned_sweep_reads.sql` policies folded in: `platform_events_retention_read` (`current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'`), the restrictive `platform_events_maintenance_delete`, and the delete-retention policy, so the sweep can delete under any role RLS applies to (the tests run it as `otto_app`; in production it runs as the connecting role, see #16) | webhook dedupe |
 | deleted_orgs, removed_members | none (pre-org lookups, as in otto-flags) | tombstones |
 
 Grants: `otto_app` gets SELECT/INSERT/UPDATE/DELETE on every table, except `deleted_orgs`
-(SELECT, INSERT: tombstones are permanent), `removed_members` (no DELETE: the sweep expires
+(SELECT only: tombstones are permanent, and the `org.deleted` handler writes them as the
+connecting role), `removed_members` (no DELETE: the sweep expires
 tombstones through the `SECURITY DEFINER` function `expire_removed_members()`, which can only
 remove rows past twice the 300 s window), and `_sqlx_migrations` (none).
 
@@ -267,11 +272,13 @@ pub struct Principal { token_id, user_id: UserId, org_id: OrgId, role: Role, cli
                        scopes: Vec<String>, kind: TokenKind, expires_at }
 impl Principal { fn can_read(&self) -> bool; fn require_read(&self) -> Result<(), MissingScope>;
                  fn require_write(&self) -> Result<(), MissingScope>; }
-pub enum AuthFailure { Missing, Inactive, Revoked, Unavailable }
+pub enum AuthFailure { Missing, Inactive, Revoked, Unavailable, Internal }
 pub async fn authenticate(db: &Db, platform: &PlatformClient, authorization: Option<&str>)
     -> Result<Principal, AuthFailure>;     // parse "Bearer x" case-insensitively; introspect;
                                            // Ok(None) => Inactive (wrong audience lands here);
-                                           // Err => Unavailable; tombstone => Revoked
+                                           // retriable Err => Unavailable; any other Err (our
+                                           // credential refused, not the platform) => Internal;
+                                           // tombstone => Revoked
 pub fn www_authenticate(public_url: &str, failure: &AuthFailure) -> String;
     // Bearer realm="otto-cxp", error="invalid_token", error_description="…",
     // resource_metadata="{public_url}/.well-known/oauth-protected-resource"
@@ -280,7 +287,7 @@ pub fn metadata(resource_uri: &str, platform_url: &str) -> ProtectedResourceMeta
 
 HTTP mapping (in cxp-mcp and cxp-api middleware, ~40 lines each): `Missing`/`Inactive`/`Revoked`
 → 401 + `WWW-Authenticate` + JSON body `{error, error_description}`; `Unavailable` → 503 +
-`Retry-After: 5`. The audience is `CXP_RESOURCE_URI` and is never derived from `Host`.
+`Retry-After: 5`; `Internal` → 500 (`error` `internal`), no `Retry-After`, logged at error. The audience is `CXP_RESOURCE_URI` and is never derived from `Host`.
 
 ### Tenancy and lifecycle (`cxp_core::platform_events`, S4)
 
@@ -297,7 +304,11 @@ then refuse with `Error::AccessRevoked` when the org is in `deleted_orgs` or the
 - `member.removed`: tombstone the member, dedupe.
 - `team.deleted`: dedupe, then `UPDATE experiences|applications|pages|components SET team_id =
   NULL WHERE org_id = $1 AND team_id = $2`; returns `Applied`.
-- `Unknown`: `Ignored`.
+- `Unknown` (a kind the pinned otto-resource does not know): `Ignored`, as otto-resource
+  documents.
+- Any other `LifecycleEvent` variant (one the pinned client parses but `apply` has no arm for,
+  after a client bump): logged at error and refused as `Error::Unavailable`, so the webhook
+  answers 503 and the platform redelivers until a release handles it.
 
 ### Metering (`cxp_core::usage`, S4)
 
@@ -308,8 +319,14 @@ default off, fail open) and inserts one `usage_outbox` row in the caller's trans
 `Meter::report(org)` returns the usage summary `whoami`/`usage` show (otto-flags' `Status`).
 `ship_once`/`run` ship batches to `POST /internal/usage` (event_id dedupe at the platform), as
 otto-flags, claiming due rows in `(next_attempt_at, id)` order, in maintenance transactions.
-The retention `sweep` (also maintenance) forgets `platform_events` markers past their retention,
-expired `removed_members` tombstones, and `usage_outbox_rejected` rows older than 90 days.
+Rows the platform refuses (per event in its receipt, or a whole batch it answers with a 4xx about
+the batch) and rows still unshipped after `MAX_SHIP_ATTEMPTS` (20) move to
+`usage_outbox_rejected` with the reason, logged at error. A receipt is trusted only if its counts
+add up and its rejected ids are distinct and all in the batch; otherwise the batch is retried.
+An enforcing meter counts only unshipped rows from the platform's current period.
+The retention `sweep` (also maintenance, one transaction per step) forgets `platform_events`
+markers past their retention, expired `removed_members` tombstones, and `usage_outbox_rejected`
+rows older than 90 days.
 
 ### MCP (`cxp-mcp`, S9)
 
@@ -321,8 +338,9 @@ with `#[tool_router(router = …)]` per file, combined in `tools/mod.rs`; `tools
 `unauthenticated`, `insufficient_scope`, `not_found`, `invalid_argument`, `access_revoked`,
 `quota_exceeded`, `unavailable`, `internal` (no database text). Resources (3) and prompts (4)
 ported; resources need read scope; `metrics://dashboard` calls `DashboardExt` (S8). `lib.rs` exposes `Config { public_url, resource_uri,
-platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Router`
-that mounts `/mcp` behind `require_bearer` and the open metadata route.
+platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Result<Router, NoAllowedHosts>`
+that mounts `/mcp` behind `require_bearer` and the open metadata route, refusing an empty
+`allowed_hosts` (rmcp reads one as "accept any Host").
 
 ### REST (`cxp-api`, S10)
 
@@ -335,23 +353,26 @@ field leaves the team unchanged and an explicit `null` clears it. The console cu
 `team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
 lands. `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
-signature 401, bad body 400), `platform_events::apply` (failure 503 so the platform retries),
-200 `{"result": …}`. Errors are JSON `{error, code}` with no database text. Request bodies
-capped (`DefaultBodyLimit`, 256 KiB). `lib.rs`: `AppState::new(db, platform, meter, config)`,
+signature 401, bad body 400), `platform_events::apply` (a failure that can pass is 503 so the
+platform retries; one that cannot is 400 `invalid_event`), 200 `{"result": …}`. Errors are JSON
+`{error, code}` with no database text. Request bodies are capped at 256 KiB
+(`cxp_api::MAX_BODY_BYTES`): `DefaultBodyLimit` on cxp-api's own routes, and cxp-server's
+router-wide `RequestBodyLimitLayer` on every surface, `/mcp` included. `lib.rs`: `AppState::new(db, platform, meter, config)`,
 `router(state) -> Router`.
 
 ### Binary (`cxp-server`, S11)
 
 Config (all `CXP_*`): `CXP_PUBLIC_URL`, `CXP_RESOURCE_URI` (default `{public}/mcp`),
 `CXP_PLATFORM_URL`, `CXP_INTROSPECTION_SECRET`, `CXP_PLATFORM_WEBHOOK_SECRET`,
-`CXP_DATABASE_URL` (falls back to `DATABASE_URL`), `CXP_DB_MAX_CONNECTIONS` (5, min 2),
+`CXP_DATABASE_URL` (falls back to `DATABASE_URL`), `CXP_DB_MAX_CONNECTIONS` (5, from 2 to 20),
 `CXP_RUN_MIGRATIONS` (true), `CXP_BIND` (`0.0.0.0:8080`), `CXP_ALLOWED_HOSTS`,
 `CXP_ALLOWED_ORIGINS`, `CXP_ENFORCE_QUOTAS` (false), `CXP_LOG_FORMAT` (`text|json`); `Debug`
 redacts secrets; `for_test()`. Boot as otto-flags: config → pool → `migrate` (logs `applying
 migrations`) → `verify_tenant_isolation` (refuse to serve on problems; log the summary) →
 platform credential check (logs `the otto platform accepted this service's credential`) → spawn
 shipper and sweeper → serve with graceful shutdown and a final usage flush. `/healthz` static,
-`/readyz` `SELECT 1` with a 2 s timeout. `tests/e2e.rs` with a mock platform proves criteria 1–4
+`/readyz` 503 while the boot platform check is `Rejected` or `Misconfigured`, else `SELECT 1`
+with a 2 s timeout. A drain or final flush that fails exits non-zero. `tests/e2e.rs` with a mock platform proves criteria 1–4
 over HTTP.
 
 ## Stories

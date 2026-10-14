@@ -1,4 +1,4 @@
-//! The `/api/v1` handlers, one module per resource as before the port.
+//! The `/api/v1` handlers, one module per resource.
 //! Request bodies and query parameters keep their snake_case names; response
 //! models are camelCase (the `cxp-core` models' serde shape).
 

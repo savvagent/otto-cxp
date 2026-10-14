@@ -61,7 +61,8 @@ Tools silently don't appear unless all of these are in place:
 3. `#[tool_handler]` on the `impl ServerHandler`.
 Follow the existing files in `crates/cxp-mcp/src/` rather than the rmcp 0.15 style: tools return
 errors as results through the crate's error mapping, never panic, and never put database text in a
-response. Every tool checks `cxp:read` or `cxp:write`.
+response. Every tool checks `cxp:read` or `cxp:write`, except `whoami` and `usage`, which need no
+scope (`tools::UNSCOPED`).
 
 ### Tenancy: `Tx` extension traits and `begin_live`
 Domain operations are methods on extension traits implemented for `otto_tenant::Tx<'_>` (for example
@@ -217,11 +218,11 @@ Hand these to Rob with the exact command; never run them:
 ### Invariants
 Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
 - **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`.
-- **Tenant isolation is RLS under `otto_app`, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot.
+- **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). In production it is still a superuser until #16 gives it a least-privilege login role.
 - **Composite `(org_id, id)` foreign keys** between tenant tables (FK checks bypass RLS).
 - **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events` and on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`) admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker.
 - **No SQL outside `cxp-core`**, and only runtime `sqlx::query`/`query_as`, never the `query!` macros.
-- **Auth.** `/mcp` and `/api` require a platform token whose audience equals `CXP_RESOURCE_URI` exactly; every tool and route checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
+- **Auth.** `/mcp` and `/api` require a platform token whose audience equals `CXP_RESOURCE_URI` exactly; every route, and every tool except `whoami` and `usage` (no scope), checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
 - **Metering:** exactly the tools `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage event each, in the tool's own transaction, into `usage_outbox`; the only route that records one is `POST /api/v1/surveys` (charged as `create_survey`); nothing else records one.
 - **Teams belong to the platform.** Catalog `team_id` is an opaque platform team id, verified at the platform on write; there is no local teams table.
 - **Platform webhooks** (`org.deleted`, `member.removed`, `team.deleted`) are signature-verified, fail closed, and apply idempotently.

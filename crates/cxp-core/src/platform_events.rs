@@ -59,8 +59,10 @@ const LIFECYCLE_LOCK: i32 = 0x6378_6c63;
 /// Every table holding an org's domain rows or unshipped usage, children
 /// before parents, as `org.deleted` purges them. `platform_events` is kept
 /// (a replay must still find its dedupe marker) and so is
-/// `usage_outbox_rejected` (the record of usage the platform refused, kept
-/// as otto-flags keeps it).
+/// `usage_outbox_rejected`: it is the only record of usage that was charged
+/// to the org but never counted by the platform, which billing questions
+/// about the deleted org may still need, and the sweep forgets it after
+/// [`REJECTED_USAGE_KEEP_DAYS`] anyway.
 pub const PURGED_TABLES: &[&str] = &[
     "survey_responses",
     "surveys",
@@ -147,34 +149,68 @@ async fn exclude_requests(tx: &mut Tx<'_>, org: OrgId) -> Result<()> {
 
 /// Housekeeping: forget dedupe markers older than `keep_days`, removed-member
 /// tombstones past twice their [`REMOVED_MEMBER_TTL_SECS`] window, and refused
-/// usage older than [`REJECTED_USAGE_KEEP_DAYS`]. Unpinned, in a maintenance
-/// transaction (`crate::maintenance`), which the unpinned policies on
-/// `platform_events` and `usage_outbox_rejected` require. Returns how many
-/// rows were deleted.
+/// usage older than [`REJECTED_USAGE_KEEP_DAYS`]. Unpinned, in maintenance
+/// transactions (`crate::maintenance`), which the unpinned policies on
+/// `platform_events` and `usage_outbox_rejected` require.
+///
+/// Each of the three is its own transaction, so one failing neither rolls
+/// back nor stops the others. Returns how many rows were deleted, or the
+/// first failure (each is also logged) once all three have been tried.
 pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
+    let mut swept = 0;
+    let mut failure = None;
+    for step in [Sweep::Events, Sweep::Tombstones, Sweep::RejectedUsage] {
+        match sweep_one(db, step, keep_days).await {
+            Ok(n) => swept += n,
+            Err(e) => {
+                tracing::warn!(?step, error = %e.log_detail(), "a retention sweep step failed");
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(swept),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Sweep {
+    Events,
+    Tombstones,
+    RejectedUsage,
+}
+
+async fn sweep_one(db: &Db, step: Sweep, keep_days: i32) -> Result<u64> {
     let mut tx = crate::maintenance::begin(db).await?;
-    let events = sqlx::query(
-        "DELETE FROM platform_events WHERE received_at < now() - make_interval(days => $1)",
-    )
-    .bind(keep_days)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    // otto_app may not DELETE tombstones; this database function deletes
-    // only expired ones (twice REMOVED_MEMBER_TTL_SECS, fixed in the
-    // migration).
-    let tombstones: i64 = sqlx::query_scalar("SELECT expire_removed_members()")
-        .fetch_one(&mut *tx)
-        .await?;
-    let rejected = sqlx::query(
-        "DELETE FROM usage_outbox_rejected WHERE rejected_at < now() - make_interval(days => $1)",
-    )
-    .bind(REJECTED_USAGE_KEEP_DAYS)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let n = match step {
+        Sweep::Events => sqlx::query(
+            "DELETE FROM platform_events WHERE received_at < now() - make_interval(days => $1)",
+        )
+        .bind(keep_days)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+        // otto_app may not DELETE tombstones; this database function deletes
+        // only expired ones (twice REMOVED_MEMBER_TTL_SECS, fixed in the
+        // migration).
+        Sweep::Tombstones => {
+            let n: i64 = sqlx::query_scalar("SELECT expire_removed_members()")
+                .fetch_one(&mut *tx)
+                .await?;
+            n as u64
+        }
+        Sweep::RejectedUsage => sqlx::query(
+            "DELETE FROM usage_outbox_rejected \
+             WHERE rejected_at < now() - make_interval(days => $1)",
+        )
+        .bind(REJECTED_USAGE_KEEP_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+    };
     tx.commit().await?;
-    Ok(events + tombstones as u64 + rejected)
+    Ok(n)
 }
 
 /// Apply one verified delivery.
@@ -187,12 +223,26 @@ pub async fn apply(db: &Db, event: &WebhookEvent) -> Result<Outcome> {
         LifecycleEvent::TeamDeleted { org_id, team_id } => {
             team_deleted(db, event, (*org_id).into(), *team_id).await
         }
+        // A kind otto-resource itself does not know: a platform newer than
+        // the pinned client added it, and no release of this service could
+        // act on it without a client bump first. Acknowledged, as
+        // otto-resource documents, or the platform would retry it forever.
         LifecycleEvent::Unknown { kind } => {
             tracing::warn!(kind = %kind, event_id = %event.id, "ignoring unknown platform event");
             Ok(Outcome::Ignored)
         }
-        // `LifecycleEvent` is #[non_exhaustive].
-        _ => Ok(Outcome::Ignored),
+        // `LifecycleEvent` is #[non_exhaustive]: a variant here is one the
+        // pinned client parses but this match was not taught (a client bump
+        // without a handler). Not the same as `Unknown`: the event is
+        // meaningful and probably needs cleanup, so acknowledging it would
+        // drop it for good. Refuse it as retriable (503) so the platform keeps
+        // redelivering until a release that handles it is deployed.
+        other => {
+            tracing::error!(event_id = %event.id, kind = ?other,
+                "a platform event this build parses but has no handler for; refusing it so \
+                 the platform redelivers it until a release handles it");
+            Err(Error::Unavailable)
+        }
     }
 }
 

@@ -10,8 +10,8 @@
 -- opaque uuid the platform issued. The platform's signed lifecycle webhooks
 -- (`POST /platform/webhooks`) clean up after deletions.
 --
--- It replaces the pre-platform `server/migrations` (001..010) for a fresh
--- database: the same tables, now org-scoped, minus the local `teams` table
+-- It is a fresh, org-scoped schema for a fresh database, derived from the
+-- standalone server's `server/migrations` (001..010): the same tables, minus the local `teams` table
 -- (teams belong to the platform), `feedback_embeddings` and the `vector`
 -- extension (nothing read or wrote them), the `uuid-ossp` extension
 -- (`gen_random_uuid()` is built in), and feedback's legacy free-text
@@ -30,10 +30,11 @@
 -- reference and leaves the NOT NULL `org_id` alone; owned children, including
 -- each catalog level under its parent, use `ON DELETE CASCADE`.
 --
--- Indexes: every index a tenant query uses leads with `org_id` (only the
--- cross-org background queues, `usage_outbox_due_idx` and
--- `platform_events_received_idx`, do not), and every foreign key's columns are
--- the leading columns of some index (so a parent delete or the org.deleted
+-- Indexes: every non-unique index leads with `org_id` except the cross-org
+-- background queues, `usage_outbox_due_idx` and `platform_events_received_idx`
+-- (unique keys such as `id` and `event_id` are identities, not tenant
+-- filters); every foreign key's columns are the leading columns of some
+-- index; tests/db.rs checks both (so a parent delete or the org.deleted
 -- purge never scans a child table). Under FORCE ROW LEVEL SECURITY the
 -- planner only pushes LEAKPROOF operators into an index condition below the
 -- policy's `org_id = current_org()`; the jsonb, array, trigram, and full-text
@@ -104,8 +105,7 @@ CREATE TYPE message_role AS ENUM ('customer', 'agent', 'system');
 
 -- The experience catalog: Experience -> Application -> Page -> Component. Each
 -- level's parent is optional (an entity may be created unparented), but a
--- parent owns its children: deleting it deletes them, as the pre-platform
--- schema did. Rows elsewhere that pointed at a deleted entity keep existing
+-- parent owns its children: deleting it deletes them. Rows elsewhere that pointed at a deleted entity keep existing
 -- with that reference nulled. `team_id` is the platform team that owns the entity: an
 -- opaque platform id, verified at the platform on write, with no foreign key
 -- (there is no local teams table). A `team.deleted` webhook nulls it.
@@ -477,11 +477,14 @@ CREATE TABLE usage_outbox (
 );
 
 -- The shipper drains across every org, so its queue index does not lead with
--- org_id; the per-org index serves the usage report and the org.deleted purge.
+-- org_id; the per-org index serves the meter's count of an org's unshipped
+-- rows (quota enforcement) and the org.deleted purge.
 CREATE INDEX usage_outbox_due_idx ON usage_outbox (next_attempt_at, id);
 CREATE INDEX usage_outbox_org_idx ON usage_outbox (org_id);
 
--- Usage the platform refused outright, kept with its reason rather than dropped.
+-- Usage that will never ship, kept with its reason rather than dropped: rows
+-- the platform refused (per event, or the whole batch) and rows given up on
+-- after `usage::MAX_SHIP_ATTEMPTS`. Swept after 90 days.
 CREATE TABLE usage_outbox_rejected (
   id          bigserial   PRIMARY KEY,
   event_id    uuid        NOT NULL,
@@ -569,8 +572,11 @@ BEGIN
   END LOOP;
 END $$;
 
--- The platform_events retention sweep runs unpinned, across every org, as
--- otto_app. Policies are permissive and OR together, so each of these adds
+-- The platform_events retention sweep runs unpinned, across every org, as the
+-- connecting role. FORCE ROW LEVEL SECURITY binds that role to these policies
+-- too unless it is a superuser or BYPASSRLS (in production it is still a
+-- superuser until #16); the tests run the sweep as otto_app to prove the
+-- policies admit it. Policies are permissive and OR together, so each of these adds
 -- exactly one thing to the tenant policy above; a pinned transaction still
 -- reaches only its own org's rows.
 --
@@ -582,7 +588,7 @@ END $$;
 -- The DELETE policy grants the unpinned delete. Postgres also applies a
 -- table's SELECT policies to a DELETE whose WHERE reads columns, and the sweep
 -- has such a WHERE (received_at), so the read policy is needed too or the
--- sweep matches nothing under otto_app.
+-- sweep matches nothing under a role RLS applies to.
 CREATE POLICY platform_events_retention ON platform_events
   FOR DELETE USING (current_org() IS NULL);
 CREATE POLICY platform_events_retention_read ON platform_events
@@ -622,7 +628,7 @@ CREATE POLICY usage_outbox_rejected_tenant_isolation ON usage_outbox_rejected
 -- Expire removed-member tombstones past twice their refusal window
 -- (`platform_events::REMOVED_MEMBER_TTL_SECS` is 300 s). otto_app may not
 -- DELETE from removed_members (grants below), so the retention sweep, which
--- may run as otto_app, deletes through this function, which can only ever
+-- must work as any role RLS and those grants apply to, deletes through this function, which can only ever
 -- remove expired rows: a live tombstone, one still refusing a removed
 -- member's cached token, cannot be deleted through it.
 CREATE FUNCTION expire_removed_members() RETURNS bigint

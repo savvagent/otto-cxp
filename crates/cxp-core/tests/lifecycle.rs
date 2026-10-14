@@ -42,6 +42,9 @@ struct Platform {
     tokens: HashMap<String, (Uuid, Uuid, Vec<String>, String)>,
     /// Answer every introspection with a 500.
     introspection_down: bool,
+    /// Answer every introspection with a 401: this service's credential is
+    /// refused.
+    introspection_rejects: bool,
     /// Event ids already counted, so a resend is a duplicate.
     seen: HashSet<Uuid>,
     /// Event ids refused outright.
@@ -50,6 +53,13 @@ struct Platform {
     usage_down: bool,
     /// Account for one event fewer than was sent.
     undercount: bool,
+    /// Answer every usage batch with this status instead.
+    ship_status: Option<StatusCode>,
+    /// Answer with a receipt whose counts add up but whose rejected ids do
+    /// not match the batch.
+    bogus: Option<Bogus>,
+    /// Hold every usage batch this long before answering.
+    ship_delay: Option<Duration>,
     /// Every usage event received, in order.
     received: Vec<UsageEvent>,
     /// Billable count and hard stop reported by usage-status.
@@ -59,6 +69,14 @@ struct Platform {
 
 type Shared = Arc<Mutex<Platform>>;
 
+#[derive(Clone, Copy)]
+enum Bogus {
+    /// One event is "rejected" under an id that was not shipped.
+    Foreign,
+    /// The same shipped id is rejected twice.
+    Repeated,
+}
+
 async fn introspect(
     State(p): State<Shared>,
     Form(f): Form<HashMap<String, String>>,
@@ -66,6 +84,9 @@ async fn introspect(
     let p = p.lock().unwrap();
     if p.introspection_down {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    if p.introspection_rejects {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(match p.tokens.get(&f["token"]) {
         Some((org, user, scopes, aud)) => IntrospectionResponse {
@@ -89,9 +110,17 @@ async fn ship(
     State(p): State<Shared>,
     Json(b): Json<UsageBatch>,
 ) -> Result<Json<UsageReceipt>, StatusCode> {
+    let delay = p.lock().unwrap().ship_delay;
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let mut p = p.lock().unwrap();
     if p.usage_down {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if let Some(status) = p.ship_status {
+        p.received.extend(b.events);
+        return Err(status);
     }
     let mut receipt = UsageReceipt::default();
     for e in &b.events {
@@ -108,6 +137,24 @@ async fn ship(
     }
     if p.undercount && receipt.accepted > 0 {
         receipt.accepted -= 1;
+    }
+    if let (Some(bogus), Some(first)) = (p.bogus, b.events.first()) {
+        let event_id = match bogus {
+            Bogus::Foreign => Uuid::new_v4(),
+            Bogus::Repeated => first.event_id,
+        };
+        receipt.accepted = b.events.len() as u32 - 2;
+        receipt.duplicates = 0;
+        receipt.rejected = vec![
+            RejectedEvent {
+                event_id: first.event_id,
+                reason: "bogus".into(),
+            },
+            RejectedEvent {
+                event_id,
+                reason: "bogus".into(),
+            },
+        ];
     }
     p.received.extend(b.events);
     Ok(Json(receipt))
@@ -409,7 +456,8 @@ async fn org_deleted_purges_every_tenant_table_once_and_spares_other_orgs(pool: 
     let team = Uuid::new_v4();
     seed(&db, doomed, team).await;
     seed(&db, other, team).await;
-    // A rejected usage event is kept, as otto-flags keeps it.
+    // A rejected usage event is kept: it is the only record of usage the
+    // platform never counted.
     sqlx::query(
         "INSERT INTO usage_outbox_rejected (event_id, org_id, tool, billable, occurred_at, reason) \
          VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(), 'test')",
@@ -1082,7 +1130,8 @@ async fn run_ships_then_flushes_on_shutdown(pool: PgPool) {
     tokio::time::timeout(Duration::from_secs(10), shipper)
         .await
         .expect("run returns on shutdown")
-        .unwrap();
+        .unwrap()
+        .expect("the final flush succeeds");
     assert!(
         outbox(&pool).await.is_empty(),
         "the final flush shipped them"
@@ -1186,4 +1235,229 @@ async fn authenticate_resolves_a_live_token_and_says_why_it_will_not(pool: PgPoo
         auth::authenticate(&closed, &platform, Some(&format!("Bearer {fresh}"))).await,
         Err(AuthFailure::Unavailable)
     );
+}
+
+/// A platform that refuses this service's own credential cannot be fixed by
+/// the caller retrying: a 500 (`internal`), not the retry-shortly 503.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn authenticate_is_internal_when_the_platform_refuses_this_services_credential(pool: PgPool) {
+    let db = db(pool);
+    let (platform, stub) = start_platform().await;
+    let t = token(&stub, org(), user(), &["cxp:read"], RESOURCE);
+    stub.lock().unwrap().introspection_rejects = true;
+    let failure = auth::authenticate(&db, &platform, Some(&format!("Bearer {t}")))
+        .await
+        .unwrap_err();
+    assert_eq!(failure, AuthFailure::Internal);
+    let refusal = auth::refusal("https://cxp.example.com", &failure);
+    assert_eq!(refusal.status, 500);
+    assert_eq!(refusal.body["error"], "internal");
+    assert!(refusal.headers.is_empty(), "{:?}", refusal.headers);
+}
+
+// ------------------------------------------------------ usage: dead letters
+
+async fn rejected_rows(pool: &PgPool) -> Vec<(Uuid, String)> {
+    sqlx::query_as("SELECT event_id, reason FROM usage_outbox_rejected ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// A batch the platform refuses outright (a 4xx about the batch) can never
+/// be accepted, so it moves to `usage_outbox_rejected` with the reason
+/// instead of retrying forever. A refused credential is this service's to
+/// fix: those rows are kept and retried.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_batch_the_platform_refuses_is_moved_aside_but_a_refused_credential_is_retried(
+    pool: PgPool,
+) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig::default();
+    charge_n(&db, &meter, org(), 2).await;
+
+    stub.lock().unwrap().ship_status = Some(StatusCode::UNAUTHORIZED);
+    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+    assert_eq!(outbox(&pool).await.len(), 2, "kept for after the fix");
+    assert!(rejected_rows(&pool).await.is_empty());
+
+    stub.lock().unwrap().ship_status = Some(StatusCode::UNPROCESSABLE_ENTITY);
+    make_due(&pool).await;
+    let shipped: HashSet<Uuid> = outbox(&pool).await.iter().map(|r| r.0).collect();
+    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+    assert!(outbox(&pool).await.is_empty());
+    let rejected = rejected_rows(&pool).await;
+    assert_eq!(
+        rejected.iter().map(|r| r.0).collect::<HashSet<_>>(),
+        shipped
+    );
+    assert!(
+        rejected
+            .iter()
+            .all(|r| r.1.contains("refused the batch") && r.1.contains("422")),
+        "{rejected:?}"
+    );
+}
+
+/// A row that keeps failing is given up on after MAX_SHIP_ATTEMPTS, with the
+/// last error as its reason, rather than retried (and counted) forever.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn usage_that_never_ships_is_given_up_on_after_max_attempts(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig::default();
+    charge_n(&db, &meter, org(), 2).await;
+    stub.lock().unwrap().usage_down = true;
+
+    // One row is on its last attempt, the other has attempts to spare.
+    let rows = outbox(&pool).await;
+    sqlx::query("UPDATE usage_outbox SET attempts = $2 WHERE event_id = $1")
+        .bind(rows[0].0)
+        .bind(usage::MAX_SHIP_ATTEMPTS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+
+    let left = outbox(&pool).await;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].0, rows[1].0);
+    let rejected = rejected_rows(&pool).await;
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].0, rows[0].0);
+    assert!(
+        rejected[0].1.contains(&format!(
+            "not shipped after {} attempts",
+            usage::MAX_SHIP_ATTEMPTS
+        )) && rejected[0].1.contains("503"),
+        "{}",
+        rejected[0].1
+    );
+}
+
+/// A receipt whose counts add up but whose rejected ids are not the batch's
+/// (one not shipped, or one named twice) is not trusted: nothing is deleted
+/// or moved, and the whole batch is retried.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_receipt_rejecting_ids_outside_the_batch_keeps_every_row(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig::default();
+    charge_n(&db, &meter, org(), 3).await;
+
+    for bogus in [Bogus::Foreign, Bogus::Repeated] {
+        stub.lock().unwrap().bogus = Some(bogus);
+        make_due(&pool).await;
+        let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+        assert!(matches!(err, ShipError::Platform(_)), "{err}");
+        let rows = outbox(&pool).await;
+        assert_eq!(rows.len(), 3, "every row kept");
+        assert!(rows.iter().all(|r| r.2.is_some()), "rescheduled: {rows:?}");
+        assert!(rejected_rows(&pool).await.is_empty(), "nothing moved");
+    }
+
+    stub.lock().unwrap().bogus = None;
+    make_due(&pool).await;
+    assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 3);
+    assert!(outbox(&pool).await.is_empty());
+}
+
+/// Two shippers racing over the same outbox (two replicas) never send the
+/// same row twice: the claim takes rows with SKIP LOCKED and leases them
+/// before the platform call.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn concurrent_shippers_deliver_each_event_once(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    for _ in 0..4 {
+        charge_n(&db, &meter, org(), 5).await;
+    }
+    stub.lock().unwrap().ship_delay = Some(Duration::from_millis(200));
+    // Small batches, so both shippers have rows to claim at once.
+    let cfg = ShipperConfig {
+        batch: 7,
+        ..ShipperConfig::default()
+    };
+
+    let drain = || async {
+        let mut total = 0;
+        loop {
+            match usage::ship_once(&db, &platform, &cfg).await.unwrap() {
+                0 => return total,
+                n => total += n,
+            }
+        }
+    };
+    let (a, b) = tokio::join!(drain(), drain());
+    assert_eq!(a + b, 20);
+    assert!(a > 0 && b > 0, "both shipped ({a}, {b})");
+    assert!(outbox(&pool).await.is_empty());
+
+    let mut deliveries: HashMap<Uuid, usize> = HashMap::new();
+    for e in &stub.lock().unwrap().received {
+        *deliveries.entry(e.event_id).or_default() += 1;
+    }
+    assert_eq!(deliveries.len(), 20);
+    assert!(
+        deliveries.values().all(|n| *n == 1),
+        "an event was delivered more than once: {deliveries:?}"
+    );
+}
+
+/// The quota counts unshipped rows from the platform's current period only:
+/// one left over from an earlier period is not this period's usage.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_enforcing_meter_counts_only_this_periods_unshipped_usage(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let (o, u) = (org(), user());
+    {
+        let mut p = stub.lock().unwrap();
+        p.used = 9;
+        p.hard_stop = true;
+    }
+    // Left over from before the period the stub reports (it starts today).
+    sqlx::query(
+        "INSERT INTO usage_outbox (org_id, tool, billable, occurred_at) \
+         VALUES ($1, 'submit_feedback', true, now() - interval '2 days')",
+    )
+    .bind(o)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let meter = Meter::new(platform, true, "https://x");
+    // 9 counted + the old row would be 10 already; it does not count.
+    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
+    meter.charge(&mut tx, u, "create_survey").await.unwrap();
+    tx.commit().await.unwrap();
+    // This period's unshipped row does.
+    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
+    let err = meter.charge(&mut tx, u, "create_survey").await.unwrap_err();
+    assert_eq!(err.code(), "quota_exceeded", "{err}");
+}
+
+/// A removal is per org: the same user in another org keeps working.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn member_removed_in_one_org_leaves_the_user_working_in_another(pool: PgPool) {
+    let db = db(pool);
+    let (a, b, u) = (org(), org(), user());
+    platform_events::apply(&db, &member_removed(a, u))
+        .await
+        .unwrap();
+    let refused = begin_live(&db, a, Some(u))
+        .await
+        .err()
+        .expect("refused in org A");
+    assert_eq!(refused.code(), "access_revoked");
+    let tx = begin_live(&db, b, Some(u))
+        .await
+        .expect("the user is still a member of org B");
+    tx.commit().await.unwrap();
+    assert!(!platform_events::revoked(&db, b, u).await.unwrap());
 }

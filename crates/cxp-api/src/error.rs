@@ -18,8 +18,8 @@
 //! | `payload_too_large` | 413 |
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
-//! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]) |
-//! | `internal` | 500 |
+//! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]): only a failure that can pass |
+//! | `internal` | 500, never with `Retry-After` (including a platform failure a retry cannot fix, such as this service's credential being refused) |
 
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -81,8 +81,13 @@ fn status_for(e: &cxp_core::Error) -> StatusCode {
         Error::Conflict(_) => StatusCode::CONFLICT,
         Error::AccessRevoked => StatusCode::UNAUTHORIZED,
         Error::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
-        Error::Unavailable | Error::Platform(_) => StatusCode::SERVICE_UNAVAILABLE,
-        Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        // Split by retriability: only a failure that can pass is a 503 (and
+        // so gets `Retry-After`); a platform that no longer knows the org is a
+        // revocation; anything else is ours to fix, not the caller's to retry.
+        Error::Platform(p) if p.is_retriable() => StatusCode::SERVICE_UNAVAILABLE,
+        Error::Platform(otto_resource::Error::NotFound) => StatusCode::UNAUTHORIZED,
+        Error::Platform(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         Error::Tenant(_) | Error::Database(_) => {
             if e.code() == "invalid_argument" {
                 StatusCode::BAD_REQUEST
@@ -97,8 +102,8 @@ impl From<cxp_core::Error> for ApiError {
     fn from(e: cxp_core::Error) -> Self {
         let code = e.code();
         if e.is_internal() || code == "internal" {
-            tracing::error!(error = %e, code, source = ?std::error::Error::source(&e),
-                "REST request failed");
+            tracing::error!(error = %e.log_detail(), code,
+                source = ?std::error::Error::source(&e), "REST request failed");
         }
         Self::new(status_for(&e), code, e.to_string())
     }
@@ -173,8 +178,23 @@ mod tests {
             ),
             (Error::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
             (
-                Error::Platform(otto_resource::Error::Unauthorized),
+                Error::Platform(otto_resource::Error::Status {
+                    status: 503,
+                    body: String::new(),
+                }),
                 StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Error::Platform(otto_resource::Error::NotFound),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Error::Platform(otto_resource::Error::Unauthorized),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                Error::Internal("bug".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
                 Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
@@ -210,6 +230,11 @@ mod tests {
             res.headers()[header::RETRY_AFTER],
             cxp_core::auth::RETRY_AFTER_SECONDS
         );
+        // A platform failure no retry can fix is not told to retry.
+        let res =
+            ApiError::from(Error::Platform(otto_resource::Error::Unauthorized)).into_response();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(res.headers().get(header::RETRY_AFTER).is_none());
         let big = ApiError::payload_too_large();
         assert_eq!(
             (big.status, big.code),

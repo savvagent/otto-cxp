@@ -167,8 +167,12 @@ pub trait CustomersExt {
     ) -> impl Future<Output = Result<Vec<Customer>>> + Send;
 
     /// Resolve a uuid, an exact email, or a name to a customer id. A uuid must
-    /// name a customer of this organization. A name matching several customers
-    /// is `Error::Invalid` (the message lists none of them; search to choose).
+    /// name a customer of this organization; anything containing `@` must be
+    /// an exact email. Anything else is matched by exact (case-insensitive)
+    /// name, and failing that by a case-insensitive substring of the name or
+    /// the email, which must match exactly one customer. Never a fuzzy
+    /// match. Several matches at either step are `Error::Invalid` (the
+    /// message lists none of them; search to choose).
     fn resolve_customer(&mut self, identifier: &str) -> impl Future<Output = Result<Uuid>> + Send;
 
     fn customer_360(&mut self, id: Uuid) -> impl Future<Output = Result<Customer360>> + Send;

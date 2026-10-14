@@ -679,7 +679,8 @@ async fn customer_email_is_unique_per_org(pool: PgPool) {
 /// Structural invariants, read back from the catalog: every foreign key
 /// between public tables is (org_id, x_id) -> (org_id, id), every tenant
 /// table with an id carries UNIQUE (org_id, id), otto_app may read and write
-/// every table, and the dropped pre-platform objects are gone.
+/// every table, every non-unique index but the two cross-org queues leads
+/// with org_id, and the objects the baseline dropped are gone.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
     let fks: Vec<(String, String, String)> = sqlx::query_as(
@@ -784,6 +785,27 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
     assert!(
         uncovered.is_empty(),
         "foreign keys with no covering index: {uncovered:?}"
+    );
+
+    // Every non-unique index leads with org_id, so a tenant query (always
+    // under `org_id = current_org()`) can use it; only the two cross-org
+    // background queues do not. Unique indexes (primary keys, event_id) are
+    // identities, not tenant filters.
+    let not_org_led: Vec<String> = sqlx::query_scalar(
+        "SELECT ic.relname::text FROM pg_index i \
+         JOIN pg_class ic ON ic.oid = i.indexrelid \
+         JOIN pg_namespace n ON n.oid = ic.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+         WHERE n.nspname = 'public' AND NOT i.indisunique AND a.attname <> 'org_id' \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        not_org_led,
+        ["platform_events_received_idx", "usage_outbox_due_idx"],
+        "only the cross-org queues may lead with something other than org_id"
     );
 
     // No GIN index: under FORCE ROW LEVEL SECURITY its non-leakproof

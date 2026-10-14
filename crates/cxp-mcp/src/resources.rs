@@ -73,7 +73,7 @@ fn parse(uri: &str) -> Result<Target, Error> {
 
 fn contents(uri: &str, value: &impl Serialize) -> Result<ReadResourceResult, ErrorData> {
     let text = serde_json::to_string_pretty(value)
-        .map_err(|_| crate::error::internal("could not encode a resource"))?;
+        .map_err(|e| crate::error::internal("could not encode a resource", &e))?;
     Ok(ReadResourceResult::new(vec![ResourceContents::text(
         text, uri,
     )

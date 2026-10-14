@@ -11,9 +11,11 @@
 //!
 //! Every request body, on every surface, is capped at
 //! [`cxp_api::MAX_BODY_BYTES`] by one layer on the composed router. axum's
-//! `DefaultBodyLimit` reaches only axum extractors; `/mcp` is a
-//! `route_service` whose body rmcp collects itself, so without this layer it
-//! would read a body of any size.
+//! `DefaultBodyLimit` reaches only axum extractors, and only on the routes it
+//! is layered on: `/mcp` is a `route_service` outside cxp-api's, whose body
+//! cxp-mcp reads through axum's `Bytes` extractor, so without this layer
+//! `/mcp` would take bodies up to axum's 2 MiB default rather than this
+//! service's cap.
 //!
 //! Assembly is a library function so a test can build the whole router: axum
 //! panics on a route registered twice, and that is better found by a test than
@@ -63,20 +65,26 @@ pub fn meter(platform: Arc<PlatformClient>, config: &Config) -> Arc<Meter> {
     ))
 }
 
-/// Every surface on one router. Fails only on a configuration that would
-/// leave `/mcp` open to any `Host` (see [`Config::allowed_hosts`]).
+/// Every surface on one router. `platform_check` is what boot's credential
+/// check found ([`boot::check_platform`]); `/readyz` reports it. Fails only
+/// on a configuration that would leave `/mcp` open to any `Host` (see
+/// [`Config::allowed_hosts`]).
 pub fn router(
     db: Db,
     platform: Arc<PlatformClient>,
     meter: Arc<Meter>,
     config: &Config,
+    platform_check: PlatformCheck,
 ) -> Result<Router> {
+    // cxp-mcp refuses an empty host list itself (rmcp reads one as "accept
+    // any"); the only way to get one here is a public URL with no host.
     let mcp = cxp_mcp::router(
         db.clone(),
         platform.clone(),
         meter.clone(),
-        mcp_config(config)?,
-    );
+        mcp_config(config),
+    )
+    .map_err(|e| anyhow!("{e}: CXP_PUBLIC_URL must have a host"))?;
     let api = cxp_api::router(cxp_api::AppState::new(
         db.clone(),
         platform,
@@ -86,7 +94,7 @@ pub fn router(
             webhook_secret: config.platform_webhook_secret.clone(),
         },
     ));
-    Ok(health::router(db)
+    Ok(health::router(db, platform_check)
         .merge(mcp)
         .merge(api)
         .fallback(not_found)
@@ -104,22 +112,15 @@ pub fn router(
         )))
 }
 
-/// Fails closed: rmcp reads an empty host list as "allow any host".
-fn mcp_config(config: &Config) -> Result<cxp_mcp::Config> {
-    let allowed_hosts = config.allowed_hosts();
-    if allowed_hosts.is_empty() {
-        return Err(anyhow!(
-            "no Host header would be accepted on /mcp, and rmcp reads that as \
-             \"accept any\": CXP_PUBLIC_URL must have a host"
-        ));
-    }
-    Ok(cxp_mcp::Config {
+/// The MCP surface's settings, from the server's.
+fn mcp_config(config: &Config) -> cxp_mcp::Config {
+    cxp_mcp::Config {
         public_url: config.public_url.clone(),
         resource_uri: config.resource_uri.clone(),
         platform_url: config.platform_url.clone(),
-        allowed_hosts,
+        allowed_hosts: config.allowed_hosts(),
         allowed_origins: config.allowed_origins.clone(),
-    })
+    }
 }
 
 /// A plain-text `413` (the body-limit layer's own, sent when `Content-Length`
@@ -163,6 +164,11 @@ mod tests {
     /// The whole router over a database that is never reached: nothing tested
     /// here may touch it except `/readyz`, which must notice.
     fn app() -> Router {
+        app_with(PlatformCheck::Accepted)
+    }
+
+    /// [`app`] as if boot's platform check had found `check`.
+    fn app_with(check: PlatformCheck) -> Router {
         let mut config = Config::for_test();
         // Nothing listens on port 1: a probe is refused at once.
         config.database_url = "postgres://cxp:cxp@127.0.0.1:1/none".into();
@@ -176,6 +182,7 @@ mod tests {
             platform.clone(),
             meter(platform, &config),
             &config,
+            check,
         )
         .unwrap()
     }
@@ -193,7 +200,14 @@ mod tests {
     }
 
     async fn send(req: Request<Body>) -> (StatusCode, http::HeaderMap, serde_json::Value) {
-        let res = app().oneshot(req).await.unwrap();
+        send_to(app(), req).await
+    }
+
+    async fn send_to(
+        app: Router,
+        req: Request<Body>,
+    ) -> (StatusCode, http::HeaderMap, serde_json::Value) {
+        let res = app.oneshot(req).await.unwrap();
         let status = res.status();
         let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -251,6 +265,38 @@ mod tests {
         );
     }
 
+    /// A credential the platform refused at boot, or a platform URL that is
+    /// not the platform, makes the replica unready, so a deploy with a bad
+    /// secret fails its health check; an unreachable platform does not.
+    #[tokio::test]
+    async fn readiness_reports_a_rejected_or_misconfigured_platform() {
+        for (check, reason) in [
+            (PlatformCheck::Rejected, "platform credential rejected"),
+            (
+                PlatformCheck::Misconfigured("HTTP 404".into()),
+                "platform misconfigured",
+            ),
+        ] {
+            let req = Request::get("/readyz")
+                .header("host", "cxp.example.com")
+                .body(Body::empty())
+                .unwrap();
+            let (status, _, body) = send_to(app_with(check), req).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+            assert_eq!(body["status"], "unready");
+            assert_eq!(body["reason"], reason);
+        }
+        // Unreachable at boot: readiness is the database's answer alone
+        // (here, unready because the database is unreachable too).
+        let req = Request::get("/readyz").body(Body::empty()).unwrap();
+        let (_, _, body) =
+            send_to(app_with(PlatformCheck::Unreachable("refused".into())), req).await;
+        assert!(
+            body["reason"].as_str().unwrap().contains("database"),
+            "{body}"
+        );
+    }
+
     /// `/mcp`'s body is read by rmcp, not an axum extractor, so only the
     /// router-wide layer caps it; every other surface is capped the same way.
     #[tokio::test]
@@ -285,7 +331,7 @@ mod tests {
     fn mcp_gets_the_public_host_and_the_extras() {
         let mut config = Config::for_test();
         config.extra_allowed_hosts = vec!["otto-cxp.fly.dev".into()];
-        let mcp = mcp_config(&config).unwrap();
+        let mcp = mcp_config(&config);
         assert_eq!(mcp.allowed_hosts, ["cxp.example.com", "otto-cxp.fly.dev"]);
         assert_eq!(mcp.resource_uri, config.resource_uri);
         assert_eq!(mcp.public_url, config.public_url);
@@ -295,18 +341,21 @@ mod tests {
     async fn mcp_refuses_to_start_open_to_any_host() {
         let mut config = Config::for_test();
         config.public_url = "not a url".into();
-        let err = mcp_config(&config).unwrap_err().to_string();
-        assert!(err.contains("accept any"), "{err}");
+        assert!(mcp_config(&config).allowed_hosts.is_empty());
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://cxp:cxp@127.0.0.1:1/none")
             .unwrap();
         let platform = platform_client(&Config::for_test()).unwrap();
-        let built = router(
+        let err = router(
             Db::from_pool(pool),
             platform.clone(),
             meter(platform, &config),
             &config,
-        );
-        assert!(built.is_err());
+            PlatformCheck::Accepted,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("accept any"), "{err}");
+        assert!(err.contains("CXP_PUBLIC_URL"), "{err}");
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! Registered with the platform (`otto-platform-server resource register
 //! --scopes …`, see docs/deploy/fly.md), advertised in
-//! `/.well-known/oauth-protected-resource`, and checked by every tool and
-//! route. One list, so the three cannot drift.
+//! `/.well-known/oauth-protected-resource`, and checked by every route and
+//! by every tool except `whoami` and `usage`, which need no scope. One list,
+//! so the three cannot drift.
 
 /// What this resource server is called on a consent screen and in its metadata.
 pub const RESOURCE_NAME: &str = "otto-cxp";

@@ -22,7 +22,11 @@
 //!
 //! **A platform or database outage is [`AuthFailure::Unavailable`] (a `503`),
 //! never a `401`.** `401` tells an agent its token is dead and sends it to
-//! re-authenticate against the very platform that is down.
+//! re-authenticate against the very platform that is down. **A platform
+//! failure no retry can fix** (it refused this service's own credential, or
+//! `CXP_PLATFORM_URL` points at something that is not the platform) is
+//! [`AuthFailure::Internal`] (a `500`): the caller's credentials may be fine,
+//! but telling it to retry shortly would be a lie.
 
 use chrono::{DateTime, Utc};
 use otto_resource::{PlatformClient, Role, TokenClaims, TokenKind};
@@ -122,6 +126,10 @@ pub enum AuthFailure {
     /// Could not find out: the platform or the database did not answer.
     /// `503` with `Retry-After`, never `401`.
     Unavailable,
+    /// Could not find out, and retrying will not help: the platform refused
+    /// this service's own credential or answered as no platform does. A
+    /// server misconfiguration, logged at `error`. `500`, no `Retry-After`.
+    Internal,
 }
 
 impl AuthFailure {
@@ -139,6 +147,10 @@ impl AuthFailure {
             }
             AuthFailure::Unavailable => {
                 "could not verify the token right now; retry shortly. Your credentials are fine."
+            }
+            AuthFailure::Internal => {
+                "otto-cxp cannot verify tokens because of a server-side misconfiguration; this \
+                 is not a problem with your credentials. Report it if it persists."
             }
         }
     }
@@ -179,9 +191,16 @@ pub async fn authenticate(
     let claims = match platform.introspect(token).await {
         Ok(Some(claims)) => claims,
         Ok(None) => return Err(AuthFailure::Inactive),
-        Err(e) => {
+        Err(e) if e.is_retriable() => {
             tracing::error!(error = %e, "token introspection failed; answering 503");
             return Err(AuthFailure::Unavailable);
+        }
+        Err(e) => {
+            tracing::error!(error = %e,
+                "token introspection failed and a retry cannot help: the platform refused this \
+                 service's credential (check CXP_INTROSPECTION_SECRET and CXP_RESOURCE_URI) or \
+                 CXP_PLATFORM_URL is not the platform; answering 500");
+            return Err(AuthFailure::Internal);
         }
     };
     match crate::platform_events::revoked(db, claims.org_id.into(), claims.user_id.into()).await {
@@ -247,7 +266,7 @@ pub struct Refusal {
 
 impl Refusal {
     /// The `WWW-Authenticate` value, if this refusal carries one (every `401`
-    /// does; a `503` does not).
+    /// does; a `503` or `500` does not).
     pub fn www_authenticate(&self) -> Option<&str> {
         self.headers
             .iter()
@@ -272,6 +291,8 @@ fn header_safe(value: &str) -> bool {
 ///   `error="invalid_token"`, body `error` `invalid_token`.
 /// - [`AuthFailure::Unavailable`]: `503` with `Retry-After: 5` and no
 ///   challenge, body `error` `unavailable`. Never `401`.
+/// - [`AuthFailure::Internal`]: `500` with no challenge and no
+///   `Retry-After`, body `error` `internal`.
 ///
 /// Should a misconfigured `public_url` make the challenge unfit for a header,
 /// the bare `Bearer realm` is sent rather than no challenge at all.
@@ -280,9 +301,12 @@ pub fn refusal(public_url: &str, failure: &AuthFailure) -> Refusal {
         AuthFailure::Missing => (401, "unauthenticated"),
         AuthFailure::Inactive | AuthFailure::Revoked => (401, "invalid_token"),
         AuthFailure::Unavailable => (503, "unavailable"),
+        AuthFailure::Internal => (500, "internal"),
     };
     let headers = if failure.is_unavailable() {
         vec![("retry-after", RETRY_AFTER_SECONDS.to_string())]
+    } else if matches!(failure, AuthFailure::Internal) {
+        vec![]
     } else {
         let challenge = www_authenticate(public_url, failure);
         let challenge = if header_safe(&challenge) {
@@ -492,6 +516,16 @@ mod tests {
     }
 
     #[test]
+    fn a_server_misconfiguration_is_500_with_no_challenge_and_no_retry() {
+        let r = refusal("https://cxp.example.com", &AuthFailure::Internal);
+        assert_eq!(r.status, 500);
+        assert!(r.headers.is_empty(), "{:?}", r.headers);
+        assert_eq!(r.body["error"], "internal");
+        assert!(!AuthFailure::Internal.is_unavailable());
+        assert!(!AuthFailure::Internal.reason().contains(['"', '\\']));
+    }
+
+    #[test]
     fn a_public_url_unfit_for_a_header_still_yields_a_challenge() {
         let r = refusal("https://cxp.example.com/\n\u{e9}", &AuthFailure::Missing);
         assert_eq!(r.status, 401);
@@ -511,6 +545,7 @@ mod tests {
                 AuthFailure::Inactive,
                 AuthFailure::Revoked,
                 AuthFailure::Unavailable,
+                AuthFailure::Internal,
             ] {
                 values.extend(refusal(url, &f).headers.into_iter().map(|(_, v)| v));
             }

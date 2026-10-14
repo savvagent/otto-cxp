@@ -33,16 +33,17 @@ pub fn from_core(e: &Error) -> ErrorData {
     if e.is_internal() {
         tracing::error!(
             code = e.code(),
-            error = %e,
+            error = %e.log_detail(),
             source = ?std::error::Error::source(e),
             "server-side failure surfaced to an MCP caller"
         );
     }
-    let rpc = match e {
-        // Well-formed calls the server declined.
-        Error::AccessRevoked | Error::QuotaExceeded { .. } => ErrorCode::INVALID_REQUEST,
+    let rpc = match e.code() {
+        // Well-formed calls the server declined (a platform that no longer
+        // knows the org reads as access_revoked too).
+        "access_revoked" | "quota_exceeded" => ErrorCode::INVALID_REQUEST,
         _ if e.is_internal() => ErrorCode::INTERNAL_ERROR,
-        Error::Unavailable => ErrorCode::INTERNAL_ERROR,
+        "unavailable" => ErrorCode::INTERNAL_ERROR,
         _ => ErrorCode::INVALID_PARAMS,
     };
     ErrorData::new(rpc, e.to_string(), data(e.code(), e.retriable()))
@@ -80,9 +81,10 @@ pub fn invalid(message: impl Into<String>) -> ErrorData {
 }
 
 /// A server-side failure with no domain error behind it (an output that could
-/// not be encoded). Logged; the caller gets the code and nothing else.
-pub fn internal(what: &'static str) -> ErrorData {
-    tracing::error!(code = "internal", "{what}");
+/// not be encoded). Logged with its cause; the caller gets the code and
+/// nothing else.
+pub fn internal(what: &'static str, cause: &dyn std::fmt::Display) -> ErrorData {
+    tracing::error!(code = "internal", error = %cause, "{what}");
     ErrorData::new(
         ErrorCode::INTERNAL_ERROR,
         cxp_core::error::INTERNAL_MESSAGE,
@@ -153,6 +155,36 @@ mod tests {
         }
     }
 
+    /// `data.retriable` is true only for a platform failure that can pass,
+    /// and agrees with the code.
+    #[test]
+    fn platform_failures_carry_a_consistent_code_and_retriable_flag() {
+        let wire = |e: otto_resource::Error| {
+            let w = from_platform(e);
+            let d = w.data.unwrap();
+            (w.code, d["code"].clone(), d["retriable"].clone())
+        };
+        assert_eq!(
+            wire(otto_resource::Error::Status {
+                status: 503,
+                body: "down".into()
+            }),
+            (ErrorCode::INTERNAL_ERROR, "unavailable".into(), true.into())
+        );
+        assert_eq!(
+            wire(otto_resource::Error::NotFound),
+            (
+                ErrorCode::INVALID_REQUEST,
+                "access_revoked".into(),
+                false.into()
+            )
+        );
+        assert_eq!(
+            wire(otto_resource::Error::Unauthorized),
+            (ErrorCode::INTERNAL_ERROR, "internal".into(), false.into())
+        );
+    }
+
     #[test]
     fn the_codes_on_the_wire_are_the_documented_ones() {
         let code = |e: Error| from_core(&e).data.unwrap()["code"].clone();
@@ -204,7 +236,7 @@ mod tests {
     #[test]
     fn helper_errors_carry_codes_and_not_found_reads_are_resource_not_found() {
         assert_eq!(invalid("x").data.unwrap()["code"], "invalid_argument");
-        let i = internal("encoding failed");
+        let i = internal("encoding failed", &"key must be a string");
         assert_eq!(i.code, ErrorCode::INTERNAL_ERROR);
         assert_eq!(i.data.unwrap()["code"], "internal");
 

@@ -53,15 +53,25 @@ pub enum Error {
         upgrade_url: String,
     },
 
-    /// A dependency could not serve the request right now; nothing was
-    /// changed. Kept for the surfaces' status mappings; nothing in cxp-core
-    /// raises it today (platform failures are [`Error::Platform`]).
+    /// This could not be completed right now; nothing was changed, and the
+    /// same call may succeed later. Raised for a platform lifecycle event this
+    /// build parses but has no handler for (so the platform redelivers it
+    /// until a release that handles it is deployed); platform failures are
+    /// [`Error::Platform`].
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
     /// A call to the otto platform failed. The text is ours, never the
-    /// platform's.
-    #[error("the otto platform could not be reached; nothing was changed. Retry shortly")]
+    /// platform's, and depends on whether the failure can pass:
+    ///
+    /// - retriable (a transport failure, 5xx, or 429): `unavailable`, "retry
+    ///   shortly";
+    /// - the platform no longer knows the caller's org (`NotFound`):
+    ///   `access_revoked`, as [`Error::AccessRevoked`];
+    /// - anything else (this service's credential refused, a misconfigured
+    ///   platform URL, an unreadable answer): `internal`. Retrying cannot
+    ///   help, so the caller is not told to.
+    #[error("{}", platform_message(.0))]
     Platform(#[from] otto_resource::Error),
 
     /// A server-side programming error (e.g. metering a tool that is not
@@ -112,6 +122,16 @@ fn is_input_rejection(e: &sqlx::Error) -> bool {
     }
 }
 
+fn platform_message(e: &otto_resource::Error) -> &'static str {
+    if e.is_retriable() {
+        "the otto platform could not be reached; nothing was changed. Retry shortly"
+    } else if matches!(e, otto_resource::Error::NotFound) {
+        "access to this organization has been revoked; sign in again"
+    } else {
+        INTERNAL_MESSAGE
+    }
+}
+
 fn tenant_message(e: &otto_tenant::Error) -> String {
     match e {
         otto_tenant::Error::Invalid(msg) => msg.clone(),
@@ -146,8 +166,12 @@ impl Error {
             Error::UnknownTeam => "unknown_team",
             Error::AccessRevoked => "access_revoked",
             Error::QuotaExceeded { .. } => "quota_exceeded",
-            Error::Unavailable | Error::Platform(_) => "unavailable",
-            Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => "internal",
+            Error::Unavailable => "unavailable",
+            Error::Platform(p) if p.is_retriable() => "unavailable",
+            Error::Platform(otto_resource::Error::NotFound) => "access_revoked",
+            Error::Platform(_) | Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => {
+                "internal"
+            }
         }
     }
 
@@ -170,9 +194,23 @@ impl Error {
             return !is_input_rejection(e);
         }
         match self {
+            Error::Platform(otto_resource::Error::NotFound) => false,
             Error::Platform(_) | Error::Internal(_) => true,
             Error::Tenant(t) => !matches!(t, otto_tenant::Error::Invalid(_)),
             _ => false,
+        }
+    }
+
+    /// What a surface logs about a server-side failure: the `Display` plus
+    /// the detail it hides from callers ([`Error::Internal`]'s message, the
+    /// platform's or the database's own error).
+    pub fn log_detail(&self) -> String {
+        match self {
+            Error::Internal(detail) => format!("internal: {detail}"),
+            Error::Platform(p) => format!("platform: {p}"),
+            Error::Tenant(t) => format!("tenant: {t}"),
+            Error::Database(d) => format!("database: {d}"),
+            other => other.to_string(),
         }
     }
 }
@@ -338,8 +376,23 @@ mod tests {
             (quota(), "quota_exceeded"),
             (Error::Unavailable, "unavailable"),
             (
-                Error::Platform(otto_resource::Error::Unauthorized),
+                Error::Platform(otto_resource::Error::Status {
+                    status: 503,
+                    body: String::new(),
+                }),
                 "unavailable",
+            ),
+            (
+                Error::Platform(otto_resource::Error::NotFound),
+                "access_revoked",
+            ),
+            (
+                Error::Platform(otto_resource::Error::Unauthorized),
+                "internal",
+            ),
+            (
+                Error::Platform(otto_resource::Error::Decode("x".into())),
+                "internal",
             ),
             (
                 Error::Tenant(otto_tenant::Error::Db(db("23505"))),
@@ -457,11 +510,53 @@ mod tests {
     }
 
     #[test]
-    fn internal_errors_hide_their_detail() {
+    fn internal_errors_hide_their_detail_but_log_it() {
         let e = Error::Internal("metered a free tool".into());
         assert_eq!(e.code(), "internal");
         assert!(e.is_internal());
         assert!(!e.retriable());
         assert_eq!(e.to_string(), INTERNAL_MESSAGE);
+        assert!(
+            e.log_detail().contains("metered a free tool"),
+            "{}",
+            e.log_detail()
+        );
+    }
+
+    /// Only a failure that can pass tells the caller to retry; a platform
+    /// that no longer knows the org is a revocation; anything else is ours.
+    #[test]
+    fn platform_failures_split_by_whether_a_retry_can_help() {
+        let down = Error::Platform(otto_resource::Error::Status {
+            status: 502,
+            body: "bad gateway".into(),
+        });
+        assert_eq!(down.code(), "unavailable");
+        assert!(down.retriable() && down.is_internal());
+        assert!(down.to_string().contains("Retry shortly"), "{down}");
+
+        let gone = Error::Platform(otto_resource::Error::NotFound);
+        assert_eq!(gone.code(), "access_revoked");
+        assert!(!gone.retriable() && !gone.is_internal());
+        assert_eq!(gone.to_string(), Error::AccessRevoked.to_string());
+
+        for broken in [
+            otto_resource::Error::Unauthorized,
+            otto_resource::Error::Status {
+                status: 404,
+                body: "<html>".into(),
+            },
+            otto_resource::Error::Decode("x".into()),
+        ] {
+            let e = Error::Platform(broken);
+            assert_eq!(e.code(), "internal", "{e:?}");
+            assert!(!e.retriable() && e.is_internal(), "{e:?}");
+            assert_eq!(e.to_string(), INTERNAL_MESSAGE);
+            assert!(
+                e.log_detail().starts_with("platform: "),
+                "{}",
+                e.log_detail()
+            );
+        }
     }
 }

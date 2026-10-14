@@ -12,12 +12,14 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 
 use super::out::List;
-use super::{uuid, IdParam, QueryParam};
+use super::{uuid, CustomerIdParam, IdParam, QueryParam};
 use crate::server::{Cxp, McpResult};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTicketParams {
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
     pub subject: String,
     #[serde(default)]
@@ -47,7 +49,9 @@ pub struct UpdateTicketParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListTicketsParams {
-    /// Only this customer's: a UUID, an exact email, or a name.
+    /// Only this customer's: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     #[serde(default)]
     pub customer_id: Option<String>,
     /// Only tickets in this status: open, in_progress, waiting, resolved, or
@@ -258,7 +262,7 @@ impl Cxp {
     pub async fn start_chat_session(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        Parameters(p): Parameters<IdParam>,
+        Parameters(p): Parameters<CustomerIdParam>,
     ) -> Result<Json<ChatSession>, ErrorData> {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;

@@ -27,9 +27,11 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   machine. Raising `min_machines_running` is a cost decision (Rob).
   While the machine is suspended its background tasks are suspended with it: the usage shipper
   does not post `usage_outbox` rows to the platform and the hourly platform-event sweep does not
-  run. Both resume with the machine. Usage recorded before the suspend stays in
-  `usage_outbox` and ships on resume (and graceful shutdown flushes it), so billing is
-  delayed, never lost; the platform's usage totals can trail by up to the idle period.
+  run. Both resume with the machine. A suspend sends the process no signal, so nothing is
+  flushed then: usage recorded before it stays in `usage_outbox` and ships on resume. A stop
+  (a deploy, `fly machine stop`) sends SIGTERM, and the final flush ships what it can within
+  its 10 s bound. Either way billing is delayed, never lost; the platform's usage totals can
+  trail by up to the idle period.
 - **Database** `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with `otto_platform`,
   `otto_factory`, and `otto_flags`. Plain Postgres 16 is enough: pgvector is NOT needed (the
   schema uses only the stock `pg_trgm`). The attach role is a superuser on the
@@ -132,6 +134,11 @@ The logs must show, in order:
 - `tenant isolation enforced as role "otto_app"`
 - `the otto platform accepted this service's credential`
 
+If the platform REJECTED the credential, or `CXP_PLATFORM_URL` is not the platform, `/readyz`
+answers 503 with `"reason": "platform credential rejected"` (or `"platform misconfigured"`), so a
+deploy with a bad secret fails its health check. The check runs once at boot: after fixing the
+secret, URL, or registration, restart the machines (`fly secrets set` already does).
+
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records.
 
@@ -141,7 +148,12 @@ never write:
 
 ```sql
 SELECT count(*), max(attempts), max(last_error) FROM usage_outbox;
+SELECT reason, count(*) FROM usage_outbox_rejected GROUP BY reason;
 ```
+
+A row the platform refuses, or one still unshipped after 20 attempts (about three and a half
+hours of failures), moves to `usage_outbox_rejected` with its reason and is logged at `error`;
+those rows are kept 90 days.
 
 ## Deploys
 
