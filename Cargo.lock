@@ -378,7 +378,6 @@ dependencies = [
  "sqlx",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "uuid",
 ]
@@ -2617,7 +2616,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
