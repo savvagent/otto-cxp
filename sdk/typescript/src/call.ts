@@ -4,6 +4,7 @@
  */
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 
 /**
@@ -17,9 +18,15 @@ export class CxpError extends Error {
 
   constructor(
     message: string,
-    options: { code?: string | undefined; retriable?: boolean | undefined; data?: unknown } = {}
+    options: {
+      code?: string | undefined;
+      retriable?: boolean | undefined;
+      data?: unknown;
+      /** The underlying error, kept for debugging. */
+      cause?: unknown;
+    } = {}
   ) {
-    super(message);
+    super(message, "cause" in options ? { cause: options.cause } : undefined);
     this.name = "CxpError";
     this.code = options.code;
     this.retriable = options.retriable;
@@ -33,7 +40,31 @@ function fromMcpError(e: McpError): CxpError {
     code: typeof data?.code === "string" ? data.code : undefined,
     retriable: typeof data?.retriable === "boolean" ? data.retriable : undefined,
     data: e.data,
+    cause: e,
   });
+}
+
+/** Longest server text echoed into an error message. */
+const MAX_ERROR_TEXT = 500;
+
+function truncate(text: string): string {
+  return text.length > MAX_ERROR_TEXT ? `${text.slice(0, MAX_ERROR_TEXT)}...` : text;
+}
+
+/**
+ * Map a transport-level HTTP failure (the MCP SDK's `StreamableHTTPError`) to a
+ * `CxpError`: 401 is `unauthenticated` (not retriable), 503 is `unavailable`
+ * (retriable). Returns `undefined` for anything else so callers rethrow it.
+ */
+export function fromTransportError(e: unknown): CxpError | undefined {
+  if (!(e instanceof StreamableHTTPError)) return undefined;
+  if (e.code === 401) {
+    return new CxpError(e.message, { code: "unauthenticated", retriable: false, cause: e });
+  }
+  if (e.code === 503) {
+    return new CxpError(e.message, { code: "unavailable", retriable: true, cause: e });
+  }
+  return undefined;
 }
 
 function firstText(content: unknown): string | undefined {
@@ -59,7 +90,7 @@ export async function callTool<T>(
     result = await client.callTool({ name, arguments: args });
   } catch (e) {
     if (e instanceof McpError) throw fromMcpError(e);
-    throw e;
+    throw fromTransportError(e) ?? e;
   }
 
   const text = firstText(result.content);
@@ -81,8 +112,8 @@ export async function callTool<T>(
   }
   try {
     return JSON.parse(text) as T;
-  } catch {
-    throw new CxpError(text, { code: "invalid_response" });
+  } catch (cause) {
+    throw new CxpError(truncate(text), { code: "invalid_response", cause });
   }
 }
 

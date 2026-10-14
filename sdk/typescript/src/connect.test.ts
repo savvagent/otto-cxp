@@ -12,6 +12,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { CxpError } from "./call.js";
 import { connectCxp, CxpAuthorizationRequired, type CxpConnection } from "./connect.js";
 import * as sdk from "./index.js";
 
@@ -22,6 +23,7 @@ let conn: CxpConnection | undefined;
 const seenAuth: Array<string | undefined> = [];
 let tokenRequests = 0;
 let tokenEndpointStatus = 200;
+let mcpStatus: number | undefined;
 
 async function startServer(accepted: string[] = [TOKEN]): Promise<string> {
   http = createServer(async (req, res) => {
@@ -49,6 +51,7 @@ async function startServer(accepted: string[] = [TOKEN]): Promise<string> {
     }
 
     seenAuth.push(req.headers.authorization);
+    if (mcpStatus !== undefined) return json(mcpStatus, { error: "forced" });
     const bearer = req.headers.authorization?.replace(/^Bearer /, "");
     if (!bearer || !accepted.includes(bearer)) return json(401, { error: "invalid_token" });
 
@@ -111,6 +114,7 @@ afterEach(async () => {
   seenAuth.length = 0;
   tokenRequests = 0;
   tokenEndpointStatus = 200;
+  mcpStatus = undefined;
   vi.restoreAllMocks();
 });
 
@@ -123,19 +127,75 @@ describe("connectCxp with a bearer token", () => {
     expect(seenAuth.every((a) => a === `Bearer ${TOKEN}`)).toBe(true);
   });
 
-  it("rejects a wrong token with a 401 error", async () => {
+  it("wraps a 401 as a non-retriable unauthenticated CxpError with the cause", async () => {
     const url = await startServer();
     const err = await connectCxp({ url, token: "nope" }).catch((e) => e);
-    expect(err).toBeInstanceOf(StreamableHTTPError);
-    expect(err.code).toBe(401);
+    expect(err).toBeInstanceOf(CxpError);
     expect(err).not.toBeInstanceOf(CxpAuthorizationRequired);
+    expect(err.code).toBe("unauthenticated");
+    expect(err.retriable).toBe(false);
+    expect(err.cause).toBeInstanceOf(StreamableHTTPError);
+    expect(err.cause.code).toBe(401);
+  });
+
+  it("wraps a 503 as a retriable unavailable CxpError with the cause", async () => {
+    const url = await startServer();
+    mcpStatus = 503;
+    const err = await connectCxp({ url, token: TOKEN }).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.code).toBe("unavailable");
+    expect(err.retriable).toBe(true);
+    expect(err.cause).toBeInstanceOf(StreamableHTTPError);
+    expect(err.cause.code).toBe(503);
+  });
+
+  it("leaves other HTTP failures untouched", async () => {
+    const url = await startServer();
+    mcpStatus = 500;
+    const err = await connectCxp({ url, token: TOKEN }).catch((e) => e);
+    expect(err).toBeInstanceOf(StreamableHTTPError);
   });
 
   it("requires exactly one of token or authProvider", async () => {
-    await expect(connectCxp({ url: "http://127.0.0.1:1/mcp" })).rejects.toThrow(/required/);
-    await expect(
-      connectCxp({ url: "http://127.0.0.1:1/mcp", token: "t", authProvider: fakeProvider() })
-    ).rejects.toThrow(/not both/);
+    // JS callers can bypass the discriminated union, so the runtime check stays.
+    const neither = { url: "http://127.0.0.1:1/mcp" } as unknown as Parameters<typeof connectCxp>[0];
+    const both = {
+      url: "http://127.0.0.1:1/mcp",
+      token: "t",
+      authProvider: fakeProvider(),
+    } as unknown as Parameters<typeof connectCxp>[0];
+    await expect(connectCxp(neither)).rejects.toThrow(/connectCxp: .*required/);
+    await expect(connectCxp(both)).rejects.toThrow(/connectCxp: .*not both/);
+  });
+
+  it("reports validation failures as invalid_argument naming the caller", () => {
+    const err = (() => {
+      try {
+        createCxpTransport({ url: "http://10.0.0.5/mcp", token: "t" });
+      } catch (e) {
+        return e as CxpError;
+      }
+    })();
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err!.code).toBe("invalid_argument");
+    expect(err!.message).toMatch(/^createCxpTransport:/);
+  });
+
+  it("keeps the parse error as cause for an invalid url", async () => {
+    const err = await connectCxp({ url: "not a url", token: "t" }).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.code).toBe("invalid_argument");
+    expect(err.message).toMatch(/^connectCxp:/);
+    expect(err.cause).toBeInstanceOf(TypeError);
+  });
+
+  it("types token and authProvider as mutually exclusive", () => {
+    const provider = fakeProvider();
+    // @ts-expect-error both token and authProvider
+    const bad: Parameters<typeof connectCxp>[0] = { url: "u", token: "t", authProvider: provider };
+    // @ts-expect-error neither
+    const none: Parameters<typeof connectCxp>[0] = { url: "u" };
+    expect([bad, none]).toHaveLength(2);
   });
 });
 
@@ -202,7 +262,8 @@ describe("client and transport cleanup", () => {
       await new Promise((r) => setTimeout(r, 25));
       closed = true;
     });
-    await expect(connectCxp({ url, token: "nope" })).rejects.toBeInstanceOf(StreamableHTTPError);
+    mcpStatus = 500;
+    await expect(connectCxp({ url, token: TOKEN })).rejects.toBeInstanceOf(StreamableHTTPError);
     expect(closed).toBe(true);
   });
 
@@ -217,6 +278,19 @@ describe("client and transport cleanup", () => {
     await expect(err.finishAuth("bad-code")).rejects.toThrow();
     expect(tokenRequests).toBeGreaterThan(0);
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a clear error when finishAuth is called twice", async () => {
+    const url = await startServer([OAUTH_TOKEN]);
+    const err = (await connectCxp({ url, authProvider: fakeProvider() }).catch(
+      (e) => e
+    )) as CxpAuthorizationRequired;
+    conn = await err.finishAuth("auth-code");
+    const again = await err.finishAuth("auth-code").catch((e) => e);
+    expect(again).toBeInstanceOf(CxpError);
+    expect(again.code).toBe("invalid_state");
+    expect(again.message).toMatch(/already called/);
+    expect(tokenRequests).toBe(1);
   });
 
   it("closes the auth transport after a successful exchange too", async () => {

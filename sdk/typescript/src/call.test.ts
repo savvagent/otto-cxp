@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { callList, callTool, CxpError } from "./call.js";
 import { FeedbackDomain } from "./domains/feedback.js";
@@ -31,6 +32,42 @@ describe("callTool", () => {
       message: "Error: boom",
       code: "invalid_response",
     });
+  });
+
+  it("truncates long non-JSON text and keeps the parse error as cause", async () => {
+    const c = clientReturning({ content: [{ type: "text", text: "x".repeat(2000) }] });
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.message.length).toBeLessThan(600);
+    expect(err.code).toBe("invalid_response");
+    expect(err.cause).toBeInstanceOf(SyntaxError);
+  });
+
+  it("keeps the McpError as cause", async () => {
+    const mcp = new McpError(-32602, "bad params", { code: "invalid_argument" });
+    const c = { callTool: vi.fn().mockRejectedValue(mcp) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.code).toBe("invalid_argument");
+    expect(err.cause).toBe(mcp);
+  });
+
+  it.each([
+    [401, "unauthenticated", false],
+    [503, "unavailable", true],
+  ])("wraps a transport %i as %s", async (status, code, retriable) => {
+    const http = new StreamableHTTPError(status, "http fail");
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.code).toBe(code);
+    expect(err.retriable).toBe(retriable);
+    expect(err.cause).toBe(http);
+  });
+
+  it("rethrows other transport errors as-is", async () => {
+    const http = new StreamableHTTPError(500, "boom");
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    await expect(callTool(c, "t", {})).rejects.toBe(http);
   });
 
   it("raises CxpError for isError results", async () => {
