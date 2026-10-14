@@ -12,7 +12,7 @@ use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{on_foreign_key, Error, Result};
+use crate::error::{Error, Result};
 use crate::paging::Page;
 
 /// The values `feedback_type` accepts.
@@ -105,7 +105,8 @@ pub struct NewSurvey {
     pub component_id: Option<Uuid>,
 }
 
-/// Fields to change on a survey; `None` leaves a field as it is.
+/// Fields to change on a survey; `None` leaves a field as it is. A field
+/// cannot be cleared back to empty (as before the port).
 #[derive(Debug, Clone, Default)]
 pub struct SurveyUpdate {
     pub title: Option<String>,
@@ -124,9 +125,10 @@ pub struct SurveyFilter {
 }
 
 /// The NPS inputs for one survey, aggregated in SQL. A response's score is
-/// the first answer's `value` when `answers` is an array (a number or a
-/// numeric string) or the `score` key when it is an object; scores outside
-/// 0 to 10 and responses with no score do not count as scored.
+/// the first answer's `value` when `answers` is an array (an integer or an
+/// integer string) or the `score` key when it is an object (an integer
+/// number only; a string is unscored). Scores outside 0 to 10 and responses
+/// with no score do not count as scored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NpsCounts {
@@ -179,7 +181,7 @@ fn check_feedback_type(t: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "feedback type must be one of {}; got \"{t}\"",
+            "feedback type must be one of {}",
             FEEDBACK_TYPES.join(", ")
         )))
     }
@@ -205,30 +207,39 @@ fn check_answers(a: &serde_json::Value) -> Result<()> {
     }
 }
 
-/// Which referenced row a foreign-key violation named. The constraint name is
-/// used only to choose the message, never shown.
-fn fk_kind(e: &sqlx::Error) -> &'static str {
-    let name = e
-        .as_database_error()
-        .and_then(|d| d.constraint())
-        .unwrap_or("");
-    for (needle, kind) in [
-        ("survey_id", "survey"),
-        ("experience_id", "experience"),
-        ("application_id", "application"),
-        ("page_id", "page"),
-        ("component_id", "component"),
-    ] {
-        if name.contains(needle) {
-            return kind;
+/// The row kind a foreign-key violation on `constraint` names, by the exact
+/// generated constraint names of `feedback`, `surveys`, and
+/// `survey_responses`. `None` for any other name.
+fn fk_kind(constraint: &str) -> Option<&'static str> {
+    Some(match constraint {
+        "feedback_org_id_customer_id_fkey" | "survey_responses_org_id_customer_id_fkey" => {
+            "customer"
         }
-    }
-    "customer"
+        "survey_responses_org_id_survey_id_fkey" => "survey",
+        "feedback_org_id_experience_id_fkey" | "surveys_org_id_experience_id_fkey" => "experience",
+        "feedback_org_id_application_id_fkey" | "surveys_org_id_application_id_fkey" => {
+            "application"
+        }
+        "feedback_org_id_page_id_fkey" | "surveys_org_id_page_id_fkey" => "page",
+        "feedback_org_id_component_id_fkey" | "surveys_org_id_component_id_fkey" => "component",
+        _ => return None,
+    })
 }
 
+/// A foreign-key violation is `NotFound` of the kind its constraint names;
+/// one this module does not recognise is an internal `Database` error, never
+/// a guessed kind. The constraint name is never shown.
 fn map_fk(e: sqlx::Error) -> Error {
-    let kind = fk_kind(&e);
-    on_foreign_key(e, || Error::NotFound { kind })
+    let kind = match &e {
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            db.constraint().and_then(fk_kind)
+        }
+        _ => None,
+    };
+    match kind {
+        Some(kind) => Error::NotFound { kind },
+        None => Error::Database(e),
+    }
 }
 
 const FEEDBACK_WHERE: &str = "org_id = $1 \
@@ -266,11 +277,14 @@ pub trait FeedbackExt {
         feedback_type: Option<&str>,
     ) -> impl std::future::Future<Output = Result<CsatCounts>> + Send;
 
+    /// Create an active survey. An empty title or non-array `questions` is
+    /// `Invalid`; an unknown catalog id is `NotFound` of that kind.
     fn create_survey(
         &mut self,
         new: &NewSurvey,
     ) -> impl std::future::Future<Output = Result<Survey>> + Send;
 
+    /// `NotFound` when the survey is not in this organization.
     fn get_survey(&mut self, id: Uuid) -> impl std::future::Future<Output = Result<Survey>> + Send;
 
     /// Surveys newest first, and the total matching the filter.
@@ -280,6 +294,8 @@ pub trait FeedbackExt {
         page: Page,
     ) -> impl std::future::Future<Output = Result<(Vec<Survey>, i64)>> + Send;
 
+    /// Change the named fields. An empty title or non-array `questions` is
+    /// `Invalid`; `NotFound` when the survey is not in this organization.
     fn update_survey(
         &mut self,
         id: Uuid,
@@ -584,19 +600,20 @@ impl FeedbackExt for Tx<'_> {
     async fn survey_nps_counts(&mut self, survey_id: Uuid) -> Result<NpsCounts> {
         self.get_survey(survey_id).await?;
         let org = self.org();
-        // The score is `answers[0].value` (number or numeric string) for an
-        // array, `answers.score` (number) for an object; integers only.
+        // The score is `answers[0].value` (integer or integer string) for an
+        // array, `answers.score` (integer number only) for an object.
         let (total, scored, promoters, passives, detractors): (i64, i64, i64, i64, i64) =
             sqlx::query_as(
                 "WITH raw AS ( \
                    SELECT CASE jsonb_typeof(answers) \
                             WHEN 'array' THEN answers -> 0 -> 'value' \
-                            WHEN 'object' THEN answers -> 'score' END AS v \
+                            WHEN 'object' THEN answers -> 'score' END AS v, \
+                          jsonb_typeof(answers) = 'array' AS is_array \
                    FROM survey_responses WHERE org_id = $1 AND survey_id = $2), \
                  txt AS ( \
-                   SELECT CASE jsonb_typeof(v) \
-                            WHEN 'number' THEN v #>> '{}' \
-                            WHEN 'string' THEN v #>> '{}' END AS t \
+                   SELECT CASE WHEN jsonb_typeof(v) = 'number' \
+                                 OR (jsonb_typeof(v) = 'string' AND is_array) \
+                               THEN v #>> '{}' END AS t \
                    FROM raw), \
                  scores AS ( \
                    SELECT t::int AS s FROM txt WHERE t ~ '^[+-]?[0-9]{1,9}$') \
@@ -618,5 +635,61 @@ impl FeedbackExt for Tx<'_> {
             passives,
             detractors,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[derive(Debug)]
+    struct Fk(Option<&'static str>);
+
+    impl std::fmt::Display for Fk {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("foreign key violation")
+        }
+    }
+    impl std::error::Error for Fk {}
+    impl sqlx::error::DatabaseError for Fk {
+        fn message(&self) -> &str {
+            "foreign key violation"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("23503"))
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.0
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::ForeignKeyViolation
+        }
+    }
+
+    #[test]
+    fn known_constraints_name_their_kind() {
+        let e = map_fk(sqlx::Error::Database(Box::new(Fk(Some(
+            "feedback_org_id_customer_id_fkey",
+        )))));
+        assert!(matches!(e, Error::NotFound { kind: "customer" }), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_or_missing_constraint_is_internal_never_a_guessed_kind() {
+        for name in [Some("some_other_fkey"), None] {
+            let e = map_fk(sqlx::Error::Database(Box::new(Fk(name))));
+            assert!(matches!(e, Error::Database(_)), "{e:?}");
+            assert_eq!(e.code(), "internal");
+        }
     }
 }

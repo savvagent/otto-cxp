@@ -31,7 +31,7 @@ async fn customer(db: &Db, org: OrgId) -> Uuid {
 
 /// An experience/application/page/component chain, returned in that order.
 async fn catalog(db: &Db, org: OrgId) -> [Uuid; 4] {
-    let ids = [Uuid::new_v4(); 4].map(|_| Uuid::new_v4());
+    let ids: [Uuid; 4] = std::array::from_fn(|_| Uuid::new_v4());
     let mut tx = db.begin(org).await.unwrap();
     for sql in [
         "INSERT INTO experiences (id, org_id, name) VALUES ($2, $1, 'Checkout')",
@@ -152,6 +152,13 @@ async fn unknown_customer_or_catalog_row_is_not_found(pool: PgPool) {
         ),
         (
             NewFeedback {
+                application_id: Some(Uuid::new_v4()),
+                ..fb(c, "praise", None)
+            },
+            "application",
+        ),
+        (
+            NewFeedback {
                 component_id: Some(Uuid::new_v4()),
                 ..fb(c, "praise", None)
             },
@@ -172,7 +179,8 @@ async fn list_feedback_filters_pages_and_counts(pool: PgPool) {
     let org = org();
     let (a, b) = (customer(&db, org).await, customer(&db, org).await);
     let [exp, app, page, comp] = catalog(&db, org).await;
-    let mut tx = db.begin(org).await.unwrap();
+    // Each in its own transaction so created_at really increases.
+    let mut ids = Vec::new();
     for (c, t) in [
         (a, "praise"),
         (a, "bug_report"),
@@ -180,24 +188,31 @@ async fn list_feedback_filters_pages_and_counts(pool: PgPool) {
         (b, "complaint"),
         (b, "praise"),
     ] {
-        tx.submit_feedback(&fb(c, t, None)).await.unwrap();
+        let mut tx = db.begin(org).await.unwrap();
+        ids.push(tx.submit_feedback(&fb(c, t, None)).await.unwrap().id);
+        tx.commit().await.unwrap();
     }
-    tx.submit_feedback(&NewFeedback {
-        experience_id: Some(exp),
-        application_id: Some(app),
-        page_id: Some(page),
-        component_id: Some(comp),
-        ..fb(a, "suggestion", None)
-    })
-    .await
-    .unwrap();
+    let mut tx = db.begin(org).await.unwrap();
+    let newest = tx
+        .submit_feedback(&NewFeedback {
+            experience_id: Some(exp),
+            application_id: Some(app),
+            page_id: Some(page),
+            component_id: Some(comp),
+            ..fb(a, "suggestion", None)
+        })
+        .await
+        .unwrap()
+        .id;
 
     let (all, total) = tx
         .list_feedback(&FeedbackFilter::default(), Page::default())
         .await
         .unwrap();
     assert_eq!((all.len(), total), (6, 6));
-    assert!(all.windows(2).all(|w| w[0].created_at >= w[1].created_at));
+    assert_eq!(all[0].id, newest, "newest first");
+    assert_eq!(all[1].id, *ids.last().unwrap());
+    assert_eq!(all[5].id, ids[0]);
 
     // Paging: total stays the full match count.
     let (p, total) = tx
@@ -299,7 +314,10 @@ async fn csat_counts_aggregate_in_sql_and_match_the_pure_math(pool: PgPool) {
     let mut with_complaint = ratings.to_vec();
     with_complaint.push(1);
     assert_eq!(all.csat(), calculate_csat(&with_complaint));
-    assert!(tx.feedback_csat_counts(Some("nope")).await.is_err());
+    assert!(matches!(
+        tx.feedback_csat_counts(Some("nope")).await.unwrap_err(),
+        Error::Invalid(_)
+    ));
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -610,6 +628,7 @@ async fn nps_counts_aggregate_in_sql_and_match_the_pure_math(pool: PgPool) {
         json!([]),
         json!({"score": "high"}),
         json!({"score": 9.5}),
+        json!({"score": "9"}),
         json!({"score": 11}),
         json!([{"value": null}]),
     ] {
@@ -619,7 +638,7 @@ async fn nps_counts_aggregate_in_sql_and_match_the_pure_math(pool: PgPool) {
 
     let n = tx.survey_nps_counts(s.id).await.unwrap();
     let scores: Vec<i32> = scored.iter().map(|(_, s)| *s).collect();
-    assert_eq!(n.total_responses, 14);
+    assert_eq!(n.total_responses, 15);
     assert_eq!(n.scored_responses, 7);
     assert_eq!((n.promoters, n.passives, n.detractors), (2, 2, 3));
     assert_eq!(n.nps(), calculate_nps(&scores));
@@ -733,7 +752,7 @@ async fn another_org_cannot_see_or_change_this_orgs_data(pool: PgPool) {
                     .await
                     .map(|_| ())
                     .unwrap_err(),
-                "feedback_with_a_experience" => tx
+                "feedback_with_an_experience" => tx
                     .submit_feedback(&NewFeedback {
                         experience_id: Some(exp_a),
                         ..fb(cb, "praise", None)
@@ -741,7 +760,7 @@ async fn another_org_cannot_see_or_change_this_orgs_data(pool: PgPool) {
                     .await
                     .map(|_| ())
                     .unwrap_err(),
-                "survey_with_a_experience" => tx
+                "survey_with_an_experience" => tx
                     .create_survey(&NewSurvey {
                         experience_id: Some(exp_a),
                         ..survey("x")
@@ -761,8 +780,8 @@ async fn another_org_cannot_see_or_change_this_orgs_data(pool: PgPool) {
     refused("send_to_a_survey", "survey").await;
     refused("response_for_a_customer", "customer").await;
     refused("feedback_for_a_customer", "customer").await;
-    refused("feedback_with_a_experience", "experience").await;
-    refused("survey_with_a_experience", "experience").await;
+    refused("feedback_with_an_experience", "experience").await;
+    refused("survey_with_an_experience", "experience").await;
 
     // A's data is untouched.
     let mut tx = db.begin(a).await.unwrap();
