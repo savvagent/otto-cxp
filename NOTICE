@@ -1,7 +1,7 @@
 otto-cxp
 Copyright (C) 2026 Savvagent, LLC
 
-The server -- everything under server/ and apps/, and the repository's build,
+The server -- everything under crates/ and apps/, and the repository's build,
 deploy, and documentation files -- is free software: you can redistribute it
 and/or modify it under the terms of the GNU Affero General Public License as
 published by the Free Software Foundation, either version 3 of the License, or
