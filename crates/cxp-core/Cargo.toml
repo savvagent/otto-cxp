@@ -26,3 +26,5 @@ sqlx.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+# A stub otto platform for the auth and usage-shipper tests.
+axum.workspace = true
