@@ -57,8 +57,12 @@ stays off (`FLY_DEPLOY` unset) until that deploy is verified.
 ```bash
 # 1. App, then its hostname first so the certificate issues while you do the rest.
 fly apps create otto-cxp --org savvagent
+# A new app has no IPs until its first deploy; allocate them now so DNS can point at
+# them. The IPv4 is the free shared one; a dedicated IPv4 is a recurring cost.
+fly ips allocate-v6 -a otto-cxp
+fly ips allocate-v4 --shared -a otto-cxp
 fly certs add otto-cxp.savvagent.com -a otto-cxp
-# DNS (Namecheap): A and AAAA records for otto-cxp -> the app's IPs (`fly ips list -a otto-cxp`)
+# DNS (Namecheap): A and AAAA records for otto-cxp -> the IPs `fly ips list -a otto-cxp` shows
 
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp

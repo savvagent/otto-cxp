@@ -17,13 +17,14 @@
 -- (customers are UNIQUE (org_id, email): if the org already has customers with
 -- these demo emails under other ids, the insert fails and nothing is written.)
 
+\set ON_ERROR_STOP on
+
 \if :{?org}
 \else
   \echo 'usage: psql "$DATABASE_URL" -v org=<org-uuid> -f scripts/seed-demo.sql'
-  \quit
+  -- Fail (psql exits 3) rather than quit successfully, so a wrapper notices.
+  SELECT 'org is required'::int;
 \endif
-
-\set ON_ERROR_STOP on
 
 BEGIN;
 
