@@ -20,13 +20,37 @@ One binary, `cxp-server`, on port 8080:
 | `/.well-known/oauth-protected-resource` | points MCP clients at the platform to sign in | none |
 | `/healthz`, `/readyz` | liveness and readiness | none |
 
-An MCP client connects to `https://otto-cxp.savvagent.com/mcp`, is sent to the platform to
-sign in, and then calls tools; call `whoami` first. Tokens must carry the `cxp:read` or
-`cxp:write` scope and be issued for this service's audience (`CXP_RESOURCE_URI`).
+Tokens must carry the `cxp:read` or `cxp:write` scope and be issued for this service's
+audience (`CXP_RESOURCE_URI`).
 
 **Tenancy.** Every row belongs to an org. Isolation is Postgres row-level security under the
 `otto_app` role, with composite `(org_id, id)` foreign keys, and `cxp-server` refuses to boot if
 the isolation check fails. Org and user ids are opaque uuids issued by the platform.
+
+## Connecting an MCP client
+
+The endpoint is `https://otto-cxp.savvagent.com/mcp` (streamable HTTP). You need an account in
+an org on the [otto platform](https://otto.savvagent.com); the platform handles sign-in.
+
+**Claude Code:**
+
+```bash
+claude mcp add --transport http --scope user otto-cxp https://otto-cxp.savvagent.com/mcp
+```
+
+`--scope user` makes it available in every project; leave it out to add it to the current
+project only. Then, in a Claude Code session, run `/mcp`, pick `otto-cxp`, and choose
+**Authenticate**. Your browser opens the platform's sign-in and consent page; approve it and
+return to Claude Code. Ask it to call the otto-cxp `whoami` tool: it answers with your org and
+user as the platform knows them.
+
+**Other MCP clients:** add a remote (streamable HTTP) server with the URL above. No client id or
+API key is needed: an unauthenticated request gets `401` with a `WWW-Authenticate` header naming
+`/.well-known/oauth-protected-resource`, which points the client at the platform for OAuth.
+
+**Scopes:** `cxp:read` covers the read tools, `cxp:write` the tools that create or change data;
+the platform's consent page shows which ones a sign-in grants. A tool called without the scope
+it needs is refused with `insufficient_scope`. `whoami` and `usage` need no scope.
 
 ## The server
 
