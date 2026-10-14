@@ -384,6 +384,7 @@ commands live in `docs/deploy/fly.md` (S12).
 - Until the console-OAuth ticket lands, the local web console cannot call `/api`.
 - `team.deleted` race: a catalog write that verified its team at the platform just before the
   team was deleted, but commits after the webhook nulled the org's team ids, keeps a stale
-  `team_id`. Accepted: the window is one request, and readers treat an unknown team id as
-  unowned. A `deleted_teams` tombstone would close it if it ever matters.
+  `team_id`. Accepted: the window is the platform client's team-lookup cache (up to 10 s),
+  and a team id the platform no longer knows simply matches no team in the console's
+  selector (`/api/v1/me/teams`), so the entity shows as unassigned. A `deleted_teams` tombstone would close it if it ever matters.
 - The usage shipper is the second caller of `cxp_core::maintenance` (after the sweep).
