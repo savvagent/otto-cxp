@@ -127,12 +127,12 @@ describe("connectCxp with a bearer token", () => {
     expect(seenAuth.every((a) => a === `Bearer ${TOKEN}`)).toBe(true);
   });
 
-  it("wraps a 401 as a non-retriable unauthenticated CxpError with the cause", async () => {
+  it("wraps a 401 as a non-retriable CxpError keeping the server kind and the cause", async () => {
     const url = await startServer();
     const err = await connectCxp({ url, token: "nope" }).catch((e) => e);
     expect(err).toBeInstanceOf(CxpError);
     expect(err).not.toBeInstanceOf(CxpAuthorizationRequired);
-    expect(err.code).toBe("unauthenticated");
+    expect(err.code).toBe("invalid_token");
     expect(err.retriable).toBe(false);
     expect(err.cause).toBeInstanceOf(StreamableHTTPError);
     expect(err.cause.code).toBe(401);
@@ -149,11 +149,24 @@ describe("connectCxp with a bearer token", () => {
     expect(err.cause.code).toBe(503);
   });
 
-  it("leaves other HTTP failures untouched", async () => {
+  it("wraps a 500 as a non-retriable internal CxpError", async () => {
     const url = await startServer();
     mcpStatus = 500;
     const err = await connectCxp({ url, token: TOKEN }).catch((e) => e);
-    expect(err).toBeInstanceOf(StreamableHTTPError);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.code).toBe("internal");
+    expect(err.retriable).toBe(false);
+    expect(err.cause).toBeInstanceOf(StreamableHTTPError);
+  });
+
+  it("wraps a 500 as internal on the authProvider path too", async () => {
+    const url = await startServer();
+    mcpStatus = 500;
+    const err = await connectCxp({ url, authProvider: fakeProvider() }).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err).not.toBeInstanceOf(CxpAuthorizationRequired);
+    expect(err.code).toBe("internal");
+    expect(err.cause).toBeInstanceOf(StreamableHTTPError);
   });
 
   it("requires exactly one of token or authProvider", async () => {
@@ -263,7 +276,7 @@ describe("client and transport cleanup", () => {
       closed = true;
     });
     mcpStatus = 500;
-    await expect(connectCxp({ url, token: TOKEN })).rejects.toBeInstanceOf(StreamableHTTPError);
+    await expect(connectCxp({ url, token: TOKEN })).rejects.toMatchObject({ code: "internal" });
     expect(closed).toBe(true);
   });
 
