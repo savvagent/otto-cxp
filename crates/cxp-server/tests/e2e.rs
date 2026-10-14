@@ -563,6 +563,44 @@ async fn criterion_1_unauthenticated_and_foreign_tokens_are_401_and_discovery_is
     assert_eq!(nope.body["code"], "not_found");
 }
 
+/// rmcp reads `/mcp`'s body itself, past axum's extractor limit, so only the
+/// router-wide cap stops an oversized one: refused before anything reads it,
+/// with or without a `Content-Length`, and from a caller with a valid token.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_oversized_body_to_mcp_is_413(pool: PgPool) {
+    let s = server(pool).await;
+    let a = s.caller();
+    // A well-formed JSON-RPC call padded to 1 MiB.
+    let pad = "x".repeat(1 << 20);
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "create_customer",
+                                 "arguments": {"email": "big@example.com", "notes": pad}}})
+    .to_string();
+    assert!(body.len() > cxp_api::MAX_BODY_BYTES);
+
+    let declared = Request::post("/mcp")
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", format!("Bearer {}", a.token))
+        .header("content-length", body.len())
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let r = s.send(declared).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", r.body);
+    assert_eq!(r.body["code"], "payload_too_large", "{}", r.body);
+
+    // No Content-Length: the body is cut off as it is read.
+    let undeclared = Server::mcp_request(Some(&a.token), &serde_json::from_str(&body).unwrap());
+    assert!(undeclared.headers().get("content-length").is_none());
+    let r = s.send(undeclared).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", r.body);
+
+    // Nothing was written.
+    let rows: HashMap<&str, Value> = s.rows_of(a.org).await.into_iter().collect();
+    assert_eq!(rows["customers"], json!([]));
+}
+
 // ============================================================ criterion 2
 
 /// Text every row org A writes carries, so a leak shows up as this string in

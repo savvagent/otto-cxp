@@ -6,9 +6,10 @@
 //! ```text
 //!   POST /mcp
 //!     └─ require_bearer ──── introspect the token at the platform, attach the principal
-//!          └─ StreamableHttpService ──── rmcp, JSON-RPC framing, stateless, JSON responses
-//!               └─ Cxp ──── one tool call, resource read, or prompt
-//!                    └─ begin_live(org) ──── cxp-core, RLS, commit
+//!          └─ buffer_body ──── read the body under the body limit, or 413
+//!               └─ StreamableHttpService ──── rmcp, JSON-RPC framing, stateless, JSON responses
+//!                    └─ Cxp ──── one tool call, resource read, or prompt
+//!                         └─ begin_live(org) ──── cxp-core, RLS, commit
 //! ```
 //!
 //! Every tool calls into `cxp-core`; no SQL lives here.
@@ -22,9 +23,14 @@ pub mod tools;
 
 use std::sync::Arc;
 
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Request};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any_service, get};
 use axum::Router;
 use cxp_core::usage::Meter;
+use http::StatusCode;
 use otto_resource::PlatformClient;
 use otto_tenant::Db;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -103,9 +109,35 @@ pub fn router(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>, config: 
         .with_state(shared.clone())
         .route_service(
             "/mcp",
-            any_service(service).layer(axum::middleware::from_fn_with_state(
-                shared,
-                auth::require_bearer,
-            )),
+            any_service(service)
+                .layer(axum::middleware::from_fn(buffer_body))
+                .layer(axum::middleware::from_fn_with_state(
+                    shared,
+                    auth::require_bearer,
+                )),
         )
+}
+
+/// Read `/mcp`'s body before rmcp does, through axum's `Bytes` extractor, so
+/// it honors whatever limit the stack sets (cxp-server's router-wide cap, or
+/// axum's default) and an oversized body is a `413` rather than the `500`
+/// rmcp answers for a body it fails to read.
+async fn buffer_body(req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let bytes = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(serde_json::json!({
+                    "error": "the request body is too large",
+                    "code": "payload_too_large",
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
