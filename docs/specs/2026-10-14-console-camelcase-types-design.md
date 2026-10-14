@@ -1,6 +1,6 @@
 # Web console reads camelCase API responses — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#23)
 **Issue:** #15
 
 ## Brief
