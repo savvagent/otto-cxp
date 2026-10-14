@@ -483,8 +483,9 @@ CREATE INDEX usage_outbox_due_idx ON usage_outbox (next_attempt_at, id);
 CREATE INDEX usage_outbox_org_idx ON usage_outbox (org_id);
 
 -- Usage that will never ship, kept with its reason rather than dropped: rows
--- the platform refused (per event, or the whole batch) and rows given up on
--- after `usage::MAX_SHIP_ATTEMPTS`. Swept after 90 days.
+-- the platform refused (alone, after a refused batch was split) and rows given
+-- up on after `usage::MAX_ROW_FAILURES` failures about the row itself (see 0002).
+-- Swept after 90 days.
 CREATE TABLE usage_outbox_rejected (
   id          bigserial   PRIMARY KEY,
   event_id    uuid        NOT NULL,
