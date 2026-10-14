@@ -55,6 +55,12 @@ struct Platform {
     undercount: bool,
     /// Answer every usage batch with this status instead.
     ship_status: Option<StatusCode>,
+    /// Refuse, whole, any usage batch containing one of these event ids,
+    /// with `poison_status` (422 if unset).
+    poison: HashSet<Uuid>,
+    poison_status: Option<StatusCode>,
+    /// The size of every usage batch received, in order.
+    batch_sizes: Vec<usize>,
     /// Answer with a receipt whose counts add up but whose rejected ids do
     /// not match the batch.
     bogus: Option<Bogus>,
@@ -117,6 +123,10 @@ async fn ship(
     let mut p = p.lock().unwrap();
     if p.usage_down {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    p.batch_sizes.push(b.events.len());
+    if b.events.iter().any(|e| p.poison.contains(&e.event_id)) {
+        return Err(p.poison_status.unwrap_or(StatusCode::UNPROCESSABLE_ENTITY));
     }
     if let Some(status) = p.ship_status {
         p.received.extend(b.events);
@@ -1264,29 +1274,54 @@ async fn rejected_rows(pool: &PgPool) -> Vec<(Uuid, String)> {
         .unwrap()
 }
 
-/// A batch the platform refuses outright (a 4xx about the batch) can never
-/// be accepted, so it moves to `usage_outbox_rejected` with the reason
-/// instead of retrying forever. A refused credential is this service's to
-/// fix: those rows are kept and retried.
+async fn row_failures(pool: &PgPool) -> Vec<i32> {
+    sqlx::query_scalar("SELECT row_failures FROM usage_outbox ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// A refusal that is about this side or passes on its own (the credential,
+/// an unknown URL, a timeout, rate limiting, an outage) keeps every row and
+/// never counts against it. A batch the platform refuses outright (a 4xx
+/// about the request) is split down to single events; one still refused
+/// alone moves to `usage_outbox_rejected` with the reason.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_batch_the_platform_refuses_is_moved_aside_but_a_refused_credential_is_retried(
-    pool: PgPool,
-) {
+async fn a_refused_event_is_moved_aside_but_a_refused_credential_is_retried(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), false, "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 2).await;
 
-    stub.lock().unwrap().ship_status = Some(StatusCode::UNAUTHORIZED);
-    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
-    assert_eq!(outbox(&pool).await.len(), 2, "kept for after the fix");
-    assert!(rejected_rows(&pool).await.is_empty());
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::REQUEST_TIMEOUT,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        stub.lock().unwrap().ship_status = Some(status);
+        make_due(&pool).await;
+        assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+        assert_eq!(
+            outbox(&pool).await.len(),
+            2,
+            "{status}: kept for after the fix"
+        );
+        assert_eq!(
+            row_failures(&pool).await,
+            [0, 0],
+            "{status}: not the rows' fault"
+        );
+        assert!(rejected_rows(&pool).await.is_empty(), "{status}");
+    }
 
     stub.lock().unwrap().ship_status = Some(StatusCode::UNPROCESSABLE_ENTITY);
     make_due(&pool).await;
     let shipped: HashSet<Uuid> = outbox(&pool).await.iter().map(|r| r.0).collect();
-    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+    assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 2);
     assert!(outbox(&pool).await.is_empty());
     let rejected = rejected_rows(&pool).await;
     assert_eq!(
@@ -1296,43 +1331,133 @@ async fn a_batch_the_platform_refuses_is_moved_aside_but_a_refused_credential_is
     assert!(
         rejected
             .iter()
-            .all(|r| r.1.contains("refused the batch") && r.1.contains("422")),
+            .all(|r| r.1.contains("refused this event") && r.1.contains("422")),
         "{rejected:?}"
     );
 }
 
-/// A row that keeps failing is given up on after MAX_SHIP_ATTEMPTS, with the
-/// last error as its reason, rather than retried (and counted) forever.
+/// One event the platform refuses must not take its batch down with it: a
+/// batch refused whole (422, or 413 for its size) is resent in halves until
+/// the refused event stands alone, and only that event is dead-lettered.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn usage_that_never_ships_is_given_up_on_after_max_attempts(pool: PgPool) {
+async fn a_poisoned_batch_is_split_until_only_the_poisoned_event_is_moved_aside(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig::default();
+
+    for status in [
+        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::PAYLOAD_TOO_LARGE,
+    ] {
+        charge_n(&db, &meter, org(), 7).await;
+        let rows = outbox(&pool).await;
+        let poisoned = rows[4].0;
+        {
+            let mut p = stub.lock().unwrap();
+            p.poison = HashSet::from([poisoned]);
+            p.poison_status = Some(status);
+            p.received.clear();
+            p.batch_sizes.clear();
+        }
+
+        assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 7);
+        assert!(outbox(&pool).await.is_empty(), "{status}");
+        let rejected = rejected_rows(&pool).await;
+        let last = rejected.last().unwrap();
+        assert_eq!(last.0, poisoned, "{status}");
+        assert!(last.1.contains(status.as_str()), "{status}: {}", last.1);
+        let p = stub.lock().unwrap();
+        let accepted: HashSet<Uuid> = p.received.iter().map(|e| e.event_id).collect();
+        let expected: HashSet<Uuid> = rows
+            .iter()
+            .map(|r| r.0)
+            .filter(|id| *id != poisoned)
+            .collect();
+        assert_eq!(accepted, expected, "{status}: every other event shipped");
+        // Depth first, in order: 7 is refused; its first 3 ship; its last 4
+        // are refused; their first 2 (holding the poisoned 5th) are refused,
+        // so each goes alone (one ships, one is refused); the last 2 ship.
+        assert_eq!(p.batch_sizes, [7, 3, 4, 2, 1, 1, 2], "{status}");
+    }
+    assert_eq!(rejected_rows(&pool).await.len(), 2);
+}
+
+/// However long the platform stays unreachable, the rows stay in the outbox
+/// (and keep counting toward their period's quota): an outage is not the
+/// rows' fault.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_unreachable_platform_never_gives_usage_up(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, _stub) = start_platform().await;
+    let meter = Meter::new(platform, false, "https://x");
+    let cfg = ShipperConfig::default();
+    charge_n(&db, &meter, org(), 2).await;
+
+    // Bound and dropped: nothing listens there.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = client(&format!("http://{}", listener.local_addr().unwrap()));
+    drop(listener);
+
+    let failures = usage::MAX_ROW_FAILURES + 5;
+    for _ in 0..failures {
+        make_due(&pool).await;
+        let err = usage::ship_once(&db, &dead, &cfg).await.unwrap_err();
+        assert!(
+            matches!(err, ShipError::Platform(otto_resource::Error::Transport(_))),
+            "{err}"
+        );
+        assert!(err.is_retriable());
+    }
+    let rows = outbox(&pool).await;
+    assert_eq!(rows.len(), 2, "still waiting to ship");
+    assert!(rows.iter().all(|r| r.1 == failures), "{rows:?}");
+    assert_eq!(row_failures(&pool).await, [0, 0]);
+    assert!(rejected_rows(&pool).await.is_empty());
+}
+
+/// A row whose batch keeps coming back with a receipt that does not account
+/// for it is given up on after MAX_ROW_FAILURES of those, with the last
+/// error as its reason; a row that has merely been tried often is not.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn usage_the_platform_keeps_failing_to_account_for_is_given_up_on(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), false, "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 2).await;
-    stub.lock().unwrap().usage_down = true;
+    stub.lock().unwrap().undercount = true;
 
-    // One row is on its last attempt, the other has attempts to spare.
+    // One row is one failure from giving up; the other has been attempted
+    // far more often than that, all through outages that never counted.
     let rows = outbox(&pool).await;
-    sqlx::query("UPDATE usage_outbox SET attempts = $2 WHERE event_id = $1")
+    sqlx::query("UPDATE usage_outbox SET row_failures = $2 WHERE event_id = $1")
         .bind(rows[0].0)
-        .bind(usage::MAX_SHIP_ATTEMPTS - 1)
+        .bind(usage::MAX_ROW_FAILURES - 1)
         .execute(&pool)
         .await
         .unwrap();
-    assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+    sqlx::query("UPDATE usage_outbox SET attempts = $2 WHERE event_id = $1")
+        .bind(rows[1].0)
+        .bind(usage::MAX_ROW_FAILURES * 3)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+    assert!(matches!(err, ShipError::Receipt(_)), "{err}");
 
     let left = outbox(&pool).await;
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].0, rows[1].0);
+    assert_eq!(row_failures(&pool).await, [1]);
     let rejected = rejected_rows(&pool).await;
     assert_eq!(rejected.len(), 1);
     assert_eq!(rejected[0].0, rows[0].0);
     assert!(
         rejected[0].1.contains(&format!(
-            "not shipped after {} attempts",
-            usage::MAX_SHIP_ATTEMPTS
-        )) && rejected[0].1.contains("503"),
+            "given up after {} failures about the row itself",
+            usage::MAX_ROW_FAILURES
+        )) && rejected[0].1.contains("accounted for"),
         "{}",
         rejected[0].1
     );
@@ -1353,7 +1478,7 @@ async fn a_receipt_rejecting_ids_outside_the_batch_keeps_every_row(pool: PgPool)
         stub.lock().unwrap().bogus = Some(bogus);
         make_due(&pool).await;
         let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
-        assert!(matches!(err, ShipError::Platform(_)), "{err}");
+        assert!(matches!(err, ShipError::Receipt(_)), "{err}");
         let rows = outbox(&pool).await;
         assert_eq!(rows.len(), 3, "every row kept");
         assert!(rows.iter().all(|r| r.2.is_some()), "rescheduled: {rows:?}");
