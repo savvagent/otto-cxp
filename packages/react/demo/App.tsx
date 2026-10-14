@@ -71,6 +71,8 @@ export default function App() {
   const [seedError, setSeedError] = useState<string | null>(null);
 
   // Bearer token for the resource server: VITE_CXP_TOKEN, or pasted below.
+  // VITE_* variables are inlined into the built bundle: local development only,
+  // never build or deploy this demo with a real token.
   const [token, setToken] = useState<string>(
     (import.meta as unknown as { env?: Record<string, string> }).env
       ?.VITE_CXP_TOKEN ?? ""

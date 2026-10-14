@@ -94,7 +94,7 @@ function ExperienceDialog({
   function onSubmit(values: ExperienceForm) {
     if (isEdit && editing) {
       updateExperience.mutate(
-        { id: editing.id, data: { name: values.name, description: values.description || undefined, team_id: values.team_id || undefined } },
+        { id: editing.id, data: { name: values.name, description: values.description || undefined, team_id: values.team_id || null } },
         {
           onSuccess: () => {
             toast.success("Experience updated");

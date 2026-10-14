@@ -108,7 +108,7 @@ function ComponentDialog({
             name: values.name,
             component_type: values.component_type || undefined,
             description: values.description || undefined,
-            team_id: values.team_id || undefined,
+            team_id: values.team_id || null,
           },
         },
         {

@@ -9,8 +9,12 @@ export { CxpClient } from "./client.js";
 export type { CxpClientOptions } from "./client.js";
 
 // Connecting and errors
-export { connectCxp } from "./connect.js";
-export type { ConnectCxpOptions, CxpConnection } from "./connect.js";
+export { connectCxp, createCxpTransport, CxpAuthorizationRequired } from "./connect.js";
+export type {
+  ConnectCxpOptions,
+  CxpTransportOptions,
+  CxpConnection,
+} from "./connect.js";
 export { CxpError } from "./call.js";
 
 // Domain modules

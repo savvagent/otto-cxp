@@ -64,18 +64,25 @@ export async function callTool<T>(
 
   const text = firstText(result.content);
   if (result.isError) {
-    throw new CxpError(text ?? `Tool ${name} failed`);
+    const sc = result.structuredContent as { code?: unknown; retriable?: unknown } | undefined;
+    throw new CxpError(text ?? `Tool ${name} failed`, {
+      code: typeof sc?.code === "string" ? sc.code : undefined,
+      retriable: typeof sc?.retriable === "boolean" ? sc.retriable : undefined,
+      data: result.structuredContent,
+    });
   }
   if (result.structuredContent !== undefined && result.structuredContent !== null) {
     return result.structuredContent as T;
   }
+  // The server emits every structured result as JSON text content as well, so
+  // fall back to it for clients or proxies that drop `structuredContent`.
   if (text === undefined) {
-    throw new CxpError(`Tool ${name} returned no content`);
+    throw new CxpError(`Tool ${name} returned no content`, { code: "invalid_response" });
   }
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new CxpError(text);
+    throw new CxpError(text, { code: "invalid_response" });
   }
 }
 
@@ -93,8 +100,9 @@ export async function callList<T>(
   name: string,
   args: Record<string, unknown>
 ): Promise<T[]> {
-  const out = await callTool<ListEnvelope<T> | T[]>(client, name, args);
-  if (Array.isArray(out)) return out;
-  if (out && Array.isArray(out.items)) return out.items;
-  throw new CxpError(`Tool ${name} returned an unexpected list shape`);
+  const out = await callTool<ListEnvelope<T> | undefined>(client, name, args);
+  if (out && !Array.isArray(out) && Array.isArray(out.items)) return out.items;
+  throw new CxpError(`Tool ${name} did not return a {items, total?} envelope`, {
+    code: "invalid_response",
+  });
 }

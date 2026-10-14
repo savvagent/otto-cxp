@@ -108,7 +108,7 @@ function PageDialog({
             name: values.name,
             path: values.path || undefined,
             description: values.description || undefined,
-            team_id: values.team_id || undefined,
+            team_id: values.team_id || null,
           },
         },
         {

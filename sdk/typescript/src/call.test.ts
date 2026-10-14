@@ -29,12 +29,22 @@ describe("callTool", () => {
     await expect(callTool(c, "get_ticket", {})).rejects.toMatchObject({
       name: "CxpError",
       message: "Error: boom",
+      code: "invalid_response",
     });
   });
 
   it("raises CxpError for isError results", async () => {
     const c = clientReturning({ isError: true, content: [{ type: "text", text: "bad input" }] });
     await expect(callTool(c, "get_ticket", {})).rejects.toBeInstanceOf(CxpError);
+  });
+
+  it("carries a code from structured content on isError results", async () => {
+    const c = clientReturning({
+      isError: true,
+      structuredContent: { code: "not_found", retriable: false },
+      content: [{ type: "text", text: "missing" }],
+    });
+    await expect(callTool(c, "t", {})).rejects.toMatchObject({ code: "not_found", retriable: false });
   });
 
   it("surfaces MCP errors as CxpError carrying data.code", async () => {
@@ -70,9 +80,16 @@ describe("callList", () => {
     expect(await callList(c, "t", {})).toEqual([{ id: "x" }]);
   });
 
-  it("rejects an unexpected shape", async () => {
+  it("rejects an unexpected shape with invalid_response", async () => {
     const c = clientReturning({ structuredContent: { id: "x" } });
-    await expect(callList(c, "t", {})).rejects.toBeInstanceOf(CxpError);
+    await expect(callList(c, "t", {})).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects a bare array (contract is the envelope only)", async () => {
+    const c = clientReturning({ structuredContent: [{ id: "x" }] });
+    await expect(callList(c, "t", {})).rejects.toMatchObject({ code: "invalid_response" });
+    const t = clientReturning({ content: [{ type: "text", text: '[{"id":"x"}]' }] });
+    await expect(callList(t, "t", {})).rejects.toMatchObject({ code: "invalid_response" });
   });
 });
 

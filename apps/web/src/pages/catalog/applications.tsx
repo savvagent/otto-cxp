@@ -108,7 +108,7 @@ function ApplicationDialog({
             name: values.name,
             description: values.description || undefined,
             platform: values.platform || undefined,
-            team_id: values.team_id || undefined,
+            team_id: values.team_id || null,
           },
         },
         {

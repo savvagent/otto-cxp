@@ -23,17 +23,32 @@ const { cxp, close } = await connectCxp({
 });
 ```
 
-Or pass an MCP `OAuthClientProvider` and let the transport run the OAuth flow
-(call `transport.finishAuth(code)` on the returned `transport` after the redirect):
+Or pass an MCP `OAuthClientProvider`. When the user must authorize in a
+browser, the provider's `redirectToAuthorization` is called and `connectCxp`
+throws `CxpAuthorizationRequired`. After the redirect back to your app, pass the
+authorization code to its `finishAuth`, which returns the connection:
 
 ```typescript
-const { cxp } = await connectCxp({ url, authProvider });
+import { connectCxp, CxpAuthorizationRequired } from "@cxp/sdk";
+
+try {
+  ({ cxp } = await connectCxp({ url, authProvider }));
+} catch (e) {
+  if (!(e instanceof CxpAuthorizationRequired)) throw e;
+  // ...the provider redirected the user; on the callback page:
+  ({ cxp } = await e.finishAuth(codeFromCallback));
+}
 ```
 
-Already have a connected MCP `Client`? Wrap it: `new CxpClient({ client })`.
+(Across a full-page redirect your app reloads, so keep the provider's state in
+storage and, on the callback page, call `createCxpTransport({ url, authProvider })`,
+then `transport.finishAuth(code)`, then `connectCxp({ url, authProvider })`.)
 
-List methods return plain arrays (the `{ items, total }` tool envelope is
-unwrapped). Failed calls throw `CxpError`; `error.code` carries the server's
+Already have a connected MCP `Client`? Wrap it: `new CxpClient({ client })`;
+`createCxpTransport` builds the HTTP transport for it.
+
+List methods return plain arrays (the `{ items, total? }` tool envelope is
+unwrapped; any other shape throws `CxpError` with code `invalid_response`). Failed calls throw `CxpError`; `error.code` carries the server's
 stable error code, such as `not_found`.
 
 ```typescript

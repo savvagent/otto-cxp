@@ -114,7 +114,7 @@ importers:
         specifier: workspace:*
         version: link:../../sdk/typescript
       '@modelcontextprotocol/sdk':
-        specifier: ^1.12.0
+        specifier: ^1.26.0
         version: 1.26.0(zod@4.3.6)
       '@testing-library/react':
         specifier: ^16.0.0
@@ -153,7 +153,7 @@ importers:
   sdk/typescript:
     dependencies:
       '@modelcontextprotocol/sdk':
-        specifier: ^1.12.0
+        specifier: ^1.26.0
         version: 1.26.0(zod@4.3.6)
     devDependencies:
       tsup:
