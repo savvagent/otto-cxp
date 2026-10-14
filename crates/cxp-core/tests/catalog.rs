@@ -51,9 +51,15 @@ fn not_found(e: Error, kind: &str) {
     }
 }
 
-async fn run_sql(db: &Db, org: OrgId, sql: &str) {
+/// Run one statement as `org` with `$1` = the org and `$2` = `arg`.
+async fn run_sql(db: &Db, org: OrgId, arg: Uuid, sql: &str) {
     let mut tx = db.begin(org).await.unwrap();
-    sqlx::query(sql).bind(org).execute(tx.conn()).await.unwrap();
+    sqlx::query(sql)
+        .bind(org)
+        .bind(arg)
+        .execute(tx.conn())
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 }
 
@@ -95,7 +101,7 @@ async fn experience_crud(pool: PgPool) {
     assert_eq!(u.description.as_deref(), Some("the flow"));
     assert_eq!(u.metadata, json!({"k": 1}));
     assert_eq!(u.team_id, Some(team));
-    assert!(u.updated_at >= e.updated_at);
+    assert!(u.updated_at > e.updated_at);
 
     tx.delete_experience(e.id).await.unwrap();
     not_found(tx.get_experience(e.id).await.unwrap_err(), "experience");
@@ -581,9 +587,8 @@ async fn dashboard_counts_and_ticket_status(pool: PgPool) {
     run_sql(
         &db,
         o,
-        &format!(
-            "INSERT INTO customers (id, org_id, email) VALUES ('{customer}', $1, 'a@example.com')"
-        ),
+        customer,
+        "INSERT INTO customers (id, org_id, email) VALUES ($2, $1, 'a@example.com')",
     )
     .await;
     for (status, n) in [
@@ -594,31 +599,39 @@ async fn dashboard_counts_and_ticket_status(pool: PgPool) {
         ("closed", 5),
     ] {
         for _ in 0..n {
-            run_sql(
-                &db,
-                o,
-                &format!(
-                    "INSERT INTO tickets (org_id, customer_id, subject, status) \
-                     VALUES ($1, '{customer}', 's', '{status}'::ticket_status)"
-                ),
+            let mut tx = db.begin(o).await.unwrap();
+            sqlx::query(
+                "INSERT INTO tickets (org_id, customer_id, subject, status) \
+                 VALUES ($1, $2, 's', $3::ticket_status)",
             )
-            .await;
+            .bind(o)
+            .bind(customer)
+            .bind(status)
+            .execute(tx.conn())
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
         }
     }
-    for rating in [5, 4, 2, 1] {
-        run_sql(
-            &db,
-            o,
-            &format!(
-                "INSERT INTO feedback (org_id, customer_id, feedback_type, rating) \
-                 VALUES ($1, '{customer}', 'praise'::feedback_type, {rating})"
-            ),
+    // Ratings 5, 4, 2, 1, and one unrated row, which neither average nor CSAT counts.
+    for rating in [Some(5), Some(4), Some(2), Some(1), None] {
+        let mut tx = db.begin(o).await.unwrap();
+        sqlx::query(
+            "INSERT INTO feedback (org_id, customer_id, feedback_type, rating) \
+             VALUES ($1, $2, 'praise'::feedback_type, $3)",
         )
-        .await;
+        .bind(o)
+        .bind(customer)
+        .bind(rating)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
     run_sql(
         &db,
         o,
+        customer,
         "INSERT INTO surveys (org_id, title, questions) VALUES ($1, 'S', '[]')",
     )
     .await;
@@ -628,7 +641,7 @@ async fn dashboard_counts_and_ticket_status(pool: PgPool) {
     assert_eq!(m.total_customers, 1);
     assert_eq!(m.total_tickets, 15);
     assert_eq!(m.open_tickets, 3);
-    assert_eq!(m.total_feedback, 4);
+    assert_eq!(m.total_feedback, 5);
     assert_eq!(m.total_surveys, 1);
     assert_eq!(m.total_experiences, 2);
 
@@ -685,15 +698,15 @@ async fn orgs_cannot_see_or_touch_each_others_catalog_or_counts(pool: PgPool) {
     run_sql(
         &db,
         a,
-        &format!("INSERT INTO customers (id, org_id, email) VALUES ('{customer}', $1, 'a@x.io')"),
+        customer,
+        "INSERT INTO customers (id, org_id, email) VALUES ($2, $1, 'a@x.io')",
     )
     .await;
     run_sql(
         &db,
         a,
-        &format!(
-            "INSERT INTO tickets (org_id, customer_id, subject) VALUES ($1, '{customer}', 's')"
-        ),
+        customer,
+        "INSERT INTO tickets (org_id, customer_id, subject) VALUES ($1, $2, 's')",
     )
     .await;
 
@@ -726,7 +739,51 @@ async fn orgs_cannot_see_or_touch_each_others_catalog_or_counts(pool: PgPool) {
         0
     );
 
+    let none = |t: i64| assert_eq!(t, 0);
+    none(
+        tx.list_pages(
+            PageFilter {
+                application_id: Some(aa),
+            },
+            Page::default(),
+        )
+        .await
+        .unwrap()
+        .1,
+    );
+    none(
+        tx.list_pages(PageFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .1,
+    );
+    none(
+        tx.list_components(ComponentFilter { page_id: Some(pa) }, Page::default())
+            .await
+            .unwrap()
+            .1,
+    );
+    none(
+        tx.list_components(ComponentFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .1,
+    );
+
     // ... cannot update or delete it.
+    not_found(
+        tx.update_application(aa, &ApplicationUpdate::default())
+            .await
+            .unwrap_err(),
+        "application",
+    );
+    not_found(tx.delete_application(aa).await.unwrap_err(), "application");
+    not_found(
+        tx.update_page(pa, &PageUpdate::default())
+            .await
+            .unwrap_err(),
+        "page",
+    );
     not_found(
         tx.update_experience(
             ea,
@@ -772,11 +829,13 @@ async fn orgs_cannot_see_or_touch_each_others_catalog_or_counts(pool: PgPool) {
             .unwrap_err(),
         "experience",
     );
+    drop(tx);
     let mut tx = db.begin(b).await.unwrap();
     not_found(
         tx.create_page(&page(Some(aa), "x")).await.unwrap_err(),
         "application",
     );
+    drop(tx);
     let mut tx = db.begin(b).await.unwrap();
     not_found(
         tx.create_component(&comp(Some(pa), "x")).await.unwrap_err(),
@@ -789,4 +848,69 @@ async fn orgs_cannot_see_or_touch_each_others_catalog_or_counts(pool: PgPool) {
     assert_eq!(tx.get_experience(ea).await.unwrap().name, "A-exp");
     assert_eq!(tx.get_component(ca).await.unwrap().name, "A-comp");
     assert_eq!(tx.dashboard_metrics().await.unwrap().total_tickets, 1);
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn blank_names_are_invalid_on_create_and_update(pool: PgPool) {
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let e = tx.create_experience(&exp("E")).await.unwrap();
+    let a = tx.create_application(&app(None, "A")).await.unwrap();
+    let p = tx.create_page(&page(None, "P")).await.unwrap();
+    let c = tx.create_component(&comp(None, "C")).await.unwrap();
+    for blank in ["", "  \t "] {
+        let invalid = |r: Result<(), Error>| assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+        invalid(tx.create_experience(&exp(blank)).await.map(|_| ()));
+        invalid(tx.create_application(&app(None, blank)).await.map(|_| ()));
+        invalid(tx.create_page(&page(None, blank)).await.map(|_| ()));
+        invalid(tx.create_component(&comp(None, blank)).await.map(|_| ()));
+        let name = Some(blank.to_string());
+        invalid(
+            tx.update_experience(
+                e.id,
+                &ExperienceUpdate {
+                    name: name.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+        invalid(
+            tx.update_application(
+                a.id,
+                &ApplicationUpdate {
+                    name: name.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+        invalid(
+            tx.update_page(
+                p.id,
+                &PageUpdate {
+                    name: name.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+        invalid(
+            tx.update_component(
+                c.id,
+                &ComponentUpdate {
+                    name,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        );
+    }
+    // Nothing was written, and the names are unchanged.
+    assert_eq!(tx.list_experiences(Page::default()).await.unwrap().1, 1);
+    assert_eq!(tx.get_experience(e.id).await.unwrap().name, "E");
 }

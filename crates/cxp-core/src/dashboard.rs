@@ -52,6 +52,9 @@ pub struct DashboardSummary {
     pub average_rating: Option<f64>,
 }
 
+/// Dashboard aggregates for one organization's transaction. Each method is one
+/// statement that scans each table once; none can fail except on a database
+/// error, and an organization with no rows gets zeros (and `None` ratings).
 pub trait DashboardExt {
     /// Counts of customers, tickets (all and open), feedback, surveys, and
     /// experiences.
@@ -62,7 +65,8 @@ pub trait DashboardExt {
         &mut self,
     ) -> impl Future<Output = Result<TicketStatusCounts>> + Send;
 
-    /// The `metrics://dashboard` payload.
+    /// The `metrics://dashboard` payload: ticket counts by status, and CSAT
+    /// and mean rating over every rated feedback row (unrated rows are ignored).
     fn dashboard_summary(&mut self) -> impl Future<Output = Result<DashboardSummary>> + Send;
 }
 
@@ -70,13 +74,14 @@ impl DashboardExt for Tx<'_> {
     async fn dashboard_metrics(&mut self) -> Result<DashboardMetrics> {
         let org = self.org();
         Ok(sqlx::query_as(
-            "SELECT \
-               (SELECT count(*) FROM customers   WHERE org_id = $1) AS total_customers, \
-               (SELECT count(*) FROM tickets     WHERE org_id = $1) AS total_tickets, \
-               (SELECT count(*) FROM tickets     WHERE org_id = $1 AND status = 'open') AS open_tickets, \
-               (SELECT count(*) FROM feedback    WHERE org_id = $1) AS total_feedback, \
-               (SELECT count(*) FROM surveys     WHERE org_id = $1) AS total_surveys, \
-               (SELECT count(*) FROM experiences WHERE org_id = $1) AS total_experiences",
+            "SELECT c.n AS total_customers, t.total AS total_tickets, t.open AS open_tickets, \
+                    f.n AS total_feedback, s.n AS total_surveys, e.n AS total_experiences \
+             FROM (SELECT count(*) AS n FROM customers WHERE org_id = $1) c, \
+                  (SELECT count(*) AS total, count(*) FILTER (WHERE status = 'open') AS open \
+                     FROM tickets WHERE org_id = $1) t, \
+                  (SELECT count(*) AS n FROM feedback WHERE org_id = $1) f, \
+                  (SELECT count(*) AS n FROM surveys WHERE org_id = $1) s, \
+                  (SELECT count(*) AS n FROM experiences WHERE org_id = $1) e",
         )
         .bind(org)
         .fetch_one(self.conn())
@@ -102,16 +107,21 @@ impl DashboardExt for Tx<'_> {
     async fn dashboard_summary(&mut self) -> Result<DashboardSummary> {
         let org = self.org();
         Ok(sqlx::query_as(
-            "SELECT \
-               (SELECT count(*) FROM tickets WHERE org_id = $1) AS total_tickets, \
-               (SELECT count(*) FROM tickets WHERE org_id = $1 AND status = 'open') AS open_tickets, \
-               (SELECT count(*) FROM tickets WHERE org_id = $1 AND status = 'in_progress') AS in_progress_tickets, \
-               (SELECT count(*) FROM tickets WHERE org_id = $1 AND status = 'waiting') AS waiting_tickets, \
-               (SELECT count(*) FROM tickets WHERE org_id = $1 AND status = 'resolved') AS resolved_tickets, \
-               (SELECT count(*) FROM tickets WHERE org_id = $1 AND status = 'closed') AS closed_tickets, \
-               (SELECT (100.0 * count(*) FILTER (WHERE rating >= 4) / NULLIF(count(rating), 0))::float8 \
-                  FROM feedback WHERE org_id = $1) AS csat_score, \
-               (SELECT avg(rating)::float8 FROM feedback WHERE org_id = $1) AS average_rating",
+            "SELECT t.total AS total_tickets, t.open AS open_tickets, \
+                    t.in_progress AS in_progress_tickets, t.waiting AS waiting_tickets, \
+                    t.resolved AS resolved_tickets, t.closed AS closed_tickets, \
+                    f.csat AS csat_score, f.avg AS average_rating \
+             FROM (SELECT count(*) AS total, \
+                          count(*) FILTER (WHERE status = 'open') AS open, \
+                          count(*) FILTER (WHERE status = 'in_progress') AS in_progress, \
+                          count(*) FILTER (WHERE status = 'waiting') AS waiting, \
+                          count(*) FILTER (WHERE status = 'resolved') AS resolved, \
+                          count(*) FILTER (WHERE status = 'closed') AS closed \
+                     FROM tickets WHERE org_id = $1) t, \
+                  (SELECT (100.0 * count(*) FILTER (WHERE rating >= 4) \
+                             / NULLIF(count(rating), 0))::float8 AS csat, \
+                          avg(rating)::float8 AS avg \
+                     FROM feedback WHERE org_id = $1) f",
         )
         .bind(org)
         .fetch_one(self.conn())
