@@ -1,18 +1,14 @@
-//! Unpinned, cross-org background access (story S4): `begin` opens a
-//! transaction with no org pinned and `app.maintenance = 'on'` set, the marker
-//! the retention policies on `platform_events` require. The only way
-//! background code reaches more than one org's rows: the `platform_events`
-//! retention sweep and the usage shipper both go through it.
+//! Unpinned, cross-org background access: `begin` opens a transaction with no
+//! org pinned and `app.maintenance = 'on'` set, the marker the unpinned
+//! row-level policies on `platform_events`, `usage_outbox`, and
+//! `usage_outbox_rejected` require. The only way background code reaches more
+//! than one org's rows: the retention sweep and the usage shipper both go
+//! through it.
 //!
-//! The unpinned row-level policies on `platform_events`
-//! (`platform_events_retention_read`, `platform_events_maintenance_delete`)
-//! grant access only when no org is pinned **and** the transaction carries the
-//! marker. Unpinned alone is not enough: a request path that forgot to pin an
-//! org is unpinned too, and must see nothing.
-//!
-//! The usage outbox's policies admit any unpinned transaction, marker or not,
-//! but the shipper opens its transactions here anyway, so that "unpinned
-//! cross-org access goes only through `maintenance`" holds without exception.
+//! Those policies grant unpinned access only when no org is pinned **and**
+//! the transaction carries the marker. Unpinned alone is not enough: a
+//! request path that forgot to pin an org is unpinned too, and must see,
+//! change, and delete nothing.
 //!
 //! **Only background maintenance code may call [`begin`]**: the retention
 //! sweep ([`crate::platform_events::sweep`]) and the usage shipper

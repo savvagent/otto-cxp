@@ -2,7 +2,7 @@
 //! caller sends can ask the shared database for an unbounded result.
 
 /// A `LIMIT`/`OFFSET` pair, already clamped: `limit` is in
-/// `1..=`[`Page::MAX_LIMIT`] and `offset` is never negative.
+/// `1..=`[`Page::MAX_LIMIT`] and `offset` in `0..=`[`Page::MAX_OFFSET`].
 ///
 /// The fields are private so an unclamped page cannot be built; read them
 /// with [`Page::limit`] and [`Page::offset`] and bind them as `i64`.
@@ -17,16 +17,21 @@ impl Page {
     pub const DEFAULT_LIMIT: i64 = 50;
     /// The largest limit any list honours; larger requests are cut to it.
     pub const MAX_LIMIT: i64 = 200;
+    /// The deepest offset any list honours; deeper requests are cut to it.
+    /// `OFFSET n` reads and discards n rows, so an unbounded offset is an
+    /// unbounded scan; past this, narrow the query with a filter instead.
+    pub const MAX_OFFSET: i64 = 10_000;
 
     /// Clamp a caller's optional `limit` and `offset`: a missing limit is
     /// [`Page::DEFAULT_LIMIT`], one below 1 is 1, one above
-    /// [`Page::MAX_LIMIT`] is the maximum; a missing or negative offset is 0.
+    /// [`Page::MAX_LIMIT`] is the maximum; a missing or negative offset is 0,
+    /// and one above [`Page::MAX_OFFSET`] is the maximum.
     pub fn new(limit: Option<i64>, offset: Option<i64>) -> Self {
         Self {
             limit: limit
                 .unwrap_or(Self::DEFAULT_LIMIT)
                 .clamp(1, Self::MAX_LIMIT),
-            offset: offset.unwrap_or(0).max(0),
+            offset: offset.unwrap_or(0).clamp(0, Self::MAX_OFFSET),
         }
     }
 
@@ -68,9 +73,12 @@ mod tests {
     }
 
     #[test]
-    fn offset_is_never_negative() {
+    fn offset_is_clamped_to_zero_through_ten_thousand() {
         assert_eq!(Page::new(None, Some(-1)).offset(), 0);
         assert_eq!(Page::new(None, Some(i64::MIN)).offset(), 0);
         assert_eq!(Page::new(None, Some(120)).offset(), 120);
+        assert_eq!(Page::new(None, Some(10_000)).offset(), 10_000);
+        assert_eq!(Page::new(None, Some(10_001)).offset(), 10_000);
+        assert_eq!(Page::new(None, Some(i64::MAX)).offset(), Page::MAX_OFFSET);
     }
 }

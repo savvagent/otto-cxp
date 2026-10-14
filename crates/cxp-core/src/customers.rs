@@ -1,4 +1,4 @@
-//! Customers (story S5): `CustomersExt` on `otto_tenant::Tx` — create, get,
+//! Customers: `CustomersExt` on `otto_tenant::Tx` — create, get,
 //! update, delete, list, search, resolve by id, email, or name, and the
 //! customer-360 view — with its model structs.
 
@@ -9,6 +9,7 @@ use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::contains_pattern;
 use crate::error::{on_unique, Error, Result};
 use crate::interactions::{Interaction, INTERACTION_COLS};
 use crate::paging::Page;
@@ -129,20 +130,6 @@ fn non_blank_email(email: &str) -> Result<&str> {
     Ok(email)
 }
 
-/// A `LIKE` pattern matching `q` anywhere, with its own wildcards escaped.
-fn contains_pattern(q: &str) -> String {
-    let mut out = String::with_capacity(q.len() + 2);
-    out.push('%');
-    for c in q.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('%');
-    out
-}
-
 pub trait CustomersExt {
     fn create_customer(
         &mut self,
@@ -170,7 +157,9 @@ pub trait CustomersExt {
     ) -> impl Future<Output = Result<(Vec<Customer>, i64)>> + Send;
 
     /// Customers whose email or name contains `query` (case-insensitive), or
-    /// whose name is similar to it; email matches first.
+    /// whose name is similar to it; email matches first. Neither `ILIKE` nor
+    /// the trigram `%` is leakproof, so under row-level security no index can
+    /// serve them: this scans the org's customers (#17).
     fn search_customers(
         &mut self,
         query: &str,
@@ -350,11 +339,12 @@ impl CustomersExt for Tx<'_> {
                     .into(),
             )
         };
-        // An exact (case-insensitive) name, else a single substring match of
+        // An exact (case-insensitive) name, through the stored `name_lower`
+        // and its (org_id, name_lower) index, else a single substring match of
         // the name or email. Never a fuzzy match: write tools resolve through
         // here, so a near miss must not land on the wrong customer.
         let exact: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM customers WHERE org_id = $1 AND lower(name) = lower($2) LIMIT 2",
+            "SELECT id FROM customers WHERE org_id = $1 AND name_lower = lower($2) LIMIT 2",
         )
         .bind(org)
         .bind(identifier)
