@@ -3,7 +3,7 @@
 # Postgres or with otto-factory's (15433) and otto-flags' (15434) containers.
 # Bound to loopback only: the credentials are the well-known dev ones, so the
 # port must not be reachable from the network.
-# Plain postgres:16: the schema needs only the stock pgcrypto and pg_trgm.
+# Plain postgres:16: the schema needs only the stock pg_trgm extension.
 services:
   postgres:
     image: docker.io/library/postgres:16

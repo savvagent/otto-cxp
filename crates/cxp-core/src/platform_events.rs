@@ -315,7 +315,8 @@ async fn team_deleted(db: &Db, event: &WebhookEvent, org: OrgId, team: Uuid) -> 
     // rest. That is all the lock guarantees: a write that verified the team
     // at the platform just before it was deleted, but opens its transaction
     // after this one commits, can still store the stale team_id. Accepted:
-    // readers treat a team_id the platform does not know as unowned.
+    // the window is one request, and the stale id stays until the entity is
+    // next edited.
     exclude_requests(&mut tx, org).await?;
     if !first_delivery(&mut tx, event, "team.deleted").await? {
         tx.commit().await?;

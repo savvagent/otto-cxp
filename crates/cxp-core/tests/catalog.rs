@@ -935,3 +935,39 @@ async fn verify_team_accepts_only_this_orgs_teams() {
     assert_eq!(e.code(), "unavailable");
     assert!(e.retriable());
 }
+
+/// A team verified for one org is refused in another org's transaction, on
+/// create and on update: the type carries the org it was checked for.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_team_verified_for_one_org_cannot_be_stored_in_another(pool: PgPool) {
+    let db = db(pool);
+    let platform = team_platform().await;
+    let (a, b) = (org(), org());
+    let a_team = platform.team(a).await;
+
+    let mut tx = db.begin(b).await.unwrap();
+    let e = tx
+        .create_experience(&NewExperience {
+            name: "B's".into(),
+            team: Some(a_team),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::UnknownTeam), "{e:?}");
+    drop(tx);
+
+    let mut tx = db.begin(b).await.unwrap();
+    let own = tx.create_experience(&exp("B's own")).await.unwrap();
+    let e = tx
+        .update_experience(
+            own.id,
+            &ExperienceUpdate {
+                team: TeamChange::Set(a_team),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::UnknownTeam), "{e:?}");
+}

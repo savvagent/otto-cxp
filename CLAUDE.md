@@ -151,7 +151,7 @@ reviews or status checks, so the merge gate below is on the agent.
 ### Worktree
 - path: .claude/worktrees/<branch with "/" replaced by "-">
 - bootstrap:
-  - Postgres: `podman ps --format '{{.Ports}}' | grep -q ':15435->'`; if that fails, run `podman start otto-cxp-postgres 2>/dev/null || podman run -d --name otto-cxp-postgres -e POSTGRES_USER=cxp -e POSTGRES_PASSWORD=cxp -e POSTGRES_DB=otto_cxp -p 15435:5432 docker.io/library/postgres:16` (one container shared by every worktree; `compose.yaml` describes the same one)
+  - Postgres: `podman ps --format '{{.Ports}}' | grep -q ':15435->'`; if that fails, run `podman start otto-cxp-postgres 2>/dev/null || podman run -d --name otto-cxp-postgres -e POSTGRES_USER=cxp -e POSTGRES_PASSWORD=cxp -e POSTGRES_DB=otto_cxp -p 127.0.0.1:15435:5432 docker.io/library/postgres:16` (one container shared by every worktree; `compose.yaml` describes the same one)
   - Role: `psql postgres://cxp:cxp@localhost:15435/otto_cxp -tAc "select 1 from pg_roles where rolname='otto_app'"`; if it prints nothing instead of `1`, run `psql postgres://cxp:cxp@localhost:15435/otto_cxp -c "CREATE ROLE otto_app NOLOGIN;"`
   - If the change touches a path in the pnpm gate below: `pnpm install --frozen-lockfile`
   - If you will run the server locally (the gates do not need it): `cp .env.example .env`, then fill in the platform settings it lists
@@ -216,7 +216,7 @@ Hand these to Rob with the exact command; never run them:
 
 ### Invariants
 Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
-- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete an existing one. `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only.
+- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`.
 - **Tenant isolation is RLS under `otto_app`, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot.
 - **Composite `(org_id, id)` foreign keys** between tenant tables (FK checks bypass RLS).
 - **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events` and on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`) admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker.

@@ -743,9 +743,10 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
         .chain(BOOKKEEPING_TABLES.iter())
         .map(|t| (*t, &all[..]))
         .collect();
-    // Tombstones are permanent; removed members expire only through
-    // expire_removed_members(); the migrator's ledger is not the app's.
-    expected.push(("deleted_orgs", &["SELECT", "INSERT"]));
+    // Tombstones are permanent and written by the connecting role, so a
+    // tenant transaction only reads them; removed members expire only
+    // through expire_removed_members(); the migrator's ledger is not the app's.
+    expected.push(("deleted_orgs", &["SELECT"]));
     expected.push(("removed_members", &["SELECT", "INSERT", "UPDATE"]));
     expected.push(("_sqlx_migrations", &[]));
     for (table, granted) in expected {

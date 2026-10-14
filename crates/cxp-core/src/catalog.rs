@@ -50,14 +50,29 @@ fn check_name_opt(name: &Option<String>) -> Result<()> {
 }
 
 /// A platform team id the platform has confirmed belongs to the org it was
-/// verified for. The field is private: [`verify_team`] is the only way to
-/// make one.
+/// verified for, carrying that org. The fields are private: [`verify_team`]
+/// is the only way to make one, and every catalog write refuses one verified
+/// for an org other than its transaction's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedTeam(TeamId);
+pub struct VerifiedTeam {
+    org: OrgId,
+    team: TeamId,
+}
 
 impl VerifiedTeam {
     pub fn id(&self) -> Uuid {
-        self.0.as_uuid()
+        self.team.as_uuid()
+    }
+
+    /// The team id, if it was verified for `org`; [`Error::UnknownTeam`]
+    /// otherwise, so a team checked for one org can never be stored in
+    /// another's rows.
+    fn for_org(self, org: OrgId) -> Result<Uuid> {
+        if self.org == org {
+            Ok(self.id())
+        } else {
+            Err(Error::UnknownTeam)
+        }
     }
 }
 
@@ -66,23 +81,24 @@ impl VerifiedTeam {
 /// cannot answer is [`Error::Platform`] (`unavailable`).
 ///
 /// A team deleted between this check and the write's commit can still be
-/// stored; readers treat a team id the platform no longer knows as unowned
-/// (see `platform_events`' `team.deleted`).
+/// stored; the stale id stays on the entity until someone edits it (see
+/// `platform_events`' `team.deleted`).
 pub async fn verify_team(
     platform: &PlatformClient,
     org: OrgId,
     team_id: Uuid,
 ) -> Result<VerifiedTeam> {
     match platform.team(org.as_uuid(), team_id).await? {
-        Some(team) if team.org_id == org.as_uuid() && team.id == team_id => {
-            Ok(VerifiedTeam(TeamId(team_id)))
-        }
+        Some(team) if team.org_id == org.as_uuid() && team.id == team_id => Ok(VerifiedTeam {
+            org,
+            team: TeamId(team_id),
+        }),
         _ => Err(Error::UnknownTeam),
     }
 }
 
-fn team_id(team: Option<VerifiedTeam>) -> Option<Uuid> {
-    team.map(|t| t.id())
+fn team_id(org: OrgId, team: Option<VerifiedTeam>) -> Result<Option<Uuid>> {
+    team.map(|t| t.for_org(org)).transpose()
 }
 
 /// What an update does to an entity's `team_id`.
@@ -99,12 +115,12 @@ pub enum TeamChange {
 
 impl TeamChange {
     /// `(change_team, new_value)` as bound into `SET team_id = CASE WHEN $a THEN $b ELSE team_id END`.
-    fn binds(self) -> (bool, Option<Uuid>) {
-        match self {
+    fn binds(self, org: OrgId) -> Result<(bool, Option<Uuid>)> {
+        Ok(match self {
             TeamChange::Keep => (false, None),
             TeamChange::Clear => (true, None),
-            TeamChange::Set(team) => (true, Some(team.id())),
-        }
+            TeamChange::Set(team) => (true, Some(team.for_org(org)?)),
+        })
     }
 }
 
@@ -413,7 +429,7 @@ impl CatalogExt for Tx<'_> {
         .bind(org)
         .bind(&new.name)
         .bind(&new.description)
-        .bind(team_id(new.team))
+        .bind(team_id(self.org(), new.team)?)
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
@@ -459,7 +475,7 @@ impl CatalogExt for Tx<'_> {
     ) -> Result<Experience> {
         check_name_opt(&update.name)?;
         let org = self.org();
-        let (change, team) = update.team.binds();
+        let (change, team) = update.team.binds(self.org())?;
         sqlx::query_as(&format!(
             "UPDATE experiences SET name = COALESCE($3, name), description = COALESCE($4, description), team_id = CASE WHEN $5 THEN $6 ELSE team_id END, metadata = COALESCE($7, metadata), \
              updated_at = clock_timestamp() WHERE org_id = $1 AND id = $2 RETURNING {EXPERIENCE_COLS}"
@@ -502,7 +518,7 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.platform)
         .bind(&new.description)
-        .bind(team_id(new.team))
+        .bind(team_id(self.org(), new.team)?)
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
@@ -556,7 +572,7 @@ impl CatalogExt for Tx<'_> {
     ) -> Result<Application> {
         check_name_opt(&update.name)?;
         let org = self.org();
-        let (change, team) = update.team.binds();
+        let (change, team) = update.team.binds(self.org())?;
         sqlx::query_as(&format!(
             "UPDATE applications SET name = COALESCE($3, name), platform = COALESCE($4, platform), description = COALESCE($5, description), team_id = CASE WHEN $6 THEN $7 ELSE team_id END, metadata = COALESCE($8, metadata), \
              updated_at = clock_timestamp() WHERE org_id = $1 AND id = $2 RETURNING {APPLICATION_COLS}"
@@ -602,7 +618,7 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.path)
         .bind(&new.description)
-        .bind(team_id(new.team))
+        .bind(team_id(self.org(), new.team)?)
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
@@ -649,7 +665,7 @@ impl CatalogExt for Tx<'_> {
     async fn update_page(&mut self, id: Uuid, update: &PageUpdate) -> Result<Page> {
         check_name_opt(&update.name)?;
         let org = self.org();
-        let (change, team) = update.team.binds();
+        let (change, team) = update.team.binds(self.org())?;
         sqlx::query_as(&format!(
             "UPDATE pages SET name = COALESCE($3, name), path = COALESCE($4, path), description = COALESCE($5, description), team_id = CASE WHEN $6 THEN $7 ELSE team_id END, metadata = COALESCE($8, metadata), \
              updated_at = clock_timestamp() WHERE org_id = $1 AND id = $2 RETURNING {PAGE_COLS}"
@@ -693,7 +709,7 @@ impl CatalogExt for Tx<'_> {
         .bind(&new.name)
         .bind(&new.component_type)
         .bind(&new.description)
-        .bind(team_id(new.team))
+        .bind(team_id(self.org(), new.team)?)
         .bind(&new.metadata)
         .fetch_one(self.conn())
         .await
@@ -741,7 +757,7 @@ impl CatalogExt for Tx<'_> {
     async fn update_component(&mut self, id: Uuid, update: &ComponentUpdate) -> Result<Component> {
         check_name_opt(&update.name)?;
         let org = self.org();
-        let (change, team) = update.team.binds();
+        let (change, team) = update.team.binds(self.org())?;
         sqlx::query_as(&format!(
             "UPDATE components SET name = COALESCE($3, name), component_type = COALESCE($4, component_type), description = COALESCE($5, description), team_id = CASE WHEN $6 THEN $7 ELSE team_id END, metadata = COALESCE($8, metadata), \
              updated_at = clock_timestamp() WHERE org_id = $1 AND id = $2 RETURNING {COMPONENT_COLS}"

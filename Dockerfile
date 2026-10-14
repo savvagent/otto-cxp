@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Both base images are pinned by digest (the multi-arch index) so a rebuild
 # uses exactly the bytes that were reviewed; the tag each digest was read from
 # is in the comment. Bump them deliberately, together with a re-read of each

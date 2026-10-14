@@ -308,6 +308,10 @@ CREATE TABLE tickets (
 );
 
 CREATE INDEX tickets_org_created_idx ON tickets (org_id, created_at DESC);
+-- Not a filter (enum `=` is not leakproof, so under RLS it cannot drive an
+-- index lookup): it lets the dashboard's count-by-status aggregates run as
+-- index-only scans instead of reading the table.
+CREATE INDEX tickets_org_status_idx ON tickets (org_id, status);
 -- A customer's tickets, newest first (the 360 view), and the FK's cover.
 CREATE INDEX tickets_org_customer_idx ON tickets (org_id, customer_id, created_at DESC);
 CREATE INDEX tickets_org_experience_idx ON tickets (org_id, experience_id);
@@ -335,8 +339,8 @@ CREATE TABLE knowledge_articles (
   UNIQUE (org_id, id)
 );
 
--- Listing, newest first, optionally only published (search reads the org's
--- published articles through the second).
+-- Listing, newest first, optionally only published. Under RLS the planner
+-- may serve search from either; neither drives the text match (#17).
 CREATE INDEX knowledge_articles_org_created_idx ON knowledge_articles (org_id, created_at DESC);
 CREATE INDEX knowledge_articles_org_published_idx
   ON knowledge_articles (org_id, published, created_at DESC);
@@ -668,7 +672,7 @@ BEGIN
     --   connecting role at boot. sqlx creates it before running any
     --   migration, so it exists here; the guard only keeps this file
     --   runnable by hand on a database that lacks it.
-    EXECUTE 'REVOKE UPDATE, DELETE ON deleted_orgs FROM otto_app';
+    EXECUTE 'REVOKE INSERT, UPDATE, DELETE ON deleted_orgs FROM otto_app';
     EXECUTE 'REVOKE DELETE ON removed_members FROM otto_app';
     IF to_regclass('public._sqlx_migrations') IS NOT NULL THEN
       EXECUTE 'REVOKE ALL ON public._sqlx_migrations FROM otto_app';

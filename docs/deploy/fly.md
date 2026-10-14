@@ -32,7 +32,7 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   delayed, never lost; the platform's usage totals can trail by up to the idle period.
 - **Database** `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with `otto_platform`,
   `otto_factory`, and `otto_flags`. Plain Postgres 16 is enough: pgvector is NOT needed (the
-  schema uses only the stock `pgcrypto` and `pg_trgm`). The attach role is a superuser on the
+  schema uses only the stock `pg_trgm`). The attach role is a superuser on the
   whole instance, so isolation inside this database rests on row-level security under
   `SET LOCAL ROLE otto_app`, which `cxp-server` proves at boot
   (`tenant isolation enforced as role "otto_app"`) and refuses to start without.
