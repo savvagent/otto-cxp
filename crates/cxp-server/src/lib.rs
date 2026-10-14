@@ -29,7 +29,7 @@ use otto_resource::{ClientConfig, PlatformClient};
 use otto_tenant::Db;
 use tower_http::trace::TraceLayer;
 
-pub use boot::{run, Boot, PlatformCheck};
+pub use boot::{run, run_with, Boot, PlatformCheck};
 pub use config::{Config, LogFormat};
 
 /// The one client every platform call goes through (it holds the caches).

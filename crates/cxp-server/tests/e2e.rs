@@ -1804,9 +1804,19 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     );
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = cxp_server::run(config, listener, async move {
-        let _ = stopped.await;
-    });
+    let server = cxp_server::run_with(
+        config,
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        // No periodic pass during the test: what the platform receives can
+        // only come from the flush on the way out.
+        cxp_core::usage::ShipperConfig {
+            poll: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -1837,8 +1847,8 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
                 "{name}: {v}"
             );
         }
-        // The shipper polls every 5 s; nothing has shipped it yet, so what
-        // arrives below was sent by the flush on the way out.
+        // The shipper's poll is an hour here; nothing has shipped it yet, so
+        // what arrives below was sent by the flush on the way out.
         assert!(mock.lock().unwrap().received.is_empty());
         stop.send(()).unwrap();
         mock

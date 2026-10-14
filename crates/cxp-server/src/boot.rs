@@ -119,6 +119,21 @@ pub async fn run<F>(config: Config, listener: TcpListener, shutdown: F) -> Resul
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    run_with(config, listener, shutdown, ShipperConfig::default()).await
+}
+
+/// [`run`] with the usage shipper's settings given, so a test can stretch its
+/// poll interval and attribute what the platform receives to the final flush
+/// rather than to a periodic pass racing the test.
+pub async fn run_with<F>(
+    config: Config,
+    listener: TcpListener,
+    shutdown: F,
+    shipper_config: ShipperConfig,
+) -> Result<Boot>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .acquire_timeout(Duration::from_secs(5))
@@ -157,7 +172,7 @@ where
     let mut shipper = tokio::spawn(cxp_core::usage::run(
         db.clone(),
         platform,
-        ShipperConfig::default(),
+        shipper_config,
         stopped.clone(),
     ));
     let mut sweeper = tokio::spawn(sweep_loop(db, stopped));
