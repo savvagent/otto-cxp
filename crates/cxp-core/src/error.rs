@@ -77,7 +77,9 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
-const INTERNAL_MESSAGE: &str =
+/// What a caller is told of any server-side failure. Shared by every surface
+/// so the wording cannot drift.
+pub const INTERNAL_MESSAGE: &str =
     "otto-cxp hit an internal error; retry, and report it if it persists";
 
 fn database_message(e: &sqlx::Error) -> &'static str {

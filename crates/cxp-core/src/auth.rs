@@ -224,6 +224,84 @@ pub fn www_authenticate(public_url: &str, failure: &AuthFailure) -> String {
     }
 }
 
+/// The `WWW-Authenticate` value for a `403` `insufficient_scope` (RFC 6750
+/// §3.1): the scope the token lacks, so the client can re-authorize for it.
+pub fn scope_challenge(scope: &str) -> String {
+    format!(
+        r#"Bearer realm="{}", error="insufficient_scope", scope="{scope}""#,
+        scopes::RESOURCE_NAME
+    )
+}
+
+/// A refusal of an HTTP request, free of any web framework: the status, the
+/// headers, and the JSON body. `cxp-mcp` and `cxp-api` each only convert it
+/// into their framework's response, so the `401`/`503` contract has one
+/// definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// Lowercase header names, values already checked to be visible ASCII.
+    pub headers: Vec<(&'static str, String)>,
+    pub body: serde_json::Value,
+}
+
+impl Refusal {
+    /// The `WWW-Authenticate` value, if this refusal carries one (every `401`
+    /// does; a `503` does not).
+    pub fn www_authenticate(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| *name == "www-authenticate")
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// The `Retry-After` seconds sent with a `503`.
+pub const RETRY_AFTER_SECONDS: &str = "5";
+
+/// Visible ASCII (and space) only: what a header value built here may hold.
+fn header_safe(value: &str) -> bool {
+    value.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+/// The refusal for a request that was not authenticated.
+///
+/// - [`AuthFailure::Missing`]: `401`, a challenge with no `error` (RFC 6750
+///   §3.1), body `error` `unauthenticated`.
+/// - [`AuthFailure::Inactive`] and [`AuthFailure::Revoked`]: `401`, challenge
+///   `error="invalid_token"`, body `error` `invalid_token`.
+/// - [`AuthFailure::Unavailable`]: `503` with `Retry-After: 5` and no
+///   challenge, body `error` `unavailable`. Never `401`.
+///
+/// Should a misconfigured `public_url` make the challenge unfit for a header,
+/// the bare `Bearer realm` is sent rather than no challenge at all.
+pub fn refusal(public_url: &str, failure: &AuthFailure) -> Refusal {
+    let (status, error) = match failure {
+        AuthFailure::Missing => (401, "unauthenticated"),
+        AuthFailure::Inactive | AuthFailure::Revoked => (401, "invalid_token"),
+        AuthFailure::Unavailable => (503, "unavailable"),
+    };
+    let headers = if failure.is_unavailable() {
+        vec![("retry-after", RETRY_AFTER_SECONDS.to_string())]
+    } else {
+        let challenge = www_authenticate(public_url, failure);
+        let challenge = if header_safe(&challenge) {
+            challenge
+        } else {
+            format!(r#"Bearer realm="{}""#, scopes::RESOURCE_NAME)
+        };
+        vec![("www-authenticate", challenge)]
+    };
+    Refusal {
+        status,
+        headers,
+        body: serde_json::json!({
+            "error": error,
+            "error_description": failure.reason(),
+        }),
+    }
+}
+
 /// The RFC 9728 protected-resource metadata document served at
 /// `/.well-known/oauth-protected-resource`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -357,6 +435,96 @@ mod tests {
                 "scopes_supported": ["cxp:read", "cxp:write"],
                 "bearer_methods_supported": ["header"],
             })
+        );
+    }
+
+    #[test]
+    fn a_missing_token_is_401_unauthenticated_with_no_error_in_the_challenge() {
+        let r = refusal("https://cxp.example.com/", &AuthFailure::Missing);
+        assert_eq!(r.status, 401);
+        assert_eq!(r.headers.len(), 1);
+        let (name, value) = &r.headers[0];
+        assert_eq!(*name, "www-authenticate");
+        assert!(!value.contains("error"), "{value}");
+        assert!(
+            value.contains(
+                r#"resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#
+            ),
+            "{value}"
+        );
+        assert_eq!(r.body["error"], "unauthenticated");
+        assert_eq!(r.body["error_description"], AuthFailure::Missing.reason());
+    }
+
+    #[test]
+    fn inactive_and_revoked_are_401_invalid_token() {
+        for f in [AuthFailure::Inactive, AuthFailure::Revoked] {
+            let r = refusal("https://cxp.example.com", &f);
+            assert_eq!(r.status, 401);
+            let (name, value) = &r.headers[0];
+            assert_eq!(*name, "www-authenticate");
+            assert!(value.contains(r#"error="invalid_token""#), "{value}");
+            assert!(value.contains("resource_metadata="), "{value}");
+            assert_eq!(r.body["error"], "invalid_token");
+            assert_eq!(r.body["error_description"], f.reason());
+        }
+    }
+
+    #[test]
+    fn an_outage_is_503_with_retry_after_and_no_challenge() {
+        let r = refusal("https://cxp.example.com", &AuthFailure::Unavailable);
+        assert_eq!(r.status, 503);
+        assert_eq!(r.headers, vec![("retry-after", "5".to_string())]);
+        assert_eq!(r.body["error"], "unavailable");
+        assert_eq!(
+            r.body["error_description"],
+            AuthFailure::Unavailable.reason()
+        );
+    }
+
+    #[test]
+    fn a_public_url_unfit_for_a_header_still_yields_a_challenge() {
+        let r = refusal("https://cxp.example.com/\n\u{e9}", &AuthFailure::Missing);
+        assert_eq!(r.status, 401);
+        assert_eq!(
+            r.headers,
+            vec![("www-authenticate", r#"Bearer realm="otto-cxp""#.to_string())]
+        );
+    }
+
+    #[test]
+    fn every_header_value_built_here_is_header_safe() {
+        let hostile = "https://cxp.example.com/\n\u{e9}";
+        let mut values = vec![scope_challenge("cxp:write")];
+        for url in ["https://cxp.example.com/", hostile] {
+            for f in [
+                AuthFailure::Missing,
+                AuthFailure::Inactive,
+                AuthFailure::Revoked,
+                AuthFailure::Unavailable,
+            ] {
+                values.extend(refusal(url, &f).headers.into_iter().map(|(_, v)| v));
+            }
+        }
+        for v in values {
+            assert!(header_safe(&v), "{v:?}");
+        }
+        let fallback = refusal(hostile, &AuthFailure::Revoked);
+        assert_eq!(
+            fallback.www_authenticate(),
+            Some(r#"Bearer realm="otto-cxp""#)
+        );
+        assert_eq!(
+            refusal("https://x", &AuthFailure::Unavailable).www_authenticate(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_scope_challenge_names_the_missing_scope() {
+        assert_eq!(
+            scope_challenge("cxp:write"),
+            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
         );
     }
 }

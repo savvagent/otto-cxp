@@ -44,41 +44,19 @@ pub(crate) async fn require_bearer(
     }
 }
 
-/// The response for a request that was not authenticated.
+/// The response for a request that was not authenticated: the shared
+/// [`cxp_core::auth::refusal`] as an axum response.
 pub(crate) fn refuse(public_url: &str, failure: AuthFailure) -> Response {
-    if failure.is_unavailable() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(http::header::RETRY_AFTER, "5")],
-            Json(serde_json::json!({
-                "error": "temporarily_unavailable",
-                "error_description": failure.reason(),
-            })),
-        )
-            .into_response();
+    let refusal = cxp_core::auth::refusal(public_url, &failure);
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED);
+    let mut response = (status, Json(refusal.body)).into_response();
+    for (name, value) in refusal.headers {
+        let value = http::HeaderValue::from_str(&value)
+            .expect("cxp_core::auth guarantees header-safe values");
+        response
+            .headers_mut()
+            .insert(http::HeaderName::from_static(name), value);
     }
-    let mut response = (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": "invalid_token",
-            "error_description": failure.reason(),
-        })),
-    )
-        .into_response();
-    let challenge = cxp_core::auth::www_authenticate(public_url, &failure);
-    // A header that fails to build would drop the discovery pointer and leave
-    // the client with a bare 401 it cannot act on, so fall back to the
-    // pointer alone rather than to nothing.
-    let value = http::HeaderValue::from_str(&challenge).unwrap_or_else(|_| {
-        http::HeaderValue::from_str(&format!(
-            r#"Bearer resource_metadata="{}""#,
-            cxp_core::auth::metadata_url(public_url)
-        ))
-        .unwrap_or_else(|_| http::HeaderValue::from_static("Bearer"))
-    });
-    response
-        .headers_mut()
-        .insert(http::header::WWW_AUTHENTICATE, value);
     response
 }
 
@@ -110,6 +88,7 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(h.starts_with("Bearer "), "{h}");
+        assert!(!h.contains("error="), "{h}");
         assert!(
             h.contains(
                 r#"resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#

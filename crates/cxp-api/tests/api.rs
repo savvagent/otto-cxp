@@ -394,7 +394,7 @@ async fn a_platform_outage_is_503_never_401(pool: PgPool) {
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.headers["retry-after"], "5");
     assert!(r.headers.get("www-authenticate").is_none());
-    assert_eq!(r.body["error"], "temporarily_unavailable");
+    assert_eq!(r.body["error"], "unavailable");
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
