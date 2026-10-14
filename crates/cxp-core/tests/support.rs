@@ -113,23 +113,53 @@ async fn ticket_lifecycle(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn resolving_through_update_stamps_resolved_at(pool: PgPool) {
+async fn resolved_at_follows_status(pool: PgPool) {
     let db = db(pool);
     let org = org();
     let cust = customer(&db, org).await;
     let mut tx = db.begin(org).await.unwrap();
+    let status = |s: &str| TicketUpdate {
+        status: Some(s.into()),
+        ..Default::default()
+    };
     let t = tx.create_ticket(&new_ticket(cust, "x")).await.unwrap();
-    let r = tx
+
+    let resolved = tx.update_ticket(t.id, &status("resolved")).await.unwrap();
+    let first = resolved.resolved_at.expect("resolve stamps resolved_at");
+
+    // Closing after resolving, by either route, keeps the first time.
+    let closed = tx.close_ticket(t.id).await.unwrap();
+    assert_eq!(
+        (closed.status.as_str(), closed.resolved_at),
+        ("closed", Some(first))
+    );
+    let again = tx.update_ticket(t.id, &status("closed")).await.unwrap();
+    assert_eq!(again.resolved_at, Some(first));
+    // An update that leaves status alone keeps it too.
+    let tagged = tx
         .update_ticket(
             t.id,
             &TicketUpdate {
-                status: Some("resolved".into()),
+                tags: Some(vec!["a".into()]),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-    assert!(r.resolved_at.is_some());
+    assert_eq!(tagged.resolved_at, Some(first));
+
+    // Reopening clears it; resolving again stamps a new time.
+    for s in ["open", "in_progress", "waiting"] {
+        tx.update_ticket(t.id, &status("resolved")).await.unwrap();
+        let r = tx.update_ticket(t.id, &status(s)).await.unwrap();
+        assert_eq!((r.status.as_str(), r.resolved_at), (s, None));
+    }
+    let again = tx.update_ticket(t.id, &status("resolved")).await.unwrap();
+    assert!(again.resolved_at.unwrap() > first);
+
+    // Closing a never-resolved ticket stamps it.
+    let u = tx.create_ticket(&new_ticket(cust, "y")).await.unwrap();
+    assert!(tx.close_ticket(u.id).await.unwrap().resolved_at.is_some());
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -163,6 +193,10 @@ async fn bad_enum_values_are_invalid_not_internal(pool: PgPool) {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("in_progress"), "{e}");
+    assert!(
+        !e.to_string().contains("done"),
+        "caller text is not echoed: {e}"
+    );
     let e = tx
         .list_tickets(
             &TicketFilter {
@@ -398,7 +432,7 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
     );
     assert!(!titles.contains(&"Shipping"));
 
-    // Stemming: "shipping" finds "ship"; title substring finds the rest.
+    // Stemming: "ships" matches "ship"; a title substring matches too.
     assert_eq!(tx.search_articles("ships").await.unwrap().len(), 1);
     assert_eq!(tx.search_articles("Account sec").await.unwrap().len(), 1);
     assert!(tx.search_articles("zebra").await.unwrap().is_empty());
@@ -407,6 +441,50 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
     assert_eq!(pct.len(), 1);
     assert_eq!(pct[0].id, ids["100% off"]);
     assert!(tx.search_articles("_").await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: PgPool) {
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    for (title, content) in [
+        (
+            "Billing",
+            "A refund can be requested within a month of purchase",
+        ),
+        ("Refund policy", "refund refund refund"),
+    ] {
+        let a = tx
+            .create_article(&NewArticle {
+                title: title.into(),
+                content: content.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tx.update_article(
+            a.id,
+            &ArticleUpdate {
+                published: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let found = tx.search_articles("refund").await.unwrap();
+    let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
+    assert_eq!(titles, ["Refund policy", "Billing"]);
+
+    for bad in ["", "   ".to_string().as_str(), &"x".repeat(201)] {
+        let e = tx.search_articles(bad).await.unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{e:?}");
+    }
+    assert!(tx
+        .search_articles(&"x".repeat(200))
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -610,13 +688,13 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
     drop(tx);
 
     // A ticket or chat session for another org's customer is refused.
-    for _ in 0..2 {
-        let mut tx = db.begin(b).await.unwrap();
-        not_found(tx.create_ticket(&new_ticket(cust_a, "x")).await, "customer");
-        drop(tx);
-        let mut tx = db.begin(b).await.unwrap();
-        not_found(tx.start_chat_session(cust_a).await, "customer");
-    }
+    // Each in its own transaction, since a refusal aborts it.
+    let mut tx = db.begin(b).await.unwrap();
+    not_found(tx.create_ticket(&new_ticket(cust_a, "x")).await, "customer");
+    drop(tx);
+    let mut tx = db.begin(b).await.unwrap();
+    not_found(tx.start_chat_session(cust_a).await, "customer");
+    drop(tx);
     // Org B's own customer still works.
     let mut tx = db.begin(b).await.unwrap();
     tx.create_ticket(&new_ticket(cust_b, "mine")).await.unwrap();

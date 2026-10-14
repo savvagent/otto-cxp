@@ -5,7 +5,7 @@ use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{on_foreign_key, Error, Result};
+use crate::error::{Error, Result};
 use crate::paging::Page;
 
 /// Valid `ticket_status` values.
@@ -54,7 +54,12 @@ pub struct NewTicket {
     pub channel: Option<String>,
 }
 
-/// Fields to change on a ticket; `None` leaves a field as it is.
+/// Fields to change on a ticket; `None` leaves a field as it is, so a field
+/// cannot be cleared once set.
+///
+/// `resolved_at` follows `status`: moving to `resolved` or `closed` stamps it
+/// only if unset (the first resolve time is kept), and moving to `open`,
+/// `in_progress` or `waiting` clears it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TicketUpdate {
@@ -79,12 +84,40 @@ pub struct TicketFilter {
     pub component_id: Option<Uuid>,
 }
 
+/// The row kind a foreign-key violation on `constraint` names, by the exact generated constraint names of `tickets`. `None` for any other name.
+fn fk_kind(constraint: &str) -> Option<&'static str> {
+    Some(match constraint {
+        "tickets_org_id_customer_id_fkey" => "customer",
+        "tickets_org_id_experience_id_fkey" => "experience",
+        "tickets_org_id_application_id_fkey" => "application",
+        "tickets_org_id_page_id_fkey" => "page",
+        "tickets_org_id_component_id_fkey" => "component",
+        _ => return None,
+    })
+}
+
+/// A foreign-key violation is `NotFound` of the kind its constraint names; one
+/// this module does not recognise is an internal `Database` error, never a
+/// guessed kind. The constraint name is never shown.
+fn map_fk(e: sqlx::Error) -> Error {
+    let kind = match &e {
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+            db.constraint().and_then(fk_kind)
+        }
+        _ => None,
+    };
+    match kind {
+        Some(kind) => Error::NotFound { kind },
+        None => Error::Database(e),
+    }
+}
+
 fn check_enum(what: &str, value: &str, allowed: &[&str]) -> Result<()> {
     if allowed.contains(&value) {
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "{what} must be one of {}; got \"{value}\"",
+            "{what} must be one of {}",
             allowed.join(", ")
         )))
     }
@@ -117,7 +150,7 @@ pub trait TicketsExt {
         page: Page,
     ) -> impl std::future::Future<Output = Result<(Vec<Ticket>, i64)>> + Send;
 
-    /// Set status `closed` and stamp `resolved_at`.
+    /// Set status `closed`; `resolved_at` is stamped only if unset.
     fn close_ticket(
         &mut self,
         id: Uuid,
@@ -156,7 +189,7 @@ impl TicketsExt for Tx<'_> {
         .bind(&new.channel)
         .fetch_one(self.conn())
         .await
-        .map_err(|e| on_foreign_key(e, || Error::NotFound { kind: "customer" }))
+        .map_err(map_fk)
     }
 
     async fn get_ticket(&mut self, id: Uuid) -> Result<Ticket> {
@@ -183,8 +216,11 @@ impl TicketsExt for Tx<'_> {
                subject = COALESCE($6, subject), \
                description = COALESCE($7, description), \
                tags = COALESCE($8, tags), \
-               resolved_at = CASE WHEN $3::text IN ('resolved', 'closed') \
-                                  THEN COALESCE(resolved_at, clock_timestamp()) ELSE resolved_at END, \
+               resolved_at = CASE \
+                 WHEN $3::text IN ('resolved', 'closed') \
+                   THEN COALESCE(resolved_at, clock_timestamp()) \
+                 WHEN $3::text IS NOT NULL THEN NULL \
+                 ELSE resolved_at END, \
                updated_at = clock_timestamp() \
              WHERE org_id = $1 AND id = $2 \
              RETURNING {TICKET_COLS}"
@@ -244,7 +280,7 @@ impl TicketsExt for Tx<'_> {
     async fn close_ticket(&mut self, id: Uuid) -> Result<Ticket> {
         let org = self.org();
         sqlx::query_as(&format!(
-            "UPDATE tickets SET status = 'closed', resolved_at = clock_timestamp(), updated_at = clock_timestamp() \
+            "UPDATE tickets SET status = 'closed', resolved_at = COALESCE(resolved_at, clock_timestamp()), updated_at = clock_timestamp() \
              WHERE org_id = $1 AND id = $2 RETURNING {TICKET_COLS}"
         ))
         .bind(org)
@@ -265,5 +301,74 @@ impl TicketsExt for Tx<'_> {
             return Err(Error::NotFound { kind: "ticket" });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[derive(Debug)]
+    struct Fk(Option<&'static str>);
+
+    impl std::fmt::Display for Fk {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("foreign key violation")
+        }
+    }
+    impl std::error::Error for Fk {}
+    impl sqlx::error::DatabaseError for Fk {
+        fn message(&self) -> &str {
+            "foreign key violation"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("23503"))
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.0
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::ForeignKeyViolation
+        }
+    }
+
+    fn fk(name: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(Fk(name)))
+    }
+
+    #[test]
+    fn known_constraints_name_their_kind() {
+        for (name, kind) in [
+            ("tickets_org_id_customer_id_fkey", "customer"),
+            ("tickets_org_id_experience_id_fkey", "experience"),
+            ("tickets_org_id_application_id_fkey", "application"),
+            ("tickets_org_id_page_id_fkey", "page"),
+            ("tickets_org_id_component_id_fkey", "component"),
+        ] {
+            let e = map_fk(fk(Some(name)));
+            assert!(
+                matches!(e, Error::NotFound { kind: k } if k == kind),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_missing_constraint_is_internal_never_a_guessed_kind() {
+        for name in [Some("some_other_fkey"), None] {
+            let e = map_fk(fk(name));
+            assert!(matches!(e, Error::Database(_)), "{e:?}");
+            assert_eq!(e.code(), "internal");
+        }
     }
 }

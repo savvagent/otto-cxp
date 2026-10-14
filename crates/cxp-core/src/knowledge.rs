@@ -10,6 +10,8 @@ use crate::paging::Page;
 
 /// Most articles a search returns.
 pub const SEARCH_LIMIT: i64 = 20;
+/// Longest search query, in characters.
+pub const MAX_QUERY_CHARS: usize = 200;
 
 const ARTICLE_COLS: &str =
     "id, title, content, category, tags, metadata, published, created_at, updated_at";
@@ -39,7 +41,8 @@ pub struct NewArticle {
     pub tags: Vec<String>,
 }
 
-/// Fields to change on an article; `None` leaves a field as it is.
+/// Fields to change on an article; `None` leaves a field as it is, so a field
+/// cannot be cleared once set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArticleUpdate {
@@ -76,7 +79,8 @@ pub trait KnowledgeExt {
     ) -> impl std::future::Future<Output = Result<KnowledgeArticle>> + Send;
 
     /// Full-text search over published articles, best match first, at most
-    /// [`SEARCH_LIMIT`].
+    /// [`SEARCH_LIMIT`]. An empty query, or one over [`MAX_QUERY_CHARS`], is
+    /// `Invalid`.
     fn search_articles(
         &mut self,
         query: &str,
@@ -102,8 +106,9 @@ impl KnowledgeExt for Tx<'_> {
     async fn create_article(&mut self, new: &NewArticle) -> Result<KnowledgeArticle> {
         let org = self.org();
         Ok(sqlx::query_as(&format!(
-            "INSERT INTO knowledge_articles (org_id, title, content, category, tags) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING {ARTICLE_COLS}"
+            "INSERT INTO knowledge_articles \
+               (org_id, title, content, category, tags, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, clock_timestamp(), clock_timestamp()) RETURNING {ARTICLE_COLS}"
         ))
         .bind(org)
         .bind(&new.title)
@@ -127,6 +132,15 @@ impl KnowledgeExt for Tx<'_> {
     }
 
     async fn search_articles(&mut self, query: &str) -> Result<Vec<KnowledgeArticle>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(Error::Invalid("query must not be empty".into()));
+        }
+        if query.chars().count() > MAX_QUERY_CHARS {
+            return Err(Error::Invalid(format!(
+                "query must be at most {MAX_QUERY_CHARS} characters"
+            )));
+        }
         let org = self.org();
         Ok(sqlx::query_as(&format!(
             "SELECT {ARTICLE_COLS} FROM knowledge_articles \
@@ -184,7 +198,7 @@ impl KnowledgeExt for Tx<'_> {
             "UPDATE knowledge_articles SET \
                title = COALESCE($3, title), content = COALESCE($4, content), \
                category = COALESCE($5, category), tags = COALESCE($6, tags), \
-               published = COALESCE($7, published), updated_at = now() \
+               published = COALESCE($7, published), updated_at = clock_timestamp() \
              WHERE org_id = $1 AND id = $2 RETURNING {ARTICLE_COLS}"
         ))
         .bind(org)
