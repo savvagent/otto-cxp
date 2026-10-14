@@ -276,6 +276,20 @@ async fn no_token_is_a_401_naming_the_metadata_document(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_cookie_alone_is_not_a_credential_on_mcp(pool: PgPool) {
+    let h = harness(pool).await;
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (s0, h0, v0) = h.send(Harness::post(None, body.clone())).await;
+    let mut req = Harness::post(None, body);
+    req.headers_mut()
+        .insert("cookie", "session=abc; otto_session=abc".parse().unwrap());
+    let (status, headers, v) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!((status, &v), (s0, &v0));
+    assert_eq!(headers["www-authenticate"], h0["www-authenticate"]);
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn inactive_and_wrong_audience_tokens_are_401(pool: PgPool) {
     let h = harness(pool).await;
     let unknown = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());

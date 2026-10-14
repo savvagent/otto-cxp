@@ -62,8 +62,11 @@ Shape (`crates/cxp-http/src/lib.rs`):
 
 - `Authenticator { db, platform, public_url }`, used as middleware state.
   `Authenticator::authenticate(&HeaderMap) -> Result<Principal, AuthFailure>`
-  is the single seam where a request's credential is read; a session-cookie
-  source (#14) extends that method and both surfaces get it. The two other
+  is the single seam where a request's credential is read. A session-cookie
+  source (#14) is opt-in per surface, like `challenge_handler_401()`: it is
+  enabled for cxp-api only, with a same-origin check on writes, and `/mcp`
+  stays bearer-only (a browser attaches cookies on its own, so a cookie on
+  `/mcp` would be CSRF-exposed and breaks the Auth invariant). The two other
   consumers of the result (`require_bearer`, `refuse`) do not change.
 - `Authenticator::challenge_handler_401()` turns on cxp-api's behaviour of
   adding the revoked-token challenge to a handler's bare `401`.

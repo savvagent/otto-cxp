@@ -17,8 +17,11 @@
 //!   misconfiguration no retry can fix, logged at `error`.
 //!
 //! The one place a request's credential becomes a [`Principal`] is
-//! [`Authenticator::authenticate`]; a further credential source (a session
-//! cookie for the console) is added there, and both surfaces pick it up.
+//! [`Authenticator::authenticate`]. A further credential source (a session
+//! cookie for the console) is opt-in per surface, like
+//! [`Authenticator::challenge_handler_401`]: only `/api` enables it, with a
+//! same-origin check on writes. `/mcp` stays bearer-only, so a cookie a
+//! browser attaches on its own can never authenticate an MCP call.
 //!
 //! The protected-resource metadata document (RFC 9728) is served by
 //! [`protected_resource_router`], which the binary mounts: the `401`s of every
@@ -69,7 +72,8 @@ impl Authenticator {
     }
 
     /// The credential in `headers`, checked. Today that is the bearer token
-    /// in `Authorization`.
+    /// in `Authorization`; any further source must be switched on per surface
+    /// (see the crate docs), never for every caller of this method.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthFailure> {
         let authorization = headers
             .get(header::AUTHORIZATION)
@@ -107,7 +111,7 @@ pub async fn require_bearer(
 
 /// The response for a request that was not authenticated: the shared
 /// [`auth::refusal`] as an axum response.
-pub fn refuse(public_url: &str, failure: AuthFailure) -> Response {
+pub(crate) fn refuse(public_url: &str, failure: AuthFailure) -> Response {
     let refusal = auth::refusal(public_url, &failure);
     let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED);
     let mut response = (status, Json(refusal.body)).into_response();
@@ -205,5 +209,9 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["resource"], "https://cxp.example.com/mcp");
         assert_eq!(doc["authorization_servers"][0], "https://p.example.com");
+        assert_eq!(
+            doc["scopes_supported"],
+            serde_json::json!(["cxp:read", "cxp:write"])
+        );
     }
 }

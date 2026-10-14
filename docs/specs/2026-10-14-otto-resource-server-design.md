@@ -90,7 +90,7 @@ One binary, `cxp-server`, on `:8080` (`CXP_BIND`), serving:
 | Path | Crate | Auth |
 |---|---|---|
 | `/healthz`, `/readyz` | cxp-server | none |
-| `/.well-known/oauth-protected-resource` | cxp-mcp | none |
+| `/.well-known/oauth-protected-resource` | cxp-http (mounted by cxp-server) | none |
 | `/mcp` (streamable HTTP, stateless, JSON responses) | cxp-mcp | bearer token |
 | `/api/v1/...` | cxp-api | bearer token |
 | `/platform/webhooks` | cxp-api | `Otto-Signature` HMAC |
@@ -98,11 +98,12 @@ One binary, `cxp-server`, on `:8080` (`CXP_BIND`), serving:
 ### Workspace
 
 ```
-Cargo.toml              workspace; members crates/cxp-{core,mcp,api,server}
+Cargo.toml              workspace; members crates/cxp-{core,http,mcp,api,server}
 rust-toolchain.toml     stable, rustfmt + clippy
 compose.yaml            postgres:16 on 15435 (cxp/cxp/otto_cxp)
 crates/cxp-core         all SQL, domain logic, tenancy, auth core, metering, lifecycle
-crates/cxp-mcp          rmcp =2.0.0 server, tools, resources, prompts, /mcp + metadata routes
+crates/cxp-http         axum auth adapter shared by /mcp and /api (require_bearer, refuse), metadata route
+crates/cxp-mcp          rmcp =2.0.0 server, tools, resources, prompts, /mcp route
 crates/cxp-api          REST /api/v1, /platform/webhooks
 crates/cxp-server       binary: config, boot, health, background tasks, router, e2e tests
 ```
@@ -285,7 +286,7 @@ pub fn www_authenticate(public_url: &str, failure: &AuthFailure) -> String;
 pub fn metadata(resource_uri: &str, platform_url: &str) -> ProtectedResourceMetadata;
 ```
 
-HTTP mapping (in cxp-mcp and cxp-api middleware, ~40 lines each): `Missing`/`Inactive`/`Revoked`
+HTTP mapping (once, in `cxp-http`, as `require_bearer` middleware shared by cxp-mcp and cxp-api): `Missing`/`Inactive`/`Revoked`
 → 401 + `WWW-Authenticate` + JSON body `{error, error_description}`; `Unavailable` → 503 +
 `Retry-After: 5`; `Internal` → 500 (`error` `internal`), no `Retry-After`, logged at error. The audience is `CXP_RESOURCE_URI` and is never derived from `Host`.
 
@@ -350,7 +351,7 @@ with `#[tool_router(router = …)]` per file, combined in `tools/mod.rs`; `tools
 `quota_exceeded`, `unavailable`, `internal` (no database text). Resources (3) and prompts (4)
 ported; resources need read scope; `metrics://dashboard` calls `DashboardExt` (S8). `lib.rs` exposes `Config { public_url, resource_uri,
 platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Result<Router, NoAllowedHosts>`
-that mounts `/mcp` behind `require_bearer` and the open metadata route, refusing an empty
+that mounts `/mcp` behind `cxp_http::require_bearer` (the open metadata route is `cxp_http`'s, mounted by cxp-server), refusing an empty
 `allowed_hosts` (rmcp reads one as "accept any Host").
 
 ### REST (`cxp-api`, S10)
