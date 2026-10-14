@@ -156,6 +156,21 @@
     "offset": 0,
     "total": 1
   },
+  "customerMinimal": {
+    "applicationId": null,
+    "company": null,
+    "componentId": null,
+    "createdAt": "2026-10-01T12:30:00Z",
+    "email": "min@example.com",
+    "experienceId": null,
+    "id": "00000000-0000-0000-0000-00000000001e",
+    "metadata": {},
+    "name": null,
+    "pageId": null,
+    "phone": null,
+    "tags": [],
+    "updatedAt": "2026-10-01T12:30:00Z"
+  },
   "dashboardMetrics": {
     "open_tickets": 1,
     "total_customers": 1,
@@ -370,5 +385,24 @@
     "limit": 25,
     "offset": 0,
     "total": 1
+  },
+  "ticketOpen": {
+    "applicationId": null,
+    "assignedTo": null,
+    "channel": null,
+    "componentId": null,
+    "createdAt": "2026-10-03T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-00000000001e",
+    "description": null,
+    "experienceId": null,
+    "id": "00000000-0000-0000-0000-00000000001f",
+    "metadata": {},
+    "pageId": null,
+    "priority": "medium",
+    "resolvedAt": null,
+    "status": "open",
+    "subject": "Open",
+    "tags": [],
+    "updatedAt": "2026-10-03T12:30:00Z"
   }
 }

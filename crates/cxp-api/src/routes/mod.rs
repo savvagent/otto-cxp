@@ -1,6 +1,9 @@
 //! The `/api/v1` handlers, one module per resource.
-//! Request bodies and query parameters keep their snake_case names; response
-//! models are camelCase (the `cxp-core` models' serde shape).
+//! Casing rule: response models are camelCase (the `cxp-core` models' serde
+//! shape), except `GET /dashboard/metrics`, which keeps its snake_case keys.
+//! Request bodies and query parameters are snake_case; catalog bodies also
+//! accept `teamId` as a permanent alias of `team_id`. The web console's types
+//! follow this (#15); a single convention for `/api/v1` is tracked in #24.
 
 pub mod catalog;
 pub mod customers;
@@ -252,12 +255,56 @@ mod wire_fixture {
         }
     }
 
+    /// A customer with every optional field unset, so a `null` is pinned.
+    fn customer_minimal() -> Customer {
+        Customer {
+            id: id(30),
+            email: "min@example.com".into(),
+            name: None,
+            phone: None,
+            company: None,
+            metadata: json!({}),
+            tags: vec![],
+            experience_id: None,
+            application_id: None,
+            page_id: None,
+            component_id: None,
+            created_at: at(1),
+            updated_at: at(1),
+        }
+    }
+
+    /// An open ticket with every optional field unset.
+    fn ticket_open() -> Ticket {
+        Ticket {
+            id: id(31),
+            customer_id: id(30),
+            subject: "Open".into(),
+            description: None,
+            status: "open".into(),
+            priority: "medium".into(),
+            channel: None,
+            assigned_to: None,
+            tags: vec![],
+            metadata: json!({}),
+            experience_id: None,
+            application_id: None,
+            page_id: None,
+            component_id: None,
+            resolved_at: None,
+            created_at: at(3),
+            updated_at: at(3),
+        }
+    }
+
     /// One sample of every response shape the console decodes.
     fn payloads() -> serde_json::Value {
         let page = cxp_core::Page::new(Some(25), Some(0));
         json!({
             "customer": customer(),
+            "customerMinimal": customer_minimal(),
             "ticket": ticket(),
+            "ticketOpen": ticket_open(),
             "feedback": feedback(),
             "survey": survey(),
             "surveyResponse": survey_response(),
@@ -297,6 +344,7 @@ mod wire_fixture {
         if std::env::var_os("UPDATE_WIRE_FIXTURES").is_some() {
             std::fs::create_dir_all(std::path::Path::new(FIXTURE).parent().unwrap()).unwrap();
             std::fs::write(FIXTURE, &actual).unwrap();
+            panic!("fixture regenerated; re-run without UPDATE_WIRE_FIXTURES");
         }
         let committed = std::fs::read_to_string(FIXTURE).unwrap_or_default();
         assert_eq!(

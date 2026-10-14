@@ -51,7 +51,9 @@ function sameKeys(actual: object, expected: object) {
 // These assignments fail `tsc` if a fixture field is missing or mistyped.
 const typed = {
   customer: wire.customer satisfies Customer,
+  customerMinimal: wire.customerMinimal satisfies Customer,
   ticket: wire.ticket satisfies Ticket,
+  ticketOpen: wire.ticketOpen satisfies Ticket,
   feedback: wire.feedback satisfies Feedback,
   survey: wire.survey satisfies Survey,
   surveyResponse: wire.surveyResponse satisfies SurveyResponse,
@@ -77,6 +79,8 @@ describe("types match the server's JSON", () => {
   it("models carry exactly the declared fields", () => {
     sameKeys(typed.customer, keys.customer);
     sameKeys(typed.ticket, keys.ticket);
+    sameKeys(typed.customerMinimal, keys.customer);
+    sameKeys(typed.ticketOpen, keys.ticket);
     sameKeys(typed.feedback, keys.feedback);
     sameKeys(typed.survey, keys.survey);
     sameKeys(typed.surveyResponse, keys.surveyResponse);
@@ -97,22 +101,29 @@ describe("types match the server's JSON", () => {
     sameKeys(typed.customer360.recentInteractions[0], keys.interaction);
   });
 
+  it("optional fields are present as null, not absent", () => {
+    const { customerMinimal: c, ticketOpen: t } = typed;
+    expect([c.name, c.phone, c.company]).toEqual([null, null, null]);
+    expect([c.experienceId, c.applicationId, c.pageId, c.componentId]).toEqual([null, null, null, null]);
+    expect([t.description, t.channel, t.assignedTo, t.resolvedAt]).toEqual([null, null, null, null]);
+  });
+
   it("list responses use the data/total/limit/offset envelope", () => {
-    for (const list of [
-      typed.customerList,
-      typed.ticketList,
-      typed.feedbackList,
-      typed.surveyList,
-      typed.experienceList,
-      typed.applicationList,
-      typed.pageList,
-      typed.componentList,
-    ]) {
+    const lists = [
+      [typed.customerList, keys.customer],
+      [typed.ticketList, keys.ticket],
+      [typed.feedbackList, keys.feedback],
+      [typed.surveyList, keys.survey],
+      [typed.experienceList, keys.experience],
+      [typed.applicationList, keys.application],
+      [typed.pageList, keys.page],
+      [typed.componentList, keys.component],
+    ] as const;
+    for (const [list, rowKeys] of lists) {
       sameKeys(list, keys.paginated);
       expect(list.data).toHaveLength(1);
+      sameKeys(list.data[0], rowKeys);
     }
-    sameKeys(typed.customerList.data[0], keys.customer);
-    sameKeys(typed.componentList.data[0], keys.component);
   });
 
   it("only the dashboard metrics keep snake_case keys", () => {
