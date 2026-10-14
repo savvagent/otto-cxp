@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 
+# Both base images are pinned by digest (the multi-arch index) so a rebuild
+# uses exactly the bytes that were reviewed; the tag each digest was read from
+# is in the comment. Bump them deliberately, together with a re-read of each
+# digest (`skopeo inspect --format '{{.Digest}}' docker://<image>:<tag>`).
+
 # ---------------------------------------------------------------- build
-FROM rust:1-slim-bookworm AS build
+# rust:1-slim-bookworm
+FROM rust@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
 
 WORKDIR /app
 # Only what the server needs. The SDKs, React package, and web app are not
@@ -32,7 +38,8 @@ RUN --mount=type=cache,id=otto-cxp-registry,target=/usr/local/cargo/registry,sha
     && cp target/release/cxp-server /usr/local/bin/cxp-server
 
 # ---------------------------------------------------------------- runtime
-FROM debian:bookworm-slim AS runtime
+# debian:bookworm-slim
+FROM debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 # Postgres over TLS and every call to the platform verify against these roots.
 RUN apt-get update \

@@ -18,7 +18,7 @@
 //! | `payload_too_large` | 413 |
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
-//! | `unavailable` | 503, with `Retry-After: 5` |
+//! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]) |
 //! | `internal` | 500 |
 
 use axum::response::{IntoResponse, Response};
@@ -54,17 +54,41 @@ impl ApiError {
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
+
+    /// A body over [`crate::MAX_BODY_BYTES`], from any extractor that reads one.
+    pub fn payload_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!(
+                "the request body is larger than {} KiB",
+                crate::MAX_BODY_BYTES / 1024
+            ),
+        )
+    }
 }
 
-fn status_for(code: &str) -> StatusCode {
-    match code {
-        "not_found" => StatusCode::NOT_FOUND,
-        "invalid_argument" | "unknown_team" => StatusCode::BAD_REQUEST,
-        "conflict" => StatusCode::CONFLICT,
-        "access_revoked" => StatusCode::UNAUTHORIZED,
-        "quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
-        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+/// The status for a domain error, decided by its variant. The match is
+/// exhaustive on purpose: a new variant does not compile until it is given a
+/// status here, rather than falling through to 500. The two variants whose
+/// code depends on what failed inside them (a database or tenant error the
+/// caller's input caused is `invalid_argument`) defer to that code.
+fn status_for(e: &cxp_core::Error) -> StatusCode {
+    use cxp_core::Error;
+    match e {
+        Error::NotFound { .. } => StatusCode::NOT_FOUND,
+        Error::Invalid(_) | Error::UnknownTeam => StatusCode::BAD_REQUEST,
+        Error::Conflict(_) => StatusCode::CONFLICT,
+        Error::AccessRevoked => StatusCode::UNAUTHORIZED,
+        Error::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+        Error::Unavailable | Error::Platform(_) => StatusCode::SERVICE_UNAVAILABLE,
+        Error::Tenant(_) | Error::Database(_) => {
+            if e.code() == "invalid_argument" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
     }
 }
 
@@ -75,7 +99,7 @@ impl From<cxp_core::Error> for ApiError {
             tracing::error!(error = %e, code, source = ?std::error::Error::source(&e),
                 "REST request failed");
         }
-        Self::new(status_for(code), code, e.to_string())
+        Self::new(status_for(&e), code, e.to_string())
     }
 }
 
@@ -114,8 +138,10 @@ impl IntoResponse for ApiError {
             res.headers_mut().insert(header::WWW_AUTHENTICATE, value);
         }
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
-            res.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            res.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(cxp_core::auth::RETRY_AFTER_SECONDS),
+            );
         }
         res
     }
@@ -150,6 +176,10 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
                 Error::Database(sqlx::Error::RowNotFound),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -169,6 +199,20 @@ mod tests {
         assert_eq!(
             res.headers()[header::WWW_AUTHENTICATE],
             r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
+        );
+    }
+
+    #[test]
+    fn unavailable_tells_the_client_when_to_retry() {
+        let res = ApiError::from(Error::Unavailable).into_response();
+        assert_eq!(
+            res.headers()[header::RETRY_AFTER],
+            cxp_core::auth::RETRY_AFTER_SECONDS
+        );
+        let big = ApiError::payload_too_large();
+        assert_eq!(
+            (big.status, big.code),
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
         );
     }
 }

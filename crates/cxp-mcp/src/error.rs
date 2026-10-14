@@ -10,6 +10,15 @@
 //! `cxp_core::Error`'s `Display` never carries database or platform text, so
 //! the message is passed through as is; server-side failures are logged here
 //! with their source, which does.
+//!
+//! **A revocation found mid-request is a JSON-RPC error, by design.** The
+//! bearer middleware answers a token that is already dead with HTTP `401` and
+//! `WWW-Authenticate`. But the org can be deleted, or the caller removed,
+//! after the token was introspected and before the tool's transaction opens;
+//! by then the request is a JSON-RPC call in flight, so it fails as one:
+//! `INVALID_REQUEST` with `data.code` `access_revoked` and no
+//! `WWW-Authenticate` header. An agent branches on the code, and its next
+//! request meets the `401` in the usual way.
 
 use cxp_core::auth::MissingScope;
 use cxp_core::Error;

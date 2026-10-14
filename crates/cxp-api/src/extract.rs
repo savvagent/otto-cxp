@@ -11,16 +11,9 @@ use serde::de::DeserializeOwned;
 
 use crate::error::ApiError;
 
-fn rejected(status: StatusCode, text: String) -> ApiError {
+pub(crate) fn rejected(status: StatusCode, text: String) -> ApiError {
     if status == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::new(
-            status,
-            "payload_too_large",
-            format!(
-                "the request body is larger than {} KiB",
-                crate::MAX_BODY_BYTES / 1024
-            ),
-        )
+        ApiError::payload_too_large()
     } else {
         ApiError::invalid(text)
     }
@@ -84,7 +77,7 @@ where
             .map_err(|e: PathRejection| {
                 if e.status().is_server_error() {
                     tracing::error!(error = %e.body_text(), "path extraction failed");
-                    ApiError::new(e.status(), "internal", "otto-cxp hit an internal error")
+                    ApiError::new(e.status(), "internal", cxp_core::error::INTERNAL_MESSAGE)
                 } else {
                     ApiError::invalid(e.body_text())
                 }

@@ -156,6 +156,7 @@ impl Cxp {
         caller.require_write().mcp()?;
         let survey_id = uuid("survey_id", &p.survey_id)?;
         let answers = parse_json("answers", &p.answers).mcp()?;
+        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
         self.charge(&mut tx, &caller, "submit_survey_response")
             .await?;
@@ -183,6 +184,7 @@ impl Cxp {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;
         let questions = parse_json("questions", &p.questions).mcp()?;
+        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
         self.charge(&mut tx, &caller, "create_survey").await?;
         let survey = tx
@@ -212,6 +214,7 @@ impl Cxp {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;
         let survey_id = uuid("survey_id", &p.survey_id)?;
+        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
         self.charge(&mut tx, &caller, "send_survey").await?;
         let customer_id = tx.resolve_customer(&p.customer_id).await.mcp()?;
@@ -259,6 +262,7 @@ impl Cxp {
         let application_id = optional_uuid("application_id", p.application_id.as_deref())?;
         let page_id = optional_uuid("page_id", p.page_id.as_deref())?;
         let component_id = optional_uuid("component_id", p.component_id.as_deref())?;
+        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
         self.charge(&mut tx, &caller, "submit_feedback").await?;
         let customer_id = tx.resolve_customer(&p.customer_id).await.mcp()?;

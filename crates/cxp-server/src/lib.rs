@@ -9,6 +9,12 @@
 //!   everything else                   JSON 404
 //! ```
 //!
+//! Every request body, on every surface, is capped at
+//! [`cxp_api::MAX_BODY_BYTES`] by one layer on the composed router. axum's
+//! `DefaultBodyLimit` reaches only axum extractors; `/mcp` is a
+//! `route_service` whose body rmcp collects itself, so without this layer it
+//! would read a body of any size.
+//!
 //! Assembly is a library function so a test can build the whole router: axum
 //! panics on a route registered twice, and that is better found by a test than
 //! by a deploy. So is the process lifecycle ([`run`]): `main` only reads the
@@ -22,11 +28,12 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::{middleware, Router};
 use cxp_core::usage::Meter;
 use http::{StatusCode, Uri};
 use otto_resource::{ClientConfig, PlatformClient};
 use otto_tenant::Db;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 pub use boot::{run, run_with, Boot, PlatformCheck};
@@ -83,6 +90,10 @@ pub fn router(
         .merge(mcp)
         .merge(api)
         .fallback(not_found)
+        .layer(RequestBodyLimitLayer::new(cxp_api::MAX_BODY_BYTES))
+        // Outside the limit: its own 413 is plain text, rewritten here to the
+        // `{error, code}` shape every other error has.
+        .layer(middleware::map_response(json_payload_too_large))
         // One INFO span per request with the method and path only: headers
         // carry bearer tokens and webhook signatures, and a query string can
         // carry a customer search.
@@ -109,6 +120,21 @@ fn mcp_config(config: &Config) -> Result<cxp_mcp::Config> {
         allowed_hosts,
         allowed_origins: config.allowed_origins.clone(),
     })
+}
+
+/// A plain-text `413` (the body-limit layer's own, sent when `Content-Length`
+/// is over the cap) becomes the JSON `payload_too_large` error. A `413` a
+/// handler already answered in JSON passes through untouched.
+async fn json_payload_too_large(res: Response) -> Response {
+    let plain = res
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/plain"));
+    if res.status() == StatusCode::PAYLOAD_TOO_LARGE && plain {
+        return cxp_api::ApiError::payload_too_large().into_response();
+    }
+    res
 }
 
 /// The same `{error, code}` shape as every `/api/v1` error.
@@ -155,17 +181,19 @@ mod tests {
     }
 
     async fn call(method: &str, path: &str) -> (StatusCode, http::HeaderMap, serde_json::Value) {
-        let res = app()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("host", "cxp.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        send(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "cxp.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn send(req: Request<Body>) -> (StatusCode, http::HeaderMap, serde_json::Value) {
+        let res = app().oneshot(req).await.unwrap();
         let status = res.status();
         let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -221,6 +249,28 @@ mod tests {
             body["reason"].as_str().unwrap().contains("database"),
             "{body}"
         );
+    }
+
+    /// `/mcp`'s body is read by rmcp, not an axum extractor, so only the
+    /// router-wide layer caps it; every other surface is capped the same way.
+    #[tokio::test]
+    async fn an_oversized_body_is_a_json_413_on_every_surface() {
+        let big = vec![b' '; cxp_api::MAX_BODY_BYTES + 1];
+        for path in ["/mcp", "/api/v1/customers", "/platform/webhooks", "/nope"] {
+            let (status, _, body) = send(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("host", "cxp.example.com")
+                    .header("content-type", "application/json")
+                    .header("content-length", big.len())
+                    .body(Body::from(big.clone()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            assert_eq!(body["code"], "payload_too_large", "{path}");
+        }
     }
 
     #[tokio::test]

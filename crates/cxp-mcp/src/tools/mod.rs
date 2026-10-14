@@ -215,6 +215,12 @@ mod tests {
             .collect();
         billable.sort();
         assert_eq!(charged, billable);
+        // And only they look the quota up at the platform.
+        let warmed: usize = SOURCES
+            .iter()
+            .map(|(_, src)| src.matches("self.warm_quota(").count())
+            .sum();
+        assert_eq!(warmed, billable.len());
     }
 
     #[test]
@@ -238,6 +244,12 @@ mod tests {
                 tx < charge && charge < commit,
                 "{tool} charges outside its transaction"
             );
+            // The quota lookup is a network call: made before the
+            // transaction holds a pooled connection.
+            let warm = body
+                .find("self.warm_quota(&caller)")
+                .unwrap_or_else(|| panic!("{tool} does not warm the quota"));
+            assert!(warm < tx, "{tool} warms the quota inside its transaction");
             // Before its write: the domain call of the same name follows the
             // charge, and does not precede it.
             assert!(

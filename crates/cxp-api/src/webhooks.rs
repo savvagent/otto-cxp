@@ -42,20 +42,7 @@ pub async fn receive(
         .get(webhook::SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(rejected)?;
-    let body = body.map_err(|e| {
-        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::new(
-                e.status(),
-                "payload_too_large",
-                format!(
-                    "the request body is larger than {} KiB",
-                    crate::MAX_BODY_BYTES / 1024
-                ),
-            )
-        } else {
-            ApiError::invalid(e.body_text())
-        }
-    })?;
+    let body = body.map_err(|e| crate::extract::rejected(e.status(), e.body_text()))?;
     let event = match webhook::verify(secret, signature, &body) {
         Ok(event) => event,
         Err(WebhookError::BadBody(reason)) => {
