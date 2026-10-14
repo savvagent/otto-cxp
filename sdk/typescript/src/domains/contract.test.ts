@@ -1,6 +1,6 @@
 /**
  * Tests that each fixed SDK call sends the argument names the cxp tools accept
- * (the param structs in server/src/tools/mod.rs), and that NPS/CSAT and
+ * (the param structs in crates/cxp-mcp/src/tools), and that NPS/CSAT and
  * Customer 360 payloads type as the server returns them.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";

@@ -1,0 +1,262 @@
+//! `cxp-server` — one binary, one port, every surface.
+//!
+//! ```text
+//!   /healthz /readyz                  health    no database on the liveness path
+//!   /.well-known/oauth-protected-resource, /mcp
+//!                                     cxp-mcp   agents: bearer tokens from the platform
+//!   /api/v1/…                         cxp-api   the console: bearer tokens from the platform
+//!   /platform/webhooks                cxp-api   the platform's signed lifecycle events
+//!   everything else                   JSON 404
+//! ```
+//!
+//! Assembly is a library function so a test can build the whole router: axum
+//! panics on a route registered twice, and that is better found by a test than
+//! by a deploy. So is the process lifecycle ([`run`]): `main` only reads the
+//! configuration, binds the port, and waits for a signal.
+
+pub mod boot;
+pub mod config;
+pub mod health;
+
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use axum::response::{IntoResponse, Response};
+use axum::Router;
+use cxp_core::usage::Meter;
+use http::{StatusCode, Uri};
+use otto_resource::{ClientConfig, PlatformClient};
+use otto_tenant::Db;
+use tower_http::trace::TraceLayer;
+
+pub use boot::{run, Boot, PlatformCheck};
+pub use config::{Config, LogFormat};
+
+/// The one client every platform call goes through (it holds the caches).
+///
+/// Built with [`Config::resource_uri`] as the audience: the client is what
+/// refuses a token minted for another service, so this is the only place the
+/// audience is set.
+pub fn platform_client(config: &Config) -> Result<Arc<PlatformClient>> {
+    let client = PlatformClient::new(ClientConfig::new(
+        &config.platform_url,
+        &config.resource_uri,
+        &config.introspection_secret,
+    ))
+    .context("CXP_PLATFORM_URL is not usable")?;
+    Ok(Arc::new(client))
+}
+
+/// The one meter the MCP tools and `POST /api/v1/surveys` charge through.
+pub fn meter(platform: Arc<PlatformClient>, config: &Config) -> Arc<Meter> {
+    Arc::new(Meter::new(
+        platform,
+        config.enforce_quotas,
+        config.upgrade_url(),
+    ))
+}
+
+/// Every surface on one router. Fails only on a configuration that would
+/// leave `/mcp` open to any `Host` (see [`Config::allowed_hosts`]).
+pub fn router(
+    db: Db,
+    platform: Arc<PlatformClient>,
+    meter: Arc<Meter>,
+    config: &Config,
+) -> Result<Router> {
+    let mcp = cxp_mcp::router(
+        db.clone(),
+        platform.clone(),
+        meter.clone(),
+        mcp_config(config)?,
+    );
+    let api = cxp_api::router(cxp_api::AppState::new(
+        db.clone(),
+        platform,
+        meter,
+        cxp_api::Config {
+            public_url: config.public_url.clone(),
+            webhook_secret: config.platform_webhook_secret.clone(),
+        },
+    ));
+    Ok(health::router(db)
+        .merge(mcp)
+        .merge(api)
+        .fallback(not_found)
+        // One INFO span per request with the method and path only: headers
+        // carry bearer tokens and webhook signatures, and a query string can
+        // carry a customer search.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |req: &http::Request<axum::body::Body>| {
+                tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+            },
+        )))
+}
+
+/// Fails closed: rmcp reads an empty host list as "allow any host".
+fn mcp_config(config: &Config) -> Result<cxp_mcp::Config> {
+    let allowed_hosts = config.allowed_hosts();
+    if allowed_hosts.is_empty() {
+        return Err(anyhow!(
+            "no Host header would be accepted on /mcp, and rmcp reads that as \
+             \"accept any\": CXP_PUBLIC_URL must have a host"
+        ));
+    }
+    Ok(cxp_mcp::Config {
+        public_url: config.public_url.clone(),
+        resource_uri: config.resource_uri.clone(),
+        platform_url: config.platform_url.clone(),
+        allowed_hosts,
+        allowed_origins: config.allowed_origins.clone(),
+    })
+}
+
+/// The same `{error, code}` shape as every `/api/v1` error.
+async fn not_found(uri: Uri) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": format!(
+                "no route serves {}. Agents: the MCP endpoint is /mcp (see \
+                 /.well-known/oauth-protected-resource). The REST API is under /api/v1.",
+                uri.path()
+            ),
+            "code": "not_found",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http::Request;
+    use tower::ServiceExt;
+
+    /// The whole router over a database that is never reached: nothing tested
+    /// here may touch it except `/readyz`, which must notice.
+    fn app() -> Router {
+        let mut config = Config::for_test();
+        // Nothing listens on port 1: a probe is refused at once.
+        config.database_url = "postgres://cxp:cxp@127.0.0.1:1/none".into();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy(&config.database_url)
+            .unwrap();
+        let platform = platform_client(&config).unwrap();
+        router(
+            Db::from_pool(pool),
+            platform.clone(),
+            meter(platform, &config),
+            &config,
+        )
+        .unwrap()
+    }
+
+    async fn call(method: &str, path: &str) -> (StatusCode, http::HeaderMap, serde_json::Value) {
+        let res = app()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "cxp.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or_default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_whole_router_assembles_and_discovery_names_the_platform() {
+        let (status, _, body) = call("GET", "/.well-known/oauth-protected-resource").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["resource"], "https://cxp.example.com/mcp");
+        assert_eq!(
+            body["authorization_servers"][0],
+            "https://platform.example.com"
+        );
+        assert_eq!(
+            body["scopes_supported"],
+            serde_json::json!(["cxp:read", "cxp:write"])
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_calls_are_told_where_to_authenticate() {
+        for (method, path) in [("POST", "/mcp"), ("GET", "/api/v1/customers")] {
+            let (status, headers, _) = call(method, path).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+            let challenge = headers["www-authenticate"].to_str().unwrap();
+            assert!(
+                challenge.contains(
+                    "resource_metadata=\"https://cxp.example.com/.well-known/oauth-protected-resource\""
+                ),
+                "{challenge}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_never_touches_the_database_and_readiness_does() {
+        let (status, _, body) = call("GET", "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+
+        let (status, _, body) = call("GET", "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unready");
+        assert!(
+            body["reason"].as_str().unwrap().contains("database"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anything_else_is_a_json_404() {
+        let (status, _, body) = call("GET", "/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+        assert!(body["error"].as_str().unwrap().contains("/nope"), "{body}");
+    }
+
+    #[test]
+    fn mcp_gets_the_public_host_and_the_extras() {
+        let mut config = Config::for_test();
+        config.extra_allowed_hosts = vec!["otto-cxp.fly.dev".into()];
+        let mcp = mcp_config(&config).unwrap();
+        assert_eq!(mcp.allowed_hosts, ["cxp.example.com", "otto-cxp.fly.dev"]);
+        assert_eq!(mcp.resource_uri, config.resource_uri);
+        assert_eq!(mcp.public_url, config.public_url);
+    }
+
+    #[tokio::test]
+    async fn mcp_refuses_to_start_open_to_any_host() {
+        let mut config = Config::for_test();
+        config.public_url = "not a url".into();
+        let err = mcp_config(&config).unwrap_err().to_string();
+        assert!(err.contains("accept any"), "{err}");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://cxp:cxp@127.0.0.1:1/none")
+            .unwrap();
+        let platform = platform_client(&Config::for_test()).unwrap();
+        let built = router(
+            Db::from_pool(pool),
+            platform.clone(),
+            meter(platform, &config),
+            &config,
+        );
+        assert!(built.is_err());
+    }
+}

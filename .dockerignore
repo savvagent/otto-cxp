@@ -1,0 +1,11 @@
+target
+node_modules
+apps
+packages
+sdk
+scripts
+docs
+.git
+.github
+.claude
+.env

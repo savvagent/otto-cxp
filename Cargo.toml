@@ -1,13 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-  # The pre-platform server (package `cxp-server`). Kept building, untouched,
-  # until the new `crates/cxp-server` binary replaces it in one change; it
-  # declares its own dependencies rather than using the workspace's.
-  "server",
   "crates/cxp-core",
   "crates/cxp-mcp",
   "crates/cxp-api",
+  "crates/cxp-server",
 ]
 
 [workspace.package]
@@ -54,6 +51,9 @@ url = "2"
 # Loads .env for local runs. Never overrides a variable already set, so a
 # deployment's real environment always wins over a file that got shipped.
 dotenvy = "0.15"
+# An HTTP client for cxp-server's lifecycle test, which talks to a real
+# socket. Already in the tree through otto-resource; no default features.
+reqwest = { version = "0.12", default-features = false }
 
 [profile.release]
 lto = "thin"
