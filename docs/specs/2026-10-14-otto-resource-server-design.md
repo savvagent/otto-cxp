@@ -319,12 +319,18 @@ default off, fail open) and inserts one `usage_outbox` row in the caller's trans
 `Meter::report(org)` returns the usage summary `whoami`/`usage` show (otto-flags' `Status`).
 `ship_once`/`run` ship batches to `POST /internal/usage` (event_id dedupe at the platform), as
 otto-flags, claiming due rows in `(next_attempt_at, id)` order, in maintenance transactions.
-Rows the platform refuses (per event in its receipt, or alone: a batch it refuses whole with a 4xx
-about the request, 413 included, is split in halves and resent recursively until the refused
-events stand alone) move to `usage_outbox_rejected` with the reason, logged at error. A receipt
+Rows the platform refuses per event in its receipt move to `usage_outbox_rejected` with the
+reason, logged at error. A batch it refuses whole with a 4xx about the request, 413 included, is
+split in halves and resent recursively until the refused events stand alone; an event refused
+alone is kept and the refusal counts toward `MAX_ROW_FAILURES` (20, column `row_failures`). If
+every event sent alone was refused and none was accepted, the refusal is systemic
+(`ShipError::RefusedAll`, logged once at error): the whole batch is rescheduled without counting.
+Splitting is bounded per pass by half the claim lease and `ShipperConfig::split_budget` requests
+(64); unsent pieces are rescheduled uncounted (`ShipError::Unfinished`, retriable). A receipt
 is trusted only if its counts add up and its rejected ids are distinct and all in the batch;
-otherwise the batch is retried, and that counts toward `MAX_ROW_FAILURES` (20, column
-`row_failures`), after which the row is given up the same way. Nothing else counts: transport
+otherwise the batch is retried, and that counts toward `MAX_ROW_FAILURES` too, after which the
+row is given up the same way. If settling the answered rows fails, the failed pieces are still
+rescheduled with their own errors. Nothing else counts: transport
 failures, 5xx, 408, 429, 401/403, 404, and an unknown org reschedule with backoff forever, so
 those rows stay in the outbox (and in the period's quota) until they ship. `run` logs failures
 that pass on their own (`ShipError::is_retriable`) at warn and the rest at error.

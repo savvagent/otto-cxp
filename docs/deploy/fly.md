@@ -154,10 +154,16 @@ SELECT count(*), max(attempts), max(row_failures), max(last_error) FROM usage_ou
 SELECT reason, count(*) FROM usage_outbox_rejected GROUP BY reason;
 ```
 
-A row the platform refuses (in its receipt, or alone: a batch refused whole is resent in halves
-until the refused events stand alone), or one whose batch came back 20 times with a receipt that
-did not account for it (`row_failures`), moves to `usage_outbox_rejected` with its reason and is
-logged at `error`; those rows are kept 90 days. Anything else (the platform down, rate limiting,
+A row the platform refuses in its receipt moves to `usage_outbox_rejected` with its reason and
+is logged at `error`. A batch it refuses whole is resent in halves until the refused events
+stand alone; each refusal of an event sent alone, like each receipt that did not account for a
+row, counts against that row (`row_failures`), and after 20 of them it moves to
+`usage_outbox_rejected` too. Rejected rows are kept 90 days. If every event sent alone is refused
+and nothing is accepted, the platform is refusing the requests themselves (a contract change, a
+gateway in the way): the shipper logs `the platform refused every event in a batch; not counting
+it against the rows` at `error` and keeps the whole batch, uncounted, until that is fixed.
+Splitting stops after half the claim lease (60 s) or 64 requests in one pass; the pieces not
+yet sent wait for the next pass, uncounted. Anything else (the platform down, rate limiting,
 the credential refused) never gives a row up: it stays in `usage_outbox`, retried with backoff
 up to every 15 minutes and still counted toward its period's quota, until it ships. A final
 flush on shutdown that cannot reach the platform is logged at `warn` and does not fail the
