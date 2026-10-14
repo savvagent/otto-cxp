@@ -13,7 +13,7 @@ import {
   useDeletePage,
 } from "@/hooks/use-pages";
 import { useApplications } from "@/hooks/use-applications";
-import { useTeams } from "@/hooks/use-teams";
+import { useMyTeams } from "@/hooks/use-me";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -51,7 +51,7 @@ const PAGE_SIZE = 20;
 
 const pageSchema = z.object({
   application_id: z.string().optional(),
-  team_id: z.string().min(1, "Team is required"),
+  team_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   path: z.string().optional(),
   description: z.string().optional(),
@@ -72,8 +72,8 @@ function PageDialog({
   const updatePage = useUpdatePage();
   const { data: appsData } = useApplications({ limit: 200 });
   const applications = appsData?.data ?? [];
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
   const isEdit = !!editing;
 
   const {
@@ -108,7 +108,7 @@ function PageDialog({
             name: values.name,
             path: values.path || undefined,
             description: values.description || undefined,
-            team_id: values.team_id,
+            team_id: values.team_id || null,
           },
         },
         {
@@ -123,7 +123,7 @@ function PageDialog({
       createPage.mutate(
         {
           application_id: values.application_id || undefined,
-          team_id: values.team_id,
+          team_id: values.team_id || undefined,
           name: values.name,
           path: values.path || undefined,
           description: values.description || undefined,
@@ -151,7 +151,7 @@ function PageDialog({
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="page-team">
-              Team <span className="text-destructive">*</span>
+              Team
             </Label>
             <Select
               value={teamId || "_none"}
@@ -160,10 +160,10 @@ function PageDialog({
               }
             >
               <SelectTrigger id="page-team">
-                <SelectValue placeholder="Select a team" />
+                <SelectValue placeholder="No team" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                <SelectItem value="_none">No team</SelectItem>
                 {teams.map((t) => (
                   <SelectItem key={t.id} value={t.id}>
                     {t.name}
@@ -267,8 +267,8 @@ export function PagesPage() {
   const { data: appsData } = useApplications({ limit: 200 });
   const applications = appsData?.data ?? [];
 
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
 
   const deletePage = useDeletePage();
   const items = data?.data ?? [];

@@ -15,7 +15,6 @@ import {
   AppWindow,
   FileText,
   Puzzle,
-  UsersRound,
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -30,7 +29,6 @@ const allItems = [
   { to: "/catalog/applications", label: "Applications", icon: AppWindow },
   { to: "/catalog/pages", label: "Pages", icon: FileText },
   { to: "/catalog/components", label: "Components", icon: Puzzle },
-  { to: "/catalog/teams", label: "Teams", icon: UsersRound },
 ];
 
 export function MobileNav({

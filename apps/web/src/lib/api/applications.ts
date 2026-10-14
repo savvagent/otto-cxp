@@ -21,7 +21,7 @@ export const applicationsApi = {
 
   create: (data: {
     experience_id?: string;
-    team_id: string;
+    team_id?: string | null;
     name: string;
     description?: string;
     platform?: string;
@@ -33,7 +33,7 @@ export const applicationsApi = {
 
   update: (
     id: string,
-    data: { name?: string; description?: string; platform?: string; team_id?: string },
+    data: { name?: string; description?: string; platform?: string; team_id?: string | null },
   ) =>
     apiFetch<Application>(`/applications/${id}`, {
       method: "PUT",

@@ -8,12 +8,20 @@
 export { CxpClient } from "./client.js";
 export type { CxpClientOptions } from "./client.js";
 
+// Connecting and errors
+export { connectCxp, createCxpTransport, CxpAuthorizationRequired } from "./connect.js";
+export type {
+  ConnectCxpOptions,
+  CxpTransportOptions,
+  CxpConnection,
+} from "./connect.js";
+export { CxpError } from "./call.js";
+
 // Domain modules
 export {
   SupportDomain,
   FeedbackDomain,
   CdpDomain,
-  TeamsDomain,
 } from "./domains/index.js";
 
 export type {
@@ -25,9 +33,6 @@ export type {
   CreateCustomerOptions,
   UpdateCustomerOptions,
   CreateSegmentOptions,
-  CreateTeamOptions,
-  UpdateTeamOptions,
-  ListTeamsOptions,
 } from "./domains/index.js";
 
 // Core types
@@ -50,7 +55,6 @@ export type {
   FeedbackContext,
   NpsResult,
   CsatResult,
-  Team,
 } from "./types.js";
 
 // Type utilities

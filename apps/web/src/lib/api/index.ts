@@ -6,5 +6,5 @@ export { experiencesApi } from "./experiences";
 export { applicationsApi } from "./applications";
 export { pagesApi } from "./pages";
 export { componentsApi } from "./components";
-export { teamsApi } from "./teams";
+export { meApi } from "./me";
 export { dashboardApi } from "./dashboard";

@@ -9,13 +9,13 @@ export const experiencesApi = {
 
   get: (id: string) => apiFetch<Experience>(`/experiences/${id}`),
 
-  create: (data: { name: string; description?: string; team_id: string }) =>
+  create: (data: { name: string; description?: string; team_id?: string | null }) =>
     apiFetch<Experience>("/experiences", {
       method: "POST",
       body: JSON.stringify(data),
     }),
 
-  update: (id: string, data: { name?: string; description?: string; team_id?: string }) =>
+  update: (id: string, data: { name?: string; description?: string; team_id?: string | null }) =>
     apiFetch<Experience>(`/experiences/${id}`, {
       method: "PUT",
       body: JSON.stringify(data),

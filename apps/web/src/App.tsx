@@ -14,7 +14,6 @@ import { ExperiencesPage } from "@/pages/catalog/experiences";
 import { ApplicationsPage } from "@/pages/catalog/applications";
 import { PagesPage } from "@/pages/catalog/pages-page";
 import { ComponentsPage } from "@/pages/catalog/components-page";
-import { TeamsPage } from "@/pages/catalog/teams";
 import { CommandPalette } from "@/components/command-palette";
 
 const queryClient = new QueryClient({
@@ -45,7 +44,6 @@ export function App() {
             <Route path="catalog/applications" element={<ApplicationsPage />} />
             <Route path="catalog/pages" element={<PagesPage />} />
             <Route path="catalog/components" element={<ComponentsPage />} />
-            <Route path="catalog/teams" element={<TeamsPage />} />
           </Route>
         </Routes>
         <CommandPalette />

@@ -171,7 +171,8 @@ describe("SupportDomain", () => {
       ];
 
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: JSON.stringify(mockTickets) }],
+        structuredContent: { items: mockTickets, total: mockTickets.length },
+        content: [],
       } as any);
 
       const result = await support.listTickets();
@@ -191,7 +192,8 @@ describe("SupportDomain", () => {
 
     it("should list tickets with filters", async () => {
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: "[]" }],
+        structuredContent: { items: [] },
+        content: [],
       } as any);
 
       await support.listTickets({
@@ -259,7 +261,8 @@ describe("SupportDomain", () => {
       ];
 
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: JSON.stringify(mockArticles) }],
+        structuredContent: { items: mockArticles, total: mockArticles.length },
+        content: [],
       } as any);
 
       const result = await support.searchKnowledgeBase("password reset");

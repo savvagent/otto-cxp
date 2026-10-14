@@ -6,7 +6,6 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SupportDomain } from "./domains/support.js";
 import { FeedbackDomain } from "./domains/feedback.js";
 import { CdpDomain } from "./domains/cdp.js";
-import { TeamsDomain } from "./domains/teams.js";
 
 export interface CxpClientOptions {
   /**
@@ -20,30 +19,24 @@ export interface CxpClientOptions {
  *
  * @example
  * ```typescript
- * import { Client } from "@modelcontextprotocol/sdk/client/index.js";
- * import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
- * import { CxpClient } from "@cxp/sdk";
+ * import { connectCxp } from "@cxp/sdk";
  *
- * const transport = new StdioClientTransport({
- *   command: "cxp-mcp-server"
+ * // Static bearer token (an otto platform access token):
+ * const { cxp } = await connectCxp({
+ *   url: "https://cxp.example.com/mcp",
+ *   token: process.env.CXP_TOKEN,
  * });
  *
- * const mcpClient = new Client({
- *   name: "my-app",
- *   version: "1.0.0"
- * }, {
- *   capabilities: {}
- * });
+ * // Or an MCP OAuthClientProvider:
+ * // await connectCxp({ url, authProvider });
  *
- * await mcpClient.connect(transport);
- *
- * const cxp = new CxpClient({ client: mcpClient });
- *
- * // Use the SDK
  * const ticket = await cxp.support.createTicket(
  *   "customer-123",
  *   "Issue with login"
  * );
+ *
+ * // To use a Client you already connected yourself:
+ * // const cxp = new CxpClient({ client: mcpClient });
  * ```
  */
 export class CxpClient {
@@ -64,17 +57,11 @@ export class CxpClient {
    */
   public readonly cdp: CdpDomain;
 
-  /**
-   * Teams domain - team management
-   */
-  public readonly teams: TeamsDomain;
-
   constructor(options: CxpClientOptions) {
     this.client = options.client;
     this.support = new SupportDomain(this.client);
     this.feedback = new FeedbackDomain(this.client);
     this.cdp = new CdpDomain(this.client);
-    this.teams = new TeamsDomain(this.client);
   }
 
   /**

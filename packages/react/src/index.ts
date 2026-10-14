@@ -5,9 +5,7 @@ export { CxpProvider, useCxp, useCxpOptional } from "./context/CxpProvider.js";
 export {
   useFeedback,
   useChat,
-  useTeams,
   type UseFeedbackOptions,
-  type UseTeamsOptions,
 } from "./hooks/index.js";
 
 // Components

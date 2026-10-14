@@ -2,6 +2,7 @@
  * Feedback domain - handles surveys, feedback, NPS, CSAT, and sentiment
  */
 
+import { callList, callTool } from "../call.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type {
   Survey,
@@ -33,23 +34,10 @@ export class FeedbackDomain {
   constructor(private client: Client) {}
 
   /**
-   * Call an MCP tool and parse the JSON response
-   */
-  private async call<T>(name: string, args: Record<string, unknown>): Promise<T> {
-    const result = await this.client.callTool({ name, arguments: args });
-    const text = (result.content as Array<{ type: string; text: string }>)[0]?.text ?? "{}";
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw new Error(text);
-    }
-  }
-
-  /**
    * Get a survey by ID
    */
   async getSurvey(surveyId: string): Promise<Survey> {
-    return this.call("get_survey", { id: surveyId });
+    return callTool(this.client, "get_survey", { id: surveyId });
   }
 
   /**
@@ -60,7 +48,7 @@ export class FeedbackDomain {
     customerId: string;
     answers: unknown;
   }): Promise<SurveyResponse> {
-    return this.call("submit_survey_response", {
+    return callTool(this.client, "submit_survey_response", {
       survey_id: response.surveyId,
       customer_id: response.customerId,
       answers: JSON.stringify(response.answers),
@@ -75,7 +63,7 @@ export class FeedbackDomain {
     questions: SurveyQuestion[],
     description?: string
   ): Promise<Survey> {
-    return this.call("create_survey", {
+    return callTool(this.client, "create_survey", {
       title,
       description,
       questions: JSON.stringify(questions),
@@ -86,7 +74,7 @@ export class FeedbackDomain {
    * Send a survey to a customer
    */
   async sendSurvey(surveyId: string, customerId: string): Promise<SurveyResponse> {
-    return this.call("send_survey", {
+    return callTool(this.client, "send_survey", {
       survey_id: surveyId,
       customer_id: customerId,
     });
@@ -96,7 +84,7 @@ export class FeedbackDomain {
    * Get all responses for a survey
    */
   async getResponses(surveyId: string): Promise<SurveyResponse[]> {
-    return this.call("get_responses", {
+    return callList(this.client, "get_survey_responses", {
       survey_id: surveyId,
     });
   }
@@ -109,7 +97,7 @@ export class FeedbackDomain {
     feedbackType: string,
     options?: SubmitFeedbackOptions
   ): Promise<Feedback> {
-    return this.call("submit_feedback", {
+    return callTool(this.client, "submit_feedback", {
       customer_id: customerId,
       feedback_type: feedbackType,
       subject: options?.subject,
@@ -126,7 +114,7 @@ export class FeedbackDomain {
    * Get feedback with optional filtering
    */
   async getFeedback(options?: GetFeedbackOptions): Promise<Feedback[]> {
-    return this.call("get_feedback", {
+    return callList(this.client, "get_feedback", {
       customer_id: options?.customerId,
       feedback_type: options?.feedbackType,
       limit: options?.limit,
@@ -137,7 +125,7 @@ export class FeedbackDomain {
    * Calculate Net Promoter Score for a survey
    */
   async calculateNps(surveyId: string): Promise<NpsResult> {
-    return this.call("calculate_nps", {
+    return callTool(this.client, "calculate_nps", {
       id: surveyId,
     });
   }
@@ -146,7 +134,7 @@ export class FeedbackDomain {
    * Calculate Customer Satisfaction score
    */
   async calculateCsat(feedbackType?: string): Promise<CsatResult> {
-    return this.call("calculate_csat", {
+    return callTool(this.client, "calculate_csat", {
       feedback_type: feedbackType,
     });
   }
@@ -155,7 +143,7 @@ export class FeedbackDomain {
    * Analyze sentiment of text
    */
   async analyzeSentiment(text: string): Promise<SentimentResult> {
-    return this.call("analyze_sentiment", {
+    return callTool(this.client, "analyze_sentiment", {
       text,
     });
   }

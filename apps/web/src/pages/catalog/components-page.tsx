@@ -13,7 +13,7 @@ import {
   useDeleteComponent,
 } from "@/hooks/use-components";
 import { usePages } from "@/hooks/use-pages";
-import { useTeams } from "@/hooks/use-teams";
+import { useMyTeams } from "@/hooks/use-me";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -51,7 +51,7 @@ const PAGE_SIZE = 20;
 
 const componentSchema = z.object({
   page_id: z.string().optional(),
-  team_id: z.string().min(1, "Team is required"),
+  team_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   component_type: z.string().optional(),
   description: z.string().optional(),
@@ -72,8 +72,8 @@ function ComponentDialog({
   const updateComponent = useUpdateComponent();
   const { data: pagesData } = usePages({ limit: 200 });
   const pages = pagesData?.data ?? [];
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
   const isEdit = !!editing;
 
   const {
@@ -108,7 +108,7 @@ function ComponentDialog({
             name: values.name,
             component_type: values.component_type || undefined,
             description: values.description || undefined,
-            team_id: values.team_id,
+            team_id: values.team_id || null,
           },
         },
         {
@@ -123,7 +123,7 @@ function ComponentDialog({
       createComponent.mutate(
         {
           page_id: values.page_id || undefined,
-          team_id: values.team_id,
+          team_id: values.team_id || undefined,
           name: values.name,
           component_type: values.component_type || undefined,
           description: values.description || undefined,
@@ -153,7 +153,7 @@ function ComponentDialog({
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="comp-team">
-              Team <span className="text-destructive">*</span>
+              Team
             </Label>
             <Select
               value={teamId || "_none"}
@@ -162,10 +162,10 @@ function ComponentDialog({
               }
             >
               <SelectTrigger id="comp-team">
-                <SelectValue placeholder="Select a team" />
+                <SelectValue placeholder="No team" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                <SelectItem value="_none">No team</SelectItem>
                 {teams.map((t) => (
                   <SelectItem key={t.id} value={t.id}>
                     {t.name}
@@ -274,8 +274,8 @@ export function ComponentsPage() {
   const { data: pagesData } = usePages({ limit: 200 });
   const pages = pagesData?.data ?? [];
 
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
 
   const deleteComponent = useDeleteComponent();
   const items = data?.data ?? [];
