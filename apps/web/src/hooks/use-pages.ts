@@ -37,7 +37,7 @@ export function useCreatePage() {
   return useMutation({
     mutationFn: (data: {
       application_id?: string;
-      team_id: string;
+      team_id?: string;
       name: string;
       path?: string;
       description?: string;

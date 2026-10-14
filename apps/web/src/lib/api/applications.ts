@@ -21,7 +21,7 @@ export const applicationsApi = {
 
   create: (data: {
     experience_id?: string;
-    team_id: string;
+    team_id?: string;
     name: string;
     description?: string;
     platform?: string;

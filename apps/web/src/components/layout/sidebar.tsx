@@ -9,7 +9,6 @@ import {
   AppWindow,
   FileText,
   Puzzle,
-  UsersRound,
   ChevronDown,
   Zap,
 } from "lucide-react";
@@ -29,7 +28,6 @@ const catalogItems = [
   { to: "/catalog/applications", label: "Applications", icon: AppWindow },
   { to: "/catalog/pages", label: "Pages", icon: FileText },
   { to: "/catalog/components", label: "Components", icon: Puzzle },
-  { to: "/catalog/teams", label: "Teams", icon: UsersRound },
 ];
 
 function NavItem({

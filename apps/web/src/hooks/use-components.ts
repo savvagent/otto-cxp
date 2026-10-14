@@ -37,7 +37,7 @@ export function useCreateComponent() {
   return useMutation({
     mutationFn: (data: {
       page_id?: string;
-      team_id: string;
+      team_id?: string;
       name: string;
       component_type?: string;
       description?: string;

@@ -9,7 +9,7 @@ export const experiencesApi = {
 
   get: (id: string) => apiFetch<Experience>(`/experiences/${id}`),
 
-  create: (data: { name: string; description?: string; team_id: string }) =>
+  create: (data: { name: string; description?: string; team_id?: string }) =>
     apiFetch<Experience>("/experiences", {
       method: "POST",
       body: JSON.stringify(data),

@@ -29,7 +29,7 @@ export function useExperience(id: string | undefined) {
 export function useCreateExperience() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (data: { name: string; description?: string; team_id: string }) =>
+    mutationFn: (data: { name: string; description?: string; team_id?: string }) =>
       experiencesApi.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: experienceKeys.lists() });

@@ -21,7 +21,7 @@ export const pagesApi = {
 
   create: (data: {
     application_id?: string;
-    team_id: string;
+    team_id?: string;
     name: string;
     path?: string;
     description?: string;

@@ -10,28 +10,33 @@ npm install @cxp/sdk
 
 ## Usage
 
+The server is an OAuth-protected MCP resource served over streamable HTTP at
+`https://<host>/mcp`. Connect with a static bearer token (an otto platform access
+token for this resource):
+
 ```typescript
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { CxpClient } from "@cxp/sdk";
+import { connectCxp } from "@cxp/sdk";
 
-// Create and connect MCP client
-const transport = new StdioClientTransport({
-  command: "cxp-mcp-server"
+const { cxp, close } = await connectCxp({
+  url: "https://cxp.example.com/mcp",
+  token: process.env.CXP_TOKEN,
 });
+```
 
-const mcpClient = new Client({
-  name: "my-app",
-  version: "1.0.0"
-}, {
-  capabilities: {}
-});
+Or pass an MCP `OAuthClientProvider` and let the transport run the OAuth flow
+(call `transport.finishAuth(code)` on the returned `transport` after the redirect):
 
-await mcpClient.connect(transport);
+```typescript
+const { cxp } = await connectCxp({ url, authProvider });
+```
 
-// Create CXP SDK client
-const cxp = new CxpClient({ client: mcpClient });
+Already have a connected MCP `Client`? Wrap it: `new CxpClient({ client })`.
 
+List methods return plain arrays (the `{ items, total }` tool envelope is
+unwrapped). Failed calls throw `CxpError`; `error.code` carries the server's
+stable error code, such as `not_found`.
+
+```typescript
 // Use the SDK
 const ticket = await cxp.support.createTicket(
   "customer-123",

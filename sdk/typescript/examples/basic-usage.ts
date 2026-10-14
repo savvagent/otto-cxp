@@ -1,32 +1,12 @@
-/**
- * Basic usage example for CXP SDK
- */
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { CxpClient } from "../src/index.js";
+import { connectCxp } from "../src/index.js";
 
 async function main() {
-  // Create MCP transport
-  const transport = new StdioClientTransport({
-    command: "cxp-mcp-server",
+  // Connect over streamable HTTP with a bearer token
+  const { cxp, close } = await connectCxp({
+    url: process.env.CXP_URL ?? "http://127.0.0.1:8080/mcp",
+    token: process.env.CXP_TOKEN,
+    name: "cxp-example",
   });
-
-  // Create and connect MCP client
-  const mcpClient = new Client(
-    {
-      name: "cxp-example",
-      version: "1.0.0",
-    },
-    {
-      capabilities: {},
-    }
-  );
-
-  await mcpClient.connect(transport);
-
-  // Create CXP SDK client
-  const cxp = new CxpClient({ client: mcpClient });
 
   console.log("Connected to CXP platform\n");
 
@@ -133,7 +113,7 @@ async function main() {
   console.log("\nExample completed successfully!");
 
   // Close the connection
-  await mcpClient.close();
+  await close();
 }
 
 main().catch((error) => {

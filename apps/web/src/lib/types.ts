@@ -133,14 +133,11 @@ export interface Interaction {
   created_at: string;
 }
 
-export interface Team {
+/** A team the caller belongs to, owned by the otto platform. */
+export interface MyTeam {
   id: string;
+  slug: string;
   name: string;
-  description: string | null;
-  owner: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
 }
 
 export interface DashboardMetrics {

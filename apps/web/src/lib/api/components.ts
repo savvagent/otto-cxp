@@ -16,7 +16,7 @@ export const componentsApi = {
 
   create: (data: {
     page_id?: string;
-    team_id: string;
+    team_id?: string;
     name: string;
     component_type?: string;
     description?: string;
