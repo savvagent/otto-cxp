@@ -9,6 +9,9 @@
 //! - The platform or the database could not answer: `503` with
 //!   `Retry-After: 5`, never `401`. A `401` sends every connected agent to
 //!   re-authenticate against the platform that is down.
+//! - The platform refused this service's own credential, or something that
+//!   is not the platform answered: `500`, with neither header. A
+//!   misconfiguration no retry can fix, logged at `error`.
 //!
 //! **The principal is per request, not per session.** It is inserted into the
 //! request's extensions, which the MCP transport carries through to every

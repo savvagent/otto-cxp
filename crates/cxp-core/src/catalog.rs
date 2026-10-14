@@ -78,7 +78,8 @@ impl VerifiedTeam {
 
 /// Ask the platform whether `team_id` is a team of `org`. A team it does not
 /// know, or one in another org, is [`Error::UnknownTeam`]; a platform that
-/// cannot answer is [`Error::Platform`] (`unavailable`).
+/// cannot answer is [`Error::Platform`] (`unavailable` when a retry can help,
+/// `internal` when it cannot).
 ///
 /// A team deleted between this check and the write's commit can still be
 /// stored; the stale id stays on the entity until someone edits it (see
