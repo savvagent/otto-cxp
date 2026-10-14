@@ -76,7 +76,7 @@ pub fn internal(what: &'static str) -> ErrorData {
     tracing::error!(code = "internal", "{what}");
     ErrorData::new(
         ErrorCode::INTERNAL_ERROR,
-        "otto-cxp hit an internal error; retry, and report it if it persists",
+        cxp_core::error::INTERNAL_MESSAGE,
         data("internal", false),
     )
 }

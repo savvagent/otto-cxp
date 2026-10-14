@@ -94,11 +94,7 @@ impl From<otto_resource::Error> for ApiError {
 impl From<MissingScope> for ApiError {
     fn from(e: MissingScope) -> Self {
         let mut err = Self::new(StatusCode::FORBIDDEN, "insufficient_scope", e.to_string());
-        err.challenge = Some(format!(
-            r#"Bearer realm="{}", error="insufficient_scope", scope="{}""#,
-            cxp_core::scopes::RESOURCE_NAME,
-            e.0
-        ));
+        err.challenge = Some(cxp_core::auth::scope_challenge(e.0));
         err
     }
 }

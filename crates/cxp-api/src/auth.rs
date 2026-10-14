@@ -11,7 +11,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cxp_core::auth::{self, AuthFailure, Principal};
-use http::{header, HeaderValue, StatusCode};
+use http::{header, HeaderName, HeaderValue, StatusCode};
 
 use crate::AppState;
 
@@ -36,7 +36,7 @@ pub async fn require_bearer(
             {
                 res.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
-                    challenge(&state.config.public_url, &AuthFailure::Revoked),
+                    revoked_challenge(&state.config.public_url),
                 );
             }
             res
@@ -45,44 +45,27 @@ pub async fn require_bearer(
     }
 }
 
+/// The shared [`auth::refusal`] as an axum response.
 fn refuse(public_url: &str, failure: AuthFailure) -> Response {
-    if failure.is_unavailable() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, "5")],
-            Json(serde_json::json!({
-                "error": "temporarily_unavailable",
-                "error_description": failure.reason(),
-            })),
-        )
-            .into_response();
+    let refusal = auth::refusal(public_url, &failure);
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED);
+    let mut res = (status, Json(refusal.body)).into_response();
+    for (name, value) in refusal.headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            res.headers_mut()
+                .insert(HeaderName::from_static(name), value);
+        }
     }
-    let mut res = (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": error_name(&failure),
-            "error_description": failure.reason(),
-        })),
-    )
-        .into_response();
-    res.headers_mut()
-        .insert(header::WWW_AUTHENTICATE, challenge(public_url, &failure));
     res
 }
 
-/// The body's `error`. A request with no credentials is `unauthenticated`,
-/// not `invalid_token`: there was no token to be invalid, and the challenge
-/// header carries no `error` for it either (RFC 6750 §3.1).
-fn error_name(failure: &AuthFailure) -> &'static str {
-    match failure {
-        AuthFailure::Missing => "unauthenticated",
-        _ => "invalid_token",
-    }
-}
-
-fn challenge(public_url: &str, failure: &AuthFailure) -> HeaderValue {
-    // `www_authenticate` emits only visible ASCII; should a misconfigured
-    // public URL break that, keep the scheme rather than drop the header.
-    HeaderValue::from_str(&auth::www_authenticate(public_url, failure))
-        .unwrap_or_else(|_| HeaderValue::from_static(r#"Bearer realm="otto-cxp""#))
+/// The challenge a handler's `401` (`access_revoked`) gets: the one a revoked
+/// token gets here.
+fn revoked_challenge(public_url: &str) -> HeaderValue {
+    auth::refusal(public_url, &AuthFailure::Revoked)
+        .headers
+        .into_iter()
+        .find(|(name, _)| *name == "www-authenticate")
+        .and_then(|(_, v)| HeaderValue::from_str(&v).ok())
+        .unwrap_or_else(|| HeaderValue::from_static("Bearer"))
 }

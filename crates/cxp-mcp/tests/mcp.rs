@@ -269,7 +269,8 @@ async fn no_token_is_a_401_naming_the_metadata_document(pool: PgPool) {
         ),
         "{challenge}"
     );
-    assert_eq!(v["error"], "invalid_token");
+    assert!(!challenge.contains("error="), "{challenge}");
+    assert_eq!(v["error"], "unauthenticated");
 
     // The metadata document itself is open.
     let (status, _, doc) = h
