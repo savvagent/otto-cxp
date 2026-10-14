@@ -278,7 +278,8 @@ async fn sweep_loop(db: Db, mut shutdown: watch::Receiver<bool>) {
         match cxp_core::platform_events::sweep(&db, PLATFORM_EVENT_RETENTION_DAYS).await {
             Ok(0) => {}
             Ok(n) => tracing::info!(rows = n, "swept old platform-event records"),
-            Err(e) => tracing::warn!(error = %e, "platform-event sweep failed"),
+            Err(e) => tracing::warn!(error = %e, source = ?std::error::Error::source(&e),
+                "platform-event sweep failed"),
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
