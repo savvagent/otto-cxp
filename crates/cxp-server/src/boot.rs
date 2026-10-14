@@ -11,7 +11,7 @@ use std::future::{Future, IntoFuture};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use cxp_core::usage::ShipperConfig;
+use cxp_core::usage::{ShipError, ShipperConfig};
 use otto_resource::{PlatformClient, TokenClaims};
 use otto_tenant::Db;
 use tokio::net::TcpListener;
@@ -116,8 +116,10 @@ pub async fn check_platform(platform: &PlatformClient, config: &Config) -> Platf
 /// on its own: the process should exit non-zero so the machine restarts,
 /// rather than serve on without shipping usage or sweeping. So is a shutdown
 /// that did not finish cleanly: in-flight requests dropped at the drain
-/// deadline, or a final usage flush that failed or ran out of time (its rows
-/// stay in the outbox for the next start).
+/// deadline, or a final usage flush that failed for a reason that will not
+/// pass on its own, or ran out of time (its rows stay in the outbox for the
+/// next start). A flush that could not reach the platform is logged at
+/// `warn` and does not fail the exit: the next start ships those rows.
 pub async fn run<F>(config: Config, listener: TcpListener, shutdown: F) -> Result<Boot>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -241,10 +243,7 @@ where
     let _ = stop.send(true);
     if !shipper_done {
         let flushed = match tokio::time::timeout(FLUSH_TIMEOUT, &mut shipper).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            // Logged by the shipper itself.
-            Ok(Ok(Err(e))) => Err(format!("the final usage flush failed: {e}")),
-            Ok(Err(e)) => Err(format!("the usage shipper did not stop cleanly: {e}")),
+            Ok(r) => flush_result(r),
             Err(_) => {
                 shipper.abort();
                 Err(format!(
@@ -267,6 +266,24 @@ where
             isolation,
             platform: check,
         }),
+    }
+}
+
+/// What the shipper's final pass means for the exit. A failure that passes
+/// on its own (the platform unreachable, failing, or rate limiting) is no
+/// reason to exit non-zero: the rows wait in the outbox and the next start
+/// ships them, and the shipper has logged it at `warn`. Anything else (the
+/// credential refused, the outbox database failing, the task panicking)
+/// needs an operator and fails the exit.
+fn flush_result(
+    r: std::result::Result<std::result::Result<(), ShipError>, JoinError>,
+) -> std::result::Result<(), String> {
+    match r {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if e.is_retriable() => Ok(()),
+        // Logged by the shipper itself.
+        Ok(Err(e)) => Err(format!("the final usage flush failed: {e}")),
+        Err(e) => Err(format!("the usage shipper did not stop cleanly: {e}")),
     }
 }
 
@@ -374,6 +391,30 @@ mod tests {
         let (a, b) = (probe_token(), probe_token());
         assert!(otto_resource::looks_like_token(&a), "{a}");
         assert_ne!(a, b);
+    }
+
+    /// A final flush the platform was unreachable for leaves its rows for the
+    /// next start and exits cleanly; one that needs an operator fails the
+    /// exit.
+    #[test]
+    fn only_a_flush_failure_that_will_not_pass_fails_the_exit() {
+        let status = |status| {
+            Ok(Err(ShipError::Platform(otto_resource::Error::Status {
+                status,
+                body: String::new(),
+            })))
+        };
+        assert_eq!(flush_result(Ok(Ok(()))), Ok(()));
+        for passes in [503, 502, 429, 408] {
+            assert_eq!(flush_result(status(passes)), Ok(()), "{passes}");
+        }
+        let err = flush_result(Ok(Err(ShipError::Platform(
+            otto_resource::Error::Unauthorized,
+        ))))
+        .unwrap_err();
+        assert!(err.contains("final usage flush failed"), "{err}");
+        assert!(flush_result(Ok(Err(ShipError::Db(sqlx::Error::PoolClosed)))).is_err());
+        assert!(flush_result(Ok(Err(ShipError::Receipt("short".into())))).is_err());
     }
 
     #[test]
