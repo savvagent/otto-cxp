@@ -6,13 +6,19 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /app
 # Only what the server needs. The SDKs, React package, and web app are not
 # part of the image, so a change to them does not invalidate this layer.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# rust-toolchain.toml is left out on purpose: it names `stable` plus
+# components, which would make rustup download a second toolchain on every
+# uncached build; the base image's stable compiler is the build's toolchain.
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # Every statement is a runtime `sqlx::query`, never a `query!` macro, so the
 # build needs no database. Migrations are embedded by `sqlx::migrate!`.
-# `target/` lives in a cache mount, so the binary is copied out in the same RUN.
+# The otto-platform crates are git dependencies, so cargo's git checkouts are
+# cached alongside the registry. `target/` lives in a cache mount, so the
+# binary is copied out in the same RUN.
 RUN --mount=type=cache,id=otto-cxp-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=otto-cxp-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=otto-cxp-target,target=/app/target,sharing=locked \
     cargo build --release --locked -p cxp-server \
     && cp target/release/cxp-server /usr/local/bin/cxp-server
