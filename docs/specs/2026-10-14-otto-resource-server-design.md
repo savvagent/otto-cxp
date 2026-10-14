@@ -280,8 +280,7 @@ then refuse with `Error::AccessRevoked` when the org is in `deleted_orgs` or the
 ### Metering (`cxp_core::usage`, S4)
 
 `BILLABLE = ["submit_feedback", "create_survey", "send_survey", "submit_survey_response"]`.
-`Meter::charge(&self, tx, user, tool)` panics in debug / errors in release if `tool` is not in
-`BILLABLE`, optionally enforces the quota (`CXP_ENFORCE_QUOTAS`, default off, fail open) and
+`Meter::charge(&self, tx, user, tool)` returns `Error::Invalid` if `tool` is not in `BILLABLE`, optionally enforces the quota (`CXP_ENFORCE_QUOTAS`, default off, fail open) and
 inserts one `usage_outbox` row in the caller's transaction. `Meter::report(org)` returns the
 usage summary `whoami`/`usage` show (otto-flags' `Status`). `ship_once`/`run` ship batches to
 `POST /internal/usage` (event_id dedupe at the platform), as otto-flags.
@@ -383,3 +382,8 @@ commands live in `docs/deploy/fly.md` (S12).
 - rmcp 2.0.0 API differences from otto-flags' usage are copied, not discovered.
 - Parallel DB tests: each parallel story runs its own Postgres container (see `CLAUDE.md`).
 - Until the console-OAuth ticket lands, the local web console cannot call `/api`.
+- `team.deleted` race: a catalog write that verified its team at the platform just before the
+  team was deleted, but commits after the webhook nulled the org's team ids, keeps a stale
+  `team_id`. Accepted: the window is one request, and readers treat an unknown team id as
+  unowned. A `deleted_teams` tombstone would close it if it ever matters.
+- The usage shipper is the second caller of `cxp_core::maintenance` (after the sweep).
