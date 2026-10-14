@@ -4,6 +4,7 @@ members = [
   "crates/cxp-core",
   "crates/cxp-mcp",
   "crates/cxp-api",
+  "crates/cxp-server",
 ]
 
 [workspace.package]
