@@ -39,7 +39,9 @@ export interface SurveyRendererProps {
   surveyId?: string;
   customerId?: string;
   onComplete?: () => void;
+  /** Catalog experience UUID (`experience_id`). Currently unused by this component. */
   experience?: string;
+  /** Catalog application UUID (`application_id`). Currently unused by this component. */
   application?: string;
   page?: string;
   component?: string;

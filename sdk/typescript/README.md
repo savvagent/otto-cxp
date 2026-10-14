@@ -104,8 +104,8 @@ const responses = await cxp.feedback.getResponses(survey.id);
 await cxp.feedback.submitFeedback(customerId, "bug_report", {
   subject: "Button not working",
   body: "The submit button is disabled",
-  application: "web-app",
-  page: "/checkout"
+  applicationId: "<application uuid>",
+  pageId: "<page uuid>"
 });
 
 // Analytics

@@ -293,7 +293,7 @@ describe("SupportDomain", () => {
 
       expect(mockClient.callTool).toHaveBeenCalledWith({
         name: "start_chat_session",
-        arguments: { customer_id: "customer-456" },
+        arguments: { id: "customer-456" },
       });
       expect(result).toEqual(mockSession);
     });
@@ -347,7 +347,7 @@ describe("SupportDomain", () => {
 
       expect(mockClient.callTool).toHaveBeenCalledWith({
         name: "end_chat_session",
-        arguments: { session_id: "session-123" },
+        arguments: { id: "session-123" },
       });
       expect(result.status).toBe("ended");
     });

@@ -57,10 +57,10 @@ export interface Feedback {
   subject?: string;
   body?: string;
   rating?: number;
-  experience?: string;
-  application?: string;
-  page?: string;
-  component?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
   metadata: Record<string, unknown>;
   createdAt: string;
 }
@@ -165,9 +165,35 @@ export interface ChatMessage {
  */
 export interface Customer360 {
   customer: Customer;
-  recentTickets: Ticket[];
+  recentTickets: TicketSummary[];
   recentInteractions: Interaction[];
-  recentFeedback: Feedback[];
+  recentFeedback: FeedbackSummary[];
+}
+
+/**
+ * A support ticket as the 360 view shows it
+ */
+export interface TicketSummary {
+  id: string;
+  subject: string;
+  status: string;
+  priority: string;
+  channel?: string | null;
+  assignedTo?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+/**
+ * A piece of feedback as the 360 view shows it
+ */
+export interface FeedbackSummary {
+  id: string;
+  feedbackType: string;
+  subject?: string | null;
+  body?: string | null;
+  rating?: number | null;
+  createdAt: string;
 }
 
 /**
@@ -200,22 +226,33 @@ export interface MetricsDashboard {
  * Feedback context information
  */
 export interface FeedbackContext {
-  experience?: string;
-  application?: string;
-  page?: string;
-  component?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 }
 
 /**
  * NPS calculation result
  */
 export interface NpsResult {
-  score: number;
+  /** Net Promoter Score (-100 to 100); null when nothing is scored */
+  nps: number | null;
+  totalResponses: number;
+  scoredResponses: number;
+  promoters: number;
+  passives: number;
+  detractors: number;
 }
 
 /**
  * CSAT calculation result
  */
 export interface CsatResult {
-  score: number;
+  /** Satisfied share of rated feedback, 0 to 100; null when nothing is rated */
+  csat: number | null;
+  totalFeedback: number;
+  ratedFeedback: number;
+  satisfied: number;
+  unsatisfied: number;
 }

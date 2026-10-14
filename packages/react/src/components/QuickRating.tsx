@@ -28,9 +28,13 @@ const EMOTICONS = ["😠", "😟", "😐", "🙂", "😄"];
 export interface QuickRatingProps {
   customerId?: string;
   feedbackType?: string;
+  /** Catalog experience UUID, sent as `experience_id`. */
   experience?: string;
+  /** Catalog application UUID, sent as `application_id`. */
   application?: string;
+  /** Catalog page UUID, sent as `page_id`. */
   page?: string;
+  /** Catalog component UUID, sent as `component_id`. */
   component?: string;
   labels?: QuickRatingLabels;
   onSubmit?: (rating: number) => void;
@@ -63,10 +67,10 @@ export function QuickRating({
         await cxp.feedback.submitFeedback(customerId, feedbackType, {
           rating,
           subject: `Quick rating: ${rating}/5`,
-          experience,
-          application,
-          page,
-          component,
+          experienceId: experience,
+          applicationId: application,
+          pageId: page,
+          componentId: component,
         });
       } else {
         await new Promise((r) => setTimeout(r, 400));

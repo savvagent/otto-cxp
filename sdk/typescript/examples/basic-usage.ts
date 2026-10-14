@@ -1,5 +1,10 @@
 import { connectCxp } from "../src/index.js";
 
+// Placeholder catalog IDs. The server expects UUIDs of existing catalog
+// entities for feedback context; replace these with real ones.
+const WEB_APP_ID = "00000000-0000-4000-8000-000000000001";
+const SETTINGS_PAGE_ID = "00000000-0000-4000-8000-000000000002";
+
 async function main() {
   // Connect over streamable HTTP with a bearer token
   const { cxp, close } = await connectCxp({
@@ -52,8 +57,8 @@ async function main() {
       subject: "Dark mode support",
       body: "Would love to see a dark mode option in the dashboard",
       rating: 4,
-      application: "web-app",
-      page: "/settings",
+      applicationId: WEB_APP_ID,
+      pageId: SETTINGS_PAGE_ID,
     }
   );
   console.log("Feedback submitted:", feedback.id);

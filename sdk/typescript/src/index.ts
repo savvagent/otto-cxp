@@ -50,6 +50,8 @@ export type {
   ChatSession,
   ChatMessage,
   Customer360,
+  TicketSummary,
+  FeedbackSummary,
   SentimentResult,
   MetricsDashboard,
   FeedbackContext,

@@ -99,7 +99,7 @@ describe("domains", () => {
     const out = await new FeedbackDomain(c).getResponses("s1");
     expect(c.callTool).toHaveBeenCalledWith({
       name: "get_survey_responses",
-      arguments: { survey_id: "s1" },
+      arguments: { id: "s1" },
     });
     expect(out).toEqual([{ id: "r1" }]);
   });
