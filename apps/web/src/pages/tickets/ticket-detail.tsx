@@ -299,11 +299,11 @@ export function TicketDetailPage() {
                 <Label htmlFor="detail-assigned">Assigned To</Label>
                 <Input
                   id="detail-assigned"
-                  defaultValue={ticket.assigned_to ?? ""}
+                  defaultValue={ticket.assignedTo ?? ""}
                   placeholder="Unassigned"
                   onBlur={(e) => {
                     const val = e.currentTarget.value.trim();
-                    if (val !== (ticket.assigned_to ?? "")) {
+                    if (val !== (ticket.assignedTo ?? "")) {
                       updateField("assigned_to", val);
                     }
                   }}
@@ -335,11 +335,11 @@ export function TicketDetailPage() {
               <div className="space-y-1.5">
                 <p className="text-sm font-medium">Customer</p>
                 <Link
-                  to={`/customers/${ticket.customer_id}`}
+                  to={`/customers/${ticket.customerId}`}
                   className="inline-flex items-center gap-1 text-sm font-mono text-primary hover:underline focus:outline-none focus:ring-2 focus:ring-ring rounded"
-                  aria-label={`View customer ${ticket.customer_id}`}
+                  aria-label={`View customer ${ticket.customerId}`}
                 >
-                  {ticket.customer_id.slice(0, 8)}...
+                  {ticket.customerId.slice(0, 8)}...
                   <ExternalLink className="h-3 w-3 shrink-0" />
                 </Link>
               </div>
@@ -353,7 +353,7 @@ export function TicketDetailPage() {
                     Created
                   </p>
                   <p className="text-sm mt-0.5">
-                    {formatDateTime(ticket.created_at)}
+                    {formatDateTime(ticket.createdAt)}
                   </p>
                 </div>
                 <div>
@@ -361,16 +361,16 @@ export function TicketDetailPage() {
                     Last Updated
                   </p>
                   <p className="text-sm mt-0.5">
-                    {formatDateTime(ticket.updated_at)}
+                    {formatDateTime(ticket.updatedAt)}
                   </p>
                 </div>
-                {ticket.resolved_at && (
+                {ticket.resolvedAt && (
                   <div>
                     <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
                       Resolved
                     </p>
                     <p className="text-sm mt-0.5">
-                      {formatDateTime(ticket.resolved_at)}
+                      {formatDateTime(ticket.resolvedAt)}
                     </p>
                   </div>
                 )}

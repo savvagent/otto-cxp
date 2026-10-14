@@ -249,7 +249,7 @@ export function SurveyDetailPage() {
                 )}
                 <div className="flex items-center gap-3 text-xs text-muted-foreground">
                   <CopyableId value={survey.id} />
-                  <span>Created {new Date(survey.created_at).toLocaleDateString()}</span>
+                  <span>Created {new Date(survey.createdAt).toLocaleDateString()}</span>
                 </div>
               </>
             )
@@ -324,11 +324,11 @@ export function SurveyDetailPage() {
                   return (
                     <TableRow key={response.id}>
                       <TableCell className="font-mono text-xs">
-                        {response.customer_id?.slice(0, 8) ?? "—"}
+                        {response.customerId?.slice(0, 8) ?? "—"}
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
-                        {response.completed_at
-                          ? new Date(response.completed_at).toLocaleString()
+                        {response.completedAt
+                          ? new Date(response.completedAt).toLocaleString()
                           : "—"}
                       </TableCell>
                       <TableCell

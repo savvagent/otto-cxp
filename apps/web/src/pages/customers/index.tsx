@@ -493,7 +493,7 @@ export function CustomersPage() {
                     </div>
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-muted-foreground text-sm">
-                    {formatDate(customer.created_at)}
+                    {formatDate(customer.createdAt)}
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
                     <CustomerRowActions customer={customer} />

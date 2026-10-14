@@ -1,3 +1,9 @@
+// Response models are camelCase, as the server serializes them (the
+// `cxp-core` models use `rename_all = "camelCase"`). Request bodies and query
+// parameters are the opposite: they stay snake_case (see `lib/api/*`).
+// `src/lib/types.test.ts` checks these shapes against the payloads in
+// `crates/cxp-api/tests/fixtures/wire.json`, which a Rust test generates.
+
 export interface Customer {
   id: string;
   email: string;
@@ -6,47 +12,47 @@ export interface Customer {
   company: string | null;
   metadata: Record<string, unknown>;
   tags: string[];
-  experience_id: string | null;
-  application_id: string | null;
-  page_id: string | null;
-  component_id: string | null;
-  created_at: string;
-  updated_at: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Ticket {
   id: string;
-  customer_id: string;
+  customerId: string;
   subject: string;
   description: string | null;
   status: string;
   priority: string;
   channel: string | null;
-  assigned_to: string | null;
+  assignedTo: string | null;
   tags: string[];
   metadata: Record<string, unknown>;
-  experience_id: string | null;
-  application_id: string | null;
-  page_id: string | null;
-  component_id: string | null;
-  resolved_at: string | null;
-  created_at: string;
-  updated_at: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Feedback {
   id: string;
-  customer_id: string;
-  feedback_type: string;
+  customerId: string;
+  feedbackType: string;
   subject: string | null;
   body: string | null;
   rating: number | null;
   metadata: Record<string, unknown>;
-  experience_id: string | null;
-  application_id: string | null;
-  page_id: string | null;
-  component_id: string | null;
-  created_at: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  createdAt: string;
 }
 
 export interface Survey {
@@ -55,82 +61,104 @@ export interface Survey {
   description: string | null;
   questions: unknown;
   active: boolean;
-  experience_id: string | null;
-  application_id: string | null;
-  page_id: string | null;
-  component_id: string | null;
-  created_at: string;
-  updated_at: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SurveyResponse {
   id: string;
-  survey_id: string;
-  customer_id: string;
+  surveyId: string;
+  customerId: string;
   answers: Record<string, unknown>;
-  completed_at: string | null;
-  created_at: string;
+  completedAt: string | null;
+  createdAt: string;
 }
 
 export interface Experience {
   id: string;
   name: string;
   description: string | null;
-  team_id: string | null;
+  teamId: string | null;
   metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Application {
   id: string;
-  experience_id: string | null;
-  team_id: string | null;
+  experienceId: string | null;
+  teamId: string | null;
   name: string;
   description: string | null;
   platform: string | null;
   metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Page {
   id: string;
-  application_id: string | null;
-  team_id: string | null;
+  applicationId: string | null;
+  teamId: string | null;
   name: string;
   path: string | null;
   description: string | null;
   metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Component {
   id: string;
-  page_id: string | null;
-  team_id: string | null;
+  pageId: string | null;
+  teamId: string | null;
   name: string;
-  component_type: string | null;
+  componentType: string | null;
   description: string | null;
   metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The ticket rows inside a customer 360 view: a subset of `Ticket`. */
+export interface TicketSummary {
+  id: string;
+  subject: string;
+  status: string;
+  priority: string;
+  channel: string | null;
+  assignedTo: string | null;
+  createdAt: string;
+  resolvedAt: string | null;
+}
+
+/** The feedback rows inside a customer 360 view: a subset of `Feedback`. */
+export interface FeedbackSummary {
+  id: string;
+  feedbackType: string;
+  subject: string | null;
+  body: string | null;
+  rating: number | null;
+  createdAt: string;
 }
 
 export interface Customer360 {
   customer: Customer;
-  recent_tickets: Ticket[];
-  recent_interactions: Interaction[];
-  recent_feedback: Feedback[];
+  recentTickets: TicketSummary[];
+  recentInteractions: Interaction[];
+  recentFeedback: FeedbackSummary[];
 }
 
 export interface Interaction {
   id: string;
-  customer_id: string;
-  interaction_type: string;
+  customerId: string;
+  interactionType: string;
   metadata: Record<string, unknown>;
-  created_at: string;
+  createdAt: string;
 }
 
 /** A team the caller belongs to, owned by the otto platform. */
@@ -140,6 +168,10 @@ export interface MyTeam {
   name: string;
 }
 
+/**
+ * The one response that stays snake_case: `GET /dashboard/metrics` keeps the
+ * keys it has always answered with (crates/cxp-api/src/routes/dashboard.rs).
+ */
 export interface DashboardMetrics {
   total_customers: number;
   total_tickets: number;

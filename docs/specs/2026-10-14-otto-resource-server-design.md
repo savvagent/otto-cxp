@@ -361,9 +361,10 @@ Same routes and JSON shapes as `server/src/api` today minus `/teams`, behind `re
 create/update with a `teamId` verifies it with `cxp_core::catalog::verify_team(platform, org, id)`
 (unknown, or another org's → 400 `unknown_team`; platform down → 503), which returns the
 `VerifiedTeam` the catalog write requires, so no route can store an unverified team id. On update, an absent team
-field leaves the team unchanged and an explicit `null` clears it. The console currently sends
-`team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
-lands. `POST /api/v1/surveys` charges `create_survey`.
+field leaves the team unchanged and an explicit `null` clears it. Request bodies are snake_case
+(`team_id`), and catalog bodies also accept `teamId` as a permanent alias; responses are
+camelCase. The casing mismatch is resolved by #15 (the console reads camelCase); the broader
+question of one convention for `/api/v1` is tracked in #24. `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
 `invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until
@@ -414,8 +415,8 @@ S12's `scripts/seed-demo.sql` is local-only demo data (a psql `-v org=<uuid>` va
 not application SQL, so "no SQL outside cxp-core" does not cover it, and running it against
 `otto-db` is a production write: human-only.
 
-Out of scope (own tickets): the web console's platform OAuth sign-in; the web app's snake_case
-types vs. the server's camelCase JSON (`apps/web/src/lib/types.ts`).
+Out of scope (own tickets): the web console's platform OAuth sign-in. The web app's types now
+read the server's camelCase JSON (#15); one casing convention for `/api/v1` is #24.
 
 ## Out-of-band and hand-offs
 
