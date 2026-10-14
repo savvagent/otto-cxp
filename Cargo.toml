@@ -1,10 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  # The pre-platform server (package `cxp-server`). Kept building, untouched,
-  # until the new `crates/cxp-server` binary replaces it in one change; it
-  # declares its own dependencies rather than using the workspace's.
-  "server",
   "crates/cxp-core",
   "crates/cxp-mcp",
   "crates/cxp-api",
