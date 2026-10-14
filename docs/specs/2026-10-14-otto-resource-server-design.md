@@ -302,7 +302,10 @@ that mounts `/mcp` behind `require_bearer` and the open metadata route.
 Same routes and JSON shapes as `server/src/api` today minus `/teams`, behind `require_bearer`: GET needs read, other methods need write. Plus
 `GET /api/v1/me/teams` → `platform.member_teams(org, user)` as `[{id, slug, name}]`. Catalog
 create/update with a `teamId` verifies it with `platform.team(org, id)` (unknown →
-400 `unknown_team`; platform down → 503). `POST /api/v1/surveys` charges `create_survey`.
+400 `unknown_team`; platform down → 503). On update, an absent team
+field leaves the team unchanged and an explicit `null` clears it. The console currently sends
+`team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
+lands. `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (failure 503 so the platform retries),
 200 `{"result": …}`. Errors are JSON `{error, code}` with no database text. Request bodies
