@@ -25,12 +25,25 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
 - **App** `otto-cxp`: shared-cpu-1x, 256 MB, `auto_stop_machines = "suspend"`,
   `min_machines_running = 0`. Idle costs nothing; the first request after idle resumes the
   machine. Raising `min_machines_running` is a cost decision (Rob).
+  While the machine is suspended its background tasks are suspended with it: the usage shipper
+  does not post `usage_outbox` rows to the platform and the hourly platform-event sweep does not
+  run. Both resume with the machine. Usage recorded before the suspend stays in
+  `usage_outbox` and ships on resume (and graceful shutdown flushes it), so billing is
+  delayed, never lost; the platform's usage totals can trail by up to the idle period.
 - **Database** `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with `otto_platform`,
   `otto_factory`, and `otto_flags`. Plain Postgres 16 is enough: pgvector is NOT needed (the
   schema uses only the stock `pgcrypto` and `pg_trgm`). The attach role is a superuser on the
   whole instance, so isolation inside this database rests on row-level security under
   `SET LOCAL ROLE otto_app`, which `cxp-server` proves at boot
-  (`tenant isolation enforced as role "otto_app"`) and refuses to start without. The pool is
+  (`tenant isolation enforced as role "otto_app"`) and refuses to start without.
+  **Risk:** the connection itself is still a superuser. A bug that ran a statement outside the
+  pinned transaction, or anyone holding `DATABASE_URL`, bypasses RLS and can reach every other
+  database on the instance (`otto_platform` included). Replacing it with a dedicated
+  non-superuser role is tracked in
+  [#16](https://github.com/savvagent/otto-cxp/issues/16); do it before real customers.
+  Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
+  planner off some index paths; fine at today's volumes, slow at scale. Making them fast is
+  tracked in [#17](https://github.com/savvagent/otto-cxp/issues/17). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
