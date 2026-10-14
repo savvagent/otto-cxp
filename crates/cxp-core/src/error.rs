@@ -53,8 +53,9 @@ pub enum Error {
         upgrade_url: String,
     },
 
-    /// A dependency (the platform, or the database under contention) could not
-    /// serve the request right now; nothing was changed.
+    /// A dependency could not serve the request right now; nothing was
+    /// changed. Kept for the surfaces' status mappings; nothing in cxp-core
+    /// raises it today (platform failures are [`Error::Platform`]).
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
@@ -63,8 +64,15 @@ pub enum Error {
     #[error("the otto platform could not be reached; nothing was changed. Retry shortly")]
     Platform(#[from] otto_resource::Error),
 
-    /// The tenant substrate failed. Only its `Invalid` text, which describes
-    /// the caller's request, is shown.
+    /// A server-side programming error (e.g. metering a tool that is not
+    /// billable). The detail is for logs (`Debug`); callers see only
+    /// [`INTERNAL_MESSAGE`].
+    #[error("{}", INTERNAL_MESSAGE)]
+    Internal(String),
+
+    /// The tenant substrate failed. Its `Invalid` text, which describes the
+    /// caller's request, is shown; its database failures read and code
+    /// exactly as [`Error::Database`] does.
     #[error("{}", tenant_message(.0))]
     Tenant(#[from] otto_tenant::Error),
 
@@ -107,46 +115,48 @@ fn is_input_rejection(e: &sqlx::Error) -> bool {
 fn tenant_message(e: &otto_tenant::Error) -> String {
     match e {
         otto_tenant::Error::Invalid(msg) => msg.clone(),
+        otto_tenant::Error::Db(db) => database_message(db).to_string(),
         _ => INTERNAL_MESSAGE.to_string(),
     }
 }
 
 impl Error {
+    /// The database error inside, whichever way it arrived: directly, or
+    /// through the tenant substrate. Both are treated identically.
+    fn db(&self) -> Option<&sqlx::Error> {
+        match self {
+            Error::Database(e) | Error::Tenant(otto_tenant::Error::Db(e)) => Some(e),
+            _ => None,
+        }
+    }
+
     /// A stable, machine-readable code. Agents branch on this, never on text.
     pub fn code(&self) -> &'static str {
+        if let Some(e) = self.db() {
+            return if is_input_rejection(e) {
+                "invalid_argument"
+            } else {
+                "internal"
+            };
+        }
         match self {
             Error::NotFound { .. } => "not_found",
             Error::Invalid(_) | Error::Tenant(otto_tenant::Error::Invalid(_)) => "invalid_argument",
-            Error::Database(e) if is_input_rejection(e) => "invalid_argument",
             Error::Conflict(_) => "conflict",
             Error::UnknownTeam => "unknown_team",
             Error::AccessRevoked => "access_revoked",
             Error::QuotaExceeded { .. } => "quota_exceeded",
             Error::Unavailable | Error::Platform(_) => "unavailable",
-            Error::Tenant(_) | Error::Database(_) => "internal",
+            Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => "internal",
         }
     }
 
     /// Whether repeating the same call unchanged could succeed.
     pub fn retriable(&self) -> bool {
-        match self {
-            Error::Database(e) => !is_input_rejection(e),
-            Error::Unavailable => true,
-            Error::Platform(p) => p.is_retriable(),
-            Error::Tenant(otto_tenant::Error::Db(_)) => true,
-            _ => false,
+        if let Some(e) = self.db() {
+            return !is_input_rejection(e);
         }
-    }
-
-    /// Whether this failure is the kind that passes on its own: contention
-    /// (serialization failure, deadlock, a lock or statement timeout), a
-    /// connection or pool problem, or the platform being unreachable. Narrower
-    /// than [`Error::retriable`], which tells an agent any database error is
-    /// worth one more try: a background job retrying on a schedule must not
-    /// keep retrying a constraint violation or a missing table.
-    pub fn is_transient(&self) -> bool {
         match self {
-            Error::Database(e) | Error::Tenant(otto_tenant::Error::Db(e)) => db_is_transient(e),
             Error::Unavailable => true,
             Error::Platform(p) => p.is_retriable(),
             _ => false,
@@ -156,27 +166,14 @@ impl Error {
     /// Whether this is the server's fault rather than a description of the
     /// caller's request. Callers log these with their source.
     pub fn is_internal(&self) -> bool {
+        if let Some(e) = self.db() {
+            return !is_input_rejection(e);
+        }
         match self {
-            Error::Database(e) => !is_input_rejection(e),
-            Error::Platform(_) => true,
+            Error::Platform(_) | Error::Internal(_) => true,
             Error::Tenant(t) => !matches!(t, otto_tenant::Error::Invalid(_)),
             _ => false,
         }
-    }
-}
-
-/// SQLSTATEs that a later attempt can avoid: serialization_failure,
-/// deadlock_detected, lock_not_available (`lock_timeout`), and query_canceled
-/// (`statement_timeout`).
-const TRANSIENT_SQLSTATES: &[&str] = &["40001", "40P01", "55P03", "57014"];
-
-fn db_is_transient(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => true,
-        sqlx::Error::Database(db) => db
-            .code()
-            .is_some_and(|code| TRANSIENT_SQLSTATES.contains(&code.as_ref())),
-        _ => false,
     }
 }
 
@@ -189,43 +186,59 @@ pub fn on_unique(e: sqlx::Error, to: impl FnOnce() -> Error) -> Error {
     }
 }
 
-/// Map a foreign-key violation to `to`, anything else to [`Error::Database`].
-/// A composite `(org_id, x_id)` foreign key refuses another org's id exactly
-/// as it refuses a missing one, so `to` is usually [`Error::NotFound`].
-pub fn on_foreign_key(e: sqlx::Error, to: impl FnOnce() -> Error) -> Error {
-    match &e {
-        sqlx::Error::Database(db) if db.is_foreign_key_violation() => to(),
-        _ => Error::Database(e),
+/// Map a foreign-key violation to [`Error::NotFound`] of the kind `kinds`
+/// pairs with its constraint name (each module lists the exact generated
+/// names of its own composite `(org_id, x_id)` keys, which refuse another
+/// org's id exactly as they refuse a missing one). A violation of a
+/// constraint not listed, or any other failure, is an internal
+/// [`Error::Database`], never a guessed kind. The constraint name is never
+/// shown.
+pub(crate) fn map_fk(e: sqlx::Error, kinds: &[(&str, &'static str)]) -> Error {
+    let kind = match &e {
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => db
+            .constraint()
+            .and_then(|c| kinds.iter().find(|(name, _)| *name == c))
+            .map(|(_, kind)| *kind),
+        _ => None,
+    };
+    match kind {
+        Some(kind) => Error::NotFound { kind },
+        None => Error::Database(e),
     }
 }
 
+/// A fake database error for unit tests: sqlx's own Postgres error cannot be
+/// built outside sqlx.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fake {
     use std::borrow::Cow;
 
-    /// A database error with a chosen SQLSTATE and message: sqlx's own
-    /// Postgres error cannot be built outside sqlx.
-    #[derive(Debug)]
-    struct Sqlstate(&'static str);
-
-    const DB_TEXT: &str =
+    pub(crate) const DB_TEXT: &str =
         "duplicate key value violates unique constraint \"customers_org_id_email_key\"";
 
-    impl std::fmt::Display for Sqlstate {
+    #[derive(Debug)]
+    pub(crate) struct FakeDbError {
+        code: &'static str,
+        constraint: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for FakeDbError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(DB_TEXT)
         }
     }
 
-    impl std::error::Error for Sqlstate {}
+    impl std::error::Error for FakeDbError {}
 
-    impl sqlx::error::DatabaseError for Sqlstate {
+    impl sqlx::error::DatabaseError for FakeDbError {
         fn message(&self) -> &str {
             DB_TEXT
         }
         fn code(&self) -> Option<Cow<'_, str>> {
-            Some(Cow::Borrowed(self.0))
+            Some(Cow::Borrowed(self.code))
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
         }
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
             self
@@ -237,7 +250,7 @@ mod tests {
             self
         }
         fn kind(&self) -> sqlx::error::ErrorKind {
-            match self.0 {
+            match self.code {
                 "23505" => sqlx::error::ErrorKind::UniqueViolation,
                 "23503" => sqlx::error::ErrorKind::ForeignKeyViolation,
                 _ => sqlx::error::ErrorKind::Other,
@@ -245,9 +258,39 @@ mod tests {
         }
     }
 
-    fn db(code: &'static str) -> sqlx::Error {
-        sqlx::Error::Database(Box::new(Sqlstate(code)))
+    /// A database error with SQLSTATE `code` and no constraint.
+    pub(crate) fn db(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code,
+            constraint: None,
+        }))
     }
+
+    /// A foreign-key violation (`23503`) naming `constraint`.
+    pub(crate) fn fk(constraint: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code: "23503",
+            constraint,
+        }))
+    }
+
+    /// Every pair in a module's constraint table maps to its kind.
+    pub(crate) fn assert_kinds(kinds: &[(&'static str, &'static str)]) {
+        assert!(!kinds.is_empty());
+        for (name, kind) in kinds {
+            let e = super::map_fk(fk(Some(*name)), kinds);
+            assert!(
+                matches!(&e, super::Error::NotFound { kind: k } if k == kind),
+                "{name}: {e:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::db;
+    use super::*;
 
     fn quota() -> Error {
         Error::QuotaExceeded {
@@ -303,6 +346,7 @@ mod tests {
                 "internal",
             ),
             (Error::Database(db("23505")), "internal"),
+            (Error::Internal("bug".into()), "internal"),
         ];
         for (err, code) in cases {
             assert_eq!(err.code(), code, "{err:?}");
@@ -368,44 +412,56 @@ mod tests {
     }
 
     #[test]
-    fn only_contention_cancellation_and_connection_failures_are_transient() {
-        let io = || std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        for transient in [
-            Error::Database(sqlx::Error::PoolTimedOut),
-            Error::Database(sqlx::Error::PoolClosed),
-            Error::Database(sqlx::Error::Io(io())),
-            Error::Database(db("40001")),
-            Error::Database(db("40P01")),
-            Error::Database(db("55P03")),
-            Error::Database(db("57014")),
-            Error::Tenant(otto_tenant::Error::Db(db("40P01"))),
-            Error::Unavailable,
-        ] {
-            assert!(transient.is_transient(), "{transient:?}");
-        }
-        for permanent in [
-            Error::Database(db("23505")),
-            Error::Database(db("42P01")),
-            Error::Database(db("42501")),
-            Error::Database(sqlx::Error::RowNotFound),
-            Error::Tenant(otto_tenant::Error::Db(db("23505"))),
-            Error::AccessRevoked,
-            Error::Invalid("bad".into()),
-        ] {
-            assert!(!permanent.is_transient(), "{permanent:?}");
-        }
-    }
-
-    #[test]
     fn constraint_violations_map_to_domain_errors() {
         let e = on_unique(db("23505"), || Error::Conflict("dup".into()));
         assert_eq!(e.code(), "conflict");
         let e = on_unique(db("23503"), || Error::Conflict("dup".into()));
         assert_eq!(e.code(), "internal");
 
-        let e = on_foreign_key(db("23503"), || Error::NotFound { kind: "customer" });
-        assert_eq!(e.code(), "not_found");
-        let e = on_foreign_key(db("23505"), || Error::NotFound { kind: "customer" });
+        let kinds = &[("tickets_org_id_customer_id_fkey", "customer")];
+        let e = map_fk(
+            super::fake::fk(Some("tickets_org_id_customer_id_fkey")),
+            kinds,
+        );
+        assert!(matches!(e, Error::NotFound { kind: "customer" }), "{e:?}");
+        // A constraint the table does not list, none at all, another
+        // violation, or no database error: internal, never a guessed kind.
+        for e in [
+            super::fake::fk(Some("some_other_fkey")),
+            super::fake::fk(None),
+            db("23505"),
+            sqlx::Error::PoolClosed,
+        ] {
+            let e = map_fk(e, kinds);
+            assert!(matches!(e, Error::Database(_)), "{e:?}");
+            assert_eq!(e.code(), "internal");
+        }
+    }
+
+    /// A database error reads and codes the same whether it arrived directly
+    /// or through the tenant substrate.
+    #[test]
+    fn tenant_database_errors_are_database_errors() {
+        for code in ["22001", "23514", "23505", "40001"] {
+            let direct = Error::Database(db(code));
+            let tenant = Error::Tenant(otto_tenant::Error::Db(db(code)));
+            assert_eq!(direct.code(), tenant.code(), "{code}");
+            assert_eq!(direct.retriable(), tenant.retriable(), "{code}");
+            assert_eq!(direct.is_internal(), tenant.is_internal(), "{code}");
+            assert_eq!(direct.to_string(), tenant.to_string(), "{code}");
+        }
+        assert_eq!(
+            Error::Tenant(otto_tenant::Error::Db(db("22001"))).code(),
+            "invalid_argument"
+        );
+    }
+
+    #[test]
+    fn internal_errors_hide_their_detail() {
+        let e = Error::Internal("metered a free tool".into());
         assert_eq!(e.code(), "internal");
+        assert!(e.is_internal());
+        assert!(!e.retriable());
+        assert_eq!(e.to_string(), INTERNAL_MESSAGE);
     }
 }

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SentimentResult {
     pub score: f64,
     pub label: String,
@@ -76,6 +77,14 @@ pub fn analyze_sentiment(text: &str) -> SentimentResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializes_in_camel_case_like_every_other_output() {
+        let v = serde_json::to_value(analyze_sentiment("great but slow")).unwrap();
+        assert_eq!(v["positiveWords"], serde_json::json!(["great"]));
+        assert_eq!(v["negativeWords"], serde_json::json!(["slow"]));
+        assert!(v.get("positive_words").is_none());
+    }
 
     #[test]
     fn text_without_keywords_is_neutral_zero() {
