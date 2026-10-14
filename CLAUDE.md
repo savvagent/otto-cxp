@@ -96,17 +96,17 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CXP_PUBLIC_URL` | required | public origin |
+| `CXP_PUBLIC_URL` | required | public origin, no path (e.g. `https://otto-cxp.savvagent.com`) |
 | `CXP_RESOURCE_URI` | `{public}/mcp` | token audience; must equal the URI registered at the platform |
-| `CXP_PLATFORM_URL` | required | the otto platform |
+| `CXP_PLATFORM_URL` | required | the otto platform; `https` unless the host is loopback |
 | `CXP_INTROSPECTION_SECRET` | required (secret) | `otto_rs_...` |
 | `CXP_PLATFORM_WEBHOOK_SECRET` | required (secret) | `otto_whsec_...` |
 | `CXP_DATABASE_URL` | falls back to `DATABASE_URL` | `postgres://cxp:cxp@localhost:15435/otto_cxp` locally |
-| `CXP_DB_MAX_CONNECTIONS` | `5` | minimum 2; the production database is shared and small |
+| `CXP_DB_MAX_CONNECTIONS` | `5` | 2 to 20; the production database is shared and small |
 | `CXP_RUN_MIGRATIONS` | `true` | |
 | `CXP_BIND` | `0.0.0.0:8080` | |
-| `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts; the `CXP_PUBLIC_URL` host is always allowed |
-| `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`; empty means no check |
+| `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts, as `host` or `host:port`; the `CXP_PUBLIC_URL` host is always allowed |
+| `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
 | `CXP_ENFORCE_QUOTAS` | `false` | fails open |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
 | `RUST_LOG` | `info` | |

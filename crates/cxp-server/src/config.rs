@@ -90,10 +90,14 @@ impl Config {
                     anyhow!("CXP_DATABASE_URL (or DATABASE_URL) is required and not set")
                 })?,
             db_max_connections: vars.parse("CXP_DB_MAX_CONNECTIONS", "5", |s| {
+                // The production database is small and shared by every
+                // otto service: a typo here must not take its connections.
                 s.parse::<u32>()
                     .ok()
-                    .filter(|n| *n >= 2)
-                    .ok_or_else(|| anyhow!("a whole number of at least 2"))
+                    .filter(|n| (MIN_CONNECTIONS..=MAX_CONNECTIONS).contains(n))
+                    .ok_or_else(|| {
+                        anyhow!("a whole number from {MIN_CONNECTIONS} to {MAX_CONNECTIONS}")
+                    })
             })?,
             run_migrations: vars.parse("CXP_RUN_MIGRATIONS", "true", bool_value)?,
             bind: vars.parse("CXP_BIND", "0.0.0.0:8080", |s| {
@@ -102,11 +106,19 @@ impl Config {
             })?,
             public_url,
             resource_uri,
-            platform_url: vars.url("CXP_PLATFORM_URL")?,
+            platform_url: vars.platform_url("CXP_PLATFORM_URL")?,
             introspection_secret: vars.required("CXP_INTROSPECTION_SECRET")?,
             platform_webhook_secret: vars.required("CXP_PLATFORM_WEBHOOK_SECRET")?,
-            extra_allowed_hosts: vars.list("CXP_ALLOWED_HOSTS"),
-            allowed_origins: vars.list("CXP_ALLOWED_ORIGINS"),
+            extra_allowed_hosts: vars
+                .list("CXP_ALLOWED_HOSTS")
+                .iter()
+                .map(|h| host_entry("CXP_ALLOWED_HOSTS", h))
+                .collect::<Result<_>>()?,
+            allowed_origins: vars
+                .list("CXP_ALLOWED_ORIGINS")
+                .iter()
+                .map(|o| origin_entry("CXP_ALLOWED_ORIGINS", o))
+                .collect::<Result<_>>()?,
             enforce_quotas: vars.parse("CXP_ENFORCE_QUOTAS", "false", bool_value)?,
             log_format: vars.parse("CXP_LOG_FORMAT", "text", |s| match s {
                 "text" => Ok(LogFormat::Text),
@@ -194,15 +206,42 @@ impl<F: Fn(&str) -> Option<String>> Vars<'_, F> {
         Ok(v.trim_end_matches('/').to_string())
     }
 
-    /// [`Self::url`], and safe inside a quoted header parameter: the public
-    /// URL is written into `resource_metadata="…"` on every `401`.
+    /// [`Self::url`], an origin only (no path, query, fragment, or
+    /// credentials: `/mcp` and the metadata document are appended to it),
+    /// and safe inside a quoted header parameter: the public URL is written
+    /// into `resource_metadata="…"` on every `401`.
     fn public_url(&self, name: &str) -> Result<String> {
         let v = self.url(name)?;
+        let parsed = url::Url::parse(&v)?;
+        if parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(anyhow!(
+                "{name} must be an origin like https://otto-cxp.savvagent.com, with no path, \
+                 query, or credentials, got {v:?}"
+            ));
+        }
         if v.chars()
             .any(|c| c == '"' || c == '\\' || c.is_whitespace())
         {
             return Err(anyhow!(
                 "{name} must not contain quotes, backslashes, or whitespace, got {v:?}"
+            ));
+        }
+        Ok(v)
+    }
+
+    /// [`Self::url`], and `https` unless the host is loopback: the
+    /// introspection secret is sent to it on every call.
+    fn platform_url(&self, name: &str) -> Result<String> {
+        let v = self.url(name)?;
+        let parsed = url::Url::parse(&v)?;
+        if parsed.scheme() != "https" && !is_loopback(&parsed) {
+            return Err(anyhow!(
+                "{name} must use https (plain http only for a loopback host), got {v:?}"
             ));
         }
         Ok(v)
@@ -224,6 +263,54 @@ impl<F: Fn(&str) -> Option<String>> Vars<'_, F> {
         let value = raw.as_deref().unwrap_or(default);
         parse(value).with_context(|| format!("{name}={value:?} is not valid"))
     }
+}
+
+/// The pool size bounds `CXP_DB_MAX_CONNECTIONS` accepts.
+pub const MIN_CONNECTIONS: u32 = 2;
+pub const MAX_CONNECTIONS: u32 = 20;
+
+fn is_loopback(u: &url::Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// One `Host` value `/mcp` accepts: `host` or `host:port`, no scheme, path,
+/// or credentials. Lowercased, as rmcp compares it.
+fn host_entry(name: &str, v: &str) -> Result<String> {
+    let bad = || anyhow!("{name} entries are host or host:port (no scheme or path), got {v:?}");
+    if v.contains("://") || v.contains(['/', '@', '"', '\\']) || v.contains(char::is_whitespace) {
+        return Err(bad());
+    }
+    let authority = http::uri::Authority::try_from(v).map_err(|_| bad())?;
+    // `host:port` needs a numeric port; a bracketed IPv6 host carries its
+    // own colons.
+    let after_host = v.rsplit_once(']').map_or(v, |(_, rest)| rest);
+    if authority.host().is_empty() || (after_host.contains(':') && authority.port_u16().is_none()) {
+        return Err(bad());
+    }
+    Ok(v.to_ascii_lowercase())
+}
+
+/// One browser origin `/mcp` accepts: `scheme://host[:port]`, normalized
+/// as a browser sends it (lowercase, default port dropped).
+fn origin_entry(name: &str, v: &str) -> Result<String> {
+    let bad = || anyhow!("{name} entries are origins like https://app.example.com, got {v:?}");
+    let parsed = url::Url::parse(v).map_err(|_| bad())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(bad());
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn http_url(name: &str, v: &str) -> Result<()> {
@@ -309,7 +396,10 @@ mod tests {
             ("CXP_RUN_MIGRATIONS", "off"),
             ("CXP_BIND", "127.0.0.1:9000"),
             ("CXP_ALLOWED_HOSTS", " otto-cxp.fly.dev , ,other.example "),
-            ("CXP_ALLOWED_ORIGINS", "https://console.example"),
+            (
+                "CXP_ALLOWED_ORIGINS",
+                "https://Console.example:443/, http://localhost:5173",
+            ),
             ("CXP_ENFORCE_QUOTAS", "yes"),
             ("CXP_LOG_FORMAT", "json"),
             ("CXP_INTROSPECTION_SECRET", "  otto_rs_padded \n"),
@@ -322,7 +412,10 @@ mod tests {
         assert!(!c.run_migrations);
         assert_eq!(c.bind, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(c.extra_allowed_hosts, ["otto-cxp.fly.dev", "other.example"]);
-        assert_eq!(c.allowed_origins, ["https://console.example"]);
+        assert_eq!(
+            c.allowed_origins,
+            ["https://console.example", "http://localhost:5173"]
+        );
         assert!(c.enforce_quotas);
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(
@@ -371,6 +464,63 @@ mod tests {
     }
 
     #[test]
+    fn the_public_url_is_an_origin_and_the_platform_is_https_off_loopback() {
+        for bad in [
+            "https://otto-cxp.savvagent.com/app",
+            "https://otto-cxp.savvagent.com/?x=1",
+            "https://otto-cxp.savvagent.com/#top",
+            "https://ops:pw@otto-cxp.savvagent.com",
+        ] {
+            let msg = error(&env(&[("CXP_PUBLIC_URL", bad)]));
+            assert!(msg.contains("CXP_PUBLIC_URL"), "{bad:?}: {msg}");
+        }
+        let msg = error(&env(&[("CXP_PLATFORM_URL", "http://otto.savvagent.com")]));
+        assert!(msg.contains("must use https"), "{msg}");
+        for ok in [
+            "http://localhost:8090",
+            "http://127.0.0.1:8090",
+            "http://[::1]:8090",
+            "https://otto.savvagent.com",
+        ] {
+            let c = load(&env(&[("CXP_PLATFORM_URL", ok)])).unwrap();
+            assert_eq!(c.platform_url, ok);
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_and_origins_are_validated() {
+        for bad in [
+            "https://otto-cxp.fly.dev",
+            "otto-cxp.fly.dev/mcp",
+            "user@otto-cxp.fly.dev",
+            "otto-cxp.fly.dev:notaport",
+        ] {
+            let msg = error(&env(&[("CXP_ALLOWED_HOSTS", bad)]));
+            assert!(msg.contains("CXP_ALLOWED_HOSTS"), "{bad:?}: {msg}");
+        }
+        let c = load(&env(&[(
+            "CXP_ALLOWED_HOSTS",
+            "Otto-CXP.fly.dev,localhost:8080",
+        )]))
+        .unwrap();
+        assert_eq!(
+            c.extra_allowed_hosts,
+            ["otto-cxp.fly.dev", "localhost:8080"]
+        );
+
+        for bad in [
+            "console.example.com",
+            "ftp://console.example.com",
+            "https://console.example.com/app",
+            "https://console.example.com?x",
+            "null",
+        ] {
+            let msg = error(&env(&[("CXP_ALLOWED_ORIGINS", bad)]));
+            assert!(msg.contains("CXP_ALLOWED_ORIGINS"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
     fn an_empty_or_missing_secret_is_refused() {
         for name in ["CXP_INTROSPECTION_SECRET", "CXP_PLATFORM_WEBHOOK_SECRET"] {
             for blank in ["", "   ", "\n"] {
@@ -387,6 +537,7 @@ mod tests {
     fn a_set_but_unparseable_value_is_an_error_naming_it() {
         for (name, bad) in [
             ("CXP_DB_MAX_CONNECTIONS", "1"),
+            ("CXP_DB_MAX_CONNECTIONS", "21"),
             ("CXP_DB_MAX_CONNECTIONS", "many"),
             ("CXP_RUN_MIGRATIONS", "maybe"),
             ("CXP_BIND", "8080"),
