@@ -417,6 +417,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "url",
  "uuid",
