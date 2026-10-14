@@ -26,7 +26,9 @@ pub struct CreateSurveyParams {
     pub title: String,
     #[serde(default)]
     pub description: Option<String>,
-    /// A JSON array of question objects, as text.
+    /// A JSON array of question objects, as text, e.g.
+    /// `[{"id": "q1", "type": "nps", "text": "How likely are you to recommend us?"},
+    /// {"id": "q2", "type": "text", "text": "What should we improve?"}]`.
     pub questions: String,
 }
 
@@ -81,6 +83,8 @@ pub struct GetFeedbackParams {
     /// Only this customer's: a UUID, an exact email, or a name.
     #[serde(default)]
     pub customer_id: Option<String>,
+    /// Only feedback of this type: bug_report, feature_request, complaint,
+    /// praise, or suggestion.
     #[serde(default)]
     pub feedback_type: Option<String>,
     /// At most this many (1 to 200, default 50).
@@ -105,7 +109,8 @@ pub struct SurveyResponsesParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CalculateCsatParams {
-    /// Only feedback of this type.
+    /// Only feedback of this type: bug_report, feature_request, complaint,
+    /// praise, or suggestion.
     #[serde(default)]
     pub feedback_type: Option<String>,
 }
@@ -117,7 +122,11 @@ pub struct TextParam {
 
 #[tool_router(router = feedback_router, vis = "pub(crate)")]
 impl Cxp {
-    #[tool(name = "get_survey", description = "Get a survey by ID.")]
+    #[tool(
+        name = "get_survey",
+        description = "Get a survey by ID.",
+        annotations(read_only_hint = true)
+    )]
     pub async fn get_survey(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -135,7 +144,8 @@ impl Cxp {
     #[tool(
         name = "submit_survey_response",
         description = "Submit a completed survey response with answers for a customer. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable."
+                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_survey_response(
         &self,
@@ -160,8 +170,10 @@ impl Cxp {
 
     #[tool(
         name = "create_survey",
-        description = "Create a new survey with questions (a JSON array, as text). Needs \
-                       cxp:write. Billable."
+        description = "Create a new survey. questions is a JSON array as text, e.g. \
+                       [{\"id\": \"q1\", \"type\": \"nps\", \"text\": \"How likely are you to \
+                       recommend us?\"}]. Needs cxp:write. Billable.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_survey(
         &self,
@@ -189,7 +201,8 @@ impl Cxp {
     #[tool(
         name = "send_survey",
         description = "Send a survey to a customer: an open response awaiting answers. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable."
+                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn send_survey(
         &self,
@@ -209,7 +222,8 @@ impl Cxp {
 
     #[tool(
         name = "get_survey_responses",
-        description = "Get a survey's responses, newest first. Returns {items, total}."
+        description = "Get a survey's responses, newest first. Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_survey_responses(
         &self,
@@ -231,7 +245,8 @@ impl Cxp {
     #[tool(
         name = "submit_feedback",
         description = "Submit customer feedback. Accepts UUID, email, or name for customer_id. \
-                       Needs cxp:write. Billable."
+                       Needs cxp:write. Billable.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_feedback(
         &self,
@@ -267,8 +282,10 @@ impl Cxp {
 
     #[tool(
         name = "get_feedback",
-        description = "Get feedback entries, newest first, with optional filters. Accepts UUID, \
-                       email, or name for customer_id. Returns {items, total}."
+        description = "Get feedback entries, newest first, with optional filters: customer_id \
+                       (UUID, email, or name) and feedback_type (bug_report, feature_request, \
+                       complaint, praise, suggestion). Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_feedback(
         &self,
@@ -299,8 +316,11 @@ impl Cxp {
 
     #[tool(
         name = "calculate_nps",
-        description = "Calculate the Net Promoter Score for a survey from its responses' scores \
-                       (0 to 10)."
+        description = "Calculate the Net Promoter Score for a survey. A response's score is the \
+                       first answer's `value` when its answers are an array, or the `score` key \
+                       when they are an object; scores outside 0 to 10, or missing, are not \
+                       counted.",
+        annotations(read_only_hint = true)
     )]
     pub async fn calculate_nps(
         &self,
@@ -321,8 +341,10 @@ impl Cxp {
 
     #[tool(
         name = "calculate_csat",
-        description = "Calculate the Customer Satisfaction Score over rated feedback, optionally \
-                       of one feedback type."
+        description = "Calculate the Customer Satisfaction Score (percent of ratings 4 or 5) \
+                       over rated feedback, optionally of one feedback_type (bug_report, \
+                       feature_request, complaint, praise, suggestion).",
+        annotations(read_only_hint = true)
     )]
     pub async fn calculate_csat(
         &self,
@@ -346,7 +368,8 @@ impl Cxp {
     #[tool(
         name = "analyze_sentiment",
         description = "Analyze the sentiment of a text string (keyword based): a score from -1 to \
-                       1, a label, and the words that drove it."
+                       1, a label, and the words that drove it.",
+        annotations(read_only_hint = true)
     )]
     pub async fn analyze_sentiment(
         &self,

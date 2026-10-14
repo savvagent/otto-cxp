@@ -73,14 +73,26 @@ fn parse(uri: &str) -> Result<Target, Error> {
 
 fn contents(uri: &str, value: &impl Serialize) -> Result<ReadResourceResult, ErrorData> {
     let text = serde_json::to_string_pretty(value)
-        .map_err(|_| ErrorData::internal_error("could not encode the resource", None))?;
+        .map_err(|_| crate::error::internal("could not encode a resource"))?;
     Ok(ReadResourceResult::new(vec![ResourceContents::text(
         text, uri,
     )
     .with_mime_type(JSON)]))
 }
 
+/// Read one resource. A missing row (or another org's) is MCP's
+/// resource-not-found, with `data.code` `not_found`.
 pub(crate) async fn read(
+    cxp: &Cxp,
+    caller: &Principal,
+    uri: &str,
+) -> Result<ReadResourceResult, ErrorData> {
+    read_target(cxp, caller, uri)
+        .await
+        .map_err(crate::error::as_resource_not_found)
+}
+
+async fn read_target(
     cxp: &Cxp,
     caller: &Principal,
     uri: &str,

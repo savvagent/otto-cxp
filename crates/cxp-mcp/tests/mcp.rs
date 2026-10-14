@@ -43,6 +43,10 @@ struct Platform {
     tokens: HashMap<String, (Uuid, Uuid, Vec<String>, String)>,
     /// Answer every introspection with a 500.
     down: bool,
+    /// Answer every usage-status request with a 503.
+    usage_down: bool,
+    /// Report every org as over its allowance on a hard-stop plan.
+    blocked: bool,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -90,16 +94,24 @@ async fn member(Path((org, user)): Path<(Uuid, Uuid)>) -> Json<MemberInfo> {
     })
 }
 
-async fn usage_status(Path(org): Path<Uuid>) -> Json<Value> {
-    Json(json!({
+async fn usage_status(
+    State(p): State<Shared>,
+    Path(org): Path<Uuid>,
+) -> Result<Json<Value>, StatusCode> {
+    let p = p.lock().unwrap();
+    if p.usage_down {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (used, hard_stop) = if p.blocked { (10, true) } else { (3, false) };
+    Ok(Json(json!({
         "org_id": org,
         "plan": "team",
         "period_start": Utc::now().date_naive(),
-        "billable_count": 3,
-        "total_count": 3,
-        "included_ops": 1000,
-        "hard_stop": false,
-    }))
+        "billable_count": used,
+        "total_count": used,
+        "included_ops": if p.blocked { 10 } else { 1000 },
+        "hard_stop": hard_stop,
+    })))
 }
 
 async fn start_platform() -> (String, Shared) {
@@ -144,12 +156,17 @@ struct Harness {
 }
 
 async fn harness(pool: PgPool) -> Harness {
+    harness_with(pool, false).await
+}
+
+/// [`harness`], with the meter enforcing quotas when `enforce` is set.
+async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
     let (base, platform) = start_platform().await;
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
     let meter = Arc::new(Meter::new(
         client.clone(),
-        false,
+        enforce,
         format!("{base}/settings/billing"),
     ));
     let app = router(
@@ -529,6 +546,8 @@ async fn another_org_cannot_read_a_customer(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(code(&refused), "not_found", "{refused}");
+    // MCP's resource-not-found.
+    assert_eq!(refused["code"], -32002, "{refused}");
 
     // Org A still sees it.
     let mine = h
@@ -616,4 +635,146 @@ async fn resources_and_prompts_are_served_with_read_scope(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(code(&refused), "insufficient_scope", "{refused}");
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn knowledge_articles_and_unknown_uris(pool: PgPool) {
+    use cxp_core::knowledge::{ArticleUpdate, KnowledgeExt, NewArticle};
+    let h = harness(pool.clone()).await;
+    let org = Uuid::new_v4();
+    let reader = token(&h.platform, org, READ);
+
+    // No tool writes articles; seed one through cxp-core in org's own
+    // transaction, as the REST surface does.
+    let db = Db::from_pool(pool);
+    let mut tx = db.begin(org.into()).await.unwrap();
+    let article = tx
+        .create_article(&NewArticle {
+            title: "Resetting a password".into(),
+            content: "Use the reset link on the sign-in page.".into(),
+            category: Some("account".into()),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    tx.update_article(
+        article.id,
+        &ArticleUpdate {
+            published: Some(true),
+            ..ArticleUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let uri = format!("knowledge://articles/{}", article.id);
+    let read = h
+        .rpc(&reader, "resources/read", json!({"uri": uri}))
+        .await
+        .unwrap();
+    let text: Value = serde_json::from_str(read["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["title"], "Resetting a password", "{text}");
+    assert_eq!(read["contents"][0]["mimeType"], "application/json");
+
+    // Another org's reader gets resource-not-found for the same id.
+    let other = token(&h.platform, Uuid::new_v4(), READ);
+    let refused = h
+        .rpc(&other, "resources/read", json!({"uri": uri}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), "not_found", "{refused}");
+    assert_eq!(refused["code"], -32002, "{refused}");
+
+    let found = h
+        .tool(
+            &reader,
+            "search_knowledge_base",
+            json!({"query": "password"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["items"][0]["id"], article.id.to_string(), "{found}");
+
+    for bad in ["file:///etc/passwd", "knowledge://articles/not-a-uuid"] {
+        let refused = h
+            .rpc(&reader, "resources/read", json!({"uri": bad}))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), "invalid_argument", "{bad}: {refused}");
+        assert_eq!(refused["data"]["retriable"], false);
+    }
+    let refused = h
+        .rpc(&reader, "prompts/get", json!({"name": "nope"}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), "invalid_argument", "{refused}");
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_org_over_its_allowance_is_refused_billable_calls(pool: PgPool) {
+    let h = harness_with(pool, true).await;
+    let org = Uuid::new_v4();
+    let writer = token(&h.platform, org, WRITE);
+    h.platform.lock().unwrap().blocked = true;
+
+    let refused = h
+        .tool(
+            &writer,
+            "create_survey",
+            json!({"title": "NPS", "questions": "[]"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), "quota_exceeded", "{refused}");
+    assert_eq!(refused["data"]["retriable"], false);
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("settings/billing"),
+        "{refused}"
+    );
+    assert!(h.charged(org).await.is_empty());
+
+    // Free calls still work.
+    h.tool(
+        &writer,
+        "create_customer",
+        json!({"email": "q@example.com"}),
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn whoami_answers_without_usage_when_the_platform_cannot_report_it(pool: PgPool) {
+    let h = harness(pool).await;
+    let org = Uuid::new_v4();
+    let t = token(&h.platform, org, READ);
+    h.platform.lock().unwrap().usage_down = true;
+
+    let me = h.tool(&t, "whoami", json!({})).await.unwrap();
+    assert_eq!(me["org"]["id"], org.to_string(), "{me}");
+    assert!(me["usage"].is_null(), "{me}");
+
+    let failed = h.tool(&t, "usage", json!({})).await.unwrap_err();
+    assert_eq!(code(&failed), "unavailable", "{failed}");
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_foreign_host_header_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let t = token(&h.platform, Uuid::new_v4(), READ);
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "whoami", "arguments": {}}});
+    let req = Request::post("/mcp")
+        .header("host", "evil.example.net")
+        .header("authorization", format!("Bearer {t}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _, _) = h.send(req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

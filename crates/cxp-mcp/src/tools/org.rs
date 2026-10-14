@@ -20,7 +20,9 @@ impl Cxp {
         name = "whoami",
         description = "Who this token says you are: your user, the one organization it opens, your \
                        role there, the scopes it carries, and how much of this month's allowance is \
-                       left. Call this first in a session. Free."
+                       left (null if the platform cannot say right now; call usage later). Call \
+                       this first in a session. Free.",
+        annotations(read_only_hint = true)
     )]
     pub async fn whoami(
         &self,
@@ -33,7 +35,20 @@ impl Cxp {
             .member(caller.org_id.as_uuid(), caller.user_id.as_uuid())
             .await
             .mcp()?;
-        let usage = self.meter().report(caller.org_id).await.mcp()?;
+        // Identity does not depend on billing: if the platform cannot report
+        // usage right now, answer without it rather than failing the call.
+        let usage = match self.meter().report(caller.org_id).await {
+            Ok(status) => Some(status),
+            Err(e) => {
+                tracing::warn!(
+                    code = e.code(),
+                    error = %e,
+                    source = ?std::error::Error::source(&e),
+                    "whoami: the usage lookup failed; answering without it"
+                );
+                None
+            }
+        };
 
         let user = member.as_ref().map(|m| &m.user);
         let org = member.as_ref().map(|m| &m.org);
@@ -70,7 +85,8 @@ impl Cxp {
         description = "How much of this organization's monthly allowance (shared across every otto \
                        service it uses) has been used and how much is left. Only submit_feedback, \
                        create_survey, send_survey, and submit_survey_response consume it. Free. If \
-                       `warning` is true, tell the person you are working for."
+                       `warning` is true, tell the person you are working for.",
+        annotations(read_only_hint = true)
     )]
     pub async fn usage(
         &self,

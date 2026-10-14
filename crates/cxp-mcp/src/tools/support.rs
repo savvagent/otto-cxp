@@ -40,6 +40,7 @@ pub struct UpdateTicketParams {
     /// low, medium, high, or urgent.
     #[serde(default)]
     pub priority: Option<String>,
+    /// Free text naming who owns the ticket, e.g. an agent's name or email.
     #[serde(default)]
     pub assigned_to: Option<String>,
 }
@@ -49,8 +50,11 @@ pub struct ListTicketsParams {
     /// Only this customer's: a UUID, an exact email, or a name.
     #[serde(default)]
     pub customer_id: Option<String>,
+    /// Only tickets in this status: open, in_progress, waiting, resolved, or
+    /// closed.
     #[serde(default)]
     pub status: Option<String>,
+    /// Only tickets of this priority: low, medium, high, or urgent.
     #[serde(default)]
     pub priority: Option<String>,
     /// At most this many (1 to 200, default 50).
@@ -87,7 +91,8 @@ impl Cxp {
     #[tool(
         name = "create_ticket",
         description = "Create a new support ticket. Accepts UUID, email, or name for customer_id. \
-                       Needs cxp:write."
+                       Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_ticket(
         &self,
@@ -114,7 +119,14 @@ impl Cxp {
 
     #[tool(
         name = "update_ticket",
-        description = "Update a support ticket's status, priority, or assignment. Needs cxp:write."
+        description = "Update a support ticket's status (open, in_progress, waiting, resolved, \
+                       closed), priority (low, medium, high, urgent), or assigned_to (free text, \
+                       e.g. an agent's name or email). Needs cxp:write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     pub async fn update_ticket(
         &self,
@@ -141,7 +153,11 @@ impl Cxp {
         Ok(Json(ticket))
     }
 
-    #[tool(name = "get_ticket", description = "Get a support ticket by ID.")]
+    #[tool(
+        name = "get_ticket",
+        description = "Get a support ticket by ID.",
+        annotations(read_only_hint = true)
+    )]
     pub async fn get_ticket(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -158,8 +174,10 @@ impl Cxp {
 
     #[tool(
         name = "list_tickets",
-        description = "List support tickets, newest first, with optional filters. Accepts UUID, \
-                       email, or name for customer_id. Returns {items, total}."
+        description = "List support tickets, newest first, with optional filters: customer_id \
+                       (UUID, email, or name), status (open, in_progress, waiting, resolved, \
+                       closed), priority (low, medium, high, urgent). Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn list_tickets(
         &self,
@@ -191,7 +209,12 @@ impl Cxp {
 
     #[tool(
         name = "close_ticket",
-        description = "Close a support ticket and set its resolved timestamp. Needs cxp:write."
+        description = "Close a support ticket and set its resolved timestamp. Needs cxp:write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     pub async fn close_ticket(
         &self,
@@ -210,7 +233,8 @@ impl Cxp {
     #[tool(
         name = "search_knowledge_base",
         description = "Search the published knowledge base articles; best matches first, at most \
-                       20. Returns {items}."
+                       20. Returns {items}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn search_knowledge_base(
         &self,
@@ -227,8 +251,9 @@ impl Cxp {
 
     #[tool(
         name = "start_chat_session",
-        description = "Start a new chat session for a customer. Accepts UUID, email, or name. \
-                       Needs cxp:write."
+        description = "Start a new chat session for a customer. `id` is the customer: a UUID, \
+                       an exact email, or a name. Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn start_chat_session(
         &self,
@@ -246,7 +271,8 @@ impl Cxp {
 
     #[tool(
         name = "send_chat_message",
-        description = "Send a message in a chat session. Needs cxp:write."
+        description = "Send a message in a chat session. Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn send_chat_message(
         &self,
@@ -267,7 +293,8 @@ impl Cxp {
 
     #[tool(
         name = "get_chat_messages",
-        description = "Get the messages in a chat session, oldest first. Returns {items, total}."
+        description = "Get the messages in a chat session, oldest first. Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_chat_messages(
         &self,
@@ -288,7 +315,12 @@ impl Cxp {
 
     #[tool(
         name = "end_chat_session",
-        description = "End an active chat session. Needs cxp:write."
+        description = "End an active chat session. Needs cxp:write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     pub async fn end_chat_session(
         &self,

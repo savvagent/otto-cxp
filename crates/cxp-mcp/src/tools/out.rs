@@ -76,7 +76,8 @@ pub struct WhoAmI {
     /// The caller's role in this org, as the platform reports it now.
     pub role: Option<Role>,
     pub token: TokenOut,
-    pub usage: Status,
+    /// Null when the platform could not report usage just now.
+    pub usage: Option<Status>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

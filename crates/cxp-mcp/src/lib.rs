@@ -45,8 +45,12 @@ pub struct Config {
     pub resource_uri: String,
     /// The platform's public base URL, advertised as the authorization server.
     pub platform_url: String,
-    /// Accepted `Host` headers. rmcp defaults to loopback only, which rejects
-    /// every request to a hosted server, so it is required here.
+    /// Accepted `Host` headers (DNS-rebinding protection); a request with any
+    /// other `Host` is refused with `403`. rmcp's default is loopback only,
+    /// which rejects every request to a hosted server, so it is required
+    /// here. **An empty list means "allow any host"** (rmcp's
+    /// `disable_allowed_hosts`), so never pass one in production: cxp-server
+    /// always passes at least the host of its public URL.
     pub allowed_hosts: Vec<String>,
     /// Accepted browser `Origin`s; empty disables the check (CLI agents send
     /// none).

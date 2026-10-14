@@ -251,24 +251,79 @@ mod tests {
         }
     }
 
+    /// The files that define tools; each tool's body is cut out of its own
+    /// file, so the order here does not matter.
+    const TOOL_SOURCES: &[(&str, &str)] = &[
+        ("org.rs", include_str!("org.rs")),
+        ("cdp.rs", include_str!("cdp.rs")),
+        ("support.rs", include_str!("support.rs")),
+        ("feedback.rs", include_str!("feedback.rs")),
+    ];
+
+    /// The source of one tool: from its `#[tool(` attribute to the next one
+    /// (or the end of its file). Exactly one file may define it.
+    fn tool_body(name: &str) -> &'static str {
+        let needle = format!("name = \"{name}\"");
+        let mut found = TOOL_SOURCES.iter().filter_map(|(file, src)| {
+            let at = src.find(&needle)?;
+            let start = src[..at].rfind("#[tool(").unwrap_or(at);
+            let rest = &src[start..];
+            let end = rest[1..].find("#[tool(").map_or(rest.len(), |i| i + 1);
+            Some((*file, &rest[..end]))
+        });
+        let (_, body) = found
+            .next()
+            .unwrap_or_else(|| panic!("{name} has no #[tool]"));
+        assert!(found.next().is_none(), "{name} is defined twice");
+        body
+    }
+
     #[test]
-    fn every_scoped_tool_checks_the_right_scope() {
-        let bodies: String = SOURCES[..4].iter().map(|(_, s)| *s).collect();
+    fn every_scoped_tool_checks_the_right_scope_before_touching_data() {
         for name in NAMES {
-            let start = bodies
-                .find(&format!("name = \"{name}\""))
-                .unwrap_or_else(|| panic!("{name} has no #[tool]"));
-            let body = &bodies[start..];
-            let end = body[1..].find("#[tool(").map_or(body.len(), |i| i + 1);
-            let body = &body[..end];
-            let reads = body.contains("caller.require_read()");
-            let writes = body.contains("caller.require_write()");
-            if UNSCOPED.contains(name) {
-                assert!(!reads && !writes, "{name} should check no scope");
+            let body = tool_body(name);
+            let read = body.find("caller.require_read()");
+            let write = body.find("caller.require_write()");
+            let tx = body.find("self.tx(");
+            let check = if UNSCOPED.contains(name) {
+                assert!(
+                    read.is_none() && write.is_none(),
+                    "{name} should check no scope"
+                );
+                assert!(tx.is_none(), "{name} should open no transaction");
+                continue;
             } else if WRITES.contains(name) {
-                assert!(writes && !reads, "{name} should require cxp:write");
+                assert!(read.is_none(), "{name} should require cxp:write, not read");
+                write.unwrap_or_else(|| panic!("{name} should require cxp:write"))
             } else {
-                assert!(reads && !writes, "{name} should require read");
+                assert!(write.is_none(), "{name} should require read, not cxp:write");
+                read.unwrap_or_else(|| panic!("{name} should require read"))
+            };
+            if let Some(tx) = tx {
+                assert!(
+                    check < tx,
+                    "{name} opens its transaction before its scope check"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annotations_agree_with_the_write_list() {
+        for tool in router().list_all() {
+            let name = tool.name.to_string();
+            let a = tool
+                .annotations
+                .unwrap_or_else(|| panic!("{name} has no annotations"));
+            if WRITES.contains(&name.as_str()) {
+                assert_eq!(a.read_only_hint, Some(false), "{name}");
+                assert_eq!(
+                    a.destructive_hint,
+                    Some(false),
+                    "{name}: nothing here deletes"
+                );
+            } else {
+                assert_eq!(a.read_only_hint, Some(true), "{name}");
             }
         }
     }

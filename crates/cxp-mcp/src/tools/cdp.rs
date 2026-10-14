@@ -105,7 +105,8 @@ pub struct SegmentMembersParams {
 impl Cxp {
     #[tool(
         name = "create_customer",
-        description = "Create a new customer profile. Needs cxp:write."
+        description = "Create a new customer profile. Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_customer(
         &self,
@@ -132,7 +133,8 @@ impl Cxp {
 
     #[tool(
         name = "list_customers",
-        description = "List customers, newest first, with pagination. Returns {items, total}."
+        description = "List customers, newest first, with pagination. Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn list_customers(
         &self,
@@ -153,7 +155,12 @@ impl Cxp {
     #[tool(
         name = "update_customer",
         description = "Update an existing customer profile. Accepts UUID, email, or name for the \
-                       id field. Needs cxp:write."
+                       id field. Needs cxp:write.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     pub async fn update_customer(
         &self,
@@ -184,7 +191,8 @@ impl Cxp {
 
     #[tool(
         name = "get_customer",
-        description = "Get a customer by ID. Accepts UUID, email, or name."
+        description = "Get a customer by ID. Accepts UUID, email, or name.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_customer(
         &self,
@@ -203,7 +211,8 @@ impl Cxp {
     #[tool(
         name = "search_customers",
         description = "Search customers by name or email; best matches first, at most 50. Returns \
-                       {items}."
+                       {items}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn search_customers(
         &self,
@@ -221,7 +230,8 @@ impl Cxp {
     #[tool(
         name = "record_interaction",
         description = "Record a customer interaction event. Accepts UUID, email, or name for \
-                       customer_id. Needs cxp:write."
+                       customer_id. Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn record_interaction(
         &self,
@@ -253,7 +263,8 @@ impl Cxp {
     #[tool(
         name = "get_journey",
         description = "Get the interaction journey for a customer, newest first. Accepts UUID, \
-                       email, or name for customer_id. Returns {items, total}."
+                       email, or name for customer_id. Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_journey(
         &self,
@@ -275,7 +286,8 @@ impl Cxp {
     #[tool(
         name = "create_segment",
         description = "Create a customer segment with filter criteria (a JSON object, as text). \
-                       Needs cxp:write."
+                       Needs cxp:write.",
+        annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_segment(
         &self,
@@ -301,7 +313,8 @@ impl Cxp {
 
     #[tool(
         name = "get_segment_members",
-        description = "Get members of a customer segment, newest first. Returns {items, total}."
+        description = "Get members of a customer segment, newest first. Returns {items, total}.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_segment_members(
         &self,
@@ -323,7 +336,8 @@ impl Cxp {
     #[tool(
         name = "get_customer_360",
         description = "Get a full 360-degree view of a customer including their recent tickets, \
-                       interactions, and feedback. Accepts UUID, email, or name."
+                       interactions, and feedback. Accepts UUID, email, or name.",
+        annotations(read_only_hint = true)
     )]
     pub async fn get_customer_360(
         &self,

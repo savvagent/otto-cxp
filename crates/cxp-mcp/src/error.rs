@@ -56,11 +56,44 @@ pub fn from_scope(e: &MissingScope) -> ErrorData {
     ErrorData::new(
         ErrorCode::INVALID_REQUEST,
         format!(
-            "{e}. Re-authorize this server requesting it (the scopes this server knows are \
-             listed at /.well-known/oauth-protected-resource)"
+            "this token lacks the {} scope; re-authorize this server requesting it (the scopes \
+             it knows are listed at /.well-known/oauth-protected-resource)",
+            e.0
         ),
         data("insufficient_scope", false),
     )
+}
+
+/// A caller's argument that is wrong, outside any domain call (an unknown
+/// prompt, a missing prompt argument, a malformed resource URI).
+pub fn invalid(message: impl Into<String>) -> ErrorData {
+    from_core(&Error::Invalid(message.into()))
+}
+
+/// A server-side failure with no domain error behind it (an output that could
+/// not be encoded). Logged; the caller gets the code and nothing else.
+pub fn internal(what: &'static str) -> ErrorData {
+    tracing::error!(code = "internal", "{what}");
+    ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        "otto-cxp hit an internal error; retry, and report it if it persists",
+        data("internal", false),
+    )
+}
+
+/// A resource read that named something this organization does not have:
+/// MCP's resource-not-found (-32002), still with `data.code` `not_found`.
+/// Anything else passes through unchanged.
+pub fn as_resource_not_found(mut e: ErrorData) -> ErrorData {
+    if e.data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(|c| c.as_str())
+        == Some("not_found")
+    {
+        e.code = ErrorCode::RESOURCE_NOT_FOUND;
+    }
+    e
 }
 
 /// Reached only if the MCP surface was mounted without its middleware.
@@ -148,6 +181,28 @@ mod tests {
     fn the_scope_error_names_the_missing_scope() {
         let e = from_scope(&MissingScope("cxp:write"));
         assert!(e.message.contains("cxp:write"), "{}", e.message);
+        // One instruction: re-authorize, not also "obtain a token".
+        assert!(!e.message.contains("obtain"), "{}", e.message);
+        assert_eq!(
+            e.message.matches("re-authorize").count(),
+            1,
+            "{}",
+            e.message
+        );
         assert_eq!(e.data.unwrap()["retriable"], false);
+    }
+
+    #[test]
+    fn helper_errors_carry_codes_and_not_found_reads_are_resource_not_found() {
+        assert_eq!(invalid("x").data.unwrap()["code"], "invalid_argument");
+        let i = internal("encoding failed");
+        assert_eq!(i.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(i.data.unwrap()["code"], "internal");
+
+        let nf = as_resource_not_found(from_core(&Error::NotFound { kind: "customer" }));
+        assert_eq!(nf.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert_eq!(nf.data.unwrap()["code"], "not_found");
+        let other = as_resource_not_found(invalid("x"));
+        assert_eq!(other.code, ErrorCode::INVALID_PARAMS);
     }
 }
