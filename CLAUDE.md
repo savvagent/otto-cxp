@@ -133,6 +133,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - when package.json, pnpm-lock.yaml, pnpm-workspace.yaml, sdk/typescript/**, packages/react/**, apps/web/**: pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 - evidence: report pass counts per test binary; `cargo test` without `DATABASE_URL` panics rather than skipping, so a panic there is a missing variable, not a test failure; `DATABASE_URL` points only at a local Postgres, never at a Fly database
 - toolchain: stable via `rust-toolchain.toml`; CI floats stable
+- known red: `cargo fmt --all -- --check` and `cargo clippy --workspace` on the legacy `server/` crate (21 unformatted files, 6 clippy errors on `main`) — #12, which deletes `server/`
 
 `sdk/swift` and `sdk/kotlin` are stubs with no gate.
 
