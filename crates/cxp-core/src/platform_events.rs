@@ -264,8 +264,12 @@ async fn member_removed(
 
 async fn team_deleted(db: &Db, event: &WebhookEvent, org: OrgId, team: Uuid) -> Result<Outcome> {
     let mut tx = db.begin(org).await?;
-    // Exclusive, so a catalog write already in flight for this org commits
-    // first and is nulled with the rest.
+    // Exclusive, so a catalog write that already holds the org's shared lock
+    // (opened through `begin_live`) commits first and is nulled with the
+    // rest. That is all the lock guarantees: a write that verified the team
+    // at the platform just before it was deleted, but opens its transaction
+    // after this one commits, can still store the stale team_id. Accepted:
+    // readers treat a team_id the platform does not know as unowned.
     exclude_requests(&mut tx, org).await?;
     if !first_delivery(&mut tx, event, "team.deleted").await? {
         tx.commit().await?;

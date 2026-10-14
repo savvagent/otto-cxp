@@ -8,6 +8,7 @@ mod common;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -440,15 +441,9 @@ async fn org_deleted_purges_every_tenant_table_once_and_spares_other_orgs(pool: 
             "{table} lost another org's rows"
         );
     }
-    // Cascades take children before the explicit delete reaches them, so a
-    // count of 0 is fine for those; every parent reports its own row.
-    for table in [
-        "customers",
-        "experiences",
-        "segments",
-        "knowledge_articles",
-        "usage_outbox",
-    ] {
+    // The purge deletes children before parents, so no row goes by cascade:
+    // every table reports the one row the org had in it.
+    for table in TENANT_TABLES {
         assert_eq!(detail[table], 1, "{table}: {detail}");
     }
     assert_eq!(count(&pool, "usage_outbox_rejected", doomed).await, 1);
@@ -822,6 +817,95 @@ async fn ship_once_ships_deletes_and_handles_duplicates_and_rejections(pool: PgP
     make_due(&pool).await;
     assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 2);
     assert!(outbox(&pool).await.is_empty());
+}
+
+/// The shipper runs unpinned across every org through `maintenance`; as
+/// `otto_app`, RLS applies to it, so this proves its policies admit it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn ship_once_drains_every_org_as_otto_app(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let (a, b) = (org(), org());
+    charge_n(&db, &meter, a, 2).await;
+    charge_n(&db, &meter, b, 1).await;
+    let refused = outbox(&pool).await[0].0;
+    stub.lock().unwrap().reject.insert(refused);
+
+    let app_db = otto_app_db(&pool).await;
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(app_db.pool())
+        .await
+        .unwrap();
+    assert_eq!(role, "otto_app");
+    let cfg = ShipperConfig::default();
+
+    // A failure reschedules as otto_app too.
+    stub.lock().unwrap().usage_down = true;
+    assert!(usage::ship_once(&app_db, &platform, &cfg).await.is_err());
+    let rows = outbox(&pool).await;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.1 == 1 && r.2.is_some()), "{rows:?}");
+
+    stub.lock().unwrap().usage_down = false;
+    make_due(&pool).await;
+    assert_eq!(usage::ship_once(&app_db, &platform, &cfg).await.unwrap(), 3);
+    app_db.pool().close().await;
+
+    assert!(outbox(&pool).await.is_empty());
+    assert_eq!(count(&pool, "usage_outbox_rejected", a).await, 1);
+    let orgs: HashSet<Uuid> = stub
+        .lock()
+        .unwrap()
+        .received
+        .iter()
+        .map(|e| e.org_id)
+        .collect();
+    assert_eq!(orgs, HashSet::from([a.as_uuid(), b.as_uuid()]));
+}
+
+/// `run` ships on its first pass, then sleeps for `poll`; flipping the
+/// shutdown channel makes it flush once more and return. The poll is an hour,
+/// so only that final flush can ship rows charged after the first pass.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_ships_then_flushes_on_shutdown(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let o = org();
+    charge_n(&db, &meter, o, 1).await;
+
+    let cfg = ShipperConfig {
+        poll: Duration::from_secs(3600),
+        ..ShipperConfig::default()
+    };
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(db.clone(), platform.clone(), cfg, shutdown));
+
+    // The first pass: shipped, answered, and deleted.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !outbox(&pool).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first pass ships");
+    assert_eq!(stub.lock().unwrap().received.len(), 1);
+
+    // Charged while `run` sleeps: still waiting in the outbox.
+    charge_n(&db, &meter, o, 2).await;
+    assert_eq!(outbox(&pool).await.len(), 2);
+
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns on shutdown")
+        .unwrap();
+    assert!(
+        outbox(&pool).await.is_empty(),
+        "the final flush shipped them"
+    );
+    assert_eq!(stub.lock().unwrap().received.len(), 3);
 }
 
 // ---------------------------------------------------------------------- auth

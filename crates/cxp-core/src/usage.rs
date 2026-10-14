@@ -90,6 +90,9 @@ impl Meter {
     /// Record one call of a [`BILLABLE`] tool in `tx`, or refuse it if the org
     /// is out of budget. Any other tool name is a caller bug and is refused
     /// with [`Error::Invalid`] without recording anything.
+    ///
+    /// The quota is soft at the boundary: concurrent calls can each see the
+    /// same count before either commits, so an org can end a few calls over.
     pub async fn charge(&self, tx: &mut Tx<'_>, user: UserId, tool: &str) -> Result<()> {
         if !is_billable(tool) {
             tracing::error!(tool, "refusing to meter a tool that is not billable");
@@ -159,7 +162,11 @@ impl Meter {
         tracing::warn!(org = %org, reason = %failure,
             "could not read usage from the platform; allowing billable calls for {FAIL_OPEN_FOR:?}");
         if let Ok(mut m) = self.fail_open.lock() {
-            m.insert(org, Instant::now() + FAIL_OPEN_FOR);
+            // Prune expired entries here, so the map holds only orgs inside
+            // their fail-open window rather than every org that ever failed.
+            let now = Instant::now();
+            m.retain(|_, until| *until > now);
+            m.insert(org, now + FAIL_OPEN_FOR);
         }
         None
     }
@@ -263,12 +270,14 @@ pub enum ShipError {
 /// nothing is deleted and the rows are rescheduled with backoff. Rows the
 /// platform refused outright move to `usage_outbox_rejected` with its reason.
 ///
-/// Runs unpinned across every org, which the outbox's policies allow.
+/// Runs unpinned across every org, in maintenance transactions
+/// (`crate::maintenance`).
 pub async fn ship_once(
     db: &Db,
     platform: &PlatformClient,
     cfg: &ShipperConfig,
 ) -> std::result::Result<usize, ShipError> {
+    let mut claim = crate::maintenance::begin(db).await?;
     let mut rows: Vec<Row> = sqlx::query_as(
         "UPDATE usage_outbox SET attempts = attempts + 1, \
                 next_attempt_at = now() + make_interval(secs => $2) \
@@ -279,8 +288,11 @@ pub async fn ship_once(
     )
     .bind(cfg.batch as i64)
     .bind(cfg.claim_lease.as_secs_f64())
-    .fetch_all(db.pool())
+    .fetch_all(&mut *claim)
     .await?;
+    // Committed before shipping, so the claim lease holds the rows back from
+    // a concurrent shipper while the platform call is in flight.
+    claim.commit().await?;
     if rows.is_empty() {
         return Ok(0);
     }
@@ -316,7 +328,7 @@ pub async fn ship_once(
         return Err(otto_resource::Error::Decode(msg).into());
     }
 
-    let mut tx = db.pool().begin().await?;
+    let mut tx = crate::maintenance::begin(db).await?;
     for r in &receipt.rejected {
         tracing::error!(event_id = %r.event_id, reason = %r.reason,
             "the platform refused a usage event; moving it to usage_outbox_rejected");
@@ -341,7 +353,20 @@ pub async fn ship_once(
 }
 
 async fn reschedule(db: &Db, ids: &[i64], error: &str, cfg: &ShipperConfig) {
-    let r = sqlx::query(
+    if let Err(e) = try_reschedule(db, ids, error, cfg).await {
+        // The claim lease still holds the rows back; this only delays a retry.
+        tracing::warn!(error = %e, "could not record a usage shipping failure");
+    }
+}
+
+async fn try_reschedule(
+    db: &Db,
+    ids: &[i64],
+    error: &str,
+    cfg: &ShipperConfig,
+) -> sqlx::Result<()> {
+    let mut tx = crate::maintenance::begin(db).await?;
+    sqlx::query(
         "UPDATE usage_outbox SET last_error = $2, \
                 next_attempt_at = now() + make_interval(secs => \
                     LEAST($3::float8 * power(2, LEAST(attempts - 1, 20)), $4::float8)) \
@@ -351,12 +376,9 @@ async fn reschedule(db: &Db, ids: &[i64], error: &str, cfg: &ShipperConfig) {
     .bind(error.chars().take(500).collect::<String>())
     .bind(cfg.base_backoff.as_secs_f64())
     .bind(cfg.max_backoff.as_secs_f64())
-    .execute(db.pool())
-    .await;
-    if let Err(e) = r {
-        // The claim lease still holds the rows back; this only delays a retry.
-        tracing::warn!(error = %e, "could not record a usage shipping failure");
-    }
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 /// Drain the outbox until `shutdown` flips, with a final pass on the way out.

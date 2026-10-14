@@ -207,13 +207,21 @@ pub fn metadata_url(public_url: &str) -> String {
 /// The `WWW-Authenticate` value for a `401`. `error` and `error_description`
 /// follow RFC 6750; `resource_metadata` follows RFC 9728 and is the field MCP
 /// clients actually read.
+///
+/// A request that carried no credentials at all ([`AuthFailure::Missing`])
+/// gets no `error` (RFC 6750 §3.1): only `realm` and `resource_metadata`.
 pub fn www_authenticate(public_url: &str, failure: &AuthFailure) -> String {
-    format!(
-        r#"Bearer realm="{}", error="invalid_token", error_description="{}", resource_metadata="{}""#,
-        scopes::RESOURCE_NAME,
-        failure.reason(),
-        metadata_url(public_url)
-    )
+    let realm = scopes::RESOURCE_NAME;
+    let metadata = metadata_url(public_url);
+    match failure {
+        AuthFailure::Missing => {
+            format!(r#"Bearer realm="{realm}", resource_metadata="{metadata}""#)
+        }
+        _ => format!(
+            r#"Bearer realm="{realm}", error="invalid_token", error_description="{}", resource_metadata="{metadata}""#,
+            failure.reason(),
+        ),
+    }
 }
 
 /// The RFC 9728 protected-resource metadata document served at
@@ -300,8 +308,15 @@ mod tests {
     /// The header a client cannot follow is the header that breaks onboarding.
     #[test]
     fn the_challenge_points_at_the_metadata_document() {
+        let missing = www_authenticate("https://cxp.example.com/", &AuthFailure::Missing);
+        assert_eq!(
+            missing,
+            r#"Bearer realm="otto-cxp", resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#
+        );
+        assert!(!missing.contains("error"), "{missing}");
+        assert!(!AuthFailure::Missing.reason().contains(['"', '\\']));
+
         for failure in [
-            AuthFailure::Missing,
             AuthFailure::Inactive,
             AuthFailure::Revoked,
             AuthFailure::Unavailable,
