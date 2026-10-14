@@ -1,6 +1,8 @@
 # Local Postgres for development and `#[sqlx::test]` integration tests.
 # Host port 15435 is deliberately non-standard so it cannot clash with a system
 # Postgres or with otto-factory's (15433) and otto-flags' (15434) containers.
+# Bound to loopback only: the credentials are the well-known dev ones, so the
+# port must not be reachable from the network.
 # Plain postgres:16: the schema needs only the stock pgcrypto and pg_trgm.
 services:
   postgres:
@@ -11,7 +13,7 @@ services:
       POSTGRES_PASSWORD: cxp
       POSTGRES_DB: otto_cxp
     ports:
-      - "15435:5432"
+      - "127.0.0.1:15435:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cxp -d otto_cxp"]
       interval: 5s
