@@ -6,7 +6,9 @@
 //! asked. Criteria keys (all optional, all ANDed): `tags_contain` (a tag),
 //! `company_eq` (exact company), `created_after` / `created_before` (any
 //! timestamp Postgres reads, e.g. `2024-01-01` or `2024-01-01 09:30:00`).
-//! Values are bound, never spliced into SQL.
+//! A timestamp without a zone is read in the database session's `TimeZone`,
+//! and `now` and `infinity` are accepted (`now` is re-evaluated on every read
+//! of the members). Values are bound, never spliced into SQL.
 
 use std::future::Future;
 
@@ -82,9 +84,9 @@ impl Criteria {
         let map = criteria
             .as_object()
             .ok_or_else(|| invalid("criteria must be a JSON object"))?;
-        if let Some(bad) = map.keys().find(|k| !CRITERIA_KEYS.contains(&k.as_str())) {
+        if map.keys().any(|k| !CRITERIA_KEYS.contains(&k.as_str())) {
             return Err(invalid(format!(
-                "unsupported criteria key `{bad}`; supported keys: {}",
+                "criteria has an unsupported key; supported keys: {}",
                 CRITERIA_KEYS.join(", ")
             )));
         }
@@ -95,53 +97,26 @@ impl Criteria {
             before: criteria_text(map, "created_before")?.map(str::to_owned),
         })
     }
-}
 
-/// Whether Postgres reads `text` as a `timestamptz`, asked inside a savepoint
-/// so a refusal leaves the transaction usable. The caller sees our message,
-/// never the database's.
-async fn check_timestamp(tx: &mut Tx<'_>, key: &str, text: &str) -> Result<()> {
-    sqlx::query("SAVEPOINT cxp_criteria_time")
-        .execute(tx.conn())
+    /// Check both timestamps with `pg_input_is_valid`, which never raises, so
+    /// a bad value cannot abort the transaction and the caller sees our
+    /// message, never the database's.
+    async fn check_times(self, tx: &mut Tx<'_>) -> Result<Self> {
+        let (after_ok, before_ok): (bool, bool) = sqlx::query_as(
+            "SELECT $1::text IS NULL OR pg_input_is_valid($1::text, 'timestamptz'), \
+                    $2::text IS NULL OR pg_input_is_valid($2::text, 'timestamptz')",
+        )
+        .bind(&self.after)
+        .bind(&self.before)
+        .fetch_one(tx.conn())
         .await?;
-    let probe = sqlx::query("SELECT $1::text::timestamptz")
-        .bind(text)
-        .execute(tx.conn())
-        .await;
-    match probe {
-        Ok(_) => {
-            sqlx::query("RELEASE SAVEPOINT cxp_criteria_time")
-                .execute(tx.conn())
-                .await?;
-            Ok(())
-        }
-        Err(e) => {
-            sqlx::query("ROLLBACK TO SAVEPOINT cxp_criteria_time")
-                .execute(tx.conn())
-                .await?;
-            let bad_time = e
-                .as_database_error()
-                .and_then(|d| d.code())
-                .is_some_and(|c| matches!(c.as_ref(), "22007" | "22008"));
-            if bad_time {
-                Err(invalid(format!(
+        for (ok, key) in [(after_ok, "created_after"), (before_ok, "created_before")] {
+            if !ok {
+                return Err(invalid(format!(
                     "criteria `{key}` is not a timestamp; use a date or date and time, \
                      like 2026-01-31 or 2026-01-31T09:30:00Z"
-                )))
-            } else {
-                Err(Error::Database(e))
+                )));
             }
-        }
-    }
-}
-
-impl Criteria {
-    async fn check_times(self, tx: &mut Tx<'_>) -> Result<Self> {
-        if let Some(t) = &self.after {
-            check_timestamp(tx, "created_after", t).await?;
-        }
-        if let Some(t) = &self.before {
-            check_timestamp(tx, "created_before", t).await?;
         }
         Ok(self)
     }

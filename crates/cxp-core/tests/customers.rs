@@ -5,7 +5,7 @@ mod common;
 
 use common::{db, org, sqlstate};
 use cxp_core::customers::{Customer, CustomerFilter, CustomerUpdate, CustomersExt, NewCustomer};
-use cxp_core::interactions::{parse_json, InteractionsExt, NewInteraction};
+use cxp_core::interactions::{parse_json, InteractionsExt, NewInteraction, INTERACTION_TYPES};
 use cxp_core::segments::{NewSegment, SegmentsExt};
 use cxp_core::{Error, Page};
 use otto_tenant::ids::OrgId;
@@ -38,6 +38,21 @@ async fn member(tx: &mut otto_tenant::Tx<'_>, org: OrgId, segment: Uuid, custome
     .bind(org)
     .bind(segment)
     .bind(customer)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+}
+
+/// Give a row an explicit creation time, `hours` after a fixed origin, so
+/// ordering assertions cannot pass on ties (every row of one transaction
+/// shares `now()`). `table` is a constant from these tests.
+async fn stamp(tx: &mut otto_tenant::Tx<'_>, table: &str, id: Uuid, hours: i32) {
+    sqlx::query(&format!(
+        "UPDATE {table} SET created_at = timestamptz '2024-01-01 00:00+00' \
+         + make_interval(hours => $2) WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(hours)
     .execute(tx.conn())
     .await
     .unwrap();
@@ -164,6 +179,7 @@ async fn list_pages_and_totals_and_filters(pool: PgPool) {
             .create_customer(&new(&format!("c{i}@example.com"), &format!("Cust {i}")))
             .await
             .unwrap();
+        stamp(&mut tx, "customers", c.id, i).await;
         ids.push(c.id);
     }
     sqlx::query("UPDATE customers SET experience_id = $3 WHERE org_id = $1 AND id = $2")
@@ -181,15 +197,11 @@ async fn list_pages_and_totals_and_filters(pool: PgPool) {
     assert_eq!((second.len(), total), (2, 5));
     let (last, _) = tx.list_customers(&all, page(2, 4)).await.unwrap();
     assert_eq!(last.len(), 1);
-    let seen: std::collections::HashSet<_> = first
-        .iter()
-        .chain(&second)
-        .chain(&last)
-        .map(|c| c.id)
-        .collect();
-    assert_eq!(seen.len(), 5);
-    // Newest first.
-    assert!(first[0].created_at >= first[1].created_at);
+    // Newest first, and pages continue where the last stopped.
+    let order = |rows: &[Customer]| rows.iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(order(&first), vec![ids[4], ids[3]]);
+    assert_eq!(order(&second), vec![ids[2], ids[1]]);
+    assert_eq!(order(&last), vec![ids[0]]);
 
     let only = CustomerFilter {
         experience_id: Some(exp),
@@ -250,7 +262,7 @@ async fn resolve_by_uuid_email_and_name(pool: PgPool) {
     let db = db(pool);
     let (a, b) = (org(), org());
     let ada = add(&db, a, new("ada@example.com", "Ada Lovelace")).await;
-    add(&db, a, new("ann1@example.com", "Ann Lee")).await;
+    let ann1 = add(&db, a, new("ann1@example.com", "Ann Lee")).await;
     add(&db, a, new("ann2@example.com", "Ann Lee-Smith")).await;
     let foreign = add(&db, b, new("bea@example.com", "Bea")).await;
 
@@ -267,8 +279,17 @@ async fn resolve_by_uuid_email_and_name(pool: PgPool) {
     assert_eq!(tx.resolve_customer("Lovelace").await.unwrap(), ada.id);
 
     // An exact name wins over a looser match ("Ann Lee" also fits "Ann Lee-Smith").
-    let ann = tx.resolve_customer("Ann Lee").await.unwrap();
-    assert_ne!(ann, ada.id);
+    assert_eq!(tx.resolve_customer("Ann Lee").await.unwrap(), ann1.id);
+
+    // A near miss is not a match: write tools resolve through here.
+    assert!(matches!(
+        tx.resolve_customer("Ada Lovelase").await,
+        Err(Error::NotFound { kind: "customer" })
+    ));
+    assert_eq!(
+        tx.resolve_customer("  ").await.unwrap_err().code(),
+        "invalid_argument"
+    );
 
     // Ambiguous: invalid, and it names nobody.
     let e = tx.resolve_customer("Ann").await.unwrap_err();
@@ -312,12 +333,16 @@ async fn interactions_record_list_and_journey(pool: PgPool) {
         .await
         .unwrap();
 
-    for (c, t) in [
+    let mut ids = Vec::new();
+    for (n, (c, t)) in [
         (&c1, "login"),
         (&c1, "purchase"),
         (&c1, "page_view"),
         (&c2, "login"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let i = tx
             .record_interaction(&NewInteraction {
                 customer_id: c.id,
@@ -329,6 +354,8 @@ async fn interactions_record_list_and_journey(pool: PgPool) {
         assert_eq!(i.interaction_type, t);
         assert_eq!(i.customer_id, c.id);
         assert_eq!(i.metadata, json!({}));
+        stamp(&mut tx, "interactions", i.id, n as i32).await;
+        ids.push(i.id);
     }
     let with_meta = tx
         .record_interaction(&NewInteraction {
@@ -339,15 +366,24 @@ async fn interactions_record_list_and_journey(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(with_meta.metadata["feature"], "export");
+    stamp(&mut tx, "interactions", with_meta.id, 4).await;
 
     let (all, total) = tx.list_interactions(page(2, 0)).await.unwrap();
     assert_eq!((all.len(), total), (2, 5));
+    assert_eq!(
+        all.iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec![with_meta.id, ids[3]]
+    );
     let (journey, total) = tx.get_journey(c1.id, Page::default()).await.unwrap();
     assert_eq!((journey.len(), total), (3, 3));
     assert!(journey.iter().all(|i| i.customer_id == c1.id));
-    assert!(journey[0].created_at >= journey[2].created_at);
+    assert_eq!(
+        journey.iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec![ids[2], ids[1], ids[0]]
+    );
     let (paged, total) = tx.get_journey(c1.id, page(1, 1)).await.unwrap();
     assert_eq!((paged.len(), total), (1, 3));
+    assert_eq!(paged[0].id, ids[1]);
 
     assert!(matches!(
         tx.get_journey(Uuid::new_v4(), Page::default()).await,
@@ -527,10 +563,13 @@ async fn segment_input_is_validated(pool: PgPool) {
         make("s", json!({"company_eq": 5}), None),
         make("s", json!({"created_after": "not a date"}), None),
         make("s", json!({"created_before": "2024-13-45"}), None),
+        make("s", json!({"created_after": "2024-01-01 Foo/Bar"}), None),
+        make("s", json!({"created_after": "2024-01-01 +99:00"}), None),
     ] {
         let e = tx.create_segment(&bad).await.unwrap_err();
         assert_eq!(e.code(), "invalid_argument", "{bad:?}");
         assert!(!e.to_string().contains("timestamptz"), "{e}");
+        assert!(!e.retriable() && !e.is_internal(), "{e:?}");
     }
     // The refusals did not abort the transaction.
     tx.create_segment(&make("ok", json!({}), None))
@@ -624,27 +663,32 @@ async fn customer_360_gathers_the_customers_recent_activity(pool: PgPool) {
         .unwrap();
 
     for i in 0..12 {
-        tx.record_interaction(&NewInteraction {
-            customer_id: c.id,
-            interaction_type: "login".into(),
-            metadata: Some(json!({"n": i})),
-        })
-        .await
-        .unwrap();
+        let rec = tx
+            .record_interaction(&NewInteraction {
+                customer_id: c.id,
+                interaction_type: "login".into(),
+                metadata: Some(json!({"n": i})),
+            })
+            .await
+            .unwrap();
+        stamp(&mut tx, "interactions", rec.id, i).await;
     }
-    for (cust, subject, status) in [
-        (c.id, "Broken", "in_progress"),
-        (c.id, "Slow", "open"),
-        (other.id, "Not mine", "open"),
+    for (cust, subject, status, hours) in [
+        (c.id, "Broken", "in_progress", 1),
+        (c.id, "Slow", "open", 2),
+        (other.id, "Not mine", "open", 3),
     ] {
         sqlx::query(
-            "INSERT INTO tickets (org_id, customer_id, subject, status, priority, channel) \
-             VALUES ($1, $2, $3, $4::ticket_status, 'high', 'chat')",
+            "INSERT INTO tickets (org_id, customer_id, subject, status, priority, channel, \
+                                  created_at) \
+             VALUES ($1, $2, $3, $4::ticket_status, 'high', 'chat', \
+                     timestamptz '2024-01-01 00:00+00' + make_interval(hours => $5))",
         )
         .bind(org)
         .bind(cust)
         .bind(subject)
         .bind(status)
+        .bind(hours)
         .execute(tx.conn())
         .await
         .unwrap();
@@ -661,14 +705,20 @@ async fn customer_360_gathers_the_customers_recent_activity(pool: PgPool) {
 
     let view = tx.customer_360(c.id).await.unwrap();
     assert_eq!(view.customer.id, c.id);
-    assert_eq!(view.recent_interactions.len(), 10);
-    assert_eq!(view.recent_tickets.len(), 2);
-    assert!(view.recent_tickets.iter().all(|t| t.subject != "Not mine"));
-    let broken = view
+    // The newest ten of twelve, newest first.
+    let ns: Vec<i64> = view
+        .recent_interactions
+        .iter()
+        .map(|i| i.metadata["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ns, (2..12).rev().collect::<Vec<_>>());
+    let subjects: Vec<&str> = view
         .recent_tickets
         .iter()
-        .find(|t| t.subject == "Broken")
-        .unwrap();
+        .map(|t| t.subject.as_str())
+        .collect();
+    assert_eq!(subjects, ["Slow", "Broken"]);
+    let broken = &view.recent_tickets[1];
     assert_eq!(
         (
             broken.status.as_str(),
@@ -864,4 +914,19 @@ async fn one_org_cannot_see_or_touch_anothers_customer_data(pool: PgPool) {
             .1,
         1
     );
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn interaction_types_match_the_enum(pool: PgPool) {
+    let (in_db,): (Vec<String>,) = sqlx::query_as(
+        "SELECT array_agg(e::text ORDER BY e) FROM unnest(enum_range(NULL::interaction_type)) e",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut in_code: Vec<String> = INTERACTION_TYPES.iter().map(|t| t.to_string()).collect();
+    in_code.sort();
+    let mut in_db = in_db;
+    in_db.sort();
+    assert_eq!(in_code, in_db);
 }

@@ -47,6 +47,8 @@ pub struct NewInteraction {
 
 /// Parse a JSON text a caller supplied (an MCP tool's `metadata` argument)
 /// into a value, or say what was wrong with it.
+/// Lives here because lib.rs is not this story's to extend; MCP tools use it for
+/// their JSON-text arguments (`metadata`, segment `criteria`).
 pub fn parse_json(what: &str, text: &str) -> Result<serde_json::Value> {
     serde_json::from_str(text).map_err(|e| Error::Invalid(format!("{what} is not valid JSON: {e}")))
 }

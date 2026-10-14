@@ -77,11 +77,16 @@ pub struct Customer360 {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct NewCustomer {
     pub email: String,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub phone: Option<String>,
+    #[serde(default)]
     pub company: Option<String>,
     /// Defaults to `{}`.
+    #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
@@ -304,7 +309,7 @@ impl CustomersExt for Tx<'_> {
         Ok(sqlx::query_as(&format!(
             "SELECT {CUSTOMER_COLS} FROM customers \
              WHERE org_id = $1 \
-               AND (email ILIKE $2 OR name ILIKE $2 OR similarity(name, $3) > 0.3) \
+               AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
              ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
                       similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
              LIMIT $4 OFFSET $5"
@@ -320,6 +325,11 @@ impl CustomersExt for Tx<'_> {
 
     async fn resolve_customer(&mut self, identifier: &str) -> Result<Uuid> {
         let identifier = identifier.trim();
+        if identifier.is_empty() {
+            return Err(Error::Invalid(
+                "name the customer by id, email address, or name; the identifier was empty".into(),
+            ));
+        }
         if let Ok(id) = Uuid::parse_str(identifier) {
             return Ok(self.get_customer(id).await?.id);
         }
@@ -333,7 +343,16 @@ impl CustomersExt for Tx<'_> {
                     .await?;
             return found.map(|(id,)| id).ok_or(NOT_FOUND);
         }
-        // One exact (case-insensitive) name beats looser matches.
+        let ambiguous = || {
+            Error::Invalid(
+                "more than one customer matches that name; pass the customer's email address \
+                 or id instead (search_customers lists the candidates)"
+                    .into(),
+            )
+        };
+        // An exact (case-insensitive) name, else a single substring match of
+        // the name or email. Never a fuzzy match: write tools resolve through
+        // here, so a near miss must not land on the wrong customer.
         let exact: Vec<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM customers WHERE org_id = $1 AND lower(name) = lower($2) LIMIT 2",
         )
@@ -341,20 +360,23 @@ impl CustomersExt for Tx<'_> {
         .bind(identifier)
         .fetch_all(self.conn())
         .await?;
-        if let [(id,)] = exact[..] {
-            return Ok(id);
+        match exact[..] {
+            [(id,)] => return Ok(id),
+            [_, _] => return Err(ambiguous()),
+            _ => {}
         }
-        let found = self
-            .search_customers(identifier, Page::new(Some(2), None))
-            .await?;
-        match found.as_slice() {
+        let found: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM customers WHERE org_id = $1 AND (name ILIKE $2 OR email ILIKE $2) \
+             LIMIT 2",
+        )
+        .bind(org)
+        .bind(contains_pattern(identifier))
+        .fetch_all(self.conn())
+        .await?;
+        match found[..] {
             [] => Err(NOT_FOUND),
-            [one] => Ok(one.id),
-            _ => Err(Error::Invalid(
-                "more than one customer matches that name; pass the customer's email address \
-                 or id instead (search_customers lists the candidates)"
-                    .into(),
-            )),
+            [(id,)] => Ok(id),
+            _ => Err(ambiguous()),
         }
     }
 
