@@ -68,14 +68,44 @@ pub enum Error {
     #[error("{}", tenant_message(.0))]
     Tenant(#[from] otto_tenant::Error),
 
-    #[error("otto-cxp hit an internal error; retry, and report it if it persists")]
+    /// A database failure. A data exception the caller's input caused (a value
+    /// too long for its column, out of range, or malformed; SQLSTATE class
+    /// `22`) or a check-constraint violation (`23514`) reads and codes as
+    /// `invalid_argument`, however the error was constructed; anything else is
+    /// `internal`.
+    #[error("{}", database_message(.0))]
     Database(#[from] sqlx::Error),
+}
+
+const INTERNAL_MESSAGE: &str =
+    "otto-cxp hit an internal error; retry, and report it if it persists";
+
+fn database_message(e: &sqlx::Error) -> &'static str {
+    if is_input_rejection(e) {
+        "a value is malformed, out of range, or too long for its field; \
+         check the arguments and try again"
+    } else {
+        INTERNAL_MESSAGE
+    }
+}
+
+/// Whether Postgres refused the statement because of a value the caller
+/// supplied: a data exception (class `22`: too long, out of range, bad
+/// format) or a check-constraint violation (`23514`, e.g. a rating outside
+/// 1..=5). Retrying such a call unchanged can never succeed.
+fn is_input_rejection(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|code| code.starts_with("22") || code == "23514"),
+        _ => false,
+    }
 }
 
 fn tenant_message(e: &otto_tenant::Error) -> String {
     match e {
         otto_tenant::Error::Invalid(msg) => msg.clone(),
-        _ => "otto-cxp hit an internal error; retry, and report it if it persists".to_string(),
+        _ => INTERNAL_MESSAGE.to_string(),
     }
 }
 
@@ -85,6 +115,7 @@ impl Error {
         match self {
             Error::NotFound { .. } => "not_found",
             Error::Invalid(_) | Error::Tenant(otto_tenant::Error::Invalid(_)) => "invalid_argument",
+            Error::Database(e) if is_input_rejection(e) => "invalid_argument",
             Error::Conflict(_) => "conflict",
             Error::UnknownTeam => "unknown_team",
             Error::AccessRevoked => "access_revoked",
@@ -97,7 +128,8 @@ impl Error {
     /// Whether repeating the same call unchanged could succeed.
     pub fn retriable(&self) -> bool {
         match self {
-            Error::Database(_) | Error::Unavailable => true,
+            Error::Database(e) => !is_input_rejection(e),
+            Error::Unavailable => true,
             Error::Platform(p) => p.is_retriable(),
             Error::Tenant(otto_tenant::Error::Db(_)) => true,
             _ => false,
@@ -123,7 +155,8 @@ impl Error {
     /// caller's request. Callers log these with their source.
     pub fn is_internal(&self) -> bool {
         match self {
-            Error::Database(_) | Error::Platform(_) => true,
+            Error::Database(e) => !is_input_rejection(e),
+            Error::Platform(_) => true,
             Error::Tenant(t) => !matches!(t, otto_tenant::Error::Invalid(_)),
             _ => false,
         }
@@ -221,6 +254,26 @@ mod tests {
             included: 10,
             plan: "free".into(),
             upgrade_url: "https://otto.savvagent.com/billing".into(),
+        }
+    }
+
+    /// A value the caller supplied that Postgres refused (too long, out of
+    /// range, malformed, or failing a check constraint) is the caller's to
+    /// fix: `invalid_argument`, not retriable, not internal, and still no
+    /// database text.
+    #[test]
+    fn input_the_database_refuses_is_invalid_not_internal() {
+        for code in ["22001", "22003", "22007", "22P02", "23514"] {
+            let e = Error::Database(db(code));
+            assert_eq!(e.code(), "invalid_argument", "{code}");
+            assert!(!e.retriable(), "{code}");
+            assert!(!e.is_internal(), "{code}");
+            assert!(!e.to_string().contains("constraint"), "{code}");
+        }
+        for code in ["23505", "23503", "42P01"] {
+            let e = Error::Database(db(code));
+            assert_eq!(e.code(), "internal", "{code}");
+            assert!(e.is_internal(), "{code}");
         }
     }
 
