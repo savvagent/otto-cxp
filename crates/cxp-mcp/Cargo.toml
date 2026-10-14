@@ -1,0 +1,27 @@
+[package]
+name = "cxp-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cxp-core.workspace = true
+otto-tenant.workspace = true
+otto-resource.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+axum.workspace = true
+http.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+sqlx.workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "cxp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+otto-tenant.workspace = true
+otto-resource.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+otto-resource.workspace = true
+otto-tenant.workspace = true
+sqlx.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
