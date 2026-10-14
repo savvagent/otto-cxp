@@ -5,12 +5,13 @@
 //! that is not a 2xx. A missing, malformed, stale, or wrong signature is `401`
 //! and nothing is processed (the body is not parsed before the MAC checks
 //! out); a signed but unreadable body is `400`; an applied, repeated, or
-//! unknown event is `200 {"result": "applied" | "duplicate" | "ignored"}`; a
-//! failure to apply that can pass (a database blip, or an event this build
-//! parses but has no handler for) is `503`, so the platform tries again; one
-//! that redelivery cannot fix is `400` `invalid_event`, so it is not retried
-//! forever. Fails closed: with no secret configured every delivery is
-//! refused.
+//! unknown event is `200 {"result": "applied" | "duplicate" | "ignored"}`; an
+//! event that is itself at fault (its data is invalid: code
+//! `invalid_argument`) is `400` `invalid_event`, so it is not retried forever;
+//! any other failure to apply it (a database blip, an event this build parses
+//! but has no handler for, a bug on this side) is `503`, so the platform
+//! redelivers it and a fix deployed meanwhile applies it. Fails closed: with
+//! no secret configured every delivery is refused.
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -73,20 +74,23 @@ pub async fn receive(
     Ok(Json(outcome))
 }
 
-/// The answer to a verified event that failed to apply: `503` when a
-/// redelivery could succeed, `400` `invalid_event` when it never can (so the
-/// platform stops redelivering it). Logged at `error` either way.
+/// The answer to a verified event that failed to apply: `400`
+/// `invalid_event` only when the event itself is at fault (its data is
+/// invalid, so no redelivery can apply it and the platform should stop);
+/// `503` for anything else, including a bug or misconfiguration here, so the
+/// platform keeps redelivering until a fix applies it rather than the event
+/// being dropped. Logged at `error` either way.
 fn apply_failed(e: &cxp_core::Error, event_id: uuid::Uuid) -> ApiError {
     tracing::error!(error = %e.log_detail(), code = e.code(), retriable = e.retriable(),
         source = ?std::error::Error::source(e), %event_id, "could not apply a platform event");
-    if e.retriable() {
-        ApiError::unavailable("could not apply the event; redeliver it")
-    } else {
+    if e.code() == "invalid_argument" {
         ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_event",
             "this event cannot be applied; redelivering it will not help",
         )
+    } else {
+        ApiError::unavailable("could not apply the event; redeliver it")
     }
 }
 
@@ -95,21 +99,30 @@ mod tests {
     use super::*;
     use cxp_core::Error;
 
+    /// Only an event at fault is refused for good; everything else, a bug
+    /// on this side included, asks for redelivery so a fix can apply it.
     #[test]
-    fn only_a_failure_that_can_pass_asks_for_redelivery() {
+    fn only_an_event_at_fault_stops_redelivery() {
         let id = uuid::Uuid::new_v4();
-        let retry = apply_failed(&Error::Unavailable, id);
-        assert_eq!(
-            (retry.status, retry.code),
-            (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
-        );
-        let db_blip = apply_failed(&Error::Database(sqlx::Error::PoolTimedOut), id);
-        assert_eq!(db_blip.status, StatusCode::SERVICE_UNAVAILABLE);
+        for redeliver in [
+            Error::Unavailable,
+            Error::Database(sqlx::Error::PoolTimedOut),
+            Error::Internal("bug".into()),
+            Error::Tenant(otto_tenant::Error::Db(sqlx::Error::PoolClosed)),
+            Error::Tenant(otto_tenant::Error::Config("bad key".into())),
+            Error::Platform(otto_resource::Error::Unauthorized),
+        ] {
+            let e = apply_failed(&redeliver, id);
+            assert_eq!(
+                (e.status, e.code),
+                (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+                "{redeliver:?}"
+            );
+        }
 
         for never in [
             Error::Invalid("bad org".into()),
             Error::Tenant(otto_tenant::Error::Invalid("bad org".into())),
-            Error::Internal("bug".into()),
         ] {
             let e = apply_failed(&never, id);
             assert_eq!(
