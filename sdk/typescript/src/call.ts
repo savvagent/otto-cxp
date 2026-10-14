@@ -53,26 +53,47 @@ function truncate(text: string): string {
 }
 
 /**
- * The server's error kind (`invalid_token`, `access_revoked`, ...) when the
- * transport error's message embeds the JSON response body. The MCP SDK's
+ * The error kind in the transport error's message, when it embeds a JSON
+ * response body (`{"error": "..."}` or `{"code": "..."}`). The MCP SDK's
  * `StreamableHTTPError` exposes only `code` (the HTTP status) and a message
  * that ends with the response text, so the body is the only place it survives.
+ * The body may come from anything in front of the server (a gateway or proxy),
+ * so callers accept only the kinds the server itself sends for that status.
  */
 function serverKind(message: string): string | undefined {
   const m = /"(?:code|error)"\s*:\s*"([a-z][a-z0-9_]{0,63})"/.exec(message);
   return m?.[1];
 }
 
+/** The kinds the server sends with a 401. */
+const UNAUTHENTICATED_KINDS: ReadonlySet<string> = new Set([
+  "invalid_token",
+  "unauthenticated",
+  "access_revoked",
+]);
+
+/**
+ * Whether a 403 is the server's `insufficient_scope`: its JSON body says so,
+ * or the message carries a `WWW-Authenticate`-style `error="insufficient_scope"`.
+ */
+function isInsufficientScope(kind: string | undefined, message: string): boolean {
+  return kind === "insufficient_scope" || /\berror\s*=\s*"?insufficient_scope\b/.test(message);
+}
+
 /**
  * Map a transport-level HTTP failure to a `CxpError`:
  *
- * - 401 `unauthenticated` (not retriable); the server's own kind, such as
- *   `invalid_token` or `access_revoked`, is kept when the body carries one
- * - 403 `insufficient_scope` (not retriable)
+ * - 401 `unauthenticated` (not retriable); the server's own kind
+ *   (`invalid_token` or `access_revoked`) is kept when the body carries one,
+ *   and any other kind (a gateway's, say) is reported as `unauthenticated`
+ * - 403 `insufficient_scope` when the body or message says so, else
+ *   `forbidden` (not retriable)
  * - 500 `internal` (not retriable)
  * - 503 `unavailable` (retriable)
  * - any other HTTP status `transport_error`, retriable for 5xx, with the
  *   status in `data.status`
+ *
+ * Whatever kind the body carried, accepted or not, is in `data.serverKind`.
  *
  * An OAuth `UnauthorizedError` becomes `unauthenticated`. Messages are
  * truncated and the original error is kept as `cause`. Returns `undefined`
@@ -89,17 +110,23 @@ export function fromTransportError(e: unknown): CxpError | undefined {
   if (!(e instanceof StreamableHTTPError)) return undefined;
   const status = e.code;
   const message = truncate(e.message);
-  const data = { status };
+  const kind = serverKind(e.message);
+  const data = kind === undefined ? { status } : { status, serverKind: kind };
   switch (status) {
     case 401:
       return new CxpError(message, {
-        code: serverKind(e.message) ?? "unauthenticated",
+        code: kind !== undefined && UNAUTHENTICATED_KINDS.has(kind) ? kind : "unauthenticated",
         retriable: false,
         data,
         cause: e,
       });
     case 403:
-      return new CxpError(message, { code: "insufficient_scope", retriable: false, data, cause: e });
+      return new CxpError(message, {
+        code: isInsufficientScope(kind, e.message) ? "insufficient_scope" : "forbidden",
+        retriable: false,
+        data,
+        cause: e,
+      });
     case 500:
       return new CxpError(message, { code: "internal", retriable: false, data, cause: e });
     case 503:
