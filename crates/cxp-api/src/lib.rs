@@ -35,10 +35,11 @@ mod webhooks;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::{middleware, Router};
 use cxp_core::auth::Principal;
 use cxp_core::usage::Meter;
+use http::Method;
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
 
@@ -98,78 +99,118 @@ impl AppState {
     }
 }
 
+/// The prefix every REST route is served under.
+pub const PREFIX: &str = "/api/v1";
+
+/// Every `/api/v1` route, as (method, full path with `{id}` placeholders).
+/// The single source [`router`] is built from: each path here is mounted
+/// with [`methods_for`], and a unit test probes every method on every path
+/// so a method served but not listed (or listed but not served) fails.
+/// Callers that must cover every route (the e2e isolation and metering
+/// tests in cxp-server) iterate this.
+pub fn route_table() -> Vec<(Method, &'static str)> {
+    let mut routes = vec![
+        (Method::GET, "/api/v1/me/teams"),
+        (Method::GET, "/api/v1/dashboard/metrics"),
+        (Method::GET, "/api/v1/customers"),
+        (Method::POST, "/api/v1/customers"),
+        (Method::GET, "/api/v1/customers/search"),
+        (Method::GET, "/api/v1/customers/{id}"),
+        (Method::PUT, "/api/v1/customers/{id}"),
+        (Method::DELETE, "/api/v1/customers/{id}"),
+        (Method::GET, "/api/v1/customers/{id}/360"),
+        (Method::GET, "/api/v1/tickets"),
+        (Method::POST, "/api/v1/tickets"),
+        (Method::GET, "/api/v1/tickets/{id}"),
+        (Method::PUT, "/api/v1/tickets/{id}"),
+        (Method::DELETE, "/api/v1/tickets/{id}"),
+        (Method::GET, "/api/v1/feedback"),
+        (Method::GET, "/api/v1/surveys"),
+        (Method::POST, "/api/v1/surveys"),
+        (Method::GET, "/api/v1/surveys/{id}"),
+        (Method::PUT, "/api/v1/surveys/{id}"),
+        (Method::DELETE, "/api/v1/surveys/{id}"),
+        (Method::GET, "/api/v1/surveys/{id}/responses"),
+    ];
+    for (collection, item) in [
+        ("/api/v1/experiences", "/api/v1/experiences/{id}"),
+        ("/api/v1/applications", "/api/v1/applications/{id}"),
+        ("/api/v1/pages", "/api/v1/pages/{id}"),
+        ("/api/v1/components", "/api/v1/components/{id}"),
+    ] {
+        routes.push((Method::GET, collection));
+        routes.push((Method::POST, collection));
+        routes.push((Method::GET, item));
+        routes.push((Method::PUT, item));
+        routes.push((Method::DELETE, item));
+    }
+    routes
+}
+
+/// The handlers for one path of [`route_table`]. Panics on a path the table
+/// lists but nothing here serves, which the router's own construction (and
+/// so every test) hits at once.
+fn methods_for(path: &str) -> MethodRouter<AppState> {
+    use routes::{catalog, customers, dashboard, feedback, me, surveys, tickets};
+    match path {
+        "/api/v1/me/teams" => get(me::teams),
+        "/api/v1/dashboard/metrics" => get(dashboard::metrics),
+        "/api/v1/customers" => get(customers::list).post(customers::create),
+        "/api/v1/customers/search" => get(customers::search),
+        "/api/v1/customers/{id}" => get(customers::get)
+            .put(customers::update)
+            .delete(customers::delete),
+        "/api/v1/customers/{id}/360" => get(customers::get_360),
+        "/api/v1/tickets" => get(tickets::list).post(tickets::create),
+        "/api/v1/tickets/{id}" => get(tickets::get)
+            .put(tickets::update)
+            .delete(tickets::delete),
+        "/api/v1/feedback" => get(feedback::list),
+        "/api/v1/surveys" => get(surveys::list).post(surveys::create),
+        "/api/v1/surveys/{id}" => get(surveys::get)
+            .put(surveys::update)
+            .delete(surveys::delete),
+        "/api/v1/surveys/{id}/responses" => get(surveys::responses),
+        "/api/v1/experiences" => get(catalog::list_experiences).post(catalog::create_experience),
+        "/api/v1/experiences/{id}" => get(catalog::get_experience)
+            .put(catalog::update_experience)
+            .delete(catalog::delete_experience),
+        "/api/v1/applications" => get(catalog::list_applications).post(catalog::create_application),
+        "/api/v1/applications/{id}" => get(catalog::get_application)
+            .put(catalog::update_application)
+            .delete(catalog::delete_application),
+        "/api/v1/pages" => get(catalog::list_pages).post(catalog::create_page),
+        "/api/v1/pages/{id}" => get(catalog::get_page)
+            .put(catalog::update_page)
+            .delete(catalog::delete_page),
+        "/api/v1/components" => get(catalog::list_components).post(catalog::create_component),
+        "/api/v1/components/{id}" => get(catalog::get_component)
+            .put(catalog::update_component)
+            .delete(catalog::delete_component),
+        other => panic!("route_table lists {other}, which methods_for does not serve"),
+    }
+}
+
+/// The `/api/v1` routes of [`route_table`], relative to [`PREFIX`], without
+/// the bearer layer.
+fn api_routes() -> Router<AppState> {
+    let mut api = Router::new();
+    let mut mounted: Vec<&str> = vec![];
+    for (_, path) in route_table() {
+        if !mounted.contains(&path) {
+            mounted.push(path);
+            let relative = path
+                .strip_prefix(PREFIX)
+                .expect("every route is under /api/v1");
+            api = api.route(relative, methods_for(path));
+        }
+    }
+    api
+}
+
 /// `/api/v1/...` behind the bearer middleware, and `POST /platform/webhooks`.
 pub fn router(state: AppState) -> Router {
-    use routes::{catalog, customers, dashboard, feedback, me, surveys, tickets};
-
-    let api = Router::new()
-        .route("/me/teams", get(me::teams))
-        .route("/dashboard/metrics", get(dashboard::metrics))
-        .route("/customers", get(customers::list).post(customers::create))
-        .route("/customers/search", get(customers::search))
-        .route(
-            "/customers/{id}",
-            get(customers::get)
-                .put(customers::update)
-                .delete(customers::delete),
-        )
-        .route("/customers/{id}/360", get(customers::get_360))
-        .route("/tickets", get(tickets::list).post(tickets::create))
-        .route(
-            "/tickets/{id}",
-            get(tickets::get)
-                .put(tickets::update)
-                .delete(tickets::delete),
-        )
-        .route("/feedback", get(feedback::list))
-        .route("/surveys", get(surveys::list).post(surveys::create))
-        .route(
-            "/surveys/{id}",
-            get(surveys::get)
-                .put(surveys::update)
-                .delete(surveys::delete),
-        )
-        .route("/surveys/{id}/responses", get(surveys::responses))
-        .route(
-            "/experiences",
-            get(catalog::list_experiences).post(catalog::create_experience),
-        )
-        .route(
-            "/experiences/{id}",
-            get(catalog::get_experience)
-                .put(catalog::update_experience)
-                .delete(catalog::delete_experience),
-        )
-        .route(
-            "/applications",
-            get(catalog::list_applications).post(catalog::create_application),
-        )
-        .route(
-            "/applications/{id}",
-            get(catalog::get_application)
-                .put(catalog::update_application)
-                .delete(catalog::delete_application),
-        )
-        .route(
-            "/pages",
-            get(catalog::list_pages).post(catalog::create_page),
-        )
-        .route(
-            "/pages/{id}",
-            get(catalog::get_page)
-                .put(catalog::update_page)
-                .delete(catalog::delete_page),
-        )
-        .route(
-            "/components",
-            get(catalog::list_components).post(catalog::create_component),
-        )
-        .route(
-            "/components/{id}",
-            get(catalog::get_component)
-                .put(catalog::update_component)
-                .delete(catalog::delete_component),
-        )
+    let api = api_routes()
         // Inside the bearer layer: an unknown path or method is answered
         // only to an authenticated caller, and in the JSON error shape.
         .fallback(not_found)
@@ -180,7 +221,7 @@ pub fn router(state: AppState) -> Router {
         ));
 
     Router::new()
-        .nest("/api/v1", api)
+        .nest(PREFIX, api)
         .route("/platform/webhooks", post(webhooks::receive))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -200,4 +241,92 @@ async fn method_not_allowed() -> ApiError {
         "method_not_allowed",
         "this route does not accept that method",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use otto_resource::{ClientConfig, PlatformClient};
+    use tower::ServiceExt;
+
+    /// The routes without the bearer layer, over a database and platform
+    /// nothing here reaches: with no principal attached, a request that
+    /// reaches a handler fails its `Extension<Principal>` extractor (500),
+    /// which no fallback answers.
+    fn bare() -> Router {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://cxp:cxp@127.0.0.1:1/none")
+            .unwrap();
+        let platform = Arc::new(
+            PlatformClient::new(ClientConfig::new(
+                "https://platform.example.com",
+                "https://cxp.example.com/mcp",
+                "otto_rs_test",
+            ))
+            .unwrap(),
+        );
+        let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
+        let state = AppState::new(
+            Db::from_pool(pool),
+            platform,
+            meter,
+            Config {
+                public_url: "https://cxp.example.com".into(),
+                webhook_secret: "otto_whsec_test".into(),
+            },
+        );
+        Router::new()
+            .nest(
+                PREFIX,
+                api_routes().method_not_allowed_fallback(method_not_allowed),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn the_router_serves_exactly_the_route_table() {
+        let table = route_table();
+        let mut paths: Vec<&str> = table.iter().map(|(_, p)| *p).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let unique: std::collections::HashSet<_> = table.iter().collect();
+        assert_eq!(unique.len(), table.len(), "a route is listed twice");
+        for path in paths {
+            let uri = path.replace("{id}", "00000000-0000-0000-0000-000000000000");
+            for method in [
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ] {
+                let res = bare()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(&uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let listed = table.contains(&(method.clone(), path));
+                if listed {
+                    assert_eq!(
+                        res.status(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "{method} {path} is listed but no handler answered it"
+                    );
+                } else {
+                    assert_eq!(
+                        res.status(),
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path} is served but not listed in route_table"
+                    );
+                }
+            }
+        }
+    }
 }
