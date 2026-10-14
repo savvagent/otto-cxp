@@ -268,7 +268,8 @@ async fn another_org_can_neither_see_nor_change_an_orgs_rows(pool: PgPool) {
 }
 
 /// A request path that forgot to pin (current_org() NULL) reads and writes
-/// nothing in a domain table, even as the table's would-be owner.
+/// nothing in a domain table: as `otto_app` with no org set, no tenant
+/// policy matches any row.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn unpinned_otto_app_sees_no_domain_rows(pool: PgPool) {
     let admin = db(pool.clone());
@@ -493,45 +494,81 @@ async fn composite_foreign_keys_refuse_cross_org_references(pool: PgPool) {
     tx.rollback().await.unwrap();
 }
 
-/// Deleting a referenced row nulls only the reference (`ON DELETE SET NULL
-/// (col)`), never the referencing row's `org_id`; owned children cascade.
+/// The catalog chain cascades: deleting an entity deletes the levels under
+/// it. Every other reference to a deleted entity (from customers, tickets,
+/// feedback, surveys) is nulled (`ON DELETE SET NULL (col)`), only that
+/// column, never the row or its `org_id`. Each catalog level is deleted in its
+/// own org so all four reference columns are exercised.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn deletes_null_optional_references_and_cascade_to_owned_rows(pool: PgPool) {
+async fn catalog_deletes_cascade_down_and_null_references(pool: PgPool) {
+    let db = db(pool);
+    let levels = [
+        ("experiences", "experience_id"),
+        ("applications", "application_id"),
+        ("pages", "page_id"),
+        ("components", "component_id"),
+    ];
+    for (deleted, (table, _)) in levels.iter().enumerate() {
+        let o = org();
+        let s = seed(&db, o).await;
+        let ids = [s.experience, s.application, s.page, s.component];
+
+        let mut tx = db.begin(o).await.unwrap();
+        let n = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
+            .bind(ids[deleted])
+            .execute(tx.conn())
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1, "deleting from {table}");
+
+        // The deleted level and everything under it is gone; above it stays.
+        for (level, (catalog, _)) in levels.iter().enumerate() {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {catalog}"))
+                .fetch_one(tx.conn())
+                .await
+                .unwrap();
+            let expected = if level >= deleted { 0 } else { 1 };
+            assert_eq!(n, expected, "{catalog} after deleting from {table}");
+        }
+
+        for referencing in ["customers", "tickets", "feedback", "surveys"] {
+            for (level, (_, column)) in levels.iter().enumerate() {
+                let (value, org_id): (Option<Uuid>, OrgId) =
+                    sqlx::query_as(&format!("SELECT {column}, org_id FROM {referencing}"))
+                        .fetch_one(tx.conn())
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("{referencing} row went after deleting from {table}: {e}")
+                        });
+                assert_eq!(
+                    org_id, o,
+                    "{referencing}.org_id after deleting from {table}"
+                );
+                let expected = if level >= deleted {
+                    None
+                } else {
+                    Some(ids[level])
+                };
+                assert_eq!(
+                    value, expected,
+                    "{referencing}.{column} after deleting from {table}"
+                );
+            }
+        }
+        tx.rollback().await.unwrap();
+    }
+}
+
+/// Owned children cascade with their customer; rows a customer does not own
+/// survive it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn deleting_a_customer_cascades_to_its_owned_rows(pool: PgPool) {
     let db = db(pool);
     let a = org();
     let s = seed(&db, a).await;
 
     let mut tx = db.begin(a).await.unwrap();
-    sqlx::query("DELETE FROM experiences WHERE id = $1")
-        .bind(s.experience)
-        .execute(tx.conn())
-        .await
-        .unwrap();
-    for table in [
-        "applications",
-        "customers",
-        "tickets",
-        "feedback",
-        "surveys",
-    ] {
-        let (refs, orgs): (i64, i64) = sqlx::query_as(&format!(
-            "SELECT count(experience_id), count(*) FILTER (WHERE org_id = $1) FROM {table}"
-        ))
-        .bind(a)
-        .fetch_one(tx.conn())
-        .await
-        .unwrap();
-        assert_eq!((refs, orgs), (0, 1), "{table} after its experience went");
-    }
-    // The rest of the catalog chain is untouched.
-    let app_parent: Option<Uuid> =
-        sqlx::query_scalar("SELECT application_id FROM pages WHERE id = $1")
-            .bind(s.page)
-            .fetch_one(tx.conn())
-            .await
-            .unwrap();
-    assert_eq!(app_parent, Some(s.application));
-
     sqlx::query("DELETE FROM customers WHERE id = $1")
         .bind(s.customer)
         .execute(tx.conn())
@@ -588,16 +625,19 @@ async fn customer_email_is_unique_per_org(pool: PgPool) {
 }
 
 /// Structural invariants, read back from the catalog: every foreign key
-/// between public tables is composite and leads with org_id, every tenant
+/// between public tables is (org_id, x_id) -> (org_id, id), every tenant
 /// table with an id carries UNIQUE (org_id, id), otto_app may read and write
 /// every table, and the dropped pre-platform objects are gone.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
-    let fks: Vec<(String, String)> = sqlx::query_as(
+    let fks: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT c.conname::text, \
                 (SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
                    FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
-                   JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) \
+                   JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum), \
+                (SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
+                   FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
+                   JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) \
          FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace \
          WHERE c.contype = 'f' AND n.nspname = 'public' ORDER BY 1",
     )
@@ -605,11 +645,15 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
     .await
     .unwrap();
     assert!(!fks.is_empty());
-    for (name, cols) in &fks {
+    for (name, cols, referenced) in &fks {
         let cols: Vec<&str> = cols.split(',').collect();
         assert!(
             cols.len() == 2 && cols[0] == "org_id",
             "{name} is not an (org_id, x_id) foreign key: {cols:?}"
+        );
+        assert_eq!(
+            referenced, "org_id,id",
+            "{name} must reference (org_id, id), in that order"
         );
     }
 

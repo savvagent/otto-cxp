@@ -25,9 +25,10 @@
 -- `(org_id, x_id) REFERENCES x (org_id, id)` foreign key: foreign-key checks
 -- bypass row-level security, so a plain `REFERENCES x (id)` would accept
 -- another org's id; keying on (org_id, id) makes the database refuse it.
--- Nullable references use `ON DELETE SET NULL (x_id)` (Postgres 15+), which
--- nulls only the reference and leaves the NOT NULL `org_id` alone; owned
--- children use `ON DELETE CASCADE`. Indexes lead with `org_id` (except the
+-- Nullable references to the catalog from customers, tickets, feedback, and
+-- surveys use `ON DELETE SET NULL (x_id)` (Postgres 15+), which nulls only the
+-- reference and leaves the NOT NULL `org_id` alone; owned children, including
+-- each catalog level under its parent, use `ON DELETE CASCADE`. Indexes lead with `org_id` (except the
 -- GIN indexes, which cannot without btree_gin; RLS's `org_id` predicate is
 -- combined with them through the `(org_id, ...)` btree indexes).
 --
@@ -93,8 +94,10 @@ CREATE TYPE message_role AS ENUM ('customer', 'agent', 'system');
 -- -------------------------------------------------------------------- catalog
 
 -- The experience catalog: Experience -> Application -> Page -> Component. Each
--- level's parent is optional, and deleting a parent leaves its children in
--- place, unparented. `team_id` is the platform team that owns the entity: an
+-- level's parent is optional (an entity may be created unparented), but a
+-- parent owns its children: deleting it deletes them, as the pre-platform
+-- schema did. Rows elsewhere that pointed at a deleted entity keep existing
+-- with that reference nulled. `team_id` is the platform team that owns the entity: an
 -- opaque platform id, verified at the platform on write, with no foreign key
 -- (there is no local teams table). A `team.deleted` webhook nulls it.
 CREATE TABLE experiences (
@@ -125,7 +128,7 @@ CREATE TABLE applications (
   updated_at    timestamptz  NOT NULL DEFAULT now(),
   UNIQUE (org_id, id),
   FOREIGN KEY (org_id, experience_id) REFERENCES experiences (org_id, id)
-    ON DELETE SET NULL (experience_id)
+    ON DELETE CASCADE
 );
 
 CREATE INDEX applications_org_created_idx ON applications (org_id, created_at DESC);
@@ -145,7 +148,7 @@ CREATE TABLE pages (
   updated_at     timestamptz  NOT NULL DEFAULT now(),
   UNIQUE (org_id, id),
   FOREIGN KEY (org_id, application_id) REFERENCES applications (org_id, id)
-    ON DELETE SET NULL (application_id)
+    ON DELETE CASCADE
 );
 
 CREATE INDEX pages_org_created_idx ON pages (org_id, created_at DESC);
@@ -165,7 +168,7 @@ CREATE TABLE components (
   updated_at     timestamptz  NOT NULL DEFAULT now(),
   UNIQUE (org_id, id),
   FOREIGN KEY (org_id, page_id) REFERENCES pages (org_id, id)
-    ON DELETE SET NULL (page_id)
+    ON DELETE CASCADE
 );
 
 CREATE INDEX components_org_created_idx ON components (org_id, created_at DESC);
@@ -326,7 +329,8 @@ CREATE TABLE knowledge_articles (
 -- exactly: to_tsvector('english', title || ' ' || content).
 CREATE INDEX knowledge_articles_org_created_idx ON knowledge_articles (org_id, created_at DESC);
 CREATE INDEX knowledge_articles_org_category_idx ON knowledge_articles (org_id, category);
-CREATE INDEX knowledge_articles_org_published_idx ON knowledge_articles (org_id, published);
+CREATE INDEX knowledge_articles_org_published_idx
+  ON knowledge_articles (org_id, published, created_at DESC);
 CREATE INDEX knowledge_articles_fts_idx
   ON knowledge_articles USING GIN (to_tsvector('english', title || ' ' || content));
 CREATE INDEX knowledge_articles_tags_idx ON knowledge_articles USING GIN (tags);
@@ -588,9 +592,12 @@ CREATE POLICY platform_events_maintenance_delete ON platform_events
   AS RESTRICTIVE FOR DELETE
   USING (current_org() IS NOT NULL OR current_setting('app.maintenance', true) = 'on');
 
--- Written by pinned transactions, drained by background tasks that serve every
--- org. A pinned transaction sees and writes only its own org's rows; an
--- unpinned one (current_org() IS NULL, which only background code is) sees all.
+-- Written by pinned transactions, drained by a background shipper that serves
+-- every org. A pinned transaction sees and writes only its own org's rows; any
+-- unpinned transaction (current_org() IS NULL) can read and write every org's
+-- rows. No marker guards this: request paths always pin (they open their
+-- transactions with `platform_events::begin_live`), and only the usage
+-- shipper runs unpinned against these tables.
 ALTER TABLE usage_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_outbox FORCE ROW LEVEL SECURITY;
 CREATE POLICY usage_outbox_tenant_isolation ON usage_outbox
