@@ -47,6 +47,8 @@ struct Platform {
     usage_down: bool,
     /// Report every org as over its allowance on a hard-stop plan.
     blocked: bool,
+    /// How many usage-status requests have arrived.
+    usage_lookups: usize,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -98,7 +100,8 @@ async fn usage_status(
     State(p): State<Shared>,
     Path(org): Path<Uuid>,
 ) -> Result<Json<Value>, StatusCode> {
-    let p = p.lock().unwrap();
+    let mut p = p.lock().unwrap();
+    p.usage_lookups += 1;
     if p.usage_down {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -501,6 +504,43 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
     let csat = h.tool(&writer, "calculate_csat", json!({})).await.unwrap();
     assert_eq!(csat["csat"], 100.0, "{csat}");
     assert_eq!(h.charged(org).await.len(), 4);
+}
+
+/// With quotas enforced, a read or a free write never calls the platform for
+/// the org's usage; only a billable tool looks it up, before its transaction.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn only_billable_tools_look_the_quota_up(pool: PgPool) {
+    let h = harness_with(pool, true).await;
+    let org = Uuid::new_v4();
+    let writer = token(&h.platform, org, WRITE);
+    let lookups = || h.platform.lock().unwrap().usage_lookups;
+
+    h.tool(
+        &writer,
+        "create_customer",
+        json!({"email": "di@example.com", "name": "Di"}),
+    )
+    .await
+    .unwrap();
+    h.tool(&writer, "list_customers", json!({})).await.unwrap();
+    h.rpc(
+        &writer,
+        "resources/read",
+        json!({"uri": "metrics://dashboard"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookups(), 0);
+
+    h.tool(
+        &writer,
+        "submit_feedback",
+        json!({"customer_id": "di@example.com", "feedback_type": "praise", "rating": 5}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookups(), 1);
+    assert_eq!(h.charged(org).await, ["submit_feedback"]);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]

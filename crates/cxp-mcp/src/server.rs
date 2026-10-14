@@ -8,9 +8,12 @@
 //! argument. [`Cxp::tx`] opens a transaction pinned to the token's org with
 //! `platform_events::begin_live`, the only way a request reaches tenant data.
 //!
-//! **A tool body:** check the scope, open the transaction, charge (the four
-//! billable tools only), do one thing, commit. Charging inside the tool's own
-//! transaction means a failed call is never billed.
+//! **A tool body:** check the scope, open the transaction, do one thing,
+//! commit. The four billable tools also warm the quota
+//! ([`Cxp::warm_quota`]) before the transaction and charge inside it
+//! ([`Cxp::charge`]): a failed call is never billed. Only they look the org's
+//! quota up on the platform; every other tool, and every read, makes no
+//! platform call of its own.
 
 use std::sync::Arc;
 
@@ -102,12 +105,17 @@ impl Cxp {
     /// Open a transaction pinned to the caller's org, refused if the org was
     /// deleted or the caller removed since their token was introspected.
     pub async fn tx(&self, caller: &Principal) -> Result<Tx<'static>, ErrorData> {
-        // The quota lookup is a network call: make it before a pooled
-        // connection is held.
-        self.meter.warm(caller.org_id).await;
         cxp_core::platform_events::begin_live(&self.db, caller.org_id, Some(caller.user_id))
             .await
             .mcp()
+    }
+
+    /// Look the org's quota standing up at the platform, before a billable
+    /// tool opens its transaction, so the network call never holds a pooled
+    /// connection. Only the four `cxp_core::usage::BILLABLE` tools call this:
+    /// every other tool, and every read, makes no platform call of its own.
+    pub async fn warm_quota(&self, caller: &Principal) {
+        self.meter.warm(caller.org_id).await;
     }
 
     /// Record one call of a billable tool (and refuse it if the org is out of
