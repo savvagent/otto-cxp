@@ -25,3 +25,5 @@ url.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 sqlx.workspace = true
+# Drives the router in-process (`ServiceExt::oneshot`) in tests/mcp.rs.
+tower.workspace = true

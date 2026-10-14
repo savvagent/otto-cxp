@@ -1,0 +1,153 @@
+//! Turning domain failures into something an agent can act on.
+//!
+//! The branch point is machine-readable: `data.code` is stable
+//! (`insufficient_scope`, `not_found`, `invalid_argument`, `conflict`,
+//! `unknown_team`, `access_revoked`, `quota_exceeded`, `unavailable`,
+//! `internal`, and `unauthenticated` for a surface mounted without its
+//! middleware) and `data.retriable` says whether repeating the call unchanged
+//! could succeed.
+//!
+//! `cxp_core::Error`'s `Display` never carries database or platform text, so
+//! the message is passed through as is; server-side failures are logged here
+//! with their source, which does.
+
+use cxp_core::auth::MissingScope;
+use cxp_core::Error;
+use rmcp::model::{ErrorCode, ErrorData};
+
+fn data(code: &str, retriable: bool) -> Option<serde_json::Value> {
+    Some(serde_json::json!({ "code": code, "retriable": retriable }))
+}
+
+/// A domain failure on the wire.
+pub fn from_core(e: &Error) -> ErrorData {
+    if e.is_internal() {
+        tracing::error!(
+            code = e.code(),
+            error = %e,
+            source = ?std::error::Error::source(e),
+            "server-side failure surfaced to an MCP caller"
+        );
+    }
+    let rpc = match e {
+        // Well-formed calls the server declined.
+        Error::AccessRevoked | Error::QuotaExceeded { .. } => ErrorCode::INVALID_REQUEST,
+        _ if e.is_internal() => ErrorCode::INTERNAL_ERROR,
+        Error::Unavailable => ErrorCode::INTERNAL_ERROR,
+        _ => ErrorCode::INVALID_PARAMS,
+    };
+    ErrorData::new(rpc, e.to_string(), data(e.code(), e.retriable()))
+}
+
+/// A tenant-substrate failure: wrapped as the domain does, so only its
+/// `Invalid` text is ever shown.
+pub fn from_tenant(e: otto_tenant::Error) -> ErrorData {
+    from_core(&Error::Tenant(e))
+}
+
+/// A platform lookup (`whoami`'s member, `usage`'s report) that failed.
+pub fn from_platform(e: otto_resource::Error) -> ErrorData {
+    from_core(&Error::Platform(e))
+}
+
+/// A token without the scope the call needs. Actionable: the agent must
+/// re-authorize asking for it, so the message names it.
+pub fn from_scope(e: &MissingScope) -> ErrorData {
+    ErrorData::new(
+        ErrorCode::INVALID_REQUEST,
+        format!(
+            "{e}. Re-authorize this server requesting it (the scopes this server knows are \
+             listed at /.well-known/oauth-protected-resource)"
+        ),
+        data("insufficient_scope", false),
+    )
+}
+
+/// Reached only if the MCP surface was mounted without its middleware.
+pub fn unauthenticated() -> ErrorData {
+    ErrorData::internal_error(
+        "this request carried no authenticated principal, which means the MCP surface was \
+         mounted without its authentication middleware; this is a server misconfiguration, \
+         not a problem with your call",
+        data("unauthenticated", false),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pg_error() -> Error {
+        Error::Database(sqlx_like())
+    }
+
+    fn sqlx_like() -> sqlx::Error {
+        sqlx::Error::Protocol("relation \"customers\" violates secret_constraint_name".into())
+    }
+
+    #[test]
+    fn every_error_carries_its_code_and_retriable_flag() {
+        for e in [
+            Error::NotFound { kind: "customer" },
+            Error::Invalid("bad".into()),
+            Error::Conflict("dup".into()),
+            Error::UnknownTeam,
+            Error::AccessRevoked,
+            Error::QuotaExceeded {
+                tool: "create_survey".into(),
+                used: 10,
+                included: 10,
+                plan: "Free".into(),
+                upgrade_url: "https://otto.example.com/settings/billing".into(),
+            },
+            Error::Unavailable,
+            pg_error(),
+            Error::Tenant(otto_tenant::Error::Config("secret".into())),
+        ] {
+            let wire = from_core(&e);
+            let d = wire.data.expect("data");
+            assert_eq!(d["code"], e.code(), "{e:?}");
+            assert_eq!(d["retriable"], e.retriable(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn the_codes_on_the_wire_are_the_documented_ones() {
+        let code = |e: Error| from_core(&e).data.unwrap()["code"].clone();
+        assert_eq!(code(Error::NotFound { kind: "ticket" }), "not_found");
+        assert_eq!(code(Error::Invalid("x".into())), "invalid_argument");
+        assert_eq!(code(Error::Conflict("x".into())), "conflict");
+        assert_eq!(code(Error::UnknownTeam), "unknown_team");
+        assert_eq!(code(Error::AccessRevoked), "access_revoked");
+        assert_eq!(code(Error::Unavailable), "unavailable");
+        assert_eq!(code(pg_error()), "internal");
+        assert_eq!(
+            from_scope(&MissingScope("cxp:write")).data.unwrap()["code"],
+            "insufficient_scope"
+        );
+        assert_eq!(unauthenticated().data.unwrap()["code"], "unauthenticated");
+    }
+
+    #[test]
+    fn database_and_tenant_text_never_reach_the_wire() {
+        let db = from_core(&pg_error());
+        assert_eq!(db.code, ErrorCode::INTERNAL_ERROR);
+        assert!(!db.message.contains("customers"), "{}", db.message);
+        assert!(!db.message.contains("secret"), "{}", db.message);
+
+        let t = from_tenant(otto_tenant::Error::Config("secret key path".into()));
+        assert!(!t.message.contains("secret"), "{}", t.message);
+        assert_eq!(t.data.unwrap()["code"], "internal");
+
+        let invalid = from_tenant(otto_tenant::Error::Invalid("bad org".into()));
+        assert_eq!(invalid.message, "bad org");
+        assert_eq!(invalid.data.unwrap()["code"], "invalid_argument");
+    }
+
+    #[test]
+    fn the_scope_error_names_the_missing_scope() {
+        let e = from_scope(&MissingScope("cxp:write"));
+        assert!(e.message.contains("cxp:write"), "{}", e.message);
+        assert_eq!(e.data.unwrap()["retriable"], false);
+    }
+}
