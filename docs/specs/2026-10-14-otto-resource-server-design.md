@@ -319,10 +319,15 @@ default off, fail open) and inserts one `usage_outbox` row in the caller's trans
 `Meter::report(org)` returns the usage summary `whoami`/`usage` show (otto-flags' `Status`).
 `ship_once`/`run` ship batches to `POST /internal/usage` (event_id dedupe at the platform), as
 otto-flags, claiming due rows in `(next_attempt_at, id)` order, in maintenance transactions.
-Rows the platform refuses (per event in its receipt, or a whole batch it answers with a 4xx about
-the batch) and rows still unshipped after `MAX_SHIP_ATTEMPTS` (20) move to
-`usage_outbox_rejected` with the reason, logged at error. A receipt is trusted only if its counts
-add up and its rejected ids are distinct and all in the batch; otherwise the batch is retried.
+Rows the platform refuses (per event in its receipt, or alone: a batch it refuses whole with a 4xx
+about the request, 413 included, is split in halves and resent recursively until the refused
+events stand alone) move to `usage_outbox_rejected` with the reason, logged at error. A receipt
+is trusted only if its counts add up and its rejected ids are distinct and all in the batch;
+otherwise the batch is retried, and that counts toward `MAX_ROW_FAILURES` (20, column
+`row_failures`), after which the row is given up the same way. Nothing else counts: transport
+failures, 5xx, 408, 429, 401/403, 404, and an unknown org reschedule with backoff forever, so
+those rows stay in the outbox (and in the period's quota) until they ship. `run` logs failures
+that pass on their own (`ShipError::is_retriable`) at warn and the rest at error.
 An enforcing meter counts only unshipped rows from the platform's current period.
 The retention `sweep` (also maintenance, one transaction per step) forgets `platform_events`
 markers past their retention, expired `removed_members` tombstones, and `usage_outbox_rejected`
@@ -353,8 +358,9 @@ field leaves the team unchanged and an explicit `null` clears it. The console cu
 `team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
 lands. `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
-signature 401, bad body 400), `platform_events::apply` (a failure that can pass is 503 so the
-platform retries; one that cannot is 400 `invalid_event`), 200 `{"result": …}`. Errors are JSON
+signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
+`invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until
+a fix applies it), 200 `{"result": …}`. Errors are JSON
 `{error, code}` with no database text. Request bodies are capped at 256 KiB
 (`cxp_api::MAX_BODY_BYTES`): `DefaultBodyLimit` on cxp-api's own routes, and cxp-server's
 router-wide `RequestBodyLimitLayer` on every surface, `/mcp` included. `lib.rs`: `AppState::new(db, platform, meter, config)`,
@@ -372,7 +378,9 @@ migrations`) → `verify_tenant_isolation` (refuse to serve on problems; log the
 platform credential check (logs `the otto platform accepted this service's credential`) → spawn
 shipper and sweeper → serve with graceful shutdown and a final usage flush. `/healthz` static,
 `/readyz` 503 while the boot platform check is `Rejected` or `Misconfigured`, else `SELECT 1`
-with a 2 s timeout. A drain or final flush that fails exits non-zero. `tests/e2e.rs` with a mock platform proves criteria 1–4
+with a 2 s timeout. A drain that fails, or a final flush that fails for a reason that will not
+pass on its own, exits non-zero; a flush that cannot reach the platform logs at warn and leaves
+its rows for the next start. `tests/e2e.rs` with a mock platform proves criteria 1–4
 over HTTP.
 
 ## Stories
