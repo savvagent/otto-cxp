@@ -34,6 +34,7 @@ impl Cxp {
             .platform()
             .member(caller.org_id.as_uuid(), caller.user_id.as_uuid())
             .await
+            .map_err(|e| cxp_core::Error::platform_for(caller.org_id, e))
             .mcp()?;
         // Identity does not depend on billing: if the platform cannot report
         // usage right now, answer without it rather than failing the call.

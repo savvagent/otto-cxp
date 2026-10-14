@@ -200,7 +200,11 @@ impl Meter {
 
     /// The org's standing, for the free `whoami` and `usage` tools.
     pub async fn report(&self, org: OrgId) -> Result<Status> {
-        let usage = self.platform.usage_status(org.as_uuid()).await?;
+        let usage = self
+            .platform
+            .usage_status(org.as_uuid())
+            .await
+            .map_err(|e| Error::platform_for(org, e))?;
         Ok(Status::new(usage, self.enforce))
     }
 }

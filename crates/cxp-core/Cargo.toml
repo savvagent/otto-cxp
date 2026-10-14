@@ -19,6 +19,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Captures log lines the tests assert on.
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full"] }
 otto-resource.workspace = true
 otto-tenant.workspace = true

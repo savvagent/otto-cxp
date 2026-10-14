@@ -141,6 +141,20 @@ fn tenant_message(e: &otto_tenant::Error) -> String {
 }
 
 impl Error {
+    /// A failed platform call about `org`. An org the platform does not know
+    /// (`NotFound`, which callers see as `access_revoked`) is logged here at
+    /// `warn` with the org: it is not a server fault, so no surface logs it,
+    /// yet a live token for an org the platform has forgotten is worth an
+    /// operator's look. Every org-scoped platform call that reaches REST or
+    /// MCP goes through this.
+    pub fn platform_for(org: otto_tenant::ids::OrgId, e: otto_resource::Error) -> Self {
+        if matches!(e, otto_resource::Error::NotFound) {
+            tracing::warn!(org = %org,
+                "the otto platform does not know this organization; answering access_revoked");
+        }
+        Error::Platform(e)
+    }
+
     /// The database error inside, whichever way it arrived: directly, or
     /// through the tenant substrate. Both are treated identically.
     fn db(&self) -> Option<&sqlx::Error> {
@@ -558,5 +572,51 @@ mod tests {
                 e.log_detail()
             );
         }
+    }
+    /// A writer collecting what a scoped subscriber logs.
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An org the platform does not know is logged at `warn` with the org
+    /// (no surface logs an `access_revoked`); other platform failures are left
+    /// to the surfaces, which log the internal ones.
+    #[test]
+    fn an_org_the_platform_does_not_know_is_logged_with_the_org() {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let org = otto_tenant::ids::OrgId::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let gone = Error::platform_for(org, otto_resource::Error::NotFound);
+            assert_eq!(gone.code(), "access_revoked");
+            let down = Error::platform_for(org, otto_resource::Error::Unauthorized);
+            assert_eq!(down.code(), "internal");
+        });
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("WARN"), "{text}");
+        assert!(lines[0].contains(&org.to_string()), "{text}");
+        assert!(
+            lines[0].contains("does not know this organization"),
+            "{text}"
+        );
     }
 }
