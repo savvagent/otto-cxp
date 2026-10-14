@@ -28,9 +28,13 @@ const EMOTICONS = ["😠", "😟", "😐", "🙂", "😄"];
 export interface QuickRatingProps {
   customerId?: string;
   feedbackType?: string;
+  /** Catalog experience UUID, sent as `experience_id`. */
   experience?: string;
+  /** Catalog application UUID, sent as `application_id`. */
   application?: string;
+  /** Catalog page UUID, sent as `page_id`. */
   page?: string;
+  /** Catalog component UUID, sent as `component_id`. */
   component?: string;
   labels?: QuickRatingLabels;
   onSubmit?: (rating: number) => void;

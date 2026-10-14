@@ -24,7 +24,9 @@ const DEFAULT_CHAT_LABELS: Required<ChatWidgetLabels> = {
 
 export interface ChatWidgetProps {
   sessionId?: string;
+  /** Catalog experience UUID (`experience_id`). Currently unused by this component. */
   experience?: string;
+  /** Catalog application UUID (`application_id`). Currently unused by this component. */
   application?: string;
   page?: string;
   component?: string;
