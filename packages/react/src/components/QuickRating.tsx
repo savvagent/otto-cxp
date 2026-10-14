@@ -63,10 +63,10 @@ export function QuickRating({
         await cxp.feedback.submitFeedback(customerId, feedbackType, {
           rating,
           subject: `Quick rating: ${rating}/5`,
-          experience,
-          application,
-          page,
-          component,
+          experienceId: experience,
+          applicationId: application,
+          pageId: page,
+          componentId: component,
         });
       } else {
         await new Promise((r) => setTimeout(r, 400));

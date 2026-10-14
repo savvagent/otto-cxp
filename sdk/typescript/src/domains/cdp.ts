@@ -22,8 +22,6 @@ export interface UpdateCustomerOptions {
   name?: string;
   phone?: string;
   company?: string;
-  metadata?: Record<string, unknown>;
-  tags?: string[];
 }
 
 export interface CreateSegmentOptions {
@@ -62,8 +60,6 @@ export class CdpDomain {
       name: updates.name,
       phone: updates.phone,
       company: updates.company,
-      metadata: updates.metadata,
-      tags: updates.tags,
     });
   }
 
@@ -127,7 +123,7 @@ export class CdpDomain {
    */
   async getSegmentMembers(segmentId: string): Promise<Customer[]> {
     return callList(this.client, "get_segment_members", {
-      segment_id: segmentId,
+      id: segmentId,
     });
   }
 
@@ -136,7 +132,7 @@ export class CdpDomain {
    */
   async getCustomer360(customerId: string): Promise<Customer360> {
     return callTool(this.client, "get_customer_360", {
-      customer_id: customerId,
+      id: customerId,
     });
   }
 }

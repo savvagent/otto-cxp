@@ -18,10 +18,10 @@ export interface SubmitFeedbackOptions {
   subject?: string;
   body?: string;
   rating?: number;
-  experience?: string;
-  application?: string;
-  page?: string;
-  component?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 }
 
 export interface GetFeedbackOptions {
@@ -85,7 +85,7 @@ export class FeedbackDomain {
    */
   async getResponses(surveyId: string): Promise<SurveyResponse[]> {
     return callList(this.client, "get_survey_responses", {
-      survey_id: surveyId,
+      id: surveyId,
     });
   }
 
@@ -103,10 +103,10 @@ export class FeedbackDomain {
       subject: options?.subject,
       body: options?.body,
       rating: options?.rating,
-      experience: options?.experience,
-      application: options?.application,
-      page: options?.page,
-      component: options?.component,
+      experience_id: options?.experienceId,
+      application_id: options?.applicationId,
+      page_id: options?.pageId,
+      component_id: options?.componentId,
     });
   }
 

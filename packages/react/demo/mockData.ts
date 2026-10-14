@@ -75,24 +75,24 @@ export async function seedMockData(cxp: CxpClient): Promise<SeededIds> {
     subject: "Love the new onboarding flow",
     body: "The step-by-step setup wizard made it really easy to get started. Great job!",
     rating: 5,
-    application: "Web App",
-    page: "/onboarding",
+    applicationId: "Web App",
+    pageId: "/onboarding",
   });
 
   await cxp.feedback.submitFeedback(customer.id, "feature_request", {
     subject: "Dark mode support",
     body: "Would love a dark mode option for the dashboard. I work late at night and the bright UI is harsh.",
     rating: 4,
-    application: "Web App",
-    page: "/settings",
+    applicationId: "Web App",
+    pageId: "/settings",
   });
 
   await cxp.feedback.submitFeedback(customer.id, "bug_report", {
     subject: "Notification bell count is off",
     body: "The notification badge shows 3 but there are actually 5 unread notifications.",
     rating: 2,
-    application: "Web App",
-    page: "/notifications",
+    applicationId: "Web App",
+    pageId: "/notifications",
     component: "NotificationBell",
   });
 

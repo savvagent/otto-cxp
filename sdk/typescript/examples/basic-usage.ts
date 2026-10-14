@@ -52,8 +52,8 @@ async function main() {
       subject: "Dark mode support",
       body: "Would love to see a dark mode option in the dashboard",
       rating: 4,
-      application: "web-app",
-      page: "/settings",
+      applicationId: "web-app",
+      pageId: "/settings",
     }
   );
   console.log("Feedback submitted:", feedback.id);

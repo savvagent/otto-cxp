@@ -96,7 +96,7 @@ export class SupportDomain {
    * Start a new chat session
    */
   async startChatSession(customerId: string): Promise<ChatSession> {
-    return callTool(this.client, "start_chat_session", { customer_id: customerId });
+    return callTool(this.client, "start_chat_session", { id: customerId });
   }
 
   /**
@@ -125,6 +125,6 @@ export class SupportDomain {
    * End a chat session
    */
   async endChatSession(sessionId: string): Promise<ChatSession> {
-    return callTool(this.client, "end_chat_session", { session_id: sessionId });
+    return callTool(this.client, "end_chat_session", { id: sessionId });
   }
 }
