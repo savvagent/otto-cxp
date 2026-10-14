@@ -2,17 +2,23 @@
  * Core data types for the CXP SDK
  */
 
+import type { JsonValue } from "./type-utils.js";
+
 /**
  * Customer entity
  */
 export interface Customer {
   id: string;
   email: string;
-  name?: string;
-  phone?: string;
-  company?: string;
+  name: string | null;
+  phone: string | null;
+  company: string | null;
   metadata: Record<string, unknown>;
   tags: string[];
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -24,14 +30,18 @@ export interface Ticket {
   id: string;
   customerId: string;
   subject: string;
-  description?: string;
+  description: string | null;
   status: string;
   priority: string;
-  channel?: string;
-  assignedTo?: string;
+  channel: string | null;
+  assignedTo: string | null;
   tags: string[];
   metadata: Record<string, unknown>;
-  resolvedAt?: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  resolvedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -54,13 +64,13 @@ export interface Feedback {
   id: string;
   customerId: string;
   feedbackType: string;
-  subject?: string;
-  body?: string;
-  rating?: number;
-  experience?: string;
-  application?: string;
-  page?: string;
-  component?: string;
+  subject: string | null;
+  body: string | null;
+  rating: number | null;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
 }
@@ -71,9 +81,17 @@ export interface Feedback {
 export interface Survey {
   id: string;
   title: string;
-  description?: string;
-  questions: SurveyQuestion[];
+  description: string | null;
+  /**
+   * Stored as free-form JSON by the server. Questions created through this
+   * SDK are `SurveyQuestion[]`, but other writers may store any JSON value.
+   */
+  questions: JsonValue;
   active: boolean;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -96,8 +114,9 @@ export interface SurveyResponse {
   id: string;
   surveyId: string;
   customerId: string;
-  answers: SurveyAnswer[];
-  completedAt?: string;
+  /** Free-form JSON as stored; responses submitted through this SDK are `SurveyAnswer[]`. */
+  answers: JsonValue;
+  completedAt: string | null;
   createdAt: string;
 }
 
@@ -116,7 +135,7 @@ export interface KnowledgeArticle {
   id: string;
   title: string;
   content: string;
-  category?: string;
+  category: string | null;
   tags: string[];
   published: boolean;
   createdAt: string;
@@ -129,7 +148,7 @@ export interface KnowledgeArticle {
 export interface Segment {
   id: string;
   name: string;
-  description?: string;
+  description: string | null;
   criteria: Record<string, unknown>;
   segmentType: string;
   createdAt: string;
@@ -145,7 +164,7 @@ export interface ChatSession {
   status: string;
   metadata: Record<string, unknown>;
   startedAt: string;
-  endedAt?: string;
+  endedAt: string | null;
 }
 
 /**
@@ -165,9 +184,35 @@ export interface ChatMessage {
  */
 export interface Customer360 {
   customer: Customer;
-  recentTickets: Ticket[];
+  recentTickets: TicketSummary[];
   recentInteractions: Interaction[];
-  recentFeedback: Feedback[];
+  recentFeedback: FeedbackSummary[];
+}
+
+/**
+ * A support ticket as the 360 view shows it
+ */
+export interface TicketSummary {
+  id: string;
+  subject: string;
+  status: string;
+  priority: string;
+  channel?: string | null;
+  assignedTo?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+/**
+ * A piece of feedback as the 360 view shows it
+ */
+export interface FeedbackSummary {
+  id: string;
+  feedbackType: string;
+  subject?: string | null;
+  body?: string | null;
+  rating?: number | null;
+  createdAt: string;
 }
 
 /**
@@ -200,35 +245,33 @@ export interface MetricsDashboard {
  * Feedback context information
  */
 export interface FeedbackContext {
-  experience?: string;
-  application?: string;
-  page?: string;
-  component?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 }
 
 /**
  * NPS calculation result
  */
 export interface NpsResult {
-  score: number;
+  /** Net Promoter Score (-100 to 100); null when nothing is scored */
+  nps: number | null;
+  totalResponses: number;
+  scoredResponses: number;
+  promoters: number;
+  passives: number;
+  detractors: number;
 }
 
 /**
  * CSAT calculation result
  */
 export interface CsatResult {
-  score: number;
-}
-
-/**
- * Team entity
- */
-export interface Team {
-  id: string;
-  name: string;
-  description?: string;
-  owner?: string;
-  metadata: Record<string, unknown>;
-  createdAt: string;
-  updatedAt: string;
+  /** Satisfied share of rated feedback, 0 to 100; null when nothing is rated */
+  csat: number | null;
+  totalFeedback: number;
+  ratedFeedback: number;
+  satisfied: number;
+  unsatisfied: number;
 }

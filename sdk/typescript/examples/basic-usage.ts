@@ -1,32 +1,17 @@
-/**
- * Basic usage example for CXP SDK
- */
+import { connectCxp } from "../src/index.js";
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { CxpClient } from "../src/index.js";
+// Placeholder catalog IDs. The server expects UUIDs of existing catalog
+// entities for feedback context; replace these with real ones.
+const WEB_APP_ID = "00000000-0000-4000-8000-000000000001";
+const SETTINGS_PAGE_ID = "00000000-0000-4000-8000-000000000002";
 
 async function main() {
-  // Create MCP transport
-  const transport = new StdioClientTransport({
-    command: "cxp-mcp-server",
+  // Connect over streamable HTTP with a bearer token
+  const { cxp, close } = await connectCxp({
+    url: process.env.CXP_URL ?? "http://127.0.0.1:8080/mcp",
+    token: process.env.CXP_TOKEN,
+    name: "cxp-example",
   });
-
-  // Create and connect MCP client
-  const mcpClient = new Client(
-    {
-      name: "cxp-example",
-      version: "1.0.0",
-    },
-    {
-      capabilities: {},
-    }
-  );
-
-  await mcpClient.connect(transport);
-
-  // Create CXP SDK client
-  const cxp = new CxpClient({ client: mcpClient });
 
   console.log("Connected to CXP platform\n");
 
@@ -72,8 +57,8 @@ async function main() {
       subject: "Dark mode support",
       body: "Would love to see a dark mode option in the dashboard",
       rating: 4,
-      application: "web-app",
-      page: "/settings",
+      applicationId: WEB_APP_ID,
+      pageId: SETTINGS_PAGE_ID,
     }
   );
   console.log("Feedback submitted:", feedback.id);
@@ -133,7 +118,7 @@ async function main() {
   console.log("\nExample completed successfully!");
 
   // Close the connection
-  await mcpClient.close();
+  await close();
 }
 
 main().catch((error) => {

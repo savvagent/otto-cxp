@@ -13,7 +13,7 @@ import {
   useDeleteApplication,
 } from "@/hooks/use-applications";
 import { useExperiences } from "@/hooks/use-experiences";
-import { useTeams } from "@/hooks/use-teams";
+import { useMyTeams } from "@/hooks/use-me";
 import { PageHeader } from "@/components/shared/page-header";
 import { CopyableId } from "@/components/shared/copyable-id";
 import { LoadingTable } from "@/components/shared/loading-state";
@@ -51,7 +51,7 @@ const PAGE_SIZE = 20;
 
 const applicationSchema = z.object({
   experience_id: z.string().optional(),
-  team_id: z.string().min(1, "Team is required"),
+  team_id: z.string().optional(),
   name: z.string().min(1, "Name is required"),
   description: z.string().optional(),
   platform: z.string().optional(),
@@ -72,8 +72,8 @@ function ApplicationDialog({
   const updateApplication = useUpdateApplication();
   const { data: experiencesData } = useExperiences({ limit: 200 });
   const experiences = experiencesData?.data ?? [];
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
   const isEdit = !!editing;
 
   const {
@@ -108,7 +108,7 @@ function ApplicationDialog({
             name: values.name,
             description: values.description || undefined,
             platform: values.platform || undefined,
-            team_id: values.team_id,
+            team_id: values.team_id || null,
           },
         },
         {
@@ -123,7 +123,7 @@ function ApplicationDialog({
       createApplication.mutate(
         {
           experience_id: values.experience_id || undefined,
-          team_id: values.team_id,
+          team_id: values.team_id || undefined,
           name: values.name,
           description: values.description || undefined,
           platform: values.platform || undefined,
@@ -153,7 +153,7 @@ function ApplicationDialog({
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="app-team">
-              Team <span className="text-destructive">*</span>
+              Team
             </Label>
             <Select
               value={teamId || "_none"}
@@ -162,10 +162,10 @@ function ApplicationDialog({
               }
             >
               <SelectTrigger id="app-team">
-                <SelectValue placeholder="Select a team" />
+                <SelectValue placeholder="No team" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="_none" disabled>Select a team</SelectItem>
+                <SelectItem value="_none">No team</SelectItem>
                 {teams.map((t) => (
                   <SelectItem key={t.id} value={t.id}>
                     {t.name}
@@ -269,8 +269,8 @@ export function ApplicationsPage() {
   const { data: experiencesData } = useExperiences({ limit: 200 });
   const experiences = experiencesData?.data ?? [];
 
-  const { data: teamsData } = useTeams({ limit: 200 });
-  const teams = teamsData?.data ?? [];
+  const { data: teamsData } = useMyTeams();
+  const teams = teamsData ?? [];
 
   const deleteApplication = useDeleteApplication();
   const items = data?.data ?? [];

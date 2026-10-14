@@ -10,28 +10,48 @@ npm install @cxp/sdk
 
 ## Usage
 
+The server is an OAuth-protected MCP resource served over streamable HTTP at
+`https://<host>/mcp`. Connect with a static bearer token (an otto platform access
+token for this resource):
+
 ```typescript
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { CxpClient } from "@cxp/sdk";
+import { connectCxp } from "@cxp/sdk";
 
-// Create and connect MCP client
-const transport = new StdioClientTransport({
-  command: "cxp-mcp-server"
+const { cxp, close } = await connectCxp({
+  url: "https://cxp.example.com/mcp",
+  token: process.env.CXP_TOKEN,
 });
+```
 
-const mcpClient = new Client({
-  name: "my-app",
-  version: "1.0.0"
-}, {
-  capabilities: {}
-});
+Or pass an MCP `OAuthClientProvider`. When the user must authorize in a
+browser, the provider's `redirectToAuthorization` is called and `connectCxp`
+throws `CxpAuthorizationRequired`. After the redirect back to your app, pass the
+authorization code to its `finishAuth`, which returns the connection:
 
-await mcpClient.connect(transport);
+```typescript
+import { connectCxp, CxpAuthorizationRequired } from "@cxp/sdk";
 
-// Create CXP SDK client
-const cxp = new CxpClient({ client: mcpClient });
+try {
+  ({ cxp } = await connectCxp({ url, authProvider }));
+} catch (e) {
+  if (!(e instanceof CxpAuthorizationRequired)) throw e;
+  // ...the provider redirected the user; on the callback page:
+  ({ cxp } = await e.finishAuth(codeFromCallback));
+}
+```
 
+(Across a full-page redirect your app reloads, so keep the provider's state in
+storage and, on the callback page, call `createCxpTransport({ url, authProvider })`,
+then `transport.finishAuth(code)`, then `connectCxp({ url, authProvider })`.)
+
+Already have a connected MCP `Client`? Wrap it: `new CxpClient({ client })`;
+`createCxpTransport` builds the HTTP transport for it.
+
+List methods return plain arrays (the `{ items, total? }` tool envelope is
+unwrapped; any other shape throws `CxpError` with code `invalid_response`). Failed calls throw `CxpError`; `error.code` carries the server's
+stable error code, such as `not_found`.
+
+```typescript
 // Use the SDK
 const ticket = await cxp.support.createTicket(
   "customer-123",
@@ -84,8 +104,8 @@ const responses = await cxp.feedback.getResponses(survey.id);
 await cxp.feedback.submitFeedback(customerId, "bug_report", {
   subject: "Button not working",
   body: "The submit button is disabled",
-  application: "web-app",
-  page: "/checkout"
+  applicationId: "<application uuid>",
+  pageId: "<page uuid>"
 });
 
 // Analytics

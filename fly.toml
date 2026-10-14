@@ -1,0 +1,67 @@
+# otto-cxp on Fly.io, org "savvagent". See docs/deploy/fly.md.
+#
+# A resource server of the otto platform (https://otto.savvagent.com): identity,
+# OAuth, orgs, and billing live there; this app holds only customer-experience
+# data (customers, tickets, feedback, surveys, catalog).
+#
+# Database: `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with
+# otto-platform, otto-factory, and otto-flags (shared for cost; split before
+# real customers, since each app's attach role is a superuser on the whole
+# instance). Isolation rests on `SET LOCAL ROLE otto_app` under row-level
+# security; cxp-server proves that at boot.
+#
+# Secrets (`fly secrets set`, never here):
+#   DATABASE_URL                    from `fly postgres attach`
+#   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
+#   CXP_PLATFORM_WEBHOOK_SECRET     otto_whsec_... from `resource set-webhook`
+
+app = "otto-cxp"
+primary_region = "iad"
+# Time to finish on stop: the final usage flush runs on graceful shutdown.
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  CXP_BIND = "0.0.0.0:8080"
+  CXP_PUBLIC_URL = "https://otto-cxp.savvagent.com"
+  # The token audience: exactly the resource_uri registered at the platform.
+  CXP_RESOURCE_URI = "https://otto-cxp.savvagent.com/mcp"
+  CXP_PLATFORM_URL = "https://otto.savvagent.com"
+  # EXTRA hosts /mcp accepts; the CXP_PUBLIC_URL host is always allowed. The
+  # fly.dev name still answers (health checks, debugging).
+  CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
+  # Small: otto-db is a shared 512 MB instance.
+  CXP_DB_MAX_CONNECTIONS = "5"
+  CXP_LOG_FORMAT = "json"
+  RUST_LOG = "info,cxp_server=info,cxp_mcp=info,cxp_api=info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # Suspend when idle and resume on the next request: cheapest. Raise
+  # min_machines_running to 1 once real traffic depends on it (a cost decision).
+  auto_stop_machines = "suspend"
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    # Sized for a 5-connection pool on a shared database.
+    soft_limit = 20
+    hard_limit = 25
+
+  [[http_service.checks]]
+    # Readiness, not liveness: whether to route traffic here.
+    path = "/readyz"
+    method = "GET"
+    interval = "15s"
+    timeout = "5s"
+    # Migrations run at startup under an advisory lock.
+    grace_period = "30s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

@@ -1,0 +1,165 @@
+name: CI
+
+# The server: crates/ (cxp-core, cxp-mcp, cxp-api, cxp-server). The TypeScript
+# SDK, React package, and web app: sdk/typescript, packages/react, apps/web.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Every action is pinned to a full commit SHA (its release in the comment): a
+# tag can be moved to other code, a SHA cannot. No job pushes, so no checkout
+# keeps the token in .git/config.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # `#[sqlx::test]` runs against a real Postgres, no mocks. A superuser, as
+      # in compose.yaml, so the baseline migration can create and grant otto_app.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cxp
+          POSTGRES_PASSWORD: cxp
+          POSTGRES_DB: otto_cxp
+        ports:
+          - 15435:5432
+        options: >-
+          --health-cmd "pg_isready -U cxp -d otto_cxp"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://cxp:cxp@localhost:15435/otto_cxp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # This action has no release tags; the toolchain comes from its `stable`
+      # branch name, so a SHA pin must name the toolchain itself.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The baseline creates otto_app itself and tolerates losing the race, but
+      # many test databases migrate in parallel against one cluster-scoped role;
+      # creating it first takes the race out.
+      - name: Pre-create the otto_app role
+        run: psql "$DATABASE_URL" -c "CREATE ROLE otto_app NOLOGIN;"
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  # Migrations are append-only. sqlx stores each applied migration's checksum
+  # and refuses to start when a known file no longer matches, so editing even
+  # a comment in an applied migration takes down the next deploy. sqlx ignores
+  # applied versions it does not know (`MIGRATOR` sets `ignore_missing` for
+  # rollbacks), so this job is what catches a deleted or renamed migration.
+  migrations-append-only:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Refuse changes to existing migrations
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-status --diff-filter=MDR "origin/${BASE_REF}...HEAD" -- 'crates/*/migrations/*')
+          if [ -n "$changed" ]; then
+            echo "::error::existing migrations were modified, deleted, or renamed; add a new migration instead"
+            echo "$changed"
+            exit 1
+          fi
+
+  # Proves the deploy artifact builds; `cargo test` can pass while the image
+  # does not.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # The TypeScript SDK, React package, and web app (pnpm workspace).
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The root package.json has no `packageManager` field, so the version is
+      # pinned here (the lockfile is v9). If `packageManager` is added later,
+      # delete `version:`: pnpm/action-setup refuses to take both.
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 9
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm test
+
+  # Every green push to main deploys, once the repo variable FLY_DEPLOY is
+  # `enabled`. Rob sets it only after the first deploy (a hand `fly deploy`) has
+  # been verified; until then this job is skipped and a merge deploys nothing. flyctl builds remotely on Fly's builder, the same path as a
+  # hand-run `fly deploy`. FLY_API_TOKEN is a deploy token scoped to this one
+  # app (`fly tokens create deploy -a otto-cxp`).
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [rust, docker-build, web]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.FLY_DEPLOY == 'enabled'
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only -a otto-cxp
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

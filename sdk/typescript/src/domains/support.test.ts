@@ -171,7 +171,8 @@ describe("SupportDomain", () => {
       ];
 
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: JSON.stringify(mockTickets) }],
+        structuredContent: { items: mockTickets, total: mockTickets.length },
+        content: [],
       } as any);
 
       const result = await support.listTickets();
@@ -191,7 +192,8 @@ describe("SupportDomain", () => {
 
     it("should list tickets with filters", async () => {
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: "[]" }],
+        structuredContent: { items: [] },
+        content: [],
       } as any);
 
       await support.listTickets({
@@ -259,7 +261,8 @@ describe("SupportDomain", () => {
       ];
 
       vi.mocked(mockClient.callTool).mockResolvedValue({
-        content: [{ type: "text", text: JSON.stringify(mockArticles) }],
+        structuredContent: { items: mockArticles, total: mockArticles.length },
+        content: [],
       } as any);
 
       const result = await support.searchKnowledgeBase("password reset");
@@ -290,7 +293,7 @@ describe("SupportDomain", () => {
 
       expect(mockClient.callTool).toHaveBeenCalledWith({
         name: "start_chat_session",
-        arguments: { customer_id: "customer-456" },
+        arguments: { id: "customer-456" },
       });
       expect(result).toEqual(mockSession);
     });
@@ -344,7 +347,7 @@ describe("SupportDomain", () => {
 
       expect(mockClient.callTool).toHaveBeenCalledWith({
         name: "end_chat_session",
-        arguments: { session_id: "session-123" },
+        arguments: { id: "session-123" },
       });
       expect(result.status).toBe("ended");
     });

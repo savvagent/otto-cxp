@@ -1,0 +1,175 @@
+//! Helpers shared by every `crates/cxp-core/tests/*.rs` file. Include with
+//! `mod common;`. Each test binary uses a different subset, hence the
+//! crate-level `dead_code` allowance.
+//!
+//! Tests run under `#[sqlx::test(migrator = "cxp_core::MIGRATOR")]`, which
+//! hands each test a fresh, migrated database on the cluster `DATABASE_URL`
+//! names, connecting as a superuser. A superuser bypasses row-level
+//! security, so a plain pool query proves nothing about isolation: tenant
+//! work goes through [`db`]'s `Db::begin` (which assumes `otto_app`), and
+//! unpinned checks go through [`as_app_unpinned`], [`as_app_maintenance`], or
+//! [`otto_app_db`].
+
+#![allow(dead_code)]
+
+use otto_tenant::ids::{OrgId, UserId};
+use otto_tenant::Db;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// The test database as a [`Db`]. `Db::begin(org)` on it runs as `otto_app`
+/// pinned to `org`, exactly as a request does.
+pub fn db(pool: PgPool) -> Db {
+    Db::from_pool(pool)
+}
+
+/// A fresh, random org id. The platform issues these; nothing here checks
+/// them against an orgs table, so any uuid is an org.
+pub fn org() -> OrgId {
+    OrgId::new()
+}
+
+/// A fresh, random user id.
+pub fn user() -> UserId {
+    UserId::new()
+}
+
+/// A `Db` whose every connection runs as `otto_app`, so even unpinned
+/// statements are subject to RLS (the test pool's superuser bypasses it).
+/// `Db::begin` still pins and works. Close `.pool()` before the test returns
+/// so sqlx can drop the test database.
+pub async fn otto_app_db(pool: &PgPool) -> Db {
+    let app_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE otto_app").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    Db::from_pool(app_pool)
+}
+
+/// A transaction as `otto_app` with no org pinned, so `current_org()` is
+/// NULL. This is what a request path that forgot to pin would see.
+pub async fn as_app_unpinned(pool: &PgPool) -> Transaction<'static, Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE otto_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+/// [`as_app_unpinned`] with the maintenance marker set, as background
+/// maintenance (`cxp_core::maintenance`) sets it.
+pub async fn as_app_maintenance(pool: &PgPool) -> Transaction<'static, Postgres> {
+    let mut tx = as_app_unpinned(pool).await;
+    sqlx::query("SET LOCAL app.maintenance = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+/// The SQLSTATE of a failed statement: `23503` foreign-key violation,
+/// `23505` unique violation, `42501` row-level-security refusal.
+pub fn sqlstate(err: &sqlx::Error) -> String {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|| format!("not a database error: {err}"))
+}
+
+// -------------------------------------------------------- stub team platform
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use cxp_core::catalog::{verify_team, VerifiedTeam};
+use otto_resource::{ClientConfig, PlatformClient, TeamInfo};
+use uuid::Uuid;
+
+#[derive(Default)]
+struct Teams {
+    /// team -> the org it belongs to
+    teams: Mutex<HashMap<Uuid, Uuid>>,
+    /// Answer every team lookup with a 503.
+    down: AtomicBool,
+}
+
+/// A stub otto platform answering `GET /internal/orgs/{org}/teams/{team}`
+/// for the teams added to it, so tests can obtain [`VerifiedTeam`]s the only
+/// way there is: [`verify_team`].
+pub struct TeamPlatform {
+    pub client: Arc<PlatformClient>,
+    state: Arc<Teams>,
+}
+
+/// Like the real platform's, but it answers a known team whatever org the
+/// path names, so a cross-org lookup exercises the org check in
+/// `verify_team` itself.
+async fn team_lookup(
+    State(t): State<Arc<Teams>>,
+    Path((_org, team)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TeamInfo>, StatusCode> {
+    if t.down.load(Ordering::SeqCst) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match t.teams.lock().unwrap().get(&team) {
+        Some(org) => Ok(Json(TeamInfo {
+            id: team,
+            org_id: *org,
+            slug: "team".into(),
+            name: "Team".into(),
+        })),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+pub async fn team_platform() -> TeamPlatform {
+    let state: Arc<Teams> = Arc::default();
+    let app = Router::new()
+        .route("/internal/orgs/{org}/teams/{team}", get(team_lookup))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = PlatformClient::new(ClientConfig::new(
+        format!("http://{addr}"),
+        "https://cxp.example.com/mcp",
+        "otto_rs_test",
+    ))
+    .unwrap();
+    TeamPlatform {
+        client: Arc::new(client),
+        state,
+    }
+}
+
+impl TeamPlatform {
+    /// A new team of `org`, known to the platform.
+    pub fn add(&self, org: OrgId) -> Uuid {
+        let team = Uuid::new_v4();
+        self.state.teams.lock().unwrap().insert(team, org.as_uuid());
+        team
+    }
+
+    /// A new team of `org`, verified.
+    pub async fn team(&self, org: OrgId) -> VerifiedTeam {
+        let id = self.add(org);
+        verify_team(&self.client, org, id).await.unwrap()
+    }
+
+    pub fn set_down(&self, down: bool) {
+        self.state.down.store(down, Ordering::SeqCst);
+    }
+}

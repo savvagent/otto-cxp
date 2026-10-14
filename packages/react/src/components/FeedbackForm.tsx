@@ -48,9 +48,13 @@ const DEFAULT_FEEDBACK_LABELS: Required<FeedbackFormLabels> = {
 
 export interface FeedbackFormProps {
   customerId?: string;
+  /** Catalog experience UUID, sent as `experience_id`. */
   experience?: string;
+  /** Catalog application UUID, sent as `application_id`. */
   application?: string;
+  /** Catalog page UUID, sent as `page_id`. */
   page?: string;
+  /** Catalog component UUID, sent as `component_id`. */
   component?: string;
   labels?: FeedbackFormLabels;
   onSubmit?: (feedback: Feedback) => void;
@@ -121,10 +125,10 @@ export function FeedbackForm({
             subject: formData.subject,
             body: formData.body,
             rating: formData.rating,
-            experience,
-            application,
-            page,
-            component,
+            experienceId: experience,
+            applicationId: application,
+            pageId: page,
+            componentId: component,
           },
         );
       } else {
@@ -137,10 +141,10 @@ export function FeedbackForm({
           subject: formData.subject,
           body: formData.body,
           rating: formData.rating,
-          experience,
-          application,
-          page,
-          component,
+          experienceId: experience ?? null,
+          applicationId: application ?? null,
+          pageId: page ?? null,
+          componentId: component ?? null,
           metadata: {},
           createdAt: new Date().toISOString(),
         };

@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { CxpClient } from "@cxp/sdk";
+import { connectCxp, type CxpClient } from "@cxp/sdk";
 import { CxpProvider } from "@cxp/react";
 import {
   ChatWidget,
@@ -72,37 +70,56 @@ export default function App() {
   const [seeding, setSeeding] = useState(false);
   const [seedError, setSeedError] = useState<string | null>(null);
 
+  // Bearer token for the resource server: VITE_CXP_TOKEN, or pasted below.
+  // VITE_* variables are inlined into the built bundle: local development only,
+  // never build or deploy this demo with a real token.
+  const envToken =
+    (import.meta as unknown as { env?: Record<string, string> }).env
+      ?.VITE_CXP_TOKEN ?? "";
+  // `token` is the text field; `connectRequest` holds the token submitted by
+  // the Connect/Reconnect button. Only the latter drives a connection, so
+  // typing never reconnects.
+  const [token, setToken] = useState<string>(envToken);
+  const [connectRequest, setConnectRequest] = useState<
+    { token: string; nonce: number } | null
+  >(envToken ? { token: envToken, nonce: 0 } : null);
+
   useEffect(() => {
+    if (!connectRequest) {
+      setCxpClient(null);
+      setConnectionStatus("failed");
+      return;
+    }
     let cancelled = false;
+    let close: (() => Promise<void>) | undefined;
+    setConnectionStatus("connecting");
 
-    async function connect() {
-      try {
-        const transport = new StreamableHTTPClientTransport(
-          new URL("/mcp", window.location.origin)
-        );
-        const mcpClient = new Client(
-          { name: "cxp-demo", version: "0.1.0" },
-          { capabilities: {} }
-        );
-        await mcpClient.connect(transport);
-
-        if (cancelled) return;
-
-        const client = new CxpClient({ client: mcpClient });
-        setCxpClient(client);
+    connectCxp({
+      url: new URL("/mcp", window.location.origin),
+      token: connectRequest.token,
+      name: "cxp-demo",
+    })
+      .then((conn) => {
+        if (cancelled) {
+          void conn.close();
+          return;
+        }
+        close = conn.close;
+        setCxpClient(conn.cxp);
         setConnectionStatus("connected");
-      } catch {
+      })
+      .catch(() => {
         if (!cancelled) {
+          setCxpClient(null);
           setConnectionStatus("failed");
         }
-      }
-    }
+      });
 
-    connect();
     return () => {
       cancelled = true;
+      void close?.();
     };
-  }, []);
+  }, [connectRequest]);
 
   const isDemo = connectionStatus !== "connected";
 
@@ -165,7 +182,56 @@ export default function App() {
             ? "Connected to server"
             : connectionStatus === "connecting"
               ? "Connecting..."
-              : "Demo mode (no server)"}
+              : "Demo mode (enter a bearer token and press Connect)"}
+        </div>
+
+        {/* Bearer token */}
+        <div
+          style={{
+            padding: "8px 16px",
+            borderBottom: "1px solid #e0e0e0",
+            fontSize: 12,
+          }}
+        >
+          <label>
+            Bearer token
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && token) {
+                  setConnectRequest((prev) => ({
+                    token,
+                    nonce: (prev?.nonce ?? 0) + 1,
+                  }));
+                }
+              }}
+              placeholder="otto platform access token"
+              style={{
+                display: "block",
+                width: "100%",
+                padding: "4px 6px",
+                fontSize: 11,
+                border: "1px solid #ccc",
+                borderRadius: 3,
+                marginTop: 2,
+                boxSizing: "border-box",
+              }}
+            />
+          </label>
+          <button
+            onClick={() =>
+              setConnectRequest((prev) => ({
+                token,
+                nonce: (prev?.nonce ?? 0) + 1,
+              }))
+            }
+            disabled={!token || connectionStatus === "connecting"}
+            style={{ marginTop: 6, fontSize: 11 }}
+          >
+            {cxpClient ? "Reconnect" : "Connect"}
+          </button>
         </div>
 
         {/* Seed mock data — only when connected */}

@@ -21,6 +21,6 @@ dependencies {
 ```kotlin
 import com.cxp.sdk.CxpClient
 
-val client = CxpClient("http://localhost:3000/mcp")
+val client = CxpClient("http://localhost:8080/mcp")
 val customer = client.getCustomer("...")
 ```
