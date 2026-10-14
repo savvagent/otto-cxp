@@ -29,7 +29,7 @@ use cxp_core::knowledge::{ArticleUpdate, KnowledgeExt, NewArticle};
 use cxp_core::platform_events::PURGED_TABLES;
 use cxp_core::usage::{ShipperConfig, BILLABLE};
 use cxp_server::{meter, platform_client, router, Config};
-use http::{HeaderMap, Request, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use otto_resource::{
     IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role, TeamInfo,
     TokenKind, UsageBatch, UsageEvent, UsageReceipt, UserInfo,
@@ -219,7 +219,8 @@ async fn server(pool: PgPool) -> Server {
         platform.clone(),
         meter(platform.clone(), &config),
         &config,
-    );
+    )
+    .unwrap();
     Server {
         app,
         db,
@@ -489,6 +490,51 @@ async fn criterion_1_unauthenticated_and_foreign_tokens_are_401_and_discovery_is
     );
     let r = s.api("GET", "/api/v1/customers", Some(&native), None).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    // A well-formed token the platform does not know is inactive: 401.
+    let unknown = format!("otto_at_{}{}", "z".repeat(11), Uuid::new_v4().simple());
+    let mcp = s.send(Server::mcp_request(Some(&unknown), &whoami)).await;
+    let api = s
+        .api("GET", "/api/v1/customers", Some(&unknown), None)
+        .await;
+    for (surface, r) in [("/mcp", &mcp), ("/api/v1/customers", &api)] {
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{surface}");
+        let challenge = r.headers["www-authenticate"].to_str().unwrap();
+        assert!(
+            challenge.contains(&metadata_pointer()),
+            "{surface}: {challenge}"
+        );
+    }
+
+    // A read-only token is authenticated but may not write: 403 on the REST
+    // API (naming the scope), insufficient_scope from the tool.
+    let reader = s.token_for(org, Uuid::new_v4(), &["cxp:read"], RESOURCE);
+    let r = s
+        .api(
+            "POST",
+            "/api/v1/customers",
+            Some(&reader),
+            Some(json!({"email": "r@example.com"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert_eq!(r.body["code"], "insufficient_scope");
+    let challenge = r.headers["www-authenticate"].to_str().unwrap();
+    assert!(challenge.contains(r#"scope="cxp:write""#), "{challenge}");
+    let refused = s
+        .tool(
+            &reader,
+            "create_customer",
+            json!({"email": "r@example.com"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), "insufficient_scope", "{refused}");
+    assert_eq!(
+        s.api_ok("GET", "/api/v1/customers", &reader, None).await["total"],
+        0,
+        "nothing was written"
+    );
 
     // Discovery and health need no token.
     let doc = s
@@ -857,6 +903,169 @@ fn assert_clean(what: &str, body: &Value, a: &Seeded) {
     }
 }
 
+/// Org B's own catalog chain: experience, application, page, component.
+#[derive(Default)]
+struct Own {
+    catalog: [String; 4],
+}
+
+/// What org B expects from one route call made with org A's data in hand.
+enum RouteExpect {
+    /// `404 not_found`: the id names nothing B can see.
+    NotFound,
+    /// `400 unknown_team`: A's team is not a team of B's org.
+    UnknownTeam,
+    /// `200`, with nothing of A's in it.
+    Clean,
+    /// `200`, counting exactly B's rows.
+    CountsOnlyB,
+}
+
+struct RouteCase {
+    uri: String,
+    body: Option<Value>,
+    expect: RouteExpect,
+}
+
+/// Every call org B makes to each `/api/v1` route, with org A's ids wherever
+/// the route takes one. Panics on a (method, path) it has no case for, so a
+/// new route cannot be left out of the isolation test.
+fn route_cases(method: &Method, path: &str, a: &Seeded, own: &Own) -> Vec<RouteCase> {
+    use RouteExpect::*;
+    let case = |uri: String, body: Option<Value>, expect| RouteCase { uri, body, expect };
+    let at = |id: &str| path.replace("{id}", id);
+    let catalog_filter = format!(
+        "experience_id={}&application_id={}&page_id={}&component_id={}",
+        a.experience, a.application, a.page, a.component
+    );
+    // (collection, A's id, B's own id, parent field, A's parent id)
+    let catalog = [
+        ("experiences", &a.experience, &own.catalog[0], None, None),
+        (
+            "applications",
+            &a.application,
+            &own.catalog[1],
+            Some("experience_id"),
+            Some(&a.experience),
+        ),
+        (
+            "pages",
+            &a.page,
+            &own.catalog[2],
+            Some("application_id"),
+            Some(&a.application),
+        ),
+        (
+            "components",
+            &a.component,
+            &own.catalog[3],
+            Some("page_id"),
+            Some(&a.page),
+        ),
+    ];
+    for (collection, a_id, b_id, parent, a_parent) in catalog {
+        let list = format!("/api/v1/{collection}");
+        let item = format!("/api/v1/{collection}/{{id}}");
+        if path == list && *method == Method::GET {
+            let mut cases = vec![case(list.clone(), None, Clean)];
+            if let (Some(field), Some(pid)) = (parent, a_parent) {
+                cases.push(case(format!("{list}?{field}={pid}"), None, Clean));
+            }
+            return cases;
+        }
+        if path == list && *method == Method::POST {
+            let mut cases = vec![
+                case(list.clone(), Some(json!({"name": "b made"})), Clean),
+                case(
+                    list.clone(),
+                    Some(json!({"name": "stolen", "team_id": a.team})),
+                    UnknownTeam,
+                ),
+                case(
+                    list.clone(),
+                    Some(json!({"name": "stolen", "teamId": a.team})),
+                    UnknownTeam,
+                ),
+            ];
+            if let (Some(field), Some(pid)) = (parent, a_parent) {
+                cases.push(case(
+                    list.clone(),
+                    Some(json!({"name": "stolen", field: pid})),
+                    NotFound,
+                ));
+            }
+            return cases;
+        }
+        if path == item {
+            return match *method {
+                Method::GET | Method::DELETE => vec![case(at(a_id), None, NotFound)],
+                Method::PUT => vec![
+                    case(at(a_id), Some(json!({"name": "stolen"})), NotFound),
+                    case(at(b_id), Some(json!({"team_id": a.team})), UnknownTeam),
+                    case(at(b_id), Some(json!({"teamId": a.team})), UnknownTeam),
+                ],
+                _ => panic!("no isolation case for {method} {path}: add one to route_cases"),
+            };
+        }
+    }
+    match (method.as_str(), path) {
+        ("GET", "/api/v1/me/teams") => vec![case(path.into(), None, Clean)],
+        ("GET", "/api/v1/dashboard/metrics") => vec![case(path.into(), None, CountsOnlyB)],
+        ("GET", "/api/v1/customers") => vec![
+            case(path.into(), None, Clean),
+            case(format!("{path}?{catalog_filter}"), None, Clean),
+        ],
+        ("POST", "/api/v1/customers") => vec![case(
+            path.into(),
+            Some(json!({"email": "b-rest@example.com"})),
+            Clean,
+        )],
+        ("GET", "/api/v1/customers/search") => vec![case(format!("{path}?q={MARK}"), None, Clean)],
+        ("GET" | "PUT" | "DELETE", "/api/v1/customers/{id}") => vec![case(
+            at(&a.customer),
+            (method == Method::PUT).then(|| json!({"name": "stolen"})),
+            NotFound,
+        )],
+        ("GET", "/api/v1/customers/{id}/360") => vec![case(at(&a.customer), None, NotFound)],
+        ("GET", "/api/v1/tickets") => vec![
+            case(path.into(), None, Clean),
+            case(format!("{path}?customer_id={}", a.customer), None, Clean),
+            case(format!("{path}?{catalog_filter}"), None, Clean),
+        ],
+        ("POST", "/api/v1/tickets") => vec![case(
+            path.into(),
+            Some(json!({"customer_id": a.customer, "subject": "stolen"})),
+            NotFound,
+        )],
+        ("GET" | "PUT" | "DELETE", "/api/v1/tickets/{id}") => vec![case(
+            at(&a.ticket),
+            (method == Method::PUT).then(|| json!({"subject": "stolen"})),
+            NotFound,
+        )],
+        ("GET", "/api/v1/feedback") => vec![
+            case(path.into(), None, Clean),
+            case(format!("{path}?customer_id={}", a.customer), None, Clean),
+            case(format!("{path}?{catalog_filter}"), None, Clean),
+        ],
+        ("GET", "/api/v1/surveys") => vec![
+            case(path.into(), None, Clean),
+            case(format!("{path}?{catalog_filter}"), None, Clean),
+        ],
+        ("POST", "/api/v1/surveys") => vec![case(
+            path.into(),
+            Some(json!({"title": "b rest survey", "questions": []})),
+            Clean,
+        )],
+        ("GET" | "PUT" | "DELETE", "/api/v1/surveys/{id}") => vec![case(
+            at(&a.survey),
+            (method == Method::PUT).then(|| json!({"title": "stolen"})),
+            NotFound,
+        )],
+        ("GET", "/api/v1/surveys/{id}/responses") => vec![case(at(&a.survey), None, NotFound)],
+        _ => panic!("no isolation case for {method} {path}: add one to route_cases"),
+    }
+}
+
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn criterion_2_org_b_cannot_read_or_write_org_a_through_any_tool_or_route(pool: PgPool) {
     let s = server(pool).await;
@@ -942,134 +1151,73 @@ async fn criterion_2_org_b_cannot_read_or_write_org_a_through_any_tool_or_route(
     assert!(members["total"].as_i64().unwrap() >= 1, "{members}");
 
     // ------------------------------------------------------------- routes
-    let bt = b.token.as_str();
-    let not_found = |r: &Reply, what: &str| {
-        assert_eq!(r.status, StatusCode::NOT_FOUND, "{what}: {}", r.body);
-        assert_eq!(r.body["code"], "not_found", "{what}: {}", r.body);
-    };
+    // B's own catalog, for updates that try to attach A's team.
+    let mut own = Own::default();
+    for (collection, field, slot) in [
+        ("experiences", None, 0usize),
+        ("applications", Some("experience_id"), 1),
+        ("pages", Some("application_id"), 2),
+        ("components", Some("page_id"), 3),
+    ] {
+        let mut body = json!({"name": format!("b {collection}")});
+        if let Some(field) = field {
+            body[field] = json!(own.catalog[slot - 1]);
+        }
+        own.catalog[slot] = id(&s
+            .api_ok(
+                "POST",
+                &format!("/api/v1/{collection}"),
+                &b.token,
+                Some(body),
+            )
+            .await);
+    }
 
-    // Every route that takes an id, with A's, by every method it serves.
-    for (collection, aid, update) in [
-        ("customers", &seeded.customer, json!({"name": "stolen"})),
-        ("tickets", &seeded.ticket, json!({"subject": "stolen"})),
-        ("surveys", &seeded.survey, json!({"title": "stolen"})),
-        ("experiences", &seeded.experience, json!({"name": "stolen"})),
-        (
-            "applications",
-            &seeded.application,
-            json!({"name": "stolen"}),
-        ),
-        ("pages", &seeded.page, json!({"name": "stolen"})),
-        ("components", &seeded.component, json!({"name": "stolen"})),
-    ] {
-        let uri = format!("/api/v1/{collection}/{aid}");
-        not_found(
-            &s.api("GET", &uri, Some(bt), None).await,
-            &format!("GET {uri}"),
-        );
-        not_found(
-            &s.api("PUT", &uri, Some(bt), Some(update)).await,
-            &format!("PUT {uri}"),
-        );
-        not_found(
-            &s.api("DELETE", &uri, Some(bt), None).await,
-            &format!("DELETE {uri}"),
-        );
+    // Every route in cxp-api's table, with A's ids wherever it takes one.
+    let mut calls = 0;
+    for (method, path) in cxp_api::route_table() {
+        for case in route_cases(&method, path, &seeded, &own) {
+            calls += 1;
+            let what = format!("{method} {} {:?}", case.uri, case.body);
+            let r = s
+                .api(method.as_str(), &case.uri, Some(&b.token), case.body)
+                .await;
+            match case.expect {
+                RouteExpect::NotFound => {
+                    assert_eq!(r.status, StatusCode::NOT_FOUND, "{what}: {}", r.body);
+                    assert_eq!(r.body["code"], "not_found", "{what}: {}", r.body);
+                }
+                RouteExpect::UnknownTeam => {
+                    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{what}: {}", r.body);
+                    assert_eq!(r.body["code"], "unknown_team", "{what}: {}", r.body);
+                }
+                RouteExpect::Clean => {
+                    assert_eq!(r.status, StatusCode::OK, "{what}: {}", r.body);
+                    assert_clean(&what, &r.body, &seeded);
+                }
+                RouteExpect::CountsOnlyB => {
+                    assert_eq!(r.status, StatusCode::OK, "{what}: {}", r.body);
+                    // Counted from B's rows as stored, past RLS.
+                    let rows: HashMap<&str, Value> = s.rows_of(b.org).await.into_iter().collect();
+                    let n = |t: &str| rows[t].as_array().unwrap().len();
+                    let open = rows["tickets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|t| t["status"] == "open")
+                        .count();
+                    assert_eq!(
+                        r.body,
+                        json!({"total_customers": n("customers"), "total_tickets": n("tickets"),
+                               "open_tickets": open, "total_feedback": n("feedback"),
+                               "total_surveys": n("surveys"), "total_experiences": n("experiences")}),
+                        "{what}"
+                    );
+                }
+            }
+        }
     }
-    for uri in [
-        format!("/api/v1/customers/{}/360", seeded.customer),
-        format!("/api/v1/surveys/{}/responses", seeded.survey),
-    ] {
-        not_found(
-            &s.api("GET", &uri, Some(bt), None).await,
-            &format!("GET {uri}"),
-        );
-    }
-    // Creates that reference A's rows.
-    for (uri, body) in [
-        (
-            "/api/v1/tickets",
-            json!({"customer_id": seeded.customer, "subject": "stolen"}),
-        ),
-        (
-            "/api/v1/applications",
-            json!({"name": "stolen", "experience_id": seeded.experience}),
-        ),
-        (
-            "/api/v1/pages",
-            json!({"name": "stolen", "application_id": seeded.application}),
-        ),
-        (
-            "/api/v1/components",
-            json!({"name": "stolen", "page_id": seeded.page}),
-        ),
-    ] {
-        not_found(
-            &s.api("POST", uri, Some(bt), Some(body)).await,
-            &format!("POST {uri}"),
-        );
-    }
-    // A's team is not a team in B's org.
-    let r = s
-        .api(
-            "POST",
-            "/api/v1/experiences",
-            Some(bt),
-            Some(json!({"name": "stolen", "team_id": seeded.team})),
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
-    assert_eq!(r.body["code"], "unknown_team");
-
-    // Every list, plain and filtered by A's ids: answered, nothing of A's.
-    let c = &seeded.customer;
-    let (e, ap, p, co) = (
-        &seeded.experience,
-        &seeded.application,
-        &seeded.page,
-        &seeded.component,
-    );
-    for uri in [
-        "/api/v1/me/teams".to_string(),
-        "/api/v1/customers".to_string(),
-        format!("/api/v1/customers/search?q={MARK}"),
-        format!(
-            "/api/v1/customers?experience_id={e}&application_id={ap}&page_id={p}&component_id={co}"
-        ),
-        "/api/v1/tickets".to_string(),
-        format!("/api/v1/tickets?customer_id={c}"),
-        format!(
-            "/api/v1/tickets?experience_id={e}&application_id={ap}&page_id={p}&component_id={co}"
-        ),
-        "/api/v1/feedback".to_string(),
-        format!("/api/v1/feedback?customer_id={c}"),
-        format!(
-            "/api/v1/feedback?experience_id={e}&application_id={ap}&page_id={p}&component_id={co}"
-        ),
-        "/api/v1/surveys".to_string(),
-        format!(
-            "/api/v1/surveys?experience_id={e}&application_id={ap}&page_id={p}&component_id={co}"
-        ),
-        "/api/v1/experiences".to_string(),
-        "/api/v1/applications".to_string(),
-        format!("/api/v1/applications?experience_id={e}"),
-        "/api/v1/pages".to_string(),
-        format!("/api/v1/pages?application_id={ap}"),
-        "/api/v1/components".to_string(),
-        format!("/api/v1/components?page_id={p}"),
-    ] {
-        let body = s.api_ok("GET", &uri, bt, None).await;
-        assert_clean(&format!("GET {uri}"), &body, &seeded);
-    }
-    // The dashboard counts B's rows only: its two customers and the one
-    // survey it created, none of A's.
-    let dash = s.api_ok("GET", "/api/v1/dashboard/metrics", bt, None).await;
-    assert_eq!(
-        dash,
-        json!({"total_customers": 2, "total_tickets": 0, "open_tickets": 0,
-               "total_feedback": 0, "total_surveys": 1, "total_experiences": 0}),
-        "{dash}"
-    );
+    assert!(calls > cxp_api::route_table().len());
 
     // A customer with A's email is B's own, and a different row (its
     // email is A's text, so this comes after the leak checks).
@@ -1175,6 +1323,114 @@ fn happy_args(name: &str, m: &Made) -> Value {
     }
 }
 
+/// The URI and body that make one `/api/v1` route succeed for the caller of
+/// criterion 3, after any setup it needs (a DELETE gets a row of its own).
+/// Panics on a (method, path) it has no case for, so a new route cannot be
+/// left out of the metering test.
+async fn happy_route(
+    s: &Server,
+    t: &str,
+    method: &Method,
+    path: &str,
+    m: &Made,
+    catalog: &HashMap<&str, String>,
+) -> (String, Option<Value>) {
+    let at = |id: &str| path.replace("{id}", id);
+    // A fresh row to delete, made through the route that creates it.
+    let doomed = |collection: &'static str, body: Value| async move {
+        id(&s
+            .api_ok("POST", &format!("/api/v1/{collection}"), t, Some(body))
+            .await)
+    };
+    let parent = |field: &str, collection: &str| -> Value {
+        json!({"name": "child", field: catalog[collection]})
+    };
+    match (method.as_str(), path) {
+        (
+            "GET",
+            "/api/v1/me/teams"
+            | "/api/v1/dashboard/metrics"
+            | "/api/v1/customers"
+            | "/api/v1/tickets"
+            | "/api/v1/feedback"
+            | "/api/v1/surveys"
+            | "/api/v1/experiences"
+            | "/api/v1/applications"
+            | "/api/v1/pages"
+            | "/api/v1/components",
+        ) => (path.into(), None),
+        ("POST", "/api/v1/customers") => (
+            path.into(),
+            Some(json!({"email": format!("{}@example.com", Uuid::new_v4())})),
+        ),
+        ("GET", "/api/v1/customers/search") => (format!("{path}?q=cy"), None),
+        ("GET", "/api/v1/customers/{id}" | "/api/v1/customers/{id}/360") => (at(&m.customer), None),
+        ("PUT", "/api/v1/customers/{id}") => (at(&m.customer), Some(json!({"name": "Cy C"}))),
+        ("DELETE", "/api/v1/customers/{id}") => {
+            let spare = doomed("customers", json!({"email": "spare@example.com"})).await;
+            (at(&spare), None)
+        }
+        ("POST", "/api/v1/tickets") => (
+            path.into(),
+            Some(json!({"customer_id": m.customer, "subject": "Slow"})),
+        ),
+        ("GET", "/api/v1/tickets/{id}") => (at(&m.ticket), None),
+        ("PUT", "/api/v1/tickets/{id}") => (at(&m.ticket), Some(json!({"status": "open"}))),
+        ("DELETE", "/api/v1/tickets/{id}") => {
+            let ticket = doomed(
+                "tickets",
+                json!({"customer_id": m.customer, "subject": "Doomed"}),
+            )
+            .await;
+            (at(&ticket), None)
+        }
+        ("POST", "/api/v1/surveys") => {
+            (path.into(), Some(json!({"title": "CSAT", "questions": []})))
+        }
+        ("GET", "/api/v1/surveys/{id}" | "/api/v1/surveys/{id}/responses") => (at(&m.survey), None),
+        ("PUT", "/api/v1/surveys/{id}") => (at(&m.survey), Some(json!({"active": true}))),
+        ("DELETE", "/api/v1/surveys/{id}") => {
+            // Creating it ships create_survey; the caller ships that first.
+            let survey = doomed("surveys", json!({"title": "Doomed", "questions": []})).await;
+            (at(&survey), None)
+        }
+        ("POST", "/api/v1/experiences") => (path.into(), Some(json!({"name": "web"}))),
+        ("POST", "/api/v1/applications") => {
+            (path.into(), Some(parent("experience_id", "experiences")))
+        }
+        ("POST", "/api/v1/pages") => (path.into(), Some(parent("application_id", "applications"))),
+        ("POST", "/api/v1/components") => (path.into(), Some(parent("page_id", "pages"))),
+        (
+            "GET" | "PUT" | "DELETE",
+            "/api/v1/experiences/{id}"
+            | "/api/v1/applications/{id}"
+            | "/api/v1/pages/{id}"
+            | "/api/v1/components/{id}",
+        ) => {
+            let collection = path
+                .strip_prefix("/api/v1/")
+                .and_then(|p| p.strip_suffix("/{id}"))
+                .unwrap();
+            match *method {
+                Method::GET => (at(&catalog[collection]), None),
+                Method::PUT => (at(&catalog[collection]), Some(json!({"description": "d"}))),
+                _ => {
+                    let leaf = id(&s
+                        .api_ok(
+                            "POST",
+                            &format!("/api/v1/{collection}"),
+                            t,
+                            Some(json!({"name": "doomed"})),
+                        )
+                        .await);
+                    (at(&leaf), None)
+                }
+            }
+        }
+        _ => panic!("no metering case for {method} {path}: add one to happy_route"),
+    }
+}
+
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: PgPool) {
     let s = server(pool).await;
@@ -1221,129 +1477,42 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
         }
     }
 
-    // Every route: only POST /api/v1/surveys ships, as create_survey.
-    let c = made.customer.clone();
-    let mut routes: Vec<(&str, String, Option<Value>, bool)> = vec![
-        ("GET", "/api/v1/me/teams".into(), None, false),
-        ("GET", "/api/v1/dashboard/metrics".into(), None, false),
-        ("GET", "/api/v1/customers".into(), None, false),
-        ("GET", "/api/v1/customers/search?q=cy".into(), None, false),
-        ("GET", format!("/api/v1/customers/{c}"), None, false),
-        ("GET", format!("/api/v1/customers/{c}/360"), None, false),
-        (
-            "PUT",
-            format!("/api/v1/customers/{c}"),
-            Some(json!({"name": "Cy C"})),
-            false,
-        ),
-        ("GET", "/api/v1/tickets".into(), None, false),
-        ("GET", "/api/v1/feedback".into(), None, false),
-        ("GET", "/api/v1/surveys".into(), None, false),
-        (
-            "POST",
-            "/api/v1/surveys".into(),
-            Some(json!({"title": "CSAT", "questions": []})),
-            true,
-        ),
-    ];
-    for collection in ["experiences", "applications", "pages", "components"] {
-        routes.push(("GET", format!("/api/v1/{collection}"), None, false));
-    }
-    for (method, uri, body, billable) in routes {
-        let reply = s.api_ok(method, &uri, t, body).await;
+    // Every route in cxp-api's table, once each: only POST /api/v1/surveys
+    // ships, as create_survey. Deletes go last (each on a row made for it),
+    // so every other route has something to act on.
+    let mut routes = cxp_api::route_table();
+    routes.sort_by_key(|(m, _)| *m == Method::DELETE);
+    let mut catalog: HashMap<&str, String> = HashMap::new();
+    for (method, path) in routes {
+        let (uri, body) = happy_route(&s, t, &method, path, &made, &catalog).await;
+        // Whatever the setup made is not this call's usage.
+        s.ship().await;
         let before = s.shipped().len();
+        let reply = s.api_ok(method.as_str(), &uri, t, body).await;
+        if method == Method::POST {
+            if let Some(collection) = path.strip_prefix("/api/v1/") {
+                catalog.insert(collection, id(&reply));
+            }
+        }
         s.ship().await;
         let new: Vec<String> = s.shipped()[before..].to_vec();
-        if billable {
-            assert_eq!(new, ["create_survey"], "{method} {uri}");
-            let survey = id(&reply);
-            // Reading, changing, and deleting it are free.
-            for (m, body) in [
-                ("GET", None),
-                ("PUT", Some(json!({"active": false}))),
-                ("DELETE", None),
-            ] {
-                s.api_ok(m, &format!("/api/v1/surveys/{survey}"), t, body)
-                    .await;
-            }
-            s.api_ok(
-                "GET",
-                &format!("/api/v1/surveys/{}/responses", made.survey),
-                t,
-                None,
-            )
-            .await;
+        if method == Method::POST && path == "/api/v1/surveys" {
+            assert_eq!(new, ["create_survey"], "{method} {path}");
         } else {
-            assert!(new.is_empty(), "{method} {uri} shipped {new:?}");
+            assert!(new.is_empty(), "{method} {path} shipped {new:?}");
         }
     }
-    // Ticket and catalog writes are free too.
-    let ticket = id(&s
-        .api_ok(
-            "POST",
-            "/api/v1/tickets",
-            t,
-            Some(json!({"customer_id": c, "subject": "Slow"})),
-        )
-        .await);
-    s.api_ok(
-        "PUT",
-        &format!("/api/v1/tickets/{ticket}"),
-        t,
-        Some(json!({"status": "closed"})),
-    )
-    .await;
-    s.api_ok("GET", &format!("/api/v1/tickets/{ticket}"), t, None)
-        .await;
-    s.api_ok("DELETE", &format!("/api/v1/tickets/{ticket}"), t, None)
-        .await;
-    let mut parent: Option<(&str, String)> = None;
-    let mut catalog = vec![];
-    for collection in ["experiences", "applications", "pages", "components"] {
-        let mut body = json!({"name": collection});
-        if let Some((field, pid)) = &parent {
-            body[*field] = json!(pid);
-        }
-        let made_id = id(&s
-            .api_ok("POST", &format!("/api/v1/{collection}"), t, Some(body))
-            .await);
-        let uri = format!("/api/v1/{collection}/{made_id}");
-        s.api_ok("GET", &uri, t, None).await;
-        s.api_ok("PUT", &uri, t, Some(json!({"description": "d"})))
-            .await;
-        parent = Some((
-            match collection {
-                "experiences" => "experience_id",
-                "applications" => "application_id",
-                _ => "page_id",
-            },
-            made_id,
-        ));
-        catalog.push(uri);
-    }
-    for uri in catalog.iter().rev() {
-        s.api_ok("DELETE", uri, t, None).await;
-    }
-    let spare = id(&s
-        .api_ok(
-            "POST",
-            "/api/v1/customers",
-            t,
-            Some(json!({"email": "spare@example.com"})),
-        )
-        .await);
-    s.api_ok("DELETE", &format!("/api/v1/customers/{spare}"), t, None)
-        .await;
     assert_eq!(s.ship().await, 0, "free routes shipped something");
 
-    // Five events in all, one per billable call, each with its own event id,
-    // for this org and user.
+    // One event per billable call (the second survey was made so DELETE
+    // had one to delete), each with its own event id, for this org and user.
     let received = s.mock.lock().unwrap().received.clone();
     let mut tools: Vec<&str> = received.iter().map(|e| e.tool.as_str()).collect();
     tools.sort_unstable();
     assert_eq!(
         tools,
         [
+            "create_survey",
             "create_survey",
             "create_survey",
             "send_survey",
@@ -1433,6 +1602,15 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
         let r = s.webhook(&body, bad).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{bad:?}: {}", r.body);
     }
+    // A genuine signature from an hour ago is a replay: refused.
+    let stale = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp() - 3600, &body);
+    let r = s.webhook(&body, &stale).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "stale: {}", r.body);
+    // Correctly signed but not an event: 400, nothing applied.
+    let junk = br#"{"not": "an event"}"#;
+    let junk_sig = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), junk);
+    let r = s.webhook(junk, &junk_sig).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "malformed: {}", r.body);
     assert_eq!(events_recorded(&s, deleted).await, 0);
     assert_eq!(status_of(&s, &a.token).await, ok, "nothing applied yet");
 
@@ -1565,4 +1743,145 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
     // The catalog of the deleted team still exists, unowned.
     let listed = s.api_ok("GET", "/api/v1/experiences", &d.token, None).await;
     assert_eq!(listed["total"], 2, "{listed}");
+}
+
+// ======================================================== the lifecycle
+
+/// Log output captured from the test's own task.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// `run`, as `main` calls it, on a real socket: it boots against the test
+/// database and the mock platform, logs the lines the deploy doc checks for,
+/// serves a billable call, and on shutdown flushes that call's usage event to
+/// the platform before returning.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (base, mock) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut database_url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    database_url.set_path(pool.connect_options().get_database().unwrap());
+    let mut config = Config::for_test();
+    config.database_url = database_url.to_string();
+    config.bind = addr;
+    config.public_url = format!("http://{addr}");
+    config.resource_uri = format!("http://{addr}/mcp");
+    config.platform_url = base;
+    let resource = config.resource_uri.clone();
+
+    let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
+    let token = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    mock.lock().unwrap().tokens.insert(
+        token.clone(),
+        (org, user, vec!["cxp:write".into()], resource),
+    );
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run(config, listener, async move {
+        let _ = stopped.await;
+    });
+    let client = async move {
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status().as_u16(), 200);
+        let call = |name: &str, args: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}});
+            http.post(format!("{base}/mcp"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(body.to_string())
+                .send()
+        };
+        for (name, args) in [
+            ("create_customer", json!({"email": "life@example.com"})),
+            (
+                "submit_feedback",
+                json!({"customer_id": "life@example.com", "feedback_type": "praise"}),
+            ),
+        ] {
+            let res = call(name, args).await.unwrap();
+            assert_eq!(res.status().as_u16(), 200, "{name}");
+            let v: Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+            assert!(
+                v["result"]["isError"] != true && v.get("error").is_none(),
+                "{name}: {v}"
+            );
+        }
+        // The shipper polls every 5 s; nothing has shipped it yet, so what
+        // arrives below was sent by the flush on the way out.
+        assert!(mock.lock().unwrap().received.is_empty());
+        stop.send(()).unwrap();
+        mock
+    };
+    let (boot, mock) = tokio::join!(server, client);
+    let boot = boot.expect("a clean stop");
+
+    assert_eq!(boot.platform, cxp_server::PlatformCheck::Accepted);
+    assert!(
+        boot.isolation
+            .contains(r#"tenant isolation enforced as role "otto_app""#),
+        "{}",
+        boot.isolation
+    );
+    let received = mock.lock().unwrap().received.clone();
+    assert_eq!(
+        received.len(),
+        1,
+        "the final flush shipped the billable call"
+    );
+    assert_eq!(
+        (
+            received[0].tool.as_str(),
+            received[0].org_id,
+            received[0].user_id
+        ),
+        ("submit_feedback", org, Some(user))
+    );
+
+    // The lines docs/deploy/fly.md tells an operator to look for, in order.
+    let text = logs.text();
+    let mut from = 0;
+    for line in [
+        "applying migrations",
+        r#"tenant isolation enforced as role "otto_app""#,
+        "the otto platform accepted this service's credential",
+        "cxp-server listening",
+        "flushing usage",
+        "stopped",
+    ] {
+        let at = text[from..]
+            .find(line)
+            .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
+        from += at + line.len();
+    }
 }

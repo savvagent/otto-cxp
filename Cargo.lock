@@ -437,6 +437,7 @@ dependencies = [
  "http",
  "otto-resource",
  "otto-tenant",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
