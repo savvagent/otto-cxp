@@ -2,86 +2,124 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+otto-cxp is an HTTP-only MCP and REST resource server of the otto platform (identity, OAuth, orgs,
+teams, and billing live there). Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
+Deploy and ops: `docs/deploy/fly.md`.
+
 ## Build & Run Commands
 
-### Rust Server
+### Rust server
 ```bash
-cargo build                              # build workspace
-cargo run -p cxp-server                  # run stdio transport (default)
-TRANSPORT=http cargo run -p cxp-server   # run HTTP transport on 127.0.0.1:3000/mcp
-cargo test                               # run all Rust tests
-cargo test -p cxp-server test_name       # run a single test
+podman compose up -d                     # Postgres 16 on :15435 (cxp/cxp/otto_cxp)
+cp .env.example .env                     # fill in the platform settings
+cargo run -p cxp-server                  # serves on 0.0.0.0:8080 (CXP_BIND)
+cargo build --workspace
+DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace
+cargo test -p cxp-core test_name         # one test
 ```
+`cargo test` needs `DATABASE_URL` (a local Postgres only) and panics without it. Migrations run at
+server start (`cxp_core::migrate`).
 
-### TypeScript/React (pnpm monorepo)
+### TypeScript/React (pnpm monorepo: `sdk/typescript`, `packages/react`, `apps/web`)
 ```bash
-pnpm install          # install all workspace deps
-pnpm build            # build all packages (tsup)
-pnpm test             # run all tests (vitest)
-pnpm lint             # lint all packages
+pnpm install --frozen-lockfile
+pnpm build   # tsup / vite
+pnpm test    # vitest
+pnpm lint
 ```
-Per-package: `cd sdk/typescript && pnpm build` or `cd packages/react && pnpm test`
-
-### Database
-```bash
-./scripts/start-db.sh                    # start pgvector container via Podman
-# or: docker compose up -d
-```
-Migrations run automatically on server startup via `sqlx::migrate!("./migrations")`.
-
-Default connection: `postgres://cxp:cxp_dev@localhost:5432/cxp`
+Per-package: `cd sdk/typescript && pnpm build`.
 
 ## Architecture
 
-Rust MCP server (`rmcp` v0.15.0) exposing 26 tools over stdio or HTTP, backed by PostgreSQL 17 with pgvector.
+One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api/v1/...`,
+`POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`.
 
-**Server (`server/src/`):**
-- `main.rs` — entry point: connects DB, runs migrations, starts stdio or HTTP transport
-- `tools/mod.rs` — `CxpServer` struct with all tool definitions, param structs, and `ServerHandler` impl
-- `tools/{cdp,support,feedback}.rs` — tool implementations split by domain
-- `db/` — database access layer: one struct per domain (`CustomerDb`, `TicketDb`, etc.), each holds a `PgPool`
-- `models/` — Rust structs deriving `sqlx::FromRow, Serialize, Deserialize`
-- `analysis/` — pure Rust analytics (NPS, CSAT, sentiment) with no DB calls
-- `prompts/mod.rs` — 4 MCP prompts; `resources/mod.rs` — 3 MCP resources
+**Crates (`crates/`):**
+- `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
+  (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
+  analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
+  `begin_live`), `usage` (metering, outbox shipper), `maintenance` (the only cross-org access).
+- `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` and metadata routes.
+  Holds no SQL.
+- `cxp-api` - REST `/api/v1` and `/platform/webhooks`. Holds no SQL.
+- `cxp-server` - the binary: `config.rs`, boot sequence (migrate, verify tenant isolation, check the
+  platform credential, spawn the usage shipper and sweeper), health routes, router, `tests/e2e.rs`.
 
 **SDKs:**
-- `sdk/typescript/` — `@cxp/sdk`: wraps `@modelcontextprotocol/sdk`, exposes `CxpClient` with `.support`, `.feedback`, `.cdp` domains
-- `sdk/swift/`, `sdk/kotlin/` — stubs targeting future HTTP transport
-- `packages/react/` — `@cxp/react`: React components and hooks consuming `@cxp/sdk`
+- `sdk/typescript/` - `@cxp/sdk` (MIT): `connectCxp({ url, token | authProvider })` returns `{ cxp }` with
+  `.support`, `.feedback`, `.cdp`.
+- `packages/react/` - `@cxp/react` (MIT): components and hooks over `@cxp/sdk`. `apps/web/` - web app.
+- `sdk/swift/`, `sdk/kotlin/` - stubs with no gate.
 
 ## Critical Patterns
 
-### rmcp 0.15 Tool Registration
-Three macros are **all required** or tools silently won't appear:
-1. `#[tool_router]` on the `impl CxpServer` block containing tool methods
-2. `#[tool]` on each tool method
-3. `#[tool_handler]` on the `impl ServerHandler for CxpServer` block
+### rmcp 2.0.0 tool registration (cxp-mcp)
+Tools silently don't appear unless all of these are in place:
+1. `#[tool_router(router = <name>_router)]` on the `impl CxpMcp` block of each tool file (one file per
+   domain), with `#[tool]` on each tool method; parameters use `Parameters<T>` structs.
+2. The per-file routers are added together into one `ToolRouter<Self>` stored on the server struct.
+3. `#[tool_handler]` on the `impl ServerHandler`.
+Follow the existing files in `crates/cxp-mcp/src/` rather than the rmcp 0.15 style: tools return
+errors as results through the crate's error mapping, never panic, and never put database text in a
+response. Every tool checks `cxp:read` or `cxp:write`.
 
-`CxpServer` must store `tool_router: ToolRouter<Self>`, initialized via `Self::tool_router()`. Tool parameters use `Parameters<T>` wrapper structs, not individual `#[tool(param)]`.
+### Tenancy: `Tx` extension traits and `begin_live`
+Domain operations are methods on extension traits implemented for `otto_tenant::Tx<'_>` (for example
+`impl CustomersExt for Tx<'_>`), binding `self.org()` and executing on `self.conn()`. Request paths open
+the transaction with `platform_events::begin_live` (it also refuses revoked orgs and members), never
+`Db::begin`. Cross-org access exists only in `cxp_core::maintenance`. Never take an org id from
+anywhere but the verified token.
 
-### PostgreSQL Enum Handling
-The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_channel`, `feedback_type`, `interaction_type`, `message_role`). sqlx cannot decode PG enums to Rust `String` directly:
-- **SELECT/RETURNING**: cast with `::text` — `status::text as status`
-- **INSERT/UPDATE params**: cast with `::enum_name` — `$5::ticket_priority`
+### PostgreSQL enum handling
+The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_channel`, `feedback_type`,
+`interaction_type`, `message_role`). sqlx cannot decode PG enums to Rust `String` directly:
+- **SELECT/RETURNING**: cast with `::text` - `status::text as status`
+- **INSERT/UPDATE params**: cast with `::enum_name` - `$5::ticket_priority`
 - Use column list constants (e.g., `TICKET_COLS`) to avoid repeating casts across queries
 
 Model structs store enum columns as `String`, not Rust enums.
 
-## Environment Variables
+### Metering
+Exactly `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage
+event each (`Meter::charge`, in the tool's own transaction, into `usage_outbox`); the only route that
+records one is `POST /api/v1/surveys` (charged as `create_survey`). Nothing else meters.
+
+### Migrations
+Append-only: add `crates/cxp-core/migrations/NNNN_<name>.sql`, never edit an applied one. New tenant
+tables need `org_id`, forced RLS with a `<table>_tenant_isolation` policy, grants to `otto_app`, and
+composite `(org_id, id)` foreign keys.
+
+## Configuration
+
+All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the local template,
+`fly.toml` `[env]` production.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | `postgres://cxp:cxp_dev@localhost:5432/cxp` | |
-| `TRANSPORT` | `stdio` | `stdio` or `http` |
-| `HTTP_HOST` | `127.0.0.1` | HTTP mode only |
-| `HTTP_PORT` | `3000` | HTTP mode only |
-| `RUST_LOG` | `info` | tracing log level |
+| `CXP_PUBLIC_URL` | required | public origin |
+| `CXP_RESOURCE_URI` | `{public}/mcp` | token audience; must equal the URI registered at the platform |
+| `CXP_PLATFORM_URL` | required | the otto platform |
+| `CXP_INTROSPECTION_SECRET` | required (secret) | `otto_rs_...` |
+| `CXP_PLATFORM_WEBHOOK_SECRET` | required (secret) | `otto_whsec_...` |
+| `CXP_DATABASE_URL` | falls back to `DATABASE_URL` | `postgres://cxp:cxp@localhost:15435/otto_cxp` locally |
+| `CXP_DB_MAX_CONNECTIONS` | `5` | minimum 2; the production database is shared and small |
+| `CXP_RUN_MIGRATIONS` | `true` | |
+| `CXP_BIND` | `0.0.0.0:8080` | |
+| `CXP_ALLOWED_HOSTS` | empty | extra Host headers `/mcp` accepts |
+| `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`; empty means no check |
+| `CXP_ENFORCE_QUOTAS` | `false` | fails open |
+| `CXP_LOG_FORMAT` | `text` | `text` or `json` |
+| `RUST_LOG` | `info` | |
 
 ## Conventions
 - All model structs: `Debug, Clone, Serialize, Deserialize, sqlx::FromRow`
-- UUIDs: `uuid::Uuid` (v4), timestamps: `chrono::DateTime<Utc>`, JSONB: `serde_json::Value`, arrays: `Vec<String>`
-- Tool error handling: return `String` with `format!("Error: {e}")` — tools never panic
+- UUIDs: `uuid::Uuid`, timestamps: `chrono::DateTime<Utc>`, JSONB: `serde_json::Value`, arrays: `Vec<String>`
+- Runtime `sqlx::query`/`query_as` only, never the `query!` macros; no SQL outside `cxp-core`
+- Errors: `cxp_core::Error` with a stable `code()`; its `Display` never includes database text
+- Tests use `#[sqlx::test]` against a real Postgres, no mocks
+- Dependencies are declared in the root `[workspace.dependencies]`; `otto-tenant` and `otto-resource` share one git rev
 - TypeScript SDK: dual CJS+ESM via tsup, strict mode, `.js` extension imports
+- Licensing: AGPL-3.0-or-later for `crates/`, `apps/`, repo-level files; MIT for `sdk/` and `packages/`
 
 ## Development Workflow
 
@@ -133,7 +171,6 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - when package.json, pnpm-lock.yaml, pnpm-workspace.yaml, sdk/typescript/**, packages/react/**, apps/web/**: pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 - evidence: report pass counts per test binary; `cargo test` without `DATABASE_URL` panics rather than skipping, so a panic there is a missing variable, not a test failure; `DATABASE_URL` points only at a local Postgres, never at a Fly database
 - toolchain: stable via `rust-toolchain.toml`; CI floats stable
-- known red: `cargo fmt --all -- --check` and `cargo clippy --workspace` on the legacy `server/` crate (21 unformatted files, 6 clippy errors on `main`) — #12, which deletes `server/`
 
 `sdk/swift` and `sdk/kotlin` are stubs with no gate.
 
@@ -188,5 +225,5 @@ Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-d
 - **Platform webhooks** (`org.deleted`, `member.removed`, `team.deleted`) are signature-verified, fail closed, and apply idempotently.
 - **Untrusted text:** customer-supplied text returned by a tool is data, and database error text never reaches a response.
 - **The database is small and shared:** pool capped by `CXP_DB_MAX_CONNECTIONS` (5); no unbounded list queries.
-- **Licensing:** `crates/`, `apps/`, `server/`, and repo-level files are AGPL-3.0-or-later; `sdk/` and `packages/` are MIT.
+- **Licensing:** `crates/`, `apps/`, and repo-level files are AGPL-3.0-or-later; `sdk/` and `packages/` are MIT.
 - **otto-platform pin:** `otto-tenant` and `otto-resource` share one git rev in the root `Cargo.toml`.
