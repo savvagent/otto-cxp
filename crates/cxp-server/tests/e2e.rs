@@ -333,6 +333,21 @@ impl Server {
         Ok(result["structuredContent"].clone())
     }
 
+    /// One `resources/read`: `Ok(the JSON its text holds)` or `Err(error)`.
+    async fn resource(&self, token: &str, uri: &str) -> Result<Value, Value> {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                          "params": {"uri": uri}});
+        let r = self.send(Self::mcp_request(Some(token), &body)).await;
+        assert!(r.status.is_success(), "{uri}: HTTP {} {}", r.status, r.body);
+        if let Some(e) = r.body.get("error") {
+            return Err(e.clone());
+        }
+        let text = r.body["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{uri}: no text in {}", r.body));
+        Ok(serde_json::from_str(text).unwrap())
+    }
+
     /// [`Self::tool`] that must succeed.
     async fn ok(&self, token: &str, name: &str, args: Value) -> Value {
         match self.tool(token, name, args.clone()).await {
@@ -1187,6 +1202,52 @@ async fn criterion_2_org_b_cannot_read_or_write_org_a_through_any_tool_or_route(
         .await;
     assert_clean("B's dynamic segment", &members, &seeded);
     assert!(members["total"].as_i64().unwrap() >= 1, "{members}");
+
+    // ---------------------------------------------------------- resources
+    for uri in [
+        format!("customer://profiles/{}", seeded.customer),
+        format!("knowledge://articles/{}", seeded.article),
+    ] {
+        let err = s
+            .resource(&b.token, &uri)
+            .await
+            .expect_err(&format!("{uri} should be refused"));
+        assert_eq!(code(&err), "not_found", "{uri}: {err}");
+    }
+    // A sees its own through the same URIs, so the refusal is about the org.
+    s.resource(
+        &a.token,
+        &format!("customer://profiles/{}", seeded.customer),
+    )
+    .await
+    .unwrap();
+    let dashboard = s.resource(&b.token, "metrics://dashboard").await.unwrap();
+    assert_clean("metrics://dashboard", &dashboard, &seeded);
+    // B's numbers, counted from B's rows as stored, past RLS.
+    let rows: HashMap<&str, Value> = s.rows_of(b.org).await.into_iter().collect();
+    let tickets = rows["tickets"].as_array().unwrap();
+    let with = |status: &str| tickets.iter().filter(|t| t["status"] == status).count();
+    let ratings: Vec<f64> = rows["feedback"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["rating"].as_f64())
+        .collect();
+    assert_eq!(dashboard["totalTickets"], tickets.len(), "{dashboard}");
+    for (field, status) in [
+        ("openTickets", "open"),
+        ("inProgressTickets", "in_progress"),
+        ("waitingTickets", "waiting"),
+        ("resolvedTickets", "resolved"),
+        ("closedTickets", "closed"),
+    ] {
+        assert_eq!(dashboard[field], with(status), "{field}: {dashboard}");
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    match dashboard["averageRating"].as_f64() {
+        Some(avg) => assert!((avg - mean(&ratings)).abs() < 1e-6, "{dashboard}"),
+        None => assert!(ratings.is_empty(), "{dashboard}"),
+    }
 
     // ------------------------------------------------------------- routes
     // B's own catalog, for updates that try to attach A's team.
