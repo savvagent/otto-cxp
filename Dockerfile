@@ -17,10 +17,18 @@ COPY crates ./crates
 # The otto-platform crates are git dependencies, so cargo's git checkouts are
 # cached alongside the registry. `target/` lives in a cache mount, so the
 # binary is copied out in the same RUN.
+#
+# Cargo decides whether a workspace crate is fresh by comparing source mtimes
+# with the artifacts in `target/`. COPY keeps the files' original mtimes, so a
+# cached `target/` built later from other sources (another branch) looks newer
+# and its stale artifacts get linked. Touching the sources first makes every
+# workspace crate rebuild against what was actually copied; dependencies stay
+# cached.
 RUN --mount=type=cache,id=otto-cxp-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=otto-cxp-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=otto-cxp-target,target=/app/target,sharing=locked \
-    cargo build --release --locked -p cxp-server \
+    find crates -type f -exec touch {} + \
+    && cargo build --release --locked -p cxp-server \
     && cp target/release/cxp-server /usr/local/bin/cxp-server
 
 # ---------------------------------------------------------------- runtime
