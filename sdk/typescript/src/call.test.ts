@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import { callList, callTool, CxpError } from "./call.js";
 import { FeedbackDomain } from "./domains/feedback.js";
@@ -53,7 +54,12 @@ describe("callTool", () => {
 
   it.each([
     [401, "unauthenticated", false],
+    [403, "insufficient_scope", false],
+    [500, "internal", false],
     [503, "unavailable", true],
+    [502, "transport_error", true],
+    [404, "transport_error", false],
+    [-1, "transport_error", false],
   ])("wraps a transport %i as %s", async (status, code, retriable) => {
     const http = new StreamableHTTPError(status, "http fail");
     const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
@@ -61,13 +67,43 @@ describe("callTool", () => {
     expect(err).toBeInstanceOf(CxpError);
     expect(err.code).toBe(code);
     expect(err.retriable).toBe(retriable);
+    expect(err.data).toEqual({ status });
     expect(err.cause).toBe(http);
   });
 
-  it("rethrows other transport errors as-is", async () => {
-    const http = new StreamableHTTPError(500, "boom");
+  it.each(["invalid_token", "access_revoked"])(
+    "keeps the server's %s kind on a 401",
+    async (kind) => {
+      const http = new StreamableHTTPError(401, `Error POSTing to endpoint: {"error":"${kind}"}`);
+      const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+      const err = await callTool(c, "t", {}).catch((e) => e);
+      expect(err.code).toBe(kind);
+      expect(err.retriable).toBe(false);
+    }
+  );
+
+  it("truncates long transport messages", async () => {
+    const http = new StreamableHTTPError(502, "y".repeat(2000));
     const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
-    await expect(callTool(c, "t", {})).rejects.toBe(http);
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.message.length).toBeLessThanOrEqual(503);
+    expect(err.cause).toBe(http);
+  });
+
+  it("wraps an OAuth UnauthorizedError as unauthenticated", async () => {
+    const unauth = new UnauthorizedError("expired");
+    const c = { callTool: vi.fn().mockRejectedValue(unauth) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpError);
+    expect(err.code).toBe("unauthenticated");
+    expect(err.retriable).toBe(false);
+    expect(err.cause).toBe(unauth);
+  });
+
+  it("rethrows non-HTTP errors as-is", async () => {
+    const boom = new TypeError("fetch failed");
+    const c = { callTool: vi.fn().mockRejectedValue(boom) } as unknown as Client;
+    await expect(callTool(c, "t", {})).rejects.toBe(boom);
   });
 
   it("raises CxpError for isError results", async () => {

@@ -198,8 +198,8 @@ export async function connectCxp(options: ConnectCxpOptions): Promise<CxpConnect
     if (e instanceof UnauthorizedError && options.authProvider) {
       throw new CxpAuthorizationRequired(options, transport);
     }
-    // Static-token path: surface a server 401/503 as a typed CxpError.
-    throw (options.authProvider ? undefined : fromTransportError(e)) ?? e;
+    // Surface transport failures as typed CxpErrors on both auth paths.
+    throw fromTransportError(e) ?? e;
   }
 
   return {

@@ -5,6 +5,7 @@
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 
 /**
@@ -52,19 +53,65 @@ function truncate(text: string): string {
 }
 
 /**
- * Map a transport-level HTTP failure (the MCP SDK's `StreamableHTTPError`) to a
- * `CxpError`: 401 is `unauthenticated` (not retriable), 503 is `unavailable`
- * (retriable). Returns `undefined` for anything else so callers rethrow it.
+ * The server's error kind (`invalid_token`, `access_revoked`, ...) when the
+ * transport error's message embeds the JSON response body. The MCP SDK's
+ * `StreamableHTTPError` exposes only `code` (the HTTP status) and a message
+ * that ends with the response text, so the body is the only place it survives.
+ */
+function serverKind(message: string): string | undefined {
+  const m = /"(?:code|error)"\s*:\s*"([a-z][a-z0-9_]{0,63})"/.exec(message);
+  return m?.[1];
+}
+
+/**
+ * Map a transport-level HTTP failure to a `CxpError`:
+ *
+ * - 401 `unauthenticated` (not retriable); the server's own kind, such as
+ *   `invalid_token` or `access_revoked`, is kept when the body carries one
+ * - 403 `insufficient_scope` (not retriable)
+ * - 500 `internal` (not retriable)
+ * - 503 `unavailable` (retriable)
+ * - any other HTTP status `transport_error`, retriable for 5xx, with the
+ *   status in `data.status`
+ *
+ * An OAuth `UnauthorizedError` becomes `unauthenticated`. Messages are
+ * truncated and the original error is kept as `cause`. Returns `undefined`
+ * for anything else so callers rethrow it.
  */
 export function fromTransportError(e: unknown): CxpError | undefined {
+  if (e instanceof UnauthorizedError) {
+    return new CxpError(truncate(e.message), {
+      code: "unauthenticated",
+      retriable: false,
+      cause: e,
+    });
+  }
   if (!(e instanceof StreamableHTTPError)) return undefined;
-  if (e.code === 401) {
-    return new CxpError(e.message, { code: "unauthenticated", retriable: false, cause: e });
+  const status = e.code;
+  const message = truncate(e.message);
+  const data = { status };
+  switch (status) {
+    case 401:
+      return new CxpError(message, {
+        code: serverKind(e.message) ?? "unauthenticated",
+        retriable: false,
+        data,
+        cause: e,
+      });
+    case 403:
+      return new CxpError(message, { code: "insufficient_scope", retriable: false, data, cause: e });
+    case 500:
+      return new CxpError(message, { code: "internal", retriable: false, data, cause: e });
+    case 503:
+      return new CxpError(message, { code: "unavailable", retriable: true, data, cause: e });
+    default:
+      return new CxpError(message, {
+        code: "transport_error",
+        retriable: typeof status === "number" && status >= 500 && status <= 599,
+        data,
+        cause: e,
+      });
   }
-  if (e.code === 503) {
-    return new CxpError(e.message, { code: "unavailable", retriable: true, cause: e });
-  }
-  return undefined;
 }
 
 function firstText(content: unknown): string | undefined {
