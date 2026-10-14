@@ -21,6 +21,6 @@ dependencies: [
 ```swift
 import CxpSdk
 
-let client = CxpClient(baseURL: URL(string: "http://localhost:3000/mcp")!)
+let client = CxpClient(baseURL: URL(string: "http://localhost:8080/mcp")!)
 let customer = try await client.getCustomer(id: "...")
 ```

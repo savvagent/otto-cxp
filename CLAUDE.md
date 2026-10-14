@@ -14,7 +14,7 @@ podman compose up -d                     # Postgres 16 on :15435 (cxp/cxp/otto_c
 cp .env.example .env                     # fill in the platform settings
 cargo run -p cxp-server                  # serves on 0.0.0.0:8080 (CXP_BIND)
 cargo build --workspace
-DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace
+DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace --locked
 cargo test -p cxp-core test_name         # one test
 ```
 `cargo test` needs `DATABASE_URL` (a local Postgres only) and panics without it. Migrations run at
@@ -25,7 +25,7 @@ server start (`cxp_core::migrate`).
 pnpm install --frozen-lockfile
 pnpm build   # tsup / vite
 pnpm test    # vitest
-pnpm lint
+pnpm lint    # currently a no-op: no package defines a `lint` script
 ```
 Per-package: `cd sdk/typescript && pnpm build`.
 
@@ -55,7 +55,7 @@ One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api
 
 ### rmcp 2.0.0 tool registration (cxp-mcp)
 Tools silently don't appear unless all of these are in place:
-1. `#[tool_router(router = <name>_router)]` on the `impl CxpMcp` block of each tool file (one file per
+1. `#[tool_router(router = <name>_router)]` on the `impl Cxp` block of each tool file (one file per
    domain), with `#[tool]` on each tool method; parameters use `Parameters<T>` structs.
 2. The per-file routers are added together into one `ToolRouter<Self>` stored on the server struct.
 3. `#[tool_handler]` on the `impl ServerHandler`.
@@ -105,7 +105,7 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 | `CXP_DB_MAX_CONNECTIONS` | `5` | minimum 2; the production database is shared and small |
 | `CXP_RUN_MIGRATIONS` | `true` | |
 | `CXP_BIND` | `0.0.0.0:8080` | |
-| `CXP_ALLOWED_HOSTS` | empty | extra Host headers `/mcp` accepts |
+| `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts; the `CXP_PUBLIC_URL` host is always allowed |
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`; empty means no check |
 | `CXP_ENFORCE_QUOTAS` | `false` | fails open |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
@@ -163,14 +163,16 @@ databases. Serialize DB test runs across worktrees, or give a worktree its own c
 another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POSTGRES_PASSWORD=cxp -e POSTGRES_DB=otto_cxp -p <port>:5432 postgres:16`, removed at teardown) and point `DATABASE_URL` at it. Ports 15433 (otto-factory) and 15434 (otto-flags) are taken.
 
 ### Gates
-- test: DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace
-- lint: cargo clippy --workspace --all-targets -- -D warnings
+- test: DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace --locked
+- lint: cargo clippy --workspace --all-targets --locked -- -D warnings
 - format: cargo fmt --all -- --check
 - extra: `git diff --name-status --diff-filter=MDR origin/main...HEAD -- 'crates/*/migrations/*'` must print nothing
 - when Dockerfile, .dockerignore, Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/**: podman build -t otto-cxp:check .   (only once a `Dockerfile` exists)
 - when package.json, pnpm-lock.yaml, pnpm-workspace.yaml, sdk/typescript/**, packages/react/**, apps/web/**: pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 - evidence: report pass counts per test binary; `cargo test` without `DATABASE_URL` panics rather than skipping, so a panic there is a missing variable, not a test failure; `DATABASE_URL` points only at a local Postgres, never at a Fly database
 - toolchain: stable via `rust-toolchain.toml`; CI floats stable
+
+`pnpm lint` is currently a no-op (no package defines a `lint` script), so the pnpm gate proves build and tests only.
 
 `sdk/swift` and `sdk/kotlin` are stubs with no gate.
 
@@ -192,7 +194,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 ### Ship
 - deploy: ci-auto
 - merge gate: on the PR's head SHA: `rust`, `docker-build`, `migrations-append-only` and `web` (CI workflow) succeeded, plus every other check that ran on the head SHA (the ruleset requires none). Before `.github/workflows/ci.yml` exists on the PR's head, the merge gate is the full local gate run on the head SHA with a clean tree
-- verify: the SHA proxy is the `deploy` job of the CI run for the merge SHA (`gh run list -R savvagent/otto-cxp --workflow CI --commit <merge-sha> --json databaseId,status,conclusion`); then `fly status -a otto-cxp` shows the machines on the new release; `curl -s https://otto-cxp.savvagent.com/readyz` returns ready; `fly logs -a otto-cxp --no-tail` shows `applying migrations`, `tenant isolation enforced as role "otto_app"`, and `the otto platform accepted this service's credential`; then exercise the changed surface read-only (`whoami` first). While the repo variable `FLY_DEPLOY` is not `enabled` the deploy job is skipped and a merge deploys nothing: report merged, not live
+- verify: the SHA proxy is the `deploy` job of the CI run for the merge SHA (`gh run list -R savvagent/otto-cxp --workflow CI --commit <merge-sha> --json databaseId,status,conclusion`); then `fly status -a otto-cxp` shows the machines on the new release; `curl -s https://otto-cxp.savvagent.com/readyz` returns ready; `fly logs -a otto-cxp --no-tail` shows `applying migrations`, `tenant isolation enforced as role "otto_app"`, and `the otto platform accepted this service's credential`; then exercise the changed surface read-only (`whoami` first). The first deploy is a hand `fly deploy -a otto-cxp --remote-only` (Rob); he sets `FLY_DEPLOY=enabled` only after verifying it. While the repo variable `FLY_DEPLOY` is not `enabled` the deploy job is skipped and a merge deploys nothing: report merged, not live
 - release: none (continuous deploy of `main`); `@cxp/sdk` and `@cxp/react` are not published, and a publish is a human decision (Rob)
 - version files: crates/*/Cargo.toml (workspace version), sdk/typescript/package.json, packages/react/package.json
 

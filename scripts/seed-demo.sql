@@ -14,6 +14,15 @@
 -- Requires the schema from crates/cxp-core/migrations (apply by starting
 -- cxp-server once, or running the migration with psql).
 
+-- (customers are UNIQUE (org_id, email): if the org already has customers with
+-- these demo emails under other ids, the insert fails and nothing is written.)
+
+\if :{?org}
+\else
+  \echo 'usage: psql "$DATABASE_URL" -v org=<org-uuid> -f scripts/seed-demo.sql'
+  \quit
+\endif
+
 \set ON_ERROR_STOP on
 
 BEGIN;

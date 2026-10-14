@@ -41,7 +41,7 @@ A Rust workspace under `crates/`:
 
 ## Local development
 
-Prerequisites: Rust (stable, via `rust-toolchain.toml`), Podman or Docker, Node 20 and pnpm 9.
+Prerequisites: Rust (stable, via `rust-toolchain.toml`), Podman or Docker, Node 22 and pnpm 9.
 
 ```bash
 podman compose up -d                     # Postgres 16 on :15435 (cxp/cxp/otto_cxp)
@@ -62,11 +62,13 @@ psql "$DATABASE_URL" -v org=<org-uuid> -f scripts/seed-demo.sql
 ## Tests
 
 ```bash
-DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 ```
+
+`pnpm lint` is currently a no-op: no package defines a `lint` script.
 
 The Rust tests run against a real Postgres (`#[sqlx::test]`), never mocks, and panic when
 `DATABASE_URL` is unset. CI runs the same gates (`.github/workflows/ci.yml`).

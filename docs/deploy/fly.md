@@ -51,14 +51,19 @@ Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set 
 
 Every step below is human-only (Rob): each one creates infrastructure, writes to the shared
 database or the platform, or sets a repo credential. The agent that wrote this repo has run
-none of them. Do them in order.
+none of them. Do them in order. The first deploy is a hand `fly deploy`; the CI deploy job
+stays off (`FLY_DEPLOY` unset) until that deploy is verified.
 
 ```bash
-# 1. App and database. Attach creates database otto_cxp and sets DATABASE_URL.
+# 1. App, then its hostname first so the certificate issues while you do the rest.
 fly apps create otto-cxp --org savvagent
+fly certs add otto-cxp.savvagent.com -a otto-cxp
+# DNS (Namecheap): A and AAAA records for otto-cxp -> the app's IPs (`fly ips list -a otto-cxp`)
+
+# 2. Database. Attach creates database otto_cxp and sets DATABASE_URL.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
-# 2. Register the resource server at the platform (run on the platform's machine).
+# 3. Register the resource server at the platform (run on the platform's machine).
 fly ssh console -a otto-platform -C 'otto-platform-server resource register \
   https://otto-cxp.savvagent.com/mcp --name otto-cxp \
   --scopes cxp:read,cxp:write --default-scopes cxp:read'
@@ -68,31 +73,32 @@ fly ssh console -a otto-platform -C 'otto-platform-server resource set-webhook \
   https://otto-cxp.savvagent.com/mcp https://otto-cxp.savvagent.com/platform/webhooks'
                                                       # prints otto_whsec_... once
 
-# 3. Secrets (staged: they apply with the first deploy).
+# 4. Secrets (staged: they apply with the first deploy).
 fly secrets set -a otto-cxp --stage \
   CXP_INTROSPECTION_SECRET='otto_rs_...' CXP_PLATFORM_WEBHOOK_SECRET='otto_whsec_...'
 
-# 4. CI deploy credentials. A deploy token scoped to this one app:
+# 5. First deploy, by hand (the CI deploy job is still off).
+fly deploy -a otto-cxp --remote-only
+```
+
+Run [Verify](#verify). Only when it passes, enable CI deploys:
+
+```bash
+# 6. A deploy token scoped to this one app, then the repo credentials.
 fly tokens create deploy -a otto-cxp                  # prints the token
 gh secret set FLY_API_TOKEN --repo savvagent/otto-cxp # paste the token
 gh variable set FLY_DEPLOY --body enabled --repo savvagent/otto-cxp
-
-# 5. First deploy: merge the PR (the CI deploy job runs once FLY_DEPLOY is enabled),
-#    or by hand:
-fly deploy -a otto-cxp --remote-only
-
-# 6. Hostname
-fly certs add otto-cxp.savvagent.com -a otto-cxp
-# DNS (Namecheap): A and AAAA records for otto-cxp -> the app's IPs (`fly ips list -a otto-cxp`)
 ```
 
-Then merge `savvagent/otto-platform` PR #39 (the marketing listing for otto-cxp) once the
-service is live: it deploys the platform site, so it goes last.
+Until `FLY_DEPLOY` is `enabled`, merging to `main` deploys nothing. Then merge
+`savvagent/otto-platform` PR #39 (the marketing listing for otto-cxp): it deploys the platform
+site, so it goes last, once the service is live.
 
 The scope list is `cxp_core::scopes::KNOWN` and the defaults `cxp_core::scopes::DEFAULT`;
 re-run the `resource register` command when a release adds a scope. `CXP_RESOURCE_URI` must be
 exactly the registered URI: it is the token audience and the HTTP Basic user on every platform
-call.
+call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name); the host of
+`CXP_PUBLIC_URL` is always accepted.
 
 ## Verify
 
@@ -112,7 +118,9 @@ The logs must show, in order:
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records.
 
-Usage backlog (SELECT-only; should drain to 0 within seconds of activity):
+Usage backlog (should drain to 0 within seconds of activity). Connect with
+`fly postgres connect -a otto-db -d otto_cxp` and run SELECTs only; production diagnostics
+never write:
 
 ```sql
 SELECT count(*), max(attempts), max(last_error) FROM usage_outbox;
@@ -122,8 +130,8 @@ SELECT count(*), max(attempts), max(last_error) FROM usage_outbox;
 
 Every push to `main` that passes CI deploys (`.github/workflows/ci.yml`, job `deploy`, which
 needs `rust`, `docker-build`, and `web`). The job runs only while the repo variable
-`FLY_DEPLOY` is `enabled`; until Rob sets it a merge deploys nothing. `FLY_API_TOKEN` is the
-deploy token from step 4. A hand deploy is `fly deploy -a otto-cxp --remote-only`.
+`FLY_DEPLOY` is `enabled`, which Rob sets after the hand-run first deploy is verified; until
+then a merge deploys nothing. `FLY_API_TOKEN` is the deploy token from step 6. A hand deploy is `fly deploy -a otto-cxp --remote-only`.
 
 ## Migrations
 
