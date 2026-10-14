@@ -54,7 +54,7 @@ describe("callTool", () => {
 
   it.each([
     [401, "unauthenticated", false],
-    [403, "insufficient_scope", false],
+    [403, "forbidden", false],
     [500, "internal", false],
     [503, "unavailable", true],
     [502, "transport_error", true],
@@ -81,6 +81,53 @@ describe("callTool", () => {
       expect(err.retriable).toBe(false);
     }
   );
+
+  it.each([
+    ["a gateway's unauthorized", `Error POSTing to endpoint: {"error":"unauthorized"}`, "unauthorized"],
+    ["an unknown kind", `Error POSTing to endpoint: {"code":"token_expired_at_edge"}`, "token_expired_at_edge"],
+  ])("reports %s on a 401 as unauthenticated, keeping the raw kind", async (_, body, raw) => {
+    const http = new StreamableHTTPError(401, body);
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.code).toBe("unauthenticated");
+    expect(err.retriable).toBe(false);
+    expect(err.data).toEqual({ status: 401, serverKind: raw });
+  });
+
+  it("keeps the server's unauthenticated kind on a 401", async () => {
+    const http = new StreamableHTTPError(401, `Error POSTing to endpoint: {"error":"unauthenticated"}`);
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.code).toBe("unauthenticated");
+    expect(err.data).toEqual({ status: 401, serverKind: "unauthenticated" });
+  });
+
+  it.each([
+    ["a JSON body", `Error POSTing to endpoint: {"error":"insufficient_scope","scope":"cxp:write"}`],
+    [
+      "a WWW-Authenticate-style challenge",
+      `Error POSTing to endpoint: Bearer error="insufficient_scope", scope="cxp:write"`,
+    ],
+    ["an unquoted challenge", "Forbidden: error=insufficient_scope"],
+  ])("reports a 403 carrying insufficient_scope in %s as insufficient_scope", async (_, body) => {
+    const http = new StreamableHTTPError(403, body);
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.code).toBe("insufficient_scope");
+    expect(err.retriable).toBe(false);
+  });
+
+  it.each([
+    ["a gateway's forbidden", `Error POSTing to endpoint: {"error":"forbidden_by_waf"}`, "forbidden_by_waf"],
+    ["an HTML page", "Error POSTing to endpoint: <html>403 Forbidden</html>", undefined],
+  ])("reports a 403 with %s as forbidden", async (_, body, raw) => {
+    const http = new StreamableHTTPError(403, body);
+    const c = { callTool: vi.fn().mockRejectedValue(http) } as unknown as Client;
+    const err = await callTool(c, "t", {}).catch((e) => e);
+    expect(err.code).toBe("forbidden");
+    expect(err.retriable).toBe(false);
+    expect(err.data).toEqual(raw === undefined ? { status: 403 } : { status: 403, serverKind: raw });
+  });
 
   it("truncates long transport messages", async () => {
     const http = new StreamableHTTPError(502, "y".repeat(2000));

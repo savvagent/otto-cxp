@@ -11,11 +11,15 @@
 //!   platform and deletes what it answered for. The platform dedupes on the
 //!   row's `event_id`, so retries are free.
 //! - **Only the rows' own faults give a row up.** A row the platform refuses
-//!   in its receipt, or alone (a whole-batch 4xx refusal is split in halves
-//!   and resent until the refused events stand alone), or one whose batch
-//!   came back with a receipt that does not account for it
-//!   [`MAX_ROW_FAILURES`] times, moves to `usage_outbox_rejected` with the
-//!   reason, logged at `error`. A failure that is not about the rows (the
+//!   in its receipt moves to `usage_outbox_rejected` with the reason, logged
+//!   at `error`. A whole-batch 4xx refusal is split in halves and resent
+//!   until the refused events stand alone (within half the claim lease and
+//!   `split_budget` requests per pass); a row refused alone, or one whose
+//!   batch came back with a receipt that does not account for it, has that
+//!   counted against it, and is moved aside after [`MAX_ROW_FAILURES`] such
+//!   failures. When every event sent alone is refused and none is accepted,
+//!   the refusal is about the requests, not the rows, and counts against
+//!   none of them. A failure that is not about the rows (the
 //!   platform unreachable, a 5xx, 408, or 429, this service's credential
 //!   refused, the org or URL unknown) keeps every row in the outbox, retried
 //!   with backoff for as long as it lasts and still counted toward its
@@ -270,6 +274,10 @@ pub struct ShipperConfig {
     pub claim_lease: Duration,
     pub base_backoff: Duration,
     pub max_backoff: Duration,
+    /// The most requests one pass sends while splitting a refused batch.
+    /// Whatever is still unsent then is kept for the next pass, as it is
+    /// once half the claim lease has gone.
+    pub split_budget: usize,
 }
 
 impl Default for ShipperConfig {
@@ -280,6 +288,7 @@ impl Default for ShipperConfig {
             claim_lease: Duration::from_secs(120),
             base_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(15 * 60),
+            split_budget: 64,
         }
     }
 }
@@ -307,6 +316,15 @@ pub enum ShipError {
     /// claim lease ran out and another shipper took it). Nothing was deleted.
     #[error("the usage outbox changed under a claim: {0}")]
     Claim(String),
+    /// A pass ran out of time (half its claim lease) or of requests while
+    /// splitting a refused batch. The rows it did not get to were not sent.
+    #[error("a usage pass stopped splitting a refused batch before sending every piece: {0}")]
+    Unfinished(String),
+    /// The platform refused every event of a split batch on its own, and
+    /// accepted none: the refusal is about the requests (a contract change, a
+    /// gateway refusing everything), not about any one event.
+    #[error("the platform refused every event of a usage batch: {0}")]
+    RefusedAll(otto_resource::Error),
     #[error("outbox database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -323,22 +341,26 @@ impl ShipError {
             ShipError::Platform(e) => {
                 e.is_retriable() || matches!(e, otto_resource::Error::Status { status: 408, .. })
             }
-            ShipError::Claim(_) => true,
-            ShipError::Receipt(_) | ShipError::Db(_) => false,
+            ShipError::Claim(_) | ShipError::Unfinished(_) => true,
+            ShipError::Receipt(_) | ShipError::RefusedAll(_) | ShipError::Db(_) => false,
         }
     }
 
     /// Whether the failure is about the rows themselves, and so counts toward
     /// [`MAX_ROW_FAILURES`]: a receipt that does not account for them, or a
     /// 4xx refusal of them. Never a transport failure, a 5xx, 408, or 429,
-    /// this service's credential refused (401/403), or an org or URL the
-    /// platform does not know (404, `NotFound`, `InvalidUrl`): rows waiting on
+    /// this service's credential refused (401/403), an org or URL the
+    /// platform does not know (404, `NotFound`, `InvalidUrl`), a refusal of
+    /// every event alike, or a pass that ran out of time: rows waiting on
     /// those are retried until they ship.
     pub fn faults_the_rows(&self) -> bool {
         match self {
             ShipError::Receipt(_) => true,
             ShipError::Platform(e) => refuses_batch(e),
-            ShipError::Claim(_) | ShipError::Db(_) => false,
+            ShipError::Claim(_)
+            | ShipError::Unfinished(_)
+            | ShipError::RefusedAll(_)
+            | ShipError::Db(_) => false,
         }
     }
 }
@@ -351,8 +373,16 @@ impl ShipError {
 ///   `usage_outbox_rejected` with its reason.
 /// - A batch it refuses whole (a 4xx about the request, 413 included; see
 ///   `refuses_batch`) is split in halves and each half resent, recursively,
-///   so one bad event cannot take the rest down with it. Only an event that
-///   is still refused when sent alone moves to `usage_outbox_rejected`.
+///   so one bad event cannot take the rest down with it. An event still
+///   refused when sent alone is kept, and the refusal counts against it, so
+///   it moves to `usage_outbox_rejected` only after [`MAX_ROW_FAILURES`] of
+///   them. If every event sent alone was refused and nothing was accepted,
+///   the refusal is about the requests, not the events: the whole batch is
+///   kept without counting it against any row ([`ShipError::RefusedAll`]).
+/// - Splitting stops once half the claim lease has gone or
+///   `split_budget` requests have been sent; the pieces not yet sent are
+///   kept for the next pass ([`ShipError::Unfinished`]), not counted
+///   against the rows.
 /// - Any other failure keeps the rows it covers, and every piece not yet
 ///   sent, for the next pass. Only failures about the rows themselves
 ///   ([`ShipError::faults_the_rows`]) count toward [`MAX_ROW_FAILURES`].
@@ -409,22 +439,54 @@ pub async fn ship_once(
     let mut refused: Vec<(Uuid, String)> = Vec::new();
     // Rows to keep and retry, with why.
     let mut failed: Vec<(Vec<i64>, ShipError)> = Vec::new();
+    // Rows the platform refused when sent alone, with its refusal.
+    let mut alone_refused: Vec<(i64, otto_resource::Error)> = Vec::new();
+    // Whether the platform answered any request of this pass with a receipt.
+    let mut any_receipt = false;
     // Ranges of `events` still to send, the next one last.
     let mut pending: Vec<std::ops::Range<usize>> = Vec::new();
     pending.push(0..events.len());
+    let started = Instant::now();
+    let deadline = cfg.claim_lease / 2;
+    let mut requests = 0usize;
     while let Some(range) = pending.pop() {
+        if requests > 0 && (requests >= cfg.split_budget || started.elapsed() >= deadline) {
+            pending.push(range);
+            let mut kept = Vec::new();
+            for rest in pending.drain(..) {
+                kept.extend_from_slice(&ids[rest]);
+            }
+            let msg = format!(
+                "sent {requests} requests in {:?} (budget {} requests, {:?}); {} of {} events \
+                 answered, {} kept for the next pass",
+                started.elapsed(),
+                cfg.split_budget,
+                deadline,
+                answered.len(),
+                ids.len(),
+                kept.len()
+            );
+            tracing::warn!("stopped splitting a refused usage batch: {msg}");
+            failed.push((kept, ShipError::Unfinished(msg)));
+            break;
+        }
+        requests += 1;
         let batch = &events[range.clone()];
         match platform.ship_usage(batch).await {
-            Ok(receipt) => match check_receipt(&receipt, batch) {
-                Ok(()) => {
-                    answered.extend_from_slice(&ids[range]);
-                    refused.extend(receipt.rejected.into_iter().map(|r| (r.event_id, r.reason)));
+            Ok(receipt) => {
+                any_receipt = true;
+                match check_receipt(&receipt, batch) {
+                    Ok(()) => {
+                        answered.extend_from_slice(&ids[range]);
+                        refused
+                            .extend(receipt.rejected.into_iter().map(|r| (r.event_id, r.reason)));
+                    }
+                    Err(msg) => {
+                        tracing::error!("{msg}; keeping every row of that batch and retrying it");
+                        failed.push((ids[range].to_vec(), ShipError::Receipt(msg)));
+                    }
                 }
-                Err(msg) => {
-                    tracing::error!("{msg}; keeping every row of that batch and retrying it");
-                    failed.push((ids[range].to_vec(), ShipError::Receipt(msg)));
-                }
-            },
+            }
             Err(e) if refuses_batch(&e) && batch.len() > 1 => {
                 tracing::warn!(events = batch.len(), error = %e,
                     "the platform refused a usage batch; resending it in halves to find the \
@@ -433,13 +495,7 @@ pub async fn ship_once(
                 pending.push(mid..range.end);
                 pending.push(range.start..mid);
             }
-            Err(e) if refuses_batch(&e) => {
-                answered.push(ids[range.start]);
-                refused.push((
-                    batch[0].event_id,
-                    format!("the platform refused this event: {e}"),
-                ));
-            }
+            Err(e) if refuses_batch(&e) => alone_refused.push((ids[range.start], e)),
             Err(e) => {
                 // Every piece not yet sent would meet the same platform: keep
                 // them all for the next pass rather than wait out a failure
@@ -453,20 +509,38 @@ pub async fn ship_once(
         }
     }
 
-    if !answered.is_empty() {
-        match settle(db, &answered, &refused).await {
-            Ok(()) => {}
-            Err(e @ ShipError::Claim(_)) => {
-                // Rolled back, so nothing is deleted on answers this pass
-                // could not match up.
-                tracing::error!(error = %e, "keeping every row and retrying the batch");
-                reschedule(db, &ids, &e, cfg).await;
-                return Err(e);
-            }
-            Err(e) => return Err(e),
+    // Events refused alone count against their rows, unless every event
+    // sent alone was refused and nothing at all was accepted: then the
+    // platform is refusing the requests, whatever they hold.
+    if alone_refused.len() > 1 && !any_receipt {
+        tracing::error!(events = alone_refused.len(), error = %alone_refused[0].1,
+            "the platform refused every event in a batch; not counting it against the rows");
+        let kept = alone_refused.iter().map(|(id, _)| *id).collect();
+        let (_, e) = alone_refused.swap_remove(0);
+        failed.push((kept, ShipError::RefusedAll(e)));
+    } else {
+        for (id, e) in alone_refused {
+            tracing::warn!(error = %e, "the platform refused a usage event sent alone; \
+                keeping it and counting the refusal against it");
+            failed.push((vec![id], e.into()));
         }
     }
-    let mut first = None;
+
+    let settled = if answered.is_empty() {
+        Ok(())
+    } else {
+        settle(db, &answered, &refused).await
+    };
+    if let Err(e @ ShipError::Claim(_)) = &settled {
+        // Rolled back, so nothing is deleted on answers this pass could not
+        // match up.
+        tracing::error!(error = %e, "keeping every answered row and retrying it");
+        reschedule(db, &answered, e, cfg).await;
+    }
+    // Whatever settling did, the pieces that failed are rescheduled with
+    // their own errors (rows a failed settle left behind wait out the claim
+    // lease).
+    let mut first = settled.err();
     for (kept, e) in failed {
         reschedule(db, &kept, &e, cfg).await;
         first.get_or_insert(e);
@@ -781,6 +855,11 @@ mod tests {
             ShipError::Platform(otto_resource::Error::InvalidUrl("x".into())),
             ShipError::Platform(otto_resource::Error::Decode("x".into())),
             ShipError::Claim("raced".into()),
+            ShipError::Unfinished("out of time".into()),
+            ShipError::RefusedAll(otto_resource::Error::Status {
+                status: 422,
+                body: "x".into(),
+            }),
             ShipError::Db(sqlx::Error::PoolTimedOut),
         ] {
             assert!(!never.faults_the_rows(), "{never}");
@@ -795,6 +874,7 @@ mod tests {
             status(500),
             status(503),
             ShipError::Claim("raced".into()),
+            ShipError::Unfinished("out of time".into()),
         ] {
             assert!(passes.is_retriable(), "{passes}");
         }
@@ -804,6 +884,10 @@ mod tests {
             ShipError::Platform(otto_resource::Error::Unauthorized),
             ShipError::Platform(otto_resource::Error::NotFound),
             ShipError::Receipt("short".into()),
+            ShipError::RefusedAll(otto_resource::Error::Status {
+                status: 422,
+                body: "x".into(),
+            }),
             ShipError::Db(sqlx::Error::PoolTimedOut),
         ] {
             assert!(!needs_attention.is_retriable(), "{needs_attention}");

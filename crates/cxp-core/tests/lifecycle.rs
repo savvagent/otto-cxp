@@ -1281,13 +1281,22 @@ async fn row_failures(pool: &PgPool) -> Vec<i32> {
         .unwrap()
 }
 
+/// Each outbox row's event id, row failures, and last error, in id order.
+async fn outbox_failures(pool: &PgPool) -> Vec<(Uuid, i32, Option<String>)> {
+    sqlx::query_as("SELECT event_id, row_failures, last_error FROM usage_outbox ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
 /// A refusal that is about this side or passes on its own (the credential,
 /// an unknown URL, a timeout, rate limiting, an outage) keeps every row and
-/// never counts against it. A batch the platform refuses outright (a 4xx
-/// about the request) is split down to single events; one still refused
-/// alone moves to `usage_outbox_rejected` with the reason.
+/// never counts against it. Nor does a 4xx the platform answers every
+/// request with: split down to single events and every one still refused,
+/// with none accepted, it is about the requests (a contract change, a
+/// gateway refusing everything), so the batch is kept whole and uncounted.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_refused_event_is_moved_aside_but_a_refused_credential_is_retried(pool: PgPool) {
+async fn a_refusal_of_every_event_or_of_the_credential_never_counts_against_the_rows(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), false, "https://x");
@@ -1318,29 +1327,44 @@ async fn a_refused_event_is_moved_aside_but_a_refused_credential_is_retried(pool
         assert!(rejected_rows(&pool).await.is_empty(), "{status}");
     }
 
-    stub.lock().unwrap().ship_status = Some(StatusCode::UNPROCESSABLE_ENTITY);
+    charge_n(&db, &meter, org(), 1).await;
+    {
+        let mut p = stub.lock().unwrap();
+        p.ship_status = Some(StatusCode::UNPROCESSABLE_ENTITY);
+        p.batch_sizes.clear();
+    }
+    for pass in 0..usage::MAX_ROW_FAILURES + 2 {
+        make_due(&pool).await;
+        let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+        assert!(matches!(err, ShipError::RefusedAll(_)), "{pass}: {err}");
+        assert!(!err.is_retriable(), "needs an operator");
+        let rows = outbox_failures(&pool).await;
+        assert_eq!(rows.len(), 3, "{pass}: every row kept");
+        assert!(
+            rows.iter()
+                .all(|r| r.1 == 0 && r.2.as_deref().is_some_and(|e| e.contains("422"))),
+            "{pass}: {rows:?}"
+        );
+        assert!(rejected_rows(&pool).await.is_empty(), "{pass}");
+    }
+    // Split to the bottom each pass: 3, then 1 and 2, then 1 and 1.
+    assert_eq!(stub.lock().unwrap().batch_sizes[..5], [3, 1, 2, 1, 1]);
+
+    // Once the platform takes them again, they ship.
+    stub.lock().unwrap().ship_status = None;
     make_due(&pool).await;
-    let shipped: HashSet<Uuid> = outbox(&pool).await.iter().map(|r| r.0).collect();
-    assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 2);
+    assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 3);
     assert!(outbox(&pool).await.is_empty());
-    let rejected = rejected_rows(&pool).await;
-    assert_eq!(
-        rejected.iter().map(|r| r.0).collect::<HashSet<_>>(),
-        shipped
-    );
-    assert!(
-        rejected
-            .iter()
-            .all(|r| r.1.contains("refused this event") && r.1.contains("422")),
-        "{rejected:?}"
-    );
+    assert!(rejected_rows(&pool).await.is_empty());
 }
 
 /// One event the platform refuses must not take its batch down with it: a
 /// batch refused whole (422, or 413 for its size) is resent in halves until
-/// the refused event stands alone, and only that event is dead-lettered.
+/// the refused event stands alone. Every other event ships; the refused one
+/// stays, the refusal counted against it, and moves to
+/// `usage_outbox_rejected` only after MAX_ROW_FAILURES of them.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_poisoned_batch_is_split_until_only_the_poisoned_event_is_moved_aside(pool: PgPool) {
+async fn a_poisoned_batch_is_split_and_only_the_poisoned_event_is_given_up_on(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), false, "https://x");
@@ -1361,26 +1385,189 @@ async fn a_poisoned_batch_is_split_until_only_the_poisoned_event_is_moved_aside(
             p.batch_sizes.clear();
         }
 
-        assert_eq!(usage::ship_once(&db, &platform, &cfg).await.unwrap(), 7);
+        let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+        assert!(err.faults_the_rows(), "{status}: {err}");
+        let left = outbox_failures(&pool).await;
+        assert_eq!(left.len(), 1, "{status}: {left:?}");
+        assert_eq!((left[0].0, left[0].1), (poisoned, 1), "{status}");
+        assert!(rejected_rows(&pool).await.len() < 2, "{status}");
+        {
+            let p = stub.lock().unwrap();
+            let accepted: HashSet<Uuid> = p.received.iter().map(|e| e.event_id).collect();
+            let expected: HashSet<Uuid> = rows
+                .iter()
+                .map(|r| r.0)
+                .filter(|id| *id != poisoned)
+                .collect();
+            assert_eq!(accepted, expected, "{status}: every other event shipped");
+            // Depth first, in order: 7 is refused; its first 3 ship; its last
+            // 4 are refused; their first 2 (holding the poisoned 5th) are
+            // refused, so each goes alone (one ships, one is refused); the
+            // last 2 ship.
+            assert_eq!(p.batch_sizes, [7, 3, 4, 2, 1, 1, 2], "{status}");
+        }
+
+        // Alone in later passes, it is still refused, and each refusal
+        // counts until it is given up on.
+        for pass in 2..usage::MAX_ROW_FAILURES {
+            make_due(&pool).await;
+            assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
+            assert_eq!(row_failures(&pool).await, [pass], "{status}");
+        }
+        make_due(&pool).await;
+        assert!(usage::ship_once(&db, &platform, &cfg).await.is_err());
         assert!(outbox(&pool).await.is_empty(), "{status}");
         let rejected = rejected_rows(&pool).await;
         let last = rejected.last().unwrap();
         assert_eq!(last.0, poisoned, "{status}");
-        assert!(last.1.contains(status.as_str()), "{status}: {}", last.1);
-        let p = stub.lock().unwrap();
-        let accepted: HashSet<Uuid> = p.received.iter().map(|e| e.event_id).collect();
-        let expected: HashSet<Uuid> = rows
-            .iter()
-            .map(|r| r.0)
-            .filter(|id| *id != poisoned)
-            .collect();
-        assert_eq!(accepted, expected, "{status}: every other event shipped");
-        // Depth first, in order: 7 is refused; its first 3 ship; its last 4
-        // are refused; their first 2 (holding the poisoned 5th) are refused,
-        // so each goes alone (one ships, one is refused); the last 2 ship.
-        assert_eq!(p.batch_sizes, [7, 3, 4, 2, 1, 1, 2], "{status}");
+        assert!(
+            last.1.contains(&format!(
+                "given up after {} failures about the row itself",
+                usage::MAX_ROW_FAILURES
+            )) && last.1.contains(status.as_str()),
+            "{status}: {}",
+            last.1
+        );
     }
     assert_eq!(rejected_rows(&pool).await.len(), 2);
+}
+
+/// Splitting stops at the pass's request budget: the pieces not yet sent are
+/// kept for the next pass, not counted against their rows, and the next
+/// pass picks up where it left off.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn splitting_stops_at_the_request_budget_and_keeps_the_rest(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig {
+        split_budget: 3,
+        ..ShipperConfig::default()
+    };
+    charge_n(&db, &meter, org(), 7).await;
+    let rows = outbox(&pool).await;
+    stub.lock().unwrap().poison = HashSet::from([rows[4].0]);
+
+    // 7 is refused, its first 3 ship, its last 4 are refused: the budget is
+    // spent, and those 4 are kept.
+    let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+    assert!(matches!(err, ShipError::Unfinished(_)), "{err}");
+    assert!(err.is_retriable() && !err.faults_the_rows());
+    assert!(err.to_string().contains("3 of 7 events answered"), "{err}");
+    assert_eq!(stub.lock().unwrap().batch_sizes, [7, 3, 4]);
+    let left = outbox_failures(&pool).await;
+    assert_eq!(
+        left.iter().map(|r| r.0).collect::<Vec<_>>(),
+        rows[3..].iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+    assert!(left.iter().all(|r| r.1 == 0), "{left:?}");
+    assert!(rejected_rows(&pool).await.is_empty());
+
+    // The next pass picks up there: 4 refused, its first 2 (holding the
+    // poisoned event) refused, the first of those shipped alone, and the
+    // budget is spent again with the rest kept.
+    make_due(&pool).await;
+    stub.lock().unwrap().batch_sizes.clear();
+    let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+    assert!(matches!(err, ShipError::Unfinished(_)), "{err}");
+    assert_eq!(stub.lock().unwrap().batch_sizes, [4, 2, 1]);
+    assert_eq!(
+        outbox(&pool).await.iter().map(|r| r.0).collect::<Vec<_>>(),
+        rows[4..].iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+    assert_eq!(row_failures(&pool).await, [0, 0, 0]);
+}
+
+/// Splitting also stops once half the claim lease has gone, so a slow
+/// platform cannot keep the claimed rows past their lease.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn splitting_stops_at_half_the_claim_lease(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig {
+        claim_lease: Duration::from_millis(200),
+        ..ShipperConfig::default()
+    };
+    charge_n(&db, &meter, org(), 4).await;
+    let poisoned = outbox(&pool).await[0].0;
+    {
+        let mut p = stub.lock().unwrap();
+        p.poison = HashSet::from([poisoned]);
+        p.ship_delay = Some(Duration::from_millis(150));
+    }
+
+    let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+    assert!(matches!(err, ShipError::Unfinished(_)), "{err}");
+    assert!(err.to_string().contains("0 of 4 events answered"), "{err}");
+    assert_eq!(
+        stub.lock().unwrap().batch_sizes,
+        [4],
+        "one request, then out of time"
+    );
+    assert_eq!(row_failures(&pool).await, [0, 0, 0, 0]);
+    assert!(rejected_rows(&pool).await.is_empty());
+}
+
+/// When settling the answered rows fails, the pieces that failed for their
+/// own reasons are still rescheduled with those reasons: a lone refusal
+/// still counts against its row.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_failed_settle_still_reschedules_the_failed_pieces(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let cfg = ShipperConfig::default();
+    charge_n(&db, &meter, org(), 3).await;
+    let rows = outbox(&pool).await;
+    let (gone, kept, poisoned) = (rows[0].0, rows[1].0, rows[2].0);
+    {
+        let mut p = stub.lock().unwrap();
+        // [a, b, c] is refused; [a] comes back with a receipt refusing a;
+        // [b, c] is refused; b ships; c is refused alone.
+        p.poison = HashSet::from([poisoned]);
+        p.reject = HashSet::from([gone]);
+        p.ship_delay = Some(Duration::from_millis(100));
+    }
+    // While the rest is in flight, the refused row disappears from under the
+    // claim, so moving it aside cannot match it and settling rolls back.
+    let watcher = {
+        let (stub, pool) = (stub.clone(), pool.clone());
+        tokio::spawn(async move {
+            while !stub
+                .lock()
+                .unwrap()
+                .received
+                .iter()
+                .any(|e| e.event_id == gone)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            sqlx::query("DELETE FROM usage_outbox WHERE event_id = $1")
+                .bind(gone)
+                .execute(&pool)
+                .await
+                .unwrap();
+        })
+    };
+
+    let err = usage::ship_once(&db, &platform, &cfg).await.unwrap_err();
+    watcher.await.unwrap();
+    assert!(matches!(err, ShipError::Claim(_)), "{err}");
+    assert_eq!(stub.lock().unwrap().batch_sizes, [3, 1, 2, 1, 1]);
+    let left = outbox_failures(&pool).await;
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert_eq!(left[0].0, kept);
+    assert_eq!(left[0].1, 0, "not the row's fault");
+    assert!(left[0]
+        .2
+        .as_deref()
+        .unwrap()
+        .contains("changed under a claim"));
+    assert_eq!(left[1].0, poisoned);
+    assert_eq!(left[1].1, 1, "its own refusal counted");
+    assert!(left[1].2.as_deref().unwrap().contains("422"), "{left:?}");
+    assert!(rejected_rows(&pool).await.is_empty());
 }
 
 /// However long the platform stays unreachable, the rows stay in the outbox
