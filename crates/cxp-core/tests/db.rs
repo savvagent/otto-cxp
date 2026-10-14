@@ -919,3 +919,96 @@ async fn a_tampered_known_migration_still_refuses_to_boot(pool: PgPool) {
         "expected VersionMismatch(1), got {err:?}"
     );
 }
+
+/// A `Db` whose every connection runs as `role` (`SET ROLE`, so
+/// `current_user` is `role`, exactly as when it logs in).
+async fn db_as(pool: &PgPool, role: &str) -> Db {
+    let set = format!("SET ROLE {role}");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let set = set.clone();
+            Box::pin(async move {
+                sqlx::query(&set).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    Db::from_pool(pool)
+}
+
+/// The boot check's view of the connecting role (#16): a plain role is not
+/// privileged; SUPERUSER, BYPASSRLS, and membership in a role with either
+/// (one `SET ROLE` away) are, and are named.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_superuser_bypassrls_and_membership(pool: PgPool) {
+    let tag = Uuid::new_v4().simple().to_string();
+    let (plain, bypass, member) = (
+        format!("cxp_t_plain_{tag}"),
+        format!("cxp_t_bypass_{tag}"),
+        format!("cxp_t_member_{tag}"),
+    );
+    for stmt in [
+        format!("CREATE ROLE {plain} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        format!("CREATE ROLE {bypass} NOLOGIN NOSUPERUSER BYPASSRLS"),
+        format!("CREATE ROLE {member} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        format!("GRANT {bypass} TO {member}"),
+        // otto_app is not privileged: membership in it, which every
+        // deployment needs, must not count.
+        format!("GRANT otto_app TO {plain}, {member}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let su = cxp_core::db_role::inspect(&db(pool.clone())).await.unwrap();
+    assert!(su.is_privileged(), "the test pool is a superuser");
+    assert_eq!(su.privileged.len(), 1, "only itself: {su:?}");
+    assert_eq!(su.privileged[0].name, su.name);
+    assert!(su.privileged[0].superuser);
+
+    let mut seen = Vec::new();
+    for name in [&plain, &bypass, &member] {
+        let as_role = db_as(&pool, name).await;
+        let role = cxp_core::db_role::inspect(&as_role).await.unwrap();
+        as_role.pool().close().await;
+        assert_eq!(&role.name, name);
+        seen.push(role);
+    }
+    let [plain_r, bypass_r, member_r] = &seen[..] else {
+        unreachable!()
+    };
+    assert!(!plain_r.is_privileged(), "{}", plain_r.summary());
+    assert_eq!(
+        bypass_r
+            .privileged
+            .iter()
+            .map(|p| (p.name.as_str(), p.superuser, p.bypassrls))
+            .collect::<Vec<_>>(),
+        [(bypass.as_str(), false, true)]
+    );
+    assert_eq!(
+        member_r
+            .privileged
+            .iter()
+            .map(|p| (p.name.as_str(), p.superuser, p.bypassrls))
+            .collect::<Vec<_>>(),
+        [(bypass.as_str(), false, true)]
+    );
+    assert!(
+        member_r
+            .summary()
+            .contains(&format!("is a member of {bypass:?} (BYPASSRLS)")),
+        "{}",
+        member_r.summary()
+    );
+
+    for stmt in [
+        format!("DROP ROLE {member}"),
+        format!("DROP ROLE {bypass}"),
+        format!("DROP ROLE {plain}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+}

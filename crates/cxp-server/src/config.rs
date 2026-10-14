@@ -137,6 +137,20 @@ impl Config {
         )
     }
 
+    /// Whether this is a deployment rather than a developer's machine, read
+    /// from the public URL: any host but a loopback one (`localhost`,
+    /// `127.0.0.0/8`, `::1`) is a deployment. A deployment refuses to serve
+    /// on a database role that is, or can become, a superuser or BYPASSRLS
+    /// (`boot::check_db_role`).
+    ///
+    /// Derived rather than a setting of its own so it cannot be switched off
+    /// by accident: a deployment whose public URL were loopback would also
+    /// advertise an audience no platform token carries, and fail every
+    /// request.
+    pub fn is_deployment(&self) -> bool {
+        url::Url::parse(&self.public_url).map_or(true, |u| !is_loopback(&u))
+    }
+
     /// The `Host` headers `/mcp` accepts: the public URL's host (with its
     /// port when that is not the scheme's default), then any extras.
     ///
@@ -437,6 +451,31 @@ mod tests {
         assert_eq!(c.resource_uri, "http://localhost:8080/mcp");
         let c = load(&env(&[("CXP_PUBLIC_URL", "https://cxp.example.com:443")])).unwrap();
         assert_eq!(c.allowed_hosts(), ["cxp.example.com"]);
+    }
+
+    #[test]
+    fn only_a_loopback_public_url_is_not_a_deployment() {
+        for local in [
+            "http://localhost:8080",
+            "http://LOCALHOST:8080",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", local)])).unwrap();
+            assert!(!c.is_deployment(), "{local}");
+        }
+        for deployed in [
+            "https://otto-cxp.savvagent.com",
+            "https://otto-cxp.fly.dev",
+            "http://10.0.0.5:8080",
+            "http://0.0.0.0:8080",
+            "http://localhost.example.com",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", deployed)])).unwrap();
+            assert!(c.is_deployment(), "{deployed}");
+        }
+        assert!(Config::for_test().is_deployment());
     }
 
     #[test]

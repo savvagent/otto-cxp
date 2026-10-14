@@ -21,6 +21,7 @@ pub mod catalog;
 pub mod chat;
 pub mod customers;
 pub mod dashboard;
+pub mod db_role;
 pub mod error;
 pub mod feedback;
 pub mod interactions;

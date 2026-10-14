@@ -1,6 +1,7 @@
 //! The process lifecycle, as a library function so a test can run it whole:
-//! connect, migrate, prove tenant isolation (or refuse to serve), check the
-//! platform credential, start the background tasks, serve until told to
+//! connect, check the database role (a deployment refuses a privileged one),
+//! migrate, prove tenant isolation (or refuse to serve), check the platform
+//! credential, start the background tasks, serve until told to
 //! stop, then drain and flush within bounds.
 //!
 //! Fly gives a stopping machine `kill_timeout = 30` seconds before SIGKILL;
@@ -11,6 +12,7 @@ use std::future::{Future, IntoFuture};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use cxp_core::db_role::DbRole;
 use cxp_core::usage::{ShipError, ShipperConfig};
 use otto_resource::{PlatformClient, TokenClaims};
 use otto_tenant::Db;
@@ -31,6 +33,8 @@ pub const PLATFORM_EVENT_RETENTION_DAYS: i32 = 30;
 /// What boot found, returned when the server stops cleanly.
 #[derive(Debug, Clone)]
 pub struct Boot {
+    /// [`DbRole::summary`] of the role this process connects as, as logged.
+    pub database_role: String,
     /// [`otto_tenant::IsolationReport::summary`], as logged.
     pub isolation: String,
     pub platform: PlatformCheck,
@@ -107,6 +111,33 @@ pub async fn check_platform(platform: &PlatformClient, config: &Config) -> Platf
     check
 }
 
+/// Whether this process may serve on the database role it connected as, and
+/// log what that role is. A role that is, or can `SET ROLE` to, a superuser
+/// or BYPASSRLS escapes every unpinned row-level policy, and on the shared
+/// `otto-db` reaches the other services' databases. A deployment
+/// ([`Config::is_deployment`]) refuses it; a developer's machine, whose
+/// local Postgres hands out a superuser, is warned.
+pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
+    let summary = role.summary();
+    if !role.is_privileged() {
+        tracing::info!("{summary}");
+        return Ok(());
+    }
+    if config.is_deployment() {
+        tracing::error!(public_url = %config.public_url,
+            "{summary}: refusing to serve. A deployment must connect as a dedicated role that \
+             is neither a superuser nor BYPASSRLS (docs/deploy/fly.md)");
+        return Err(anyhow!(
+            "refusing to serve: {summary}; a deployment must connect as a role that is neither a \
+             superuser nor BYPASSRLS, nor a member of one (docs/deploy/fly.md)"
+        ));
+    }
+    tracing::warn!(public_url = %config.public_url,
+        "{summary}: allowed only because CXP_PUBLIC_URL is a loopback origin (local \
+         development); a deployment refuses it");
+    Ok(())
+}
+
 /// Run the server on `listener` until `shutdown` completes, then drain
 /// in-flight requests (at most [`DRAIN_TIMEOUT`]) and flush usage (at most
 /// [`FLUSH_TIMEOUT`]).
@@ -146,6 +177,12 @@ where
         .await
         .context("could not connect to the database")?;
     let db = Db::from_pool(pool);
+
+    // Before anything runs as this role, migrations included.
+    let role = cxp_core::db_role::inspect(&db)
+        .await
+        .context("could not read the database role's privileges")?;
+    check_db_role(&role, &config)?;
 
     if config.run_migrations {
         tracing::info!("applying migrations");
@@ -263,6 +300,7 @@ where
     match failure {
         Some(e) => Err(e),
         None => Ok(Boot {
+            database_role: role.summary(),
             isolation,
             platform: check,
         }),
@@ -415,6 +453,44 @@ mod tests {
         assert!(err.contains("final usage flush failed"), "{err}");
         assert!(flush_result(Ok(Err(ShipError::Db(sqlx::Error::PoolClosed)))).is_err());
         assert!(flush_result(Ok(Err(ShipError::Receipt("short".into())))).is_err());
+    }
+
+    /// A deployment refuses a superuser, a BYPASSRLS role, and a member of
+    /// either; a loopback public URL (a developer's machine) only warns.
+    #[test]
+    fn a_deployment_refuses_a_privileged_database_role() {
+        use cxp_core::db_role::PrivilegedRole;
+        let role = |privileged: Vec<(&str, bool, bool)>| DbRole {
+            name: "cxp_server".into(),
+            privileged: privileged
+                .into_iter()
+                .map(|(n, s, b)| PrivilegedRole {
+                    name: n.into(),
+                    superuser: s,
+                    bypassrls: b,
+                })
+                .collect(),
+        };
+        let deployed = Config::for_test();
+        assert!(deployed.is_deployment());
+        let mut local = Config::for_test();
+        local.public_url = "http://localhost:8080".into();
+
+        let least = role(vec![]);
+        assert!(check_db_role(&least, &deployed).is_ok());
+        assert!(check_db_role(&least, &local).is_ok());
+
+        for privileged in [
+            vec![("cxp_server", true, false)],
+            vec![("cxp_server", false, true)],
+            vec![("postgres", true, true)],
+        ] {
+            let r = role(privileged);
+            let err = format!("{:#}", check_db_role(&r, &deployed).unwrap_err());
+            assert!(err.contains("refusing to serve"), "{err}");
+            assert!(err.contains(&r.summary()), "{err}");
+            assert!(check_db_role(&r, &local).is_ok(), "{}", r.summary());
+        }
     }
 
     #[test]
