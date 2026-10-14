@@ -38,8 +38,8 @@ stubs; scopes finer than `cxp:read` / `cxp:write`; new CXP domain features; otto
 - **pgvector is not needed.** Nothing reads or writes `feedback_embeddings` at runtime:
   `server/src/db/embeddings.rs` and `models/embedding.rs` are not even compiled. The baseline
   drops the `vector` extension and that table, which removes the epic's first risk (pgvector on
-  the shared `otto-db`). Plain `postgres:16` is enough; `pg_trgm` and `pgcrypto` are stock
-  contrib extensions.
+  the shared `otto-db`). Plain `postgres:16` is enough; `pg_trgm` is a stock contrib extension
+  (and `gen_random_uuid()` is built in, so `pgcrypto` is not needed).
 - **35 tools, not 26.** 10 customer-data, 10 support, 10 feedback, 5 team tools. After the
   team tools go, 30 domain tools remain, plus `whoami` and `usage`: 32.
 - **Prompts are advertised but never served** today (`enable_prompts()` with no handler). The
@@ -124,13 +124,17 @@ a later story needing a new dependency adds it to its own crate's `Cargo.toml` o
 ### cxp-core module map (S1 creates every file; S4–S8 fill their own)
 
 ```
-lib.rs              pub mod declarations for everything below; re-exports Error, Result, MIGRATOR, migrate
+lib.rs              pub mod declarations for everything below; re-exports Error, Result, MIGRATOR, migrate;
+                    ping(&Db) (the /readyz probe, so no SQL lives outside cxp-core)
 error.rs            Error enum (NotFound { kind: &'static str }, Invalid(String), Conflict(String),
                     UnknownTeam, AccessRevoked, QuotaExceeded{..}, Unavailable, Platform(..),
-                    Database(sqlx::Error), ...) with `code() -> &'static str` and
+                    Internal(String), Tenant(..), Database(sqlx::Error)) with `code() -> &'static str` and
                     `retriable() -> bool` (the codes MCP and REST put on the wire: not_found,
                     invalid_argument, conflict, unknown_team, access_revoked, quota_exceeded,
-                    unavailable, internal); Display never includes database text
+                    unavailable, internal); Display never includes database text; a
+                    database error reads the same through Tenant(Db(..)) as through Database;
+                    pub(crate) map_fk(e, &[(constraint, kind)]) maps a composite-FK violation
+                    to NotFound { kind }
 migrate.rs          MIGRATOR { ignore_missing: true, ..sqlx::migrate!("./migrations") }; migrate(&Db)
 scopes.rs           RESOURCE_NAME = "otto-cxp"; CXP_READ = "cxp:read"; CXP_WRITE = "cxp:write";
                     KNOWN = [CXP_READ, CXP_WRITE]; DEFAULT = [CXP_READ]
@@ -139,7 +143,7 @@ platform_events.rs  S4   begin_live(); revoked(); apply(WebhookEvent) -> Outcome
 maintenance.rs      S4   pub(crate) begin(&Db) (unpinned, SET LOCAL app.maintenance = 'on')
 usage.rs            S4   BILLABLE; Meter { charge(), report() }; ship_once(); run()
 analysis/           pure NPS, CSAT, sentiment (moved from server/src/analysis, unchanged logic)
-paging.rs           Page { limit, offset } with clamp (limit 1..=200, default 50)
+paging.rs           Page { limit, offset } with clamp (limit 1..=200, default 50; offset 0..=10_000)
 customers.rs        S5   CustomersExt
 interactions.rs     S5   InteractionsExt
 segments.rs         S5   SegmentsExt
@@ -147,7 +151,9 @@ tickets.rs          S6   TicketsExt
 knowledge.rs        S6   KnowledgeExt
 chat.rs             S6   ChatExt
 feedback.rs         S7   FeedbackExt (feedback, surveys, survey responses)
-catalog.rs          S8   CatalogExt (experiences, applications, pages, components)
+catalog.rs          S8   CatalogExt (experiences, applications, pages, components); VerifiedTeam,
+                         made only by verify_team(&PlatformClient, OrgId, Uuid); New*.team and
+                         TeamChange::Set take a VerifiedTeam
 dashboard.rs        S8   DashboardExt (metrics, incl. ticket counts by status as one SQL aggregate)
 ```
 
@@ -197,7 +203,7 @@ impl CustomersExt for Tx<'_> { ... sqlx::query_as(..).bind(self.org())...fetch_o
 ### Schema: `crates/cxp-core/migrations/0001_baseline.sql` (S1)
 
 Modeled on `otto-flags/crates/flags-core/migrations/0001_baseline.sql`: the tolerant
-`CREATE ROLE otto_app` block, `pgcrypto` and `pg_trgm`, `current_org()`, the six enums, then the
+`CREATE ROLE otto_app` block, `pg_trgm`, `current_org()`, the six enums, then the
 tables below, then a loop enabling and forcing RLS with `<table>_tenant_isolation` policies
 (`USING (org_id = current_org()) WITH CHECK (org_id = current_org())`), then the grant block.
 Ids default to `gen_random_uuid()`.
@@ -208,19 +214,27 @@ Every tenant table: `org_id uuid NOT NULL`, `id uuid PRIMARY KEY DEFAULT gen_ran
 `ON DELETE SET NULL (x_id)` (Postgres 15+ column list, so `org_id` is not nulled); owned children
 use `ON DELETE CASCADE`. Exception kept from the legacy schema: the catalog parent links
 (`applications.experience_id`, `pages.application_id`, `components.page_id`) are nullable but
-`ON DELETE CASCADE`, so deleting a catalog parent still deletes its children. Indexes lead with `org_id`.
+`ON DELETE CASCADE`, so deleting a catalog parent still deletes its children.
+
+Indexes: btree only, leading with `org_id`, and every foreign key's columns lead some index (a
+test checks both). Under FORCE ROW LEVEL SECURITY the planner only uses LEAKPROOF operators as
+index conditions beneath the policy's `org_id = current_org()`; the jsonb, array, trigram, and
+full-text operators are not leakproof, so GIN indexes on them (metadata, tags, criteria,
+trigram, full-text) and the `(org_id, status|priority|type|category)` btrees no query used were
+dropped: they could never serve a tenant query and only cost writes. Customer substring/fuzzy
+search and knowledge full-text search therefore scan the org's rows (#17).
 
 | Table | From | Changes beyond org_id/composite FKs |
 |---|---|---|
-| customers | 001, 008 | `UNIQUE (org_id, email)`; catalog refs (experience/application/page/component) |
-| tickets | 001, 008 | catalog refs |
+| customers | 001, 008 | `UNIQUE (org_id, email)`; catalog refs (experience/application/page/component); stored `name_lower` + `(org_id, name_lower)` for resolve_customer's exact-name step |
+| tickets | 001, 008 | catalog refs; `(org_id, customer_id, created_at DESC)` for the 360 view |
 | interactions | 001 | — |
-| feedback | 001, 007 | catalog refs; legacy free-text experience/application/page/component columns dropped |
+| feedback | 001, 007 | catalog refs; legacy free-text experience/application/page/component columns dropped; `(org_id, customer_id, created_at DESC)` |
 | surveys | 001, 008 | catalog refs |
 | survey_responses | 001 | — |
 | chat_sessions | 001 | — |
 | chat_messages | 001 | — |
-| knowledge_articles | 002 | full-text index includes org_id-leading btree for listing |
+| knowledge_articles | 002 | stored `search_tsv` (generated `to_tsvector('english', title \|\| ' ' \|\| content)`) that search matches and ranks; no GIN index (#17); `(org_id, published, created_at DESC)` |
 | segments | 003 | — |
 | segment_members | 003 | PK `(org_id, segment_id, customer_id)` |
 | experiences | 006 | `team_id uuid NULL` (platform team id, no FK) |
@@ -228,16 +242,21 @@ use `ON DELETE CASCADE`. Exception kept from the legacy schema: the catalog pare
 | pages | 006, 009 | nullable `application_id`; `team_id` |
 | components | 006, 009 | nullable `page_id`; `team_id` |
 
-Dropped: `teams`, `feedback_embeddings`, the `vector` and `uuid-ossp` extensions, and the legacy
-free-text columns from 005.
+Dropped: `teams`, `feedback_embeddings`, the `vector`, `uuid-ossp`, and `pgcrypto` extensions,
+and the legacy free-text columns from 005.
 
 Service bookkeeping (copy otto-flags' definitions and policies):
 
 | Table | RLS | Purpose |
 |---|---|---|
-| usage_outbox, usage_outbox_rejected | `org_id = current_org() OR current_org() IS NULL` | metering |
+| usage_outbox, usage_outbox_rejected | `org_id = current_org() OR (current_org() IS NULL AND current_setting('app.maintenance', true) = 'on')`: an unpinned transaction without the maintenance marker sees, changes, and deletes nothing, as on `platform_events` | metering |
 | platform_events | tenant, keyed by `event_id`, **plus** otto-flags' `0003_unpinned_sweep_reads.sql` policies folded in: `platform_events_retention_read` (`current_org() IS NULL AND current_setting('app.maintenance', true) = 'on'`), the restrictive `platform_events_maintenance_delete`, and the delete-retention policy, so the sweep deletes as `otto_app` | webhook dedupe |
 | deleted_orgs, removed_members | none (pre-org lookups, as in otto-flags) | tombstones |
+
+Grants: `otto_app` gets SELECT/INSERT/UPDATE/DELETE on every table, except `deleted_orgs`
+(SELECT, INSERT: tombstones are permanent), `removed_members` (no DELETE: the sweep expires
+tombstones through the `SECURITY DEFINER` function `expire_removed_members()`, which can only
+remove rows past twice the 300 s window), and `_sqlx_migrations` (none).
 
 No `audit_events` table: this service does not call `Tx::audit`.
 
@@ -270,8 +289,11 @@ then refuse with `Error::AccessRevoked` when the org is in `deleted_orgs` or the
 `removed_members` (300 s window). Every request path opens its transaction here.
 
 `apply(db, WebhookEvent) -> Outcome { Applied | Duplicate | Ignored }`:
-- `org.deleted`: tombstone, exclusive lock, dedupe, delete every tenant table's rows for the org,
-  children before parents.
+- `org.deleted`: tombstone (committed on its own), then short transactions that each take the
+  exclusive lock and delete at most `PURGE_BATCH` (5000) rows per table, children before parents,
+  stopping at the first table that still has rows (so nothing goes by cascade), until every
+  table is empty. The dedupe marker is written in that last transaction, so a crash mid-purge
+  leaves no marker and the redelivery finishes the purge. A duplicate re-runs the purge too.
 - `member.removed`: tombstone the member, dedupe.
 - `team.deleted`: dedupe, then `UPDATE experiences|applications|pages|components SET team_id =
   NULL WHERE org_id = $1 AND team_id = $2`; returns `Applied`.
@@ -280,10 +302,14 @@ then refuse with `Error::AccessRevoked` when the org is in `deleted_orgs` or the
 ### Metering (`cxp_core::usage`, S4)
 
 `BILLABLE = ["submit_feedback", "create_survey", "send_survey", "submit_survey_response"]`.
-`Meter::charge(&self, tx, user, tool)` returns `Error::Invalid` if `tool` is not in `BILLABLE`, optionally enforces the quota (`CXP_ENFORCE_QUOTAS`, default off, fail open) and
-inserts one `usage_outbox` row in the caller's transaction. `Meter::report(org)` returns the
-usage summary `whoami`/`usage` show (otto-flags' `Status`). `ship_once`/`run` ship batches to
-`POST /internal/usage` (event_id dedupe at the platform), as otto-flags.
+`Meter::charge(&self, tx, user, tool)` returns `Error::Internal` (a programming error, code
+`internal`) if `tool` is not in `BILLABLE`, optionally enforces the quota (`CXP_ENFORCE_QUOTAS`,
+default off, fail open) and inserts one `usage_outbox` row in the caller's transaction.
+`Meter::report(org)` returns the usage summary `whoami`/`usage` show (otto-flags' `Status`).
+`ship_once`/`run` ship batches to `POST /internal/usage` (event_id dedupe at the platform), as
+otto-flags, claiming due rows in `(next_attempt_at, id)` order, in maintenance transactions.
+The retention `sweep` (also maintenance) forgets `platform_events` markers past their retention,
+expired `removed_members` tombstones, and `usage_outbox_rejected` rows older than 90 days.
 
 ### MCP (`cxp-mcp`, S9)
 
@@ -302,8 +328,9 @@ that mounts `/mcp` behind `require_bearer` and the open metadata route.
 
 Same routes and JSON shapes as `server/src/api` today minus `/teams`, behind `require_bearer`: GET needs read, other methods need write. Plus
 `GET /api/v1/me/teams` → `platform.member_teams(org, user)` as `[{id, slug, name}]`. Catalog
-create/update with a `teamId` verifies it with `platform.team(org, id)` (unknown →
-400 `unknown_team`; platform down → 503). On update, an absent team
+create/update with a `teamId` verifies it with `cxp_core::catalog::verify_team(platform, org, id)`
+(unknown, or another org's → 400 `unknown_team`; platform down → 503), which returns the
+`VerifiedTeam` the catalog write requires, so no route can store an unverified team id. On update, an absent team
 field leaves the team unchanged and an explicit `null` clears it. The console currently sends
 `team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
 lands. `POST /api/v1/surveys` charges `create_survey`.
@@ -388,3 +415,12 @@ commands live in `docs/deploy/fly.md` (S12).
   route verifies the team before opening its transaction), and a team id the platform no longer knows simply matches no team in the console's
   selector (`/api/v1/me/teams`), so the entity shows as unassigned. A `deleted_teams` tombstone would close it if it ever matters.
 - The usage shipper is the second caller of `cxp_core::maintenance` (after the sweep).
+- Search under RLS (#17): forced row-level security keeps non-leakproof operators (`ILIKE`,
+  trigram `%`, full-text `@@`) from being index conditions, so `search_customers` and
+  `search_articles` scan the org's customers / published articles. Fine at today's org sizes;
+  #17 tracks a leakproof-safe search path (e.g. a security-barrier function or per-org search
+  index) before an org grows large.
+- Database role (#16): cxp-server connects as the migrating role and assumes `otto_app` per
+  tenant transaction; background maintenance and the tombstone write run as the connecting
+  role. The grants narrow what `otto_app` can do, but the connecting role itself is still
+  privileged; #16 tracks a least-privilege login role.
