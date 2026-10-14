@@ -2,8 +2,9 @@
 //!
 //! ```text
 //!   /healthz /readyz                  health    no database on the liveness path
-//!   /.well-known/oauth-protected-resource, /mcp
-//!                                     cxp-mcp   agents: bearer tokens from the platform
+//!   /.well-known/oauth-protected-resource
+//!                                     cxp-http  open; every 401 points at it
+//!   /mcp                              cxp-mcp   agents: bearer tokens from the platform
 //!   /api/v1/…                         cxp-api   the console: bearer tokens from the platform
 //!   /platform/webhooks                cxp-api   the platform's signed lifecycle events
 //!   everything else                   JSON 404
@@ -95,6 +96,11 @@ pub fn router(
         },
     ));
     Ok(health::router(db, platform_check)
+        // Open, and not part of either surface: every `401` points at it.
+        .merge(cxp_http::protected_resource_router(
+            &config.resource_uri,
+            &config.platform_url,
+        ))
         .merge(mcp)
         .merge(api)
         .fallback(not_found)
@@ -116,8 +122,6 @@ pub fn router(
 fn mcp_config(config: &Config) -> cxp_mcp::Config {
     cxp_mcp::Config {
         public_url: config.public_url.clone(),
-        resource_uri: config.resource_uri.clone(),
-        platform_url: config.platform_url.clone(),
         allowed_hosts: config.allowed_hosts(),
         allowed_origins: config.allowed_origins.clone(),
     }
@@ -247,6 +251,13 @@ mod tests {
                 ),
                 "{challenge}"
             );
+            // ...and what it points at is served, open, by this router.
+            let (status, _, _) = call("GET", cxp_http::PROTECTED_RESOURCE_PATH).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                challenge.contains(cxp_http::PROTECTED_RESOURCE_PATH),
+                "{challenge}"
+            );
         }
     }
 
@@ -333,7 +344,6 @@ mod tests {
         config.extra_allowed_hosts = vec!["otto-cxp.fly.dev".into()];
         let mcp = mcp_config(&config);
         assert_eq!(mcp.allowed_hosts, ["cxp.example.com", "otto-cxp.fly.dev"]);
-        assert_eq!(mcp.resource_uri, config.resource_uri);
         assert_eq!(mcp.public_url, config.public_url);
     }
 

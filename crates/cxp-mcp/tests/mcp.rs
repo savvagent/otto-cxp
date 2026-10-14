@@ -178,8 +178,6 @@ async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
         meter,
         Config {
             public_url: PUBLIC_URL.into(),
-            resource_uri: RESOURCE.into(),
-            platform_url: base,
             allowed_hosts: vec![HOST.into()],
             allowed_origins: vec![],
         },
@@ -275,18 +273,6 @@ async fn no_token_is_a_401_naming_the_metadata_document(pool: PgPool) {
     );
     assert!(!challenge.contains("error="), "{challenge}");
     assert_eq!(v["error"], "unauthenticated");
-
-    // The metadata document itself is open.
-    let (status, _, doc) = h
-        .send(
-            Request::get("/.well-known/oauth-protected-resource")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(doc["resource"], RESOURCE);
-    assert_eq!(doc["scopes_supported"], json!(["cxp:read", "cxp:write"]));
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -838,8 +824,6 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
             meter,
             Config {
                 public_url: PUBLIC_URL.into(),
-                resource_uri: RESOURCE.into(),
-                platform_url: base.clone(),
                 allowed_hosts: hosts.clone(),
                 allowed_origins: vec![],
             },
