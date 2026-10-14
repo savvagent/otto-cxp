@@ -1,4 +1,6 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { createCxpTransport } from "./connect.js";
 import { createServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -19,6 +21,7 @@ let http: HttpServer | undefined;
 let conn: CxpConnection | undefined;
 const seenAuth: Array<string | undefined> = [];
 let tokenRequests = 0;
+let tokenEndpointStatus = 200;
 
 async function startServer(accepted: string[] = [TOKEN]): Promise<string> {
   http = createServer(async (req, res) => {
@@ -41,6 +44,7 @@ async function startServer(accepted: string[] = [TOKEN]): Promise<string> {
     if (path === "/token") {
       tokenRequests++;
       req.resume();
+      if (tokenEndpointStatus !== 200) return json(tokenEndpointStatus, { error: "invalid_grant" });
       return json(200, { access_token: OAUTH_TOKEN, token_type: "Bearer" });
     }
 
@@ -106,6 +110,8 @@ afterEach(async () => {
   http = undefined;
   seenAuth.length = 0;
   tokenRequests = 0;
+  tokenEndpointStatus = 200;
+  vi.restoreAllMocks();
 });
 
 describe("connectCxp with a bearer token", () => {
@@ -130,6 +136,98 @@ describe("connectCxp with a bearer token", () => {
     await expect(
       connectCxp({ url: "http://127.0.0.1:1/mcp", token: "t", authProvider: fakeProvider() })
     ).rejects.toThrow(/not both/);
+  });
+});
+
+describe("static token safety", () => {
+  it("refuses a token over plain http to a non-loopback host", async () => {
+    await expect(connectCxp({ url: "http://cxp.example.com/mcp", token: "t" })).rejects.toThrow(
+      /refusing to send a static `token`.*https/
+    );
+    expect(() => createCxpTransport({ url: "http://10.0.0.5/mcp", token: "t" })).toThrow(/https/);
+  });
+
+  it("refuses a token for a non-http(s) scheme", () => {
+    expect(() => createCxpTransport({ url: "ftp://cxp.example.com/mcp", token: "t" })).toThrow(
+      /refusing/
+    );
+  });
+
+  it("allows https and loopback http", () => {
+    for (const u of [
+      "https://cxp.example.com/mcp",
+      "http://localhost:3000/mcp",
+      "http://127.0.0.1:3000/mcp",
+      "http://[::1]:3000/mcp",
+    ]) {
+      expect(() => createCxpTransport({ url: u, token: "t" }), u).not.toThrow();
+    }
+  });
+
+  it("does not apply the https rule to an authProvider", () => {
+    expect(() =>
+      createCxpTransport({ url: "http://cxp.example.com/mcp", authProvider: fakeProvider() })
+    ).not.toThrow();
+  });
+
+  it("rejects a token containing CR or LF", async () => {
+    for (const bad of ["abc\r\nX-Injected: 1", "abc\ndef", "abc\rdef"]) {
+      expect(() => createCxpTransport({ url: "https://cxp.example.com/mcp", token: bad })).toThrow(
+        /CR or LF/
+      );
+    }
+    await expect(
+      connectCxp({ url: "https://cxp.example.com/mcp", token: "a\nb" })
+    ).rejects.toThrow(/connectCxp: .*CR or LF/);
+  });
+});
+
+describe("client and transport cleanup", () => {
+  it("closes the unused client before throwing CxpAuthorizationRequired", async () => {
+    const url = await startServer([OAUTH_TOKEN]);
+    let closed = false;
+    vi.spyOn(Client.prototype, "close").mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      closed = true;
+    });
+    const err = await connectCxp({ url, authProvider: fakeProvider() }).catch((e) => e);
+    expect(err).toBeInstanceOf(CxpAuthorizationRequired);
+    expect(closed).toBe(true);
+  });
+
+  it("closes the client when the connection fails for another reason", async () => {
+    const url = await startServer();
+    let closed = false;
+    vi.spyOn(Client.prototype, "close").mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      closed = true;
+    });
+    await expect(connectCxp({ url, token: "nope" })).rejects.toBeInstanceOf(StreamableHTTPError);
+    expect(closed).toBe(true);
+  });
+
+  it("closes the auth transport when the code exchange fails", async () => {
+    const url = await startServer([OAUTH_TOKEN]);
+    const err = (await connectCxp({ url, authProvider: fakeProvider() }).catch(
+      (e) => e
+    )) as CxpAuthorizationRequired;
+    expect(err).toBeInstanceOf(CxpAuthorizationRequired);
+    const close = vi.spyOn(err.transport, "close");
+    tokenEndpointStatus = 400;
+    await expect(err.finishAuth("bad-code")).rejects.toThrow();
+    expect(tokenRequests).toBeGreaterThan(0);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the auth transport after a successful exchange too", async () => {
+    const url = await startServer([OAUTH_TOKEN]);
+    const err = (await connectCxp({ url, authProvider: fakeProvider() }).catch(
+      (e) => e
+    )) as CxpAuthorizationRequired;
+    const close = vi.spyOn(err.transport, "close");
+    conn = await err.finishAuth("auth-code");
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(await conn.cxp.support.listTickets()).toEqual([{ id: "t1" }]);
   });
 });
 
