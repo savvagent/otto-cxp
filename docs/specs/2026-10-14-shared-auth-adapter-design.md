@@ -1,6 +1,6 @@
 # One axum auth adapter for /mcp and /api
 
-**Status:** DRAFT (#18)
+**Status:** IMPLEMENTED (#22)
 
 ## Brief
 
