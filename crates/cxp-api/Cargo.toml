@@ -11,7 +11,6 @@ otto-tenant.workspace = true
 otto-resource.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-chrono.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 axum.workspace = true
@@ -23,3 +22,4 @@ tower-http.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true, features = ["util"] }
 sqlx.workspace = true
+chrono.workspace = true
