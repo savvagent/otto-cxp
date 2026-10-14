@@ -730,6 +730,10 @@ are matched before the fallback). No out-of-band steps.
             "the address comes from CXP_RESOURCE_URI"
         );
         assert!(html.contains("href=\"https://platform.example.com/\""));
+        // A query string does not change the path.
+        let (status, _, _) =
+            send_raw(app(), request("GET", "/?from=console", &[("accept", BROWSER_ACCEPT)])).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -846,6 +850,10 @@ async fn fallback(page: InstallPage, method: Method, uri: Uri, headers: HeaderMa
 }
 ```
 
+  - In `router()`'s doc comment, replace the sentence beginning "Fails only on a configuration
+    that would leave `/mcp` open" with: "Fails on a configuration that would leave `/mcp` open to
+    any `Host` (see [`Config::allowed_hosts`]) or a platform URL the install page cannot take an
+    origin from."
   - In the module doc's route table, replace the last line `//!   everything else                   JSON 404` with:
 
 ```rust
@@ -875,3 +883,11 @@ git commit -m "feat(server): serve the install page to browsers at /" -m "A brow
 
 Refs #25"
 ```
+
+---
+
+## Closing (orchestrator, not an implementer task)
+
+- The PR body carries `Fixes #25` (the commits say `Refs #25`).
+- Before merge, a final docs commit sets the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and
+  ticks this plan's boxes.
