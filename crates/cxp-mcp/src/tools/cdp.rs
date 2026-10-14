@@ -13,7 +13,7 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 
 use super::out::List;
-use super::{uuid, IdParam, QueryParam};
+use super::{uuid, CustomerIdParam, QueryParam};
 use crate::server::{Cxp, McpResult};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -30,7 +30,9 @@ pub struct CreateCustomerParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UpdateCustomerParams {
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub id: String,
     #[serde(default)]
     pub email: Option<String>,
@@ -54,7 +56,9 @@ pub struct ListCustomersParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordInteractionParams {
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
     /// One of page_view, purchase, support_contact, email_open, email_click,
     /// feature_use, login.
@@ -66,7 +70,9 @@ pub struct RecordInteractionParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetJourneyParams {
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
     /// At most this many (1 to 200, default 50).
     #[serde(default)]
@@ -197,7 +203,7 @@ impl Cxp {
     pub async fn get_customer(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        Parameters(p): Parameters<IdParam>,
+        Parameters(p): Parameters<CustomerIdParam>,
     ) -> Result<Json<Customer>, ErrorData> {
         let caller = self.caller(&parts)?;
         caller.require_read().mcp()?;
@@ -342,7 +348,7 @@ impl Cxp {
     pub async fn get_customer_360(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        Parameters(p): Parameters<IdParam>,
+        Parameters(p): Parameters<CustomerIdParam>,
     ) -> Result<Json<Customer360>, ErrorData> {
         let caller = self.caller(&parts)?;
         caller.require_read().mcp()?;

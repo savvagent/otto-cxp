@@ -26,9 +26,19 @@ pub struct CreateSurveyParams {
     pub title: String,
     #[serde(default)]
     pub description: Option<String>,
-    /// A JSON array of question objects, as text, e.g.
-    /// `[{"id": "q1", "type": "nps", "text": "How likely are you to recommend us?"},
-    /// {"id": "q2", "type": "text", "text": "What should we improve?"}]`.
+    /// A JSON array of question objects, as text. Each has `id` (unique in
+    /// the survey), `questionType` (`rating`, `multiple_choice`, or `text`),
+    /// `text`, and `required` (true or false); a `multiple_choice` question
+    /// also has `options`, an array of strings. Other shapes are stored but
+    /// not rendered by the otto-cxp console. There is no scale field: for an
+    /// NPS question, use a `rating` asking for 0 to 10 and put it first
+    /// (calculate_nps scores a response by its first answer). E.g.
+    /// `[{"id": "q1", "questionType": "rating", "text": "How likely are you to
+    /// recommend us, from 0 to 10?", "required": true}, {"id": "q2",
+    /// "questionType": "multiple_choice", "text": "Which feature do you use
+    /// most?", "options": ["Dashboard", "Reports"], "required": true}, {"id":
+    /// "q3", "questionType": "text", "text": "What should we improve?",
+    /// "required": false}]`.
     pub questions: String,
 }
 
@@ -36,7 +46,9 @@ pub struct CreateSurveyParams {
 pub struct SendSurveyParams {
     /// The survey's UUID.
     pub survey_id: String,
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
 }
 
@@ -44,7 +56,9 @@ pub struct SendSurveyParams {
 pub struct SubmitSurveyResponseParams {
     /// The survey's UUID.
     pub survey_id: String,
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
     /// The answers as JSON text: an array of {questionId, value} objects, or
     /// an object such as {"score": 9}.
@@ -53,7 +67,9 @@ pub struct SubmitSurveyResponseParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SubmitFeedbackParams {
-    /// The customer: a UUID, an exact email, or a name.
+    /// The customer: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     pub customer_id: String,
     /// bug_report, feature_request, complaint, praise, or suggestion.
     pub feedback_type: String,
@@ -80,7 +96,9 @@ pub struct SubmitFeedbackParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetFeedbackParams {
-    /// Only this customer's: a UUID, an exact email, or a name.
+    /// Only this customer's: a UUID, an exact email, or a name
+    /// (matched exactly, case-insensitively, else by a unique partial match of
+    /// the name or email; several matches are refused).
     #[serde(default)]
     pub customer_id: Option<String>,
     /// Only feedback of this type: bug_report, feature_request, complaint,
@@ -171,9 +189,17 @@ impl Cxp {
 
     #[tool(
         name = "create_survey",
-        description = "Create a new survey. questions is a JSON array as text, e.g. \
-                       [{\"id\": \"q1\", \"type\": \"nps\", \"text\": \"How likely are you to \
-                       recommend us?\"}]. Needs cxp:write. Billable.",
+        description = "Create a new survey. questions is a JSON array of question objects, as \
+                       text: each has id, questionType (rating, multiple_choice, or text), text, \
+                       and required; a multiple_choice question also has options. For NPS, put \
+                       a 0-to-10 rating question first (calculate_nps scores the first answer). \
+                       E.g. [{\"id\": \"q1\", \"questionType\": \"rating\", \"text\": \"How \
+                       likely are you to recommend us, from 0 to 10?\", \"required\": true}, \
+                       {\"id\": \"q2\", \"questionType\": \"multiple_choice\", \"text\": \"Which \
+                       feature do you use most?\", \"options\": [\"Dashboard\", \"Reports\"], \
+                       \"required\": true}, {\"id\": \"q3\", \"questionType\": \"text\", \
+                       \"text\": \"What should we improve?\", \"required\": false}]. Needs \
+                       cxp:write. Billable.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_survey(
@@ -321,7 +347,9 @@ impl Cxp {
     #[tool(
         name = "calculate_nps",
         description = "Calculate the Net Promoter Score for a survey. A response's score is the \
-                       first answer's `value` when its answers are an array, or the `score` key \
+                       first answer's `value` when its answers are an array (as \
+                       submit_survey_response's [{questionId, value}] answers are, so a survey \
+                       made for NPS puts its 0-to-10 rating question first), or the `score` key \
                        when they are an object; scores outside 0 to 10, or missing, are not \
                        counted.",
         annotations(read_only_hint = true)

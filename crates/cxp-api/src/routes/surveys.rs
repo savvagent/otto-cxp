@@ -130,7 +130,7 @@ pub async fn delete(
     Ok(deleted())
 }
 
-/// A plain array, as before the port; paged by `limit`/`offset` (default 50).
+/// A plain array (not the `{items, total}` envelope); paged by `limit`/`offset` (default 50).
 /// `404` when the survey is not in the caller's org.
 pub async fn responses(
     State(state): State<AppState>,

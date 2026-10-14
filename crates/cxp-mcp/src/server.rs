@@ -11,9 +11,10 @@
 //! **A tool body:** check the scope, open the transaction, do one thing,
 //! commit. The four billable tools also warm the quota
 //! ([`Cxp::warm_quota`]) before the transaction and charge inside it
-//! ([`Cxp::charge`]): a failed call is never billed. Only they look the org's
-//! quota up on the platform; every other tool, and every read, makes no
-//! platform call of its own.
+//! ([`Cxp::charge`]): a failed call is never billed. Besides the platform's
+//! token introspection (every request, in the auth middleware), only they
+//! (the quota) and the free `whoami` and `usage` (the caller's membership and
+//! the org's usage report) call the platform; no other tool does.
 
 use std::sync::Arc;
 
@@ -112,8 +113,9 @@ impl Cxp {
 
     /// Look the org's quota standing up at the platform, before a billable
     /// tool opens its transaction, so the network call never holds a pooled
-    /// connection. Only the four `cxp_core::usage::BILLABLE` tools call this:
-    /// every other tool, and every read, makes no platform call of its own.
+    /// connection. Only the four `cxp_core::usage::BILLABLE` tools call this;
+    /// of the rest, only `whoami` and `usage` call the platform (for the
+    /// caller's membership and the org's usage report).
     pub async fn warm_quota(&self, caller: &Principal) {
         self.meter.warm(caller.org_id).await;
     }

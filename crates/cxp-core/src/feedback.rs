@@ -106,7 +106,7 @@ pub struct NewSurvey {
 }
 
 /// Fields to change on a survey; `None` leaves a field as it is. A field
-/// cannot be cleared back to empty (as before the port).
+/// cannot be cleared back to empty.
 #[derive(Debug, Clone, Default)]
 pub struct SurveyUpdate {
     pub title: Option<String>,

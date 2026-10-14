@@ -4,8 +4,9 @@
 //! otto-platform's migration history, whose version numbers collide with this
 //! one's. The platform's schema lives in the platform's database.
 //!
-//! The pre-platform `server/migrations` (001..010) are not this history: the
-//! baseline here is a fresh, org-scoped schema for a fresh database.
+//! The standalone server's `server/migrations` (001..010) are not this
+//! history: the baseline here is a fresh, org-scoped schema for a fresh
+//! database.
 
 use otto_tenant::Db;
 use sqlx::migrate::Migrator;

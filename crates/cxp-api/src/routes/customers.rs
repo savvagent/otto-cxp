@@ -69,7 +69,7 @@ pub async fn list(
     Ok(Json(Paginated::new(rows, page)))
 }
 
-/// A plain array, as before the port; paged by `limit`/`offset` (default 50).
+/// A plain array (not the `{items, total}` envelope); paged by `limit`/`offset` (default 50).
 pub async fn search(
     State(state): State<AppState>,
     Extension(caller): Extension<Principal>,

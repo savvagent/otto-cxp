@@ -1,11 +1,15 @@
-//! The four MCP prompts, ported from the pre-platform server (which advertised
-//! them but never served them). Each is a user message steering the agent to
+//! The four MCP prompts. Each is a user message steering the agent to
 //! the tools that answer it; none reads data itself. Getting one needs read
 //! scope, checked by the caller ([`crate::server`]).
 
 use rmcp::model::{
     ErrorData, GetPromptResult, JsonObject, Prompt, PromptArgument, PromptMessage, Role,
 };
+
+/// The question shape `create_survey` takes and the otto-cxp console
+/// renders (`SurveyQuestion` in `@cxp/sdk`). The tool's description spells
+/// the same example out; a test keeps the two in step.
+pub(crate) const SURVEY_QUESTIONS_EXAMPLE: &str = r#"[{"id": "q1", "questionType": "rating", "text": "How likely are you to recommend us, from 0 to 10?", "required": true}, {"id": "q2", "questionType": "multiple_choice", "text": "Which feature do you use most?", "options": ["Dashboard", "Reports"], "required": true}, {"id": "q3", "questionType": "text", "text": "What should we improve?", "required": false}]"#;
 
 /// Appended to every prompt that has the agent read what customers wrote
 /// (tickets, histories, feedback): that text is untrusted.
@@ -122,8 +126,13 @@ pub fn get(name: &str, args: Option<&JsonObject>) -> Result<GetPromptResult, Err
                 "Create a customer survey",
                 format!(
                     "Create a customer survey about '{topic}' with {count} questions. Include a \
-                     mix of rating scales (1-5), multiple choice, and open-ended questions. \
-                     Format the questions as a JSON array suitable for the create_survey tool."
+                     mix of rating, multiple choice, and open-ended questions. Write them as a \
+                     JSON array of question objects, each with id, questionType (rating, \
+                     multiple_choice, or text), text, and required, plus options (an array of \
+                     strings) on a multiple_choice question, and pass it, as JSON text, as the \
+                     create_survey tool's questions. For example: {SURVEY_QUESTIONS_EXAMPLE}. \
+                     A rating has no scale field, so say the scale in its text; to measure NPS, \
+                     put a 0-to-10 rating first, which calculate_nps scores."
                 ),
             )
         }
@@ -202,6 +211,35 @@ mod tests {
         assert_eq!(e.data.unwrap()["code"], "invalid_argument");
         assert!(get("support_response", None).is_err());
         assert!(get("nope", None).is_err());
+    }
+
+    /// The survey prompt teaches the question shape the console renders, and
+    /// the example is a valid array of such questions.
+    #[test]
+    fn the_survey_prompt_teaches_the_rendered_question_shape() {
+        let p = get(
+            "survey_creation",
+            Some(&args(serde_json::json!({"topic": "onboarding"}))),
+        )
+        .unwrap();
+        let text = serde_json::to_value(&p.messages[0].content).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains(SURVEY_QUESTIONS_EXAMPLE), "{text}");
+        assert!(!text.contains("\"type\""), "{text}");
+        let questions: Vec<serde_json::Value> =
+            serde_json::from_str(SURVEY_QUESTIONS_EXAMPLE).unwrap();
+        let types: Vec<&str> = questions
+            .iter()
+            .map(|q| q["questionType"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["rating", "multiple_choice", "text"]);
+        for q in &questions {
+            assert!(q["id"].is_string() && q["text"].is_string(), "{q}");
+            assert!(q["required"].is_boolean(), "{q}");
+        }
+        assert!(questions[1]["options"].is_array());
     }
 
     /// Any prompt that sends the agent to customer-written data must say that
