@@ -89,7 +89,11 @@ pub async fn verify_team(
     org: OrgId,
     team_id: Uuid,
 ) -> Result<VerifiedTeam> {
-    match platform.team(org.as_uuid(), team_id).await? {
+    match platform
+        .team(org.as_uuid(), team_id)
+        .await
+        .map_err(|e| Error::platform_for(org, e))?
+    {
         Some(team) if team.org_id == org.as_uuid() && team.id == team_id => Ok(VerifiedTeam {
             org,
             team: TeamId(team_id),

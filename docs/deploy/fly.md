@@ -137,7 +137,10 @@ The logs must show, in order:
 If the platform REJECTED the credential, or `CXP_PLATFORM_URL` is not the platform, `/readyz`
 answers 503 with `"reason": "platform credential rejected"` (or `"platform misconfigured"`), so a
 deploy with a bad secret fails its health check. The check runs once at boot: after fixing the
-secret, URL, or registration, restart the machines (`fly secrets set` already does).
+secret, URL, or registration, restart the machines (`fly secrets set` already does). Readiness
+reflects only that boot check, so a credential the platform starts refusing after boot shows as
+500s on authenticated requests and `error` logs (`the platform rejected this resource server's
+credential`), not as a failing `/readyz`.
 
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records.
@@ -147,13 +150,18 @@ Usage backlog (should drain to 0 within seconds of activity). Connect with
 never write:
 
 ```sql
-SELECT count(*), max(attempts), max(last_error) FROM usage_outbox;
+SELECT count(*), max(attempts), max(row_failures), max(last_error) FROM usage_outbox;
 SELECT reason, count(*) FROM usage_outbox_rejected GROUP BY reason;
 ```
 
-A row the platform refuses, or one still unshipped after 20 attempts (about three and a half
-hours of failures), moves to `usage_outbox_rejected` with its reason and is logged at `error`;
-those rows are kept 90 days.
+A row the platform refuses (in its receipt, or alone: a batch refused whole is resent in halves
+until the refused events stand alone), or one whose batch came back 20 times with a receipt that
+did not account for it (`row_failures`), moves to `usage_outbox_rejected` with its reason and is
+logged at `error`; those rows are kept 90 days. Anything else (the platform down, rate limiting,
+the credential refused) never gives a row up: it stays in `usage_outbox`, retried with backoff
+up to every 15 minutes and still counted toward its period's quota, until it ships. A final
+flush on shutdown that cannot reach the platform is logged at `warn` and does not fail the
+exit; the next start ships those rows.
 
 ## Deploys
 

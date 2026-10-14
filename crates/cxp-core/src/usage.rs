@@ -10,11 +10,17 @@
 //! - **Shipping is a background task** ([`run`]) that posts rows to the
 //!   platform and deletes what it answered for. The platform dedupes on the
 //!   row's `event_id`, so retries are free.
-//! - **Nothing retries forever.** A row the platform refuses (in its receipt,
-//!   or by refusing the whole batch with a 4xx about the batch itself), or one
-//!   still unshipped after [`MAX_SHIP_ATTEMPTS`] attempts, moves to
-//!   `usage_outbox_rejected` with the reason, logged at `error`. The sweep
-//!   forgets those after `platform_events::REJECTED_USAGE_KEEP_DAYS`.
+//! - **Only the rows' own faults give a row up.** A row the platform refuses
+//!   in its receipt, or alone (a whole-batch 4xx refusal is split in halves
+//!   and resent until the refused events stand alone), or one whose batch
+//!   came back with a receipt that does not account for it
+//!   [`MAX_ROW_FAILURES`] times, moves to `usage_outbox_rejected` with the
+//!   reason, logged at `error`. A failure that is not about the rows (the
+//!   platform unreachable, a 5xx, 408, or 429, this service's credential
+//!   refused, the org or URL unknown) keeps every row in the outbox, retried
+//!   with backoff for as long as it lasts and still counted toward its
+//!   period's quota. The sweep forgets rejected rows after
+//!   `platform_events::REJECTED_USAGE_KEEP_DAYS`.
 //! - **Enforcing** reads the platform's cached usage status (and counts this
 //!   org's unshipped rows from the platform's current billing period on top).
 //!   Off by default (`CXP_ENFORCE_QUOTAS`). If the platform cannot answer, the
@@ -54,11 +60,11 @@ const QUOTA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const FAIL_OPEN_FOR: Duration = Duration::from_secs(5);
 /// The share of the allowance at or past which [`Status::warning`] is set.
 pub const WARN_AT: f64 = 0.8;
-/// How many times a usage row is offered to the platform before it is given
-/// up on and moved to `usage_outbox_rejected`. With the default backoff
-/// (5 s doubling to 15 min) that is roughly three and a half hours of
-/// failures.
-pub const MAX_SHIP_ATTEMPTS: i32 = 20;
+/// How many failures about a usage row itself (see
+/// [`ShipError::faults_the_rows`]) it survives before it is given up on and
+/// moved to `usage_outbox_rejected`. Failures that are not about the rows
+/// never count: those rows are retried, with backoff, until they ship.
+pub const MAX_ROW_FAILURES: i32 = 20;
 
 #[derive(Clone)]
 pub struct Meter {
@@ -200,7 +206,11 @@ impl Meter {
 
     /// The org's standing, for the free `whoami` and `usage` tools.
     pub async fn report(&self, org: OrgId) -> Result<Status> {
-        let usage = self.platform.usage_status(org.as_uuid()).await?;
+        let usage = self
+            .platform
+            .usage_status(org.as_uuid())
+            .await
+            .map_err(|e| Error::platform_for(org, e))?;
         Ok(Status::new(usage, self.enforce))
     }
 }
@@ -289,20 +299,69 @@ struct Row {
 pub enum ShipError {
     #[error("the platform did not accept the batch: {0}")]
     Platform(#[from] otto_resource::Error),
+    /// The platform answered with a receipt that does not account for every
+    /// event of the batch exactly once, so nothing in it was trusted.
+    #[error("the platform's usage receipt was not trusted: {0}")]
+    Receipt(String),
+    /// A claimed row changed while the platform call was in flight (its
+    /// claim lease ran out and another shipper took it). Nothing was deleted.
+    #[error("the usage outbox changed under a claim: {0}")]
+    Claim(String),
     #[error("outbox database error: {0}")]
     Db(#[from] sqlx::Error),
 }
 
+impl ShipError {
+    /// Whether the failure passes without anyone acting: the platform
+    /// unreachable, failing (5xx), timing out (408), or rate limiting (429),
+    /// or a claim race between shippers. Anything else (this service's
+    /// credential refused, an org or URL the platform does not know, an
+    /// unreadable answer or receipt, the outbox database failing) needs an
+    /// operator. Either way the rows stay in the outbox.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            ShipError::Platform(e) => {
+                e.is_retriable() || matches!(e, otto_resource::Error::Status { status: 408, .. })
+            }
+            ShipError::Claim(_) => true,
+            ShipError::Receipt(_) | ShipError::Db(_) => false,
+        }
+    }
+
+    /// Whether the failure is about the rows themselves, and so counts toward
+    /// [`MAX_ROW_FAILURES`]: a receipt that does not account for them, or a
+    /// 4xx refusal of them. Never a transport failure, a 5xx, 408, or 429,
+    /// this service's credential refused (401/403), or an org or URL the
+    /// platform does not know (404, `NotFound`, `InvalidUrl`): rows waiting on
+    /// those are retried until they ship.
+    pub fn faults_the_rows(&self) -> bool {
+        match self {
+            ShipError::Receipt(_) => true,
+            ShipError::Platform(e) => refuses_batch(e),
+            ShipError::Claim(_) | ShipError::Db(_) => false,
+        }
+    }
+}
+
 /// Claim a batch of due rows, ship them, delete what the platform answered
-/// for. Returns how many rows were claimed. Never loses a row: on a failure
-/// that can pass nothing is deleted and the rows are rescheduled with
-/// backoff. Rows the platform refused (in its receipt, or by refusing the
-/// whole batch), and rows that have failed [`MAX_SHIP_ATTEMPTS`] times, move
-/// to `usage_outbox_rejected` with the reason.
+/// for. Returns how many rows were claimed. Never loses a row: whatever was
+/// not answered for is rescheduled with backoff.
+///
+/// - Events the platform refuses in its receipt move to
+///   `usage_outbox_rejected` with its reason.
+/// - A batch it refuses whole (a 4xx about the request, 413 included; see
+///   `refuses_batch`) is split in halves and each half resent, recursively,
+///   so one bad event cannot take the rest down with it. Only an event that
+///   is still refused when sent alone moves to `usage_outbox_rejected`.
+/// - Any other failure keeps the rows it covers, and every piece not yet
+///   sent, for the next pass. Only failures about the rows themselves
+///   ([`ShipError::faults_the_rows`]) count toward [`MAX_ROW_FAILURES`].
 ///
 /// A receipt is trusted only if it accounts for every event exactly once:
 /// its counts add up to the batch, and its rejected ids are distinct and all
-/// in the batch. Anything else keeps every row and retries the batch.
+/// in the batch. Anything else keeps every row of that batch and retries it.
+///
+/// Returns the first failure, if any piece failed, after settling the rest.
 ///
 /// Runs unpinned across every org, in maintenance transactions
 /// (`crate::maintenance`).
@@ -344,61 +403,114 @@ pub async fn ship_once(
         })
         .collect();
 
-    let receipt = match platform.ship_usage(&events).await {
-        Ok(r) => r,
-        Err(e) if refuses_batch(&e) => {
-            let reason = format!("the platform refused the batch: {e}");
-            tracing::error!(rows = ids.len(), error = %e,
-                "the platform refused a usage batch outright; moving it to usage_outbox_rejected");
-            let mut tx = crate::maintenance::begin(db).await?;
-            move_to_rejected(&mut tx, &ids, &reason).await?;
-            tx.commit().await?;
-            return Err(e.into());
+    // Rows the platform answered for (to delete), and which of those it
+    // refused, with its reason (to move aside).
+    let mut answered: Vec<i64> = Vec::with_capacity(ids.len());
+    let mut refused: Vec<(Uuid, String)> = Vec::new();
+    // Rows to keep and retry, with why.
+    let mut failed: Vec<(Vec<i64>, ShipError)> = Vec::new();
+    // Ranges of `events` still to send, the next one last.
+    let mut pending: Vec<std::ops::Range<usize>> = Vec::new();
+    pending.push(0..events.len());
+    while let Some(range) = pending.pop() {
+        let batch = &events[range.clone()];
+        match platform.ship_usage(batch).await {
+            Ok(receipt) => match check_receipt(&receipt, batch) {
+                Ok(()) => {
+                    answered.extend_from_slice(&ids[range]);
+                    refused.extend(receipt.rejected.into_iter().map(|r| (r.event_id, r.reason)));
+                }
+                Err(msg) => {
+                    tracing::error!("{msg}; keeping every row of that batch and retrying it");
+                    failed.push((ids[range].to_vec(), ShipError::Receipt(msg)));
+                }
+            },
+            Err(e) if refuses_batch(&e) && batch.len() > 1 => {
+                tracing::warn!(events = batch.len(), error = %e,
+                    "the platform refused a usage batch; resending it in halves to find the \
+                     events it refuses");
+                let mid = range.start + batch.len() / 2;
+                pending.push(mid..range.end);
+                pending.push(range.start..mid);
+            }
+            Err(e) if refuses_batch(&e) => {
+                answered.push(ids[range.start]);
+                refused.push((
+                    batch[0].event_id,
+                    format!("the platform refused this event: {e}"),
+                ));
+            }
+            Err(e) => {
+                // Every piece not yet sent would meet the same platform: keep
+                // them all for the next pass rather than wait out a failure
+                // per piece.
+                let mut kept = ids[range].to_vec();
+                for rest in pending.drain(..) {
+                    kept.extend_from_slice(&ids[rest]);
+                }
+                failed.push((kept, e.into()));
+            }
         }
-        Err(e) => {
-            reschedule(db, &ids, &e.to_string(), cfg).await;
-            return Err(e.into());
-        }
-    };
-    if let Err(msg) = check_receipt(&receipt, &events) {
-        tracing::error!("{msg}; keeping every row and retrying the batch");
-        reschedule(db, &ids, &msg, cfg).await;
-        return Err(otto_resource::Error::Decode(msg).into());
     }
 
+    if !answered.is_empty() {
+        match settle(db, &answered, &refused).await {
+            Ok(()) => {}
+            Err(e @ ShipError::Claim(_)) => {
+                // Rolled back, so nothing is deleted on answers this pass
+                // could not match up.
+                tracing::error!(error = %e, "keeping every row and retrying the batch");
+                reschedule(db, &ids, &e, cfg).await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let mut first = None;
+    for (kept, e) in failed {
+        reschedule(db, &kept, &e, cfg).await;
+        first.get_or_insert(e);
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(ids.len()),
+    }
+}
+
+/// In one transaction, move each `refused` event (which must be among the
+/// `answered` rows) to `usage_outbox_rejected` with its reason, then delete
+/// every `answered` row. A refused event that does not match exactly one
+/// answered row (it changed under the claim lease) rolls everything back.
+async fn settle(
+    db: &Db,
+    answered: &[i64],
+    refused: &[(Uuid, String)],
+) -> std::result::Result<(), ShipError> {
     let mut tx = crate::maintenance::begin(db).await?;
-    for r in &receipt.rejected {
-        tracing::error!(event_id = %r.event_id, reason = %r.reason,
+    for (event_id, reason) in refused {
+        tracing::error!(%event_id, %reason,
             "the platform refused a usage event; moving it to usage_outbox_rejected");
         let moved = sqlx::query(&format!(
             "{MOVE_TO_REJECTED} AND event_id = $3 {INSERT_REJECTED} left($2, 500) FROM moved"
         ))
-        .bind(&ids)
-        .bind(&r.reason)
-        .bind(r.event_id)
+        .bind(answered)
+        .bind(reason)
+        .bind(event_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
         if moved != 1 {
-            // Validated above, so only a row that changed under the claim
-            // lease gets here. Roll back, so nothing is deleted on a receipt
-            // this pass could not match up.
-            drop(tx);
-            let msg = format!(
-                "moving rejected usage event {} affected {moved} rows, not 1",
-                r.event_id
-            );
-            tracing::error!("{msg}; keeping every row and retrying the batch");
-            reschedule(db, &ids, &msg, cfg).await;
-            return Err(otto_resource::Error::Decode(msg).into());
+            return Err(ShipError::Claim(format!(
+                "moving rejected usage event {event_id} affected {moved} rows, not 1"
+            )));
         }
     }
     sqlx::query("DELETE FROM usage_outbox WHERE id = ANY($1)")
-        .bind(&ids)
+        .bind(answered)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(ids.len())
+    Ok(())
 }
 
 /// The start of a statement moving claimed rows (`$1`, ids) into
@@ -407,31 +519,16 @@ pub async fn ship_once(
 const MOVE_TO_REJECTED: &str = "WITH moved AS ( \
        DELETE FROM usage_outbox WHERE id = ANY($1)";
 const INSERT_REJECTED: &str = "RETURNING event_id, org_id, user_id, tool, billable, occurred_at, \
-       attempts) \
+       attempts, row_failures) \
      INSERT INTO usage_outbox_rejected \
        (event_id, org_id, user_id, tool, billable, occurred_at, reason) \
      SELECT event_id, org_id, user_id, tool, billable, occurred_at,";
 
-/// Move every row of `ids` to `usage_outbox_rejected` with `reason`.
-async fn move_to_rejected(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
-    ids: &[i64],
-    reason: &str,
-) -> sqlx::Result<u64> {
-    Ok(sqlx::query(&format!(
-        "{MOVE_TO_REJECTED} {INSERT_REJECTED} left($2, 500) FROM moved"
-    ))
-    .bind(ids)
-    .bind(reason)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected())
-}
-
-/// Whether the platform refused the batch itself, so that resending it can
-/// never succeed: a 4xx about the request. Not this service's credential
-/// (401/403), a wrong URL (404), a timeout (408), or rate limiting (429):
-/// those are fixed on this side or pass, and the batch is fine.
+/// Whether the platform refused the request itself, so that resending it
+/// unchanged can never succeed: a 4xx about the request (413 included). Not
+/// this service's credential (401/403), a wrong URL (404), a timeout (408),
+/// or rate limiting (429): those are fixed on this side or pass, and the
+/// events are fine.
 fn refuses_batch(e: &otto_resource::Error) -> bool {
     matches!(e, otto_resource::Error::Status { status, .. }
         if (400..500).contains(status) && ![401, 403, 404, 408, 429].contains(status))
@@ -468,25 +565,28 @@ fn check_receipt(
     Ok(())
 }
 
-async fn reschedule(db: &Db, ids: &[i64], error: &str, cfg: &ShipperConfig) {
-    if let Err(e) = try_reschedule(db, ids, error, cfg).await {
+async fn reschedule(db: &Db, ids: &[i64], failure: &ShipError, cfg: &ShipperConfig) {
+    if let Err(e) = try_reschedule(db, ids, failure, cfg).await {
         // The claim lease still holds the rows back; this only delays a retry.
         tracing::warn!(error = %e, "could not record a usage shipping failure");
     }
 }
 
-/// Back the rows off, then give up on any that have now failed
-/// [`MAX_SHIP_ATTEMPTS`] times.
+/// Back the rows off and record why. A failure about the rows themselves
+/// ([`ShipError::faults_the_rows`]) also counts against them, and any that
+/// have now had [`MAX_ROW_FAILURES`] of those are given up on; any other
+/// failure leaves them to retry until they ship.
 async fn try_reschedule(
     db: &Db,
     ids: &[i64],
-    error: &str,
+    failure: &ShipError,
     cfg: &ShipperConfig,
 ) -> sqlx::Result<()> {
-    let error: String = error.chars().take(400).collect();
+    let error: String = failure.to_string().chars().take(400).collect();
+    let counts = failure.faults_the_rows();
     let mut tx = crate::maintenance::begin(db).await?;
     sqlx::query(
-        "UPDATE usage_outbox SET last_error = $2, \
+        "UPDATE usage_outbox SET last_error = $2, row_failures = row_failures + $5, \
                 next_attempt_at = now() + make_interval(secs => \
                     LEAST($3::float8 * power(2, LEAST(attempts - 1, 20)), $4::float8)) \
          WHERE id = ANY($1)",
@@ -495,21 +595,27 @@ async fn try_reschedule(
     .bind(&error)
     .bind(cfg.base_backoff.as_secs_f64())
     .bind(cfg.max_backoff.as_secs_f64())
+    .bind(i32::from(counts))
     .execute(&mut *tx)
     .await?;
-    let gave_up = sqlx::query(&format!(
-        "{MOVE_TO_REJECTED} AND attempts >= $3 {INSERT_REJECTED} \
-         'not shipped after ' || attempts || ' attempts; last error: ' || $2 FROM moved"
-    ))
-    .bind(ids)
-    .bind(&error)
-    .bind(MAX_SHIP_ATTEMPTS)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let gave_up = if counts {
+        sqlx::query(&format!(
+            "{MOVE_TO_REJECTED} AND row_failures >= $3 {INSERT_REJECTED} \
+             'given up after ' || row_failures || ' failures about the row itself; \
+             last error: ' || $2 FROM moved"
+        ))
+        .bind(ids)
+        .bind(&error)
+        .bind(MAX_ROW_FAILURES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
     tx.commit().await?;
     if gave_up > 0 {
-        tracing::error!(rows = gave_up, attempts = MAX_SHIP_ATTEMPTS, last_error = %error,
+        tracing::error!(rows = gave_up, failures = MAX_ROW_FAILURES, last_error = %error,
             "gave up shipping usage; moved to usage_outbox_rejected");
     }
     Ok(())
@@ -517,7 +623,11 @@ async fn try_reschedule(
 
 /// Drain the outbox until `shutdown` flips, with a final pass on the way out.
 /// Returns that final pass's failure, if it failed (the rows stay in the
-/// outbox for the next start), so the process can exit non-zero.
+/// outbox for the next start); the caller decides with
+/// [`ShipError::is_retriable`] whether that should fail the exit.
+///
+/// A failure that passes on its own is logged at `warn`; one that needs an
+/// operator at `error`.
 pub async fn run(
     db: Db,
     platform: Arc<PlatformClient>,
@@ -543,12 +653,16 @@ pub async fn run(
                     .min(Duration::from_secs(60));
                 match &e {
                     ShipError::Platform(otto_resource::Error::Unauthorized) => tracing::error!(
-                        "the platform rejected this resource server's credential; usage is \
-                         accumulating in the outbox. Check CXP_INTROSPECTION_SECRET"
+                        retry_in = ?wait,
+                        "the platform rejected this resource server's credential; usage stays in \
+                         the outbox and is retried until the platform accepts it. Check \
+                         CXP_INTROSPECTION_SECRET"
                     ),
-                    other => {
-                        tracing::warn!(error = %other, retry_in = ?wait, "usage shipping failed")
-                    }
+                    e if e.is_retriable() => tracing::warn!(error = %e, retry_in = ?wait,
+                        "usage shipping failed; the rows stay in the outbox and are retried"),
+                    e => tracing::error!(error = %e, retry_in = ?wait,
+                        "usage shipping failed and needs attention; the rows stay in the outbox \
+                         and are retried"),
                 }
                 wait
             }
@@ -559,8 +673,14 @@ pub async fn run(
                 return match ship_once(&db, &platform, &cfg).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
-                        tracing::error!(error = %e,
-                            "final usage flush failed; rows stay in the outbox");
+                        if e.is_retriable() {
+                            tracing::warn!(error = %e,
+                                "the final usage flush could not ship; rows stay in the outbox \
+                                 for the next start");
+                        } else {
+                            tracing::error!(error = %e,
+                                "final usage flush failed; rows stay in the outbox");
+                        }
                         Err(e)
                     }
                 };
@@ -627,5 +747,66 @@ mod tests {
         assert_eq!(s.remaining, 0);
         assert_eq!(s.plan, "Team");
         assert_eq!(s.total_calls, 153);
+    }
+    fn status(status: u16) -> ShipError {
+        ShipError::Platform(otto_resource::Error::Status {
+            status,
+            body: String::new(),
+        })
+    }
+
+    /// Only failures about the rows count toward giving them up; everything
+    /// else (unreachable, overloaded, rate limited, a refused credential, an
+    /// org or URL the platform does not know) is retried until it ships.
+    #[test]
+    fn only_failures_about_the_rows_count_toward_giving_up() {
+        for counts in [
+            status(400),
+            status(413),
+            status(422),
+            ShipError::Receipt("short".into()),
+        ] {
+            assert!(counts.faults_the_rows(), "{counts}");
+        }
+        for never in [
+            status(401),
+            status(403),
+            status(404),
+            status(408),
+            status(429),
+            status(500),
+            status(503),
+            ShipError::Platform(otto_resource::Error::Unauthorized),
+            ShipError::Platform(otto_resource::Error::NotFound),
+            ShipError::Platform(otto_resource::Error::InvalidUrl("x".into())),
+            ShipError::Platform(otto_resource::Error::Decode("x".into())),
+            ShipError::Claim("raced".into()),
+            ShipError::Db(sqlx::Error::PoolTimedOut),
+        ] {
+            assert!(!never.faults_the_rows(), "{never}");
+        }
+    }
+
+    #[test]
+    fn only_failures_that_pass_on_their_own_are_retriable() {
+        for passes in [
+            status(408),
+            status(429),
+            status(500),
+            status(503),
+            ShipError::Claim("raced".into()),
+        ] {
+            assert!(passes.is_retriable(), "{passes}");
+        }
+        for needs_attention in [
+            status(400),
+            status(404),
+            ShipError::Platform(otto_resource::Error::Unauthorized),
+            ShipError::Platform(otto_resource::Error::NotFound),
+            ShipError::Receipt("short".into()),
+            ShipError::Db(sqlx::Error::PoolTimedOut),
+        ] {
+            assert!(!needs_attention.is_retriable(), "{needs_attention}");
+        }
     }
 }
