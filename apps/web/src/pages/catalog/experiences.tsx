@@ -82,10 +82,10 @@ function ExperienceDialog({
     defaultValues: {
       name: editing?.name ?? "",
       description: editing?.description ?? "",
-      team_id: editing?.team_id ?? "",
+      team_id: editing?.teamId ?? "",
     },
     values: editing
-      ? { name: editing.name, description: editing.description ?? "", team_id: editing.team_id ?? "" }
+      ? { name: editing.name, description: editing.description ?? "", team_id: editing.teamId ?? "" }
       : undefined,
   });
 
@@ -257,13 +257,13 @@ export function ExperiencesPage() {
                   <TableCell><CopyableId value={exp.id} /></TableCell>
                   <TableCell className="font-medium">{exp.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {exp.team_id ? teamName(exp.team_id) : "—"}
+                    {exp.teamId ? teamName(exp.teamId) : "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell max-w-[300px] truncate text-muted-foreground text-sm">
                     {exp.description ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                    {new Date(exp.created_at).toLocaleDateString()}
+                    {new Date(exp.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">

@@ -87,10 +87,10 @@ function ComponentDialog({
     resolver: zodResolver(componentSchema),
     values: editing
       ? {
-          page_id: editing.page_id ?? undefined,
-          team_id: editing.team_id ?? "",
+          page_id: editing.pageId ?? undefined,
+          team_id: editing.teamId ?? "",
           name: editing.name,
-          component_type: editing.component_type ?? "",
+          component_type: editing.componentType ?? "",
           description: editing.description ?? "",
         }
       : undefined,
@@ -385,19 +385,19 @@ export function ComponentsPage() {
                   <TableCell><CopyableId value={comp.id} /></TableCell>
                   <TableCell className="font-medium">{comp.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {comp.team_id ? teamName(comp.team_id) : "—"}
+                    {comp.teamId ? teamName(comp.teamId) : "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
-                    {comp.component_type ?? "—"}
+                    {comp.componentType ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm">
-                    {comp.page_id ? pageName(comp.page_id) : "—"}
+                    {comp.pageId ? pageName(comp.pageId) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {comp.description ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                    {new Date(comp.created_at).toLocaleDateString()}
+                    {new Date(comp.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">

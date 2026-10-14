@@ -87,8 +87,8 @@ function ApplicationDialog({
     resolver: zodResolver(applicationSchema),
     values: editing
       ? {
-          experience_id: editing.experience_id ?? undefined,
-          team_id: editing.team_id ?? "",
+          experience_id: editing.experienceId ?? undefined,
+          team_id: editing.teamId ?? "",
           name: editing.name,
           description: editing.description ?? "",
           platform: editing.platform ?? "",
@@ -374,19 +374,19 @@ export function ApplicationsPage() {
                   <TableCell><CopyableId value={app.id} /></TableCell>
                   <TableCell className="font-medium">{app.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {app.team_id ? teamName(app.team_id) : "—"}
+                    {app.teamId ? teamName(app.teamId) : "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm text-muted-foreground">
                     {app.platform ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm">
-                    {app.experience_id ? experienceName(app.experience_id) : "—"}
+                    {app.experienceId ? experienceName(app.experienceId) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {app.description ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                    {new Date(app.created_at).toLocaleDateString()}
+                    {new Date(app.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
