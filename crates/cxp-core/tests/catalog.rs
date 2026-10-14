@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{db, org};
+use common::{db, org, team_platform};
 use cxp_core::catalog::*;
 use cxp_core::dashboard::DashboardExt;
 use cxp_core::{Error, Page};
@@ -67,13 +67,15 @@ async fn run_sql(db: &Db, org: OrgId, arg: Uuid, sql: &str) {
 async fn experience_crud(pool: PgPool) {
     let db = db(pool);
     let o = org();
+    let platform = team_platform().await;
+    let verified = platform.team(o).await;
+    let team = verified.id();
     let mut tx = db.begin(o).await.unwrap();
-    let team = Uuid::new_v4();
     let e = tx
         .create_experience(&NewExperience {
             name: "Checkout".into(),
             description: Some("the flow".into()),
-            team_id: Some(team),
+            team: Some(verified),
             metadata: Some(json!({"k": 1})),
         })
         .await
@@ -326,13 +328,14 @@ async fn lists_filter_page_and_count(pool: PgPool) {
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
     let db = db(pool);
-    let mut tx = db.begin(org()).await.unwrap();
-    let t1 = Uuid::new_v4();
-    let t2 = Uuid::new_v4();
+    let o = org();
+    let platform = team_platform().await;
+    let (t1, t2) = (platform.team(o).await, platform.team(o).await);
+    let mut tx = db.begin(o).await.unwrap();
 
     let e = tx
         .create_experience(&NewExperience {
-            team_id: Some(t1),
+            team: Some(t1),
             ..exp("E")
         })
         .await
@@ -341,7 +344,7 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         .update_experience(e.id, &ExperienceUpdate::default())
         .await
         .unwrap();
-    assert_eq!(kept.team_id, Some(t1));
+    assert_eq!(kept.team_id, Some(t1.id()));
     let set = tx
         .update_experience(
             e.id,
@@ -352,7 +355,7 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(set.team_id, Some(t2));
+    assert_eq!(set.team_id, Some(t2.id()));
     let cleared = tx
         .update_experience(
             e.id,
@@ -376,11 +379,11 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(again.team_id, Some(t1));
+    assert_eq!(again.team_id, Some(t1.id()));
 
     let a = tx
         .create_application(&NewApplication {
-            team_id: Some(t1),
+            team: Some(t1),
             ..app(None, "A")
         })
         .await
@@ -406,16 +409,16 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(a.team_id, Some(t2));
+    assert_eq!(a.team_id, Some(t2.id()));
     let a = tx
         .update_application(a.id, &ApplicationUpdate::default())
         .await
         .unwrap();
-    assert_eq!(a.team_id, Some(t2));
+    assert_eq!(a.team_id, Some(t2.id()));
 
     let p = tx
         .create_page(&NewPage {
-            team_id: Some(t1),
+            team: Some(t1),
             ..page(None, "P")
         })
         .await
@@ -441,18 +444,18 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(p.team_id, Some(t2));
+    assert_eq!(p.team_id, Some(t2.id()));
     assert_eq!(
         tx.update_page(p.id, &PageUpdate::default())
             .await
             .unwrap()
             .team_id,
-        Some(t2)
+        Some(t2.id())
     );
 
     let c = tx
         .create_component(&NewComponent {
-            team_id: Some(t1),
+            team: Some(t1),
             ..comp(None, "C")
         })
         .await
@@ -478,22 +481,14 @@ async fn team_keep_clear_set_on_every_entity(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(c.team_id, Some(t2));
+    assert_eq!(c.team_id, Some(t2.id()));
     assert_eq!(
         tx.update_component(c.id, &ComponentUpdate::default())
             .await
             .unwrap()
             .team_id,
-        Some(t2)
+        Some(t2.id())
     );
-}
-
-#[test]
-fn team_change_from_nested_maps_absent_null_and_id() {
-    let id = Uuid::new_v4();
-    assert_eq!(TeamChange::from_nested(None), TeamChange::Keep);
-    assert_eq!(TeamChange::from_nested(Some(None)), TeamChange::Clear);
-    assert_eq!(TeamChange::from_nested(Some(Some(id))), TeamChange::Set(id));
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -913,4 +908,30 @@ async fn blank_names_are_invalid_on_create_and_update(pool: PgPool) {
     // Nothing was written, and the names are unchanged.
     assert_eq!(tx.list_experiences(Page::default()).await.unwrap().1, 1);
     assert_eq!(tx.get_experience(e.id).await.unwrap().name, "E");
+}
+
+/// A team id becomes storable only through `verify_team`: one the platform
+/// knows in this org verifies; an unknown one, or another org's, is
+/// `unknown_team`; a platform that cannot answer is `unavailable`.
+#[tokio::test]
+async fn verify_team_accepts_only_this_orgs_teams() {
+    let platform = team_platform().await;
+    let (o, other) = (org(), org());
+    let mine = platform.add(o);
+    let theirs = platform.add(other);
+
+    let v = verify_team(&platform.client, o, mine).await.unwrap();
+    assert_eq!(v.id(), mine);
+
+    for id in [theirs, Uuid::new_v4()] {
+        let e = verify_team(&platform.client, o, id).await.unwrap_err();
+        assert!(matches!(e, Error::UnknownTeam), "{e:?}");
+        assert_eq!(e.code(), "unknown_team");
+    }
+
+    platform.set_down(true);
+    let e = verify_team(&platform.client, o, mine).await.unwrap_err();
+    assert!(matches!(e, Error::Platform(_)), "{e:?}");
+    assert_eq!(e.code(), "unavailable");
+    assert!(e.retriable());
 }
