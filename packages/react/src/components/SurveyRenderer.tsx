@@ -85,19 +85,31 @@ const DEMO_SURVEY: Survey = {
 };
 
 /**
+ * Older docs described the question kind as `type`; `questionType` is the
+ * canonical key. `nps` is a 0-10 rating, which the rating question (a fixed
+ * 1-10 button row, no configurable scale) renders as `rating`.
+ */
+function normalizeQuestionType(q: Record<string, unknown>): string | undefined {
+  const kind = typeof q["questionType"] === "string" ? q["questionType"] : q["type"];
+  if (typeof kind !== "string") return undefined;
+  return kind === "nps" ? "rating" : kind;
+}
+
+/**
  * The server stores survey questions as free-form JSON. Keep only the entries
- * that have the shape this component can render.
+ * that have the shape this component can render, accepting `type` as an alias
+ * of `questionType`.
  */
 function parseQuestions(value: Survey["questions"]): SurveyQuestion[] {
   if (!Array.isArray(value)) return [];
-  return value.filter((q) => {
-    if (typeof q !== "object" || q === null || Array.isArray(q)) return false;
-    return (
-      typeof q["id"] === "string" &&
-      typeof q["text"] === "string" &&
-      typeof q["questionType"] === "string"
-    );
-  }) as unknown as SurveyQuestion[];
+  const out: SurveyQuestion[] = [];
+  for (const q of value) {
+    if (typeof q !== "object" || q === null || Array.isArray(q)) continue;
+    const questionType = normalizeQuestionType(q);
+    if (typeof q["id"] !== "string" || typeof q["text"] !== "string" || !questionType) continue;
+    out.push({ ...q, questionType } as unknown as SurveyQuestion);
+  }
+  return out;
 }
 
 /**
