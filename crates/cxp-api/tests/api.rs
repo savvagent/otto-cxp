@@ -47,6 +47,8 @@ struct Platform {
     introspection_down: bool,
     /// Answer team and member-team lookups with a 503.
     teams_down: bool,
+    /// Report the org's allowance used up with a hard stop.
+    blocked: bool,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -138,15 +140,16 @@ async fn team(
     }
 }
 
-async fn usage_status(Path(org): Path<Uuid>) -> Json<Value> {
+async fn usage_status(State(p): State<Shared>, Path(org): Path<Uuid>) -> Json<Value> {
+    let blocked = p.lock().unwrap().blocked;
     Json(json!({
         "org_id": org,
         "plan": "team",
         "period_start": Utc::now().date_naive(),
-        "billable_count": 0,
+        "billable_count": if blocked { 1000 } else { 0 },
         "total_count": 0,
         "included_ops": 1000,
-        "hard_stop": false,
+        "hard_stop": blocked,
     }))
 }
 
@@ -214,12 +217,17 @@ struct Harness {
 }
 
 async fn harness_with(pool: PgPool, webhook_secret: &str) -> Harness {
+    harness_opts(pool, webhook_secret, false).await
+}
+
+/// [`harness_with`], with the meter enforcing quotas when `enforce` is set.
+async fn harness_opts(pool: PgPool, webhook_secret: &str, enforce: bool) -> Harness {
     let (base, stub) = start_platform().await;
     let platform =
         Arc::new(PlatformClient::new(ClientConfig::new(base, RESOURCE, "otto_rs_test")).unwrap());
     let meter = Arc::new(Meter::new(
         platform.clone(),
-        false,
+        enforce,
         "https://otto.example.com",
     ));
     let state = AppState::new(
@@ -1123,4 +1131,43 @@ async fn bodies_over_256_kib_are_413(pool: PgPool) {
         h.webhook(Some(&sig), &body).await.status,
         StatusCode::PAYLOAD_TOO_LARGE
     );
+}
+
+/// The console's billable route is refused like the billable tool once the
+/// org's allowance is used up (enforcing meter): 429 `quota_exceeded`,
+/// nothing created, nothing recorded. Free routes still work.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_org_over_its_allowance_cannot_create_a_survey_over_rest(pool: PgPool) {
+    let h = harness_opts(pool, SECRET, true).await;
+    h.stub.lock().unwrap().blocked = true;
+    let (org, _, t) = h.caller(RW);
+
+    let r = h
+        .call(
+            "POST",
+            "/api/v1/surveys",
+            Some(&t),
+            Some(json!({"title": "NPS", "questions": []})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    assert_eq!(r.body["code"], "quota_exceeded");
+    let surveys: i64 = sqlx::query_scalar("SELECT count(*) FROM surveys WHERE org_id = $1")
+        .bind(org)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(surveys, 0, "nothing created");
+    assert!(h.outbox().await.is_empty(), "nothing recorded");
+
+    let r = h
+        .call(
+            "POST",
+            "/api/v1/customers",
+            Some(&t),
+            Some(json!({"email": "still@example.com"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(h.outbox().await.is_empty());
 }

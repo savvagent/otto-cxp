@@ -219,6 +219,7 @@ async fn server(pool: PgPool) -> Server {
         platform.clone(),
         meter(platform.clone(), &config),
         &config,
+        cxp_server::PlatformCheck::Accepted,
     )
     .unwrap();
     Server {
@@ -1993,4 +1994,49 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
             .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
         from += at + line.len();
     }
+}
+
+/// A database where one tenant table no longer enforces row-level security
+/// is refused before anything is served: `run` returns the refusal and never
+/// accepts a connection. (`NO FORCE` alone would not break it here: the
+/// tenant role `otto_app` does not own the table, so RLS still applies to it,
+/// and the boot proof knows that.)
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_server_refuses_to_serve_when_tenant_isolation_is_broken(pool: PgPool) {
+    // Every callsite this boot logs through gets an interest computed with a
+    // subscriber present, so the log assertions of the other boot test, run
+    // concurrently on another thread, see their lines.
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(Logs::default)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    sqlx::query("ALTER TABLE customers DISABLE ROW LEVEL SECURITY")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut database_url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    database_url.set_path(pool.connect_options().get_database().unwrap());
+    let mut config = Config::for_test();
+    config.database_url = database_url.to_string();
+    config.bind = addr;
+    config.public_url = format!("http://{addr}");
+    config.resource_uri = format!("http://{addr}/mcp");
+    config.platform_url = base;
+
+    // The shutdown signal never fires: only a refusal can end this.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(err.contains("refusing to serve"), "{err}");
+    // Nothing listens: the listener was dropped with the refusal.
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
 }

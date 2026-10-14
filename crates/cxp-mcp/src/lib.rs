@@ -54,14 +54,23 @@ pub struct Config {
     /// Accepted `Host` headers (DNS-rebinding protection); a request with any
     /// other `Host` is refused with `403`. rmcp's default is loopback only,
     /// which rejects every request to a hosted server, so it is required
-    /// here. **An empty list means "allow any host"** (rmcp's
-    /// `disable_allowed_hosts`), so never pass one in production: cxp-server
-    /// always passes at least the host of its public URL.
+    /// here. rmcp reads an empty list as "allow any host", so [`router`]
+    /// refuses one (and a list of only blank entries) rather than serve `/mcp`
+    /// open to DNS rebinding.
     pub allowed_hosts: Vec<String>,
     /// Accepted browser `Origin`s; empty disables the check (CLI agents send
     /// none).
     pub allowed_origins: Vec<String>,
 }
+
+/// [`router`] was given no allowed `Host`, which rmcp would read as "accept
+/// any". Fails closed at the crate boundary, whoever the caller is.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "no Host header would be accepted on /mcp, and rmcp reads an empty allowed-host list as \
+     \"accept any\"; give at least one allowed host"
+)]
+pub struct NoAllowedHosts;
 
 /// What the auth middleware and the metadata route share.
 #[derive(Clone)]
@@ -79,7 +88,18 @@ pub(crate) struct Shared {
 ///
 /// Stateless transport with JSON responses: nothing is pushed to a client, so
 /// any replica can serve any request without sticky sessions.
-pub fn router(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>, config: Config) -> Router {
+///
+/// Refuses ([`NoAllowedHosts`]) a [`Config::allowed_hosts`] with no
+/// non-blank entry.
+pub fn router(
+    db: Db,
+    platform: Arc<PlatformClient>,
+    meter: Arc<Meter>,
+    config: Config,
+) -> Result<Router, NoAllowedHosts> {
+    if config.allowed_hosts.iter().all(|h| h.trim().is_empty()) {
+        return Err(NoAllowedHosts);
+    }
     let shared = Arc::new(Shared {
         db: db.clone(),
         platform: platform.clone(),
@@ -101,7 +121,7 @@ pub fn router(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>, config: 
         transport,
     );
 
-    Router::new()
+    Ok(Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             get(auth::protected_resource_metadata),
@@ -115,7 +135,7 @@ pub fn router(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>, config: 
                     shared,
                     auth::require_bearer,
                 )),
-        )
+        ))
 }
 
 /// Read `/mcp`'s body before rmcp does, through axum's `Bytes` extractor, so

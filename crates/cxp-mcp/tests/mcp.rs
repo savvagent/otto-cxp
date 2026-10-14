@@ -183,7 +183,8 @@ async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
             allowed_hosts: vec![HOST.into()],
             allowed_origins: vec![],
         },
-    );
+    )
+    .unwrap();
     Harness {
         app,
         pool,
@@ -819,4 +820,30 @@ async fn a_foreign_host_header_is_refused(pool: PgPool) {
         .unwrap();
     let (status, _, _) = h.send(req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// rmcp reads an empty allowed-host list as "accept any Host", so the crate
+/// refuses to build a router from one (or from only blank entries) whoever
+/// the caller is.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
+    let (base, _) = start_platform().await;
+    let client =
+        Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
+    for hosts in [vec![], vec![" ".to_string(), String::new()]] {
+        let meter = Arc::new(Meter::new(client.clone(), false, "https://x"));
+        let built = router(
+            Db::from_pool(pool.clone()),
+            client.clone(),
+            meter,
+            Config {
+                public_url: PUBLIC_URL.into(),
+                resource_uri: RESOURCE.into(),
+                platform_url: base.clone(),
+                allowed_hosts: hosts.clone(),
+                allowed_origins: vec![],
+            },
+        );
+        assert_eq!(built.err(), Some(cxp_mcp::NoAllowedHosts), "{hosts:?}");
+    }
 }
