@@ -51,10 +51,10 @@ fn refuse(public_url: &str, failure: AuthFailure) -> Response {
     let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED);
     let mut res = (status, Json(refusal.body)).into_response();
     for (name, value) in refusal.headers {
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            res.headers_mut()
-                .insert(HeaderName::from_static(name), value);
-        }
+        let value =
+            HeaderValue::from_str(&value).expect("cxp_core::auth guarantees header-safe values");
+        res.headers_mut()
+            .insert(HeaderName::from_static(name), value);
     }
     res
 }
@@ -62,10 +62,9 @@ fn refuse(public_url: &str, failure: AuthFailure) -> Response {
 /// The challenge a handler's `401` (`access_revoked`) gets: the one a revoked
 /// token gets here.
 fn revoked_challenge(public_url: &str) -> HeaderValue {
-    auth::refusal(public_url, &AuthFailure::Revoked)
-        .headers
-        .into_iter()
-        .find(|(name, _)| *name == "www-authenticate")
-        .and_then(|(_, v)| HeaderValue::from_str(&v).ok())
-        .unwrap_or_else(|| HeaderValue::from_static("Bearer"))
+    let refusal = auth::refusal(public_url, &AuthFailure::Revoked);
+    let challenge = refusal
+        .www_authenticate()
+        .expect("a 401 refusal carries a challenge");
+    HeaderValue::from_str(challenge).expect("cxp_core::auth guarantees header-safe values")
 }

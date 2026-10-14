@@ -51,11 +51,11 @@ pub(crate) fn refuse(public_url: &str, failure: AuthFailure) -> Response {
     let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::UNAUTHORIZED);
     let mut response = (status, Json(refusal.body)).into_response();
     for (name, value) in refusal.headers {
-        if let Ok(value) = http::HeaderValue::from_str(&value) {
-            response
-                .headers_mut()
-                .insert(http::HeaderName::from_static(name), value);
-        }
+        let value = http::HeaderValue::from_str(&value)
+            .expect("cxp_core::auth guarantees header-safe values");
+        response
+            .headers_mut()
+            .insert(http::HeaderName::from_static(name), value);
     }
     response
 }

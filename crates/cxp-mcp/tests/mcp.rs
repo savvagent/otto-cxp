@@ -310,10 +310,11 @@ async fn a_platform_outage_is_a_503_not_a_401(pool: PgPool) {
     let t = token(&h.platform, Uuid::new_v4(), READ);
     h.platform.lock().unwrap().down = true;
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
-    let (status, headers, _) = h.send(Harness::post(Some(&t), body)).await;
+    let (status, headers, v) = h.send(Harness::post(Some(&t), body)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(headers["retry-after"], "5");
     assert!(headers.get("www-authenticate").is_none());
+    assert_eq!(v["error"], "unavailable");
 }
 
 // ------------------------------------------------------------------- scopes

@@ -245,6 +245,17 @@ pub struct Refusal {
     pub body: serde_json::Value,
 }
 
+impl Refusal {
+    /// The `WWW-Authenticate` value, if this refusal carries one (every `401`
+    /// does; a `503` does not).
+    pub fn www_authenticate(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| *name == "www-authenticate")
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 /// The `Retry-After` seconds sent with a `503`.
 pub const RETRY_AFTER_SECONDS: &str = "5";
 
@@ -478,6 +489,34 @@ mod tests {
         assert_eq!(
             r.headers,
             vec![("www-authenticate", r#"Bearer realm="otto-cxp""#.to_string())]
+        );
+    }
+
+    #[test]
+    fn every_header_value_built_here_is_header_safe() {
+        let hostile = "https://cxp.example.com/\n\u{e9}";
+        let mut values = vec![scope_challenge("cxp:write")];
+        for url in ["https://cxp.example.com/", hostile] {
+            for f in [
+                AuthFailure::Missing,
+                AuthFailure::Inactive,
+                AuthFailure::Revoked,
+                AuthFailure::Unavailable,
+            ] {
+                values.extend(refusal(url, &f).headers.into_iter().map(|(_, v)| v));
+            }
+        }
+        for v in values {
+            assert!(header_safe(&v), "{v:?}");
+        }
+        let fallback = refusal(hostile, &AuthFailure::Revoked);
+        assert_eq!(
+            fallback.www_authenticate(),
+            Some(r#"Bearer realm="otto-cxp""#)
+        );
+        assert_eq!(
+            refusal("https://x", &AuthFailure::Unavailable).www_authenticate(),
+            None
         );
     }
 
