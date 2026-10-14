@@ -41,10 +41,10 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   under row-level security, which `cxp-server` proves at boot
   (`tenant isolation enforced as role "otto_app"`) and refuses to start without; everything
   else (migrations, the sweep and usage shipper, tombstones, `/readyz`) runs as `cxp_server`,
-  which FORCE ROW LEVEL SECURITY binds too. A deployment (a non-loopback `CXP_PUBLIC_URL`)
-  refuses to serve when the connecting role is, or can `SET ROLE` to, a superuser or BYPASSRLS
-  role ([#16](https://github.com/savvagent/otto-cxp/issues/16)), so the role `fly postgres
-  attach` creates, a superuser on the whole instance, is refused.
+  which FORCE ROW LEVEL SECURITY binds too, as long as it does not alter its own tables. A
+  deployment refuses to serve when the connecting role is, or can `SET ROLE` to, a
+  superuser-equivalent role ([#16](https://github.com/savvagent/otto-cxp/issues/16)), so the
+  role `fly postgres attach` creates, a superuser on the whole instance, is refused.
   Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
   planner off some index paths; fine at today's volumes, slow at scale. Making them fast is
   tracked in [#17](https://github.com/savvagent/otto-cxp/issues/17). The pool is
@@ -67,20 +67,36 @@ Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set 
 ## Database role
 
 otto-cxp connects to `otto-db` as `cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB,
-NOCREATEROLE, a member of `otto_app` (so tenant transactions can `SET LOCAL ROLE otto_app`), and
-the owner of database `otto_cxp` and every object in it. Owning the database lets it run
-otto-cxp's migrations (`pg_trgm` is a trusted extension a database owner may create); FORCE ROW
-LEVEL SECURITY binds it as the tables' owner, so its background work reaches other orgs' rows
-only through the maintenance policies. `CONNECT` on `otto_cxp`, `otto_platform`,
-`otto_factory`, and `otto_flags` is revoked from `PUBLIC`, so `cxp_server` can open no other
-service's database. `otto_app` is shared by every otto service, which is one more reason the
-revoke matters: a role that could connect to `otto_platform` would hold whatever `otto_app`
-holds there.
+NOCREATEROLE, NOREPLICATION, a member of `otto_app` (so tenant transactions can `SET LOCAL ROLE
+otto_app`), and the owner of database `otto_cxp` and every object in it. Owning the database
+lets it run otto-cxp's migrations (`pg_trgm` is a trusted extension a database owner may
+create). FORCE ROW LEVEL SECURITY binds it as the tables' owner, so its background work reaches
+other orgs' rows only through the maintenance policies, but only while it leaves its own tables
+alone: an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, `DISABLE ROW LEVEL
+SECURITY`, or `DROP POLICY`, so code running as `cxp_server` could switch RLS off on
+`otto_cxp`'s tables (and nothing beyond them). Splitting the migration owner from the runtime
+role closes that: [#27](https://github.com/savvagent/otto-cxp/issues/27). `CONNECT` on
+`otto_cxp`, `otto_platform`, `otto_factory`, and `otto_flags` is revoked from `PUBLIC`, so
+`cxp_server` can open no other service's database.
 
-A deployment (a non-loopback `CXP_PUBLIC_URL`) refuses to serve as a role that is, or is a
-member of, a superuser or BYPASSRLS role, and logs
-`database role "..." is SUPERUSER: refusing to serve`. A developer's machine (`localhost`) only
-warns, since a local Postgres hands out a superuser.
+`otto_app` is shared by every otto service, which is one more reason the revoke matters: a role
+that could connect to `otto_platform` would hold whatever `otto_app` holds there. So, a rule for
+every service on `otto-db`: **no service may grant `CONNECT`, or any other database-level
+privilege, to `otto_app`**. A grant to it would hand that database to every service's login
+role. Giving each service its own tenant role is
+[#28](https://github.com/savvagent/otto-cxp/issues/28).
+
+A deployment refuses to serve on a superuser-equivalent connection. The process is a
+deployment when `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI` has a non-loopback host, or
+`FLY_APP_NAME` is set (Fly sets it on every machine). Boot reads both the session user (who
+logged in, and who `RESET ROLE` returns to) and the current user, and refuses when either is,
+or is a member of, a role with SUPERUSER, BYPASSRLS, CREATEROLE, or REPLICATION, or is a member
+of `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files`,
+`pg_read_all_data`, or `pg_write_all_data`. It logs, for example,
+`database role "otto_cxp" is SUPERUSER, BYPASSRLS, CREATEROLE, REPLICATION: refusing to serve`,
+or `database role "cxp_server" (session user "otto_cxp"): session user "otto_cxp" is SUPERUSER`
+for a superuser login whose connections `SET ROLE cxp_server`. A developer's machine (loopback
+URLs, no `FLY_APP_NAME`) only warns, since a local Postgres hands out a superuser.
 
 ### Runbook: from the attach role to `cxp_server` (human-only, Rob)
 
@@ -158,6 +174,17 @@ BEGIN
   IF old::text IN ('cxp_server', 'postgres') THEN
     RAISE EXCEPTION 'old_role must be the attach role, not %', old;
   END IF;
+  -- The attach role ran the migrations, so it owns the tables (a fresh setup has none yet).
+  IF to_regclass('public.customers') IS NULL THEN
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public') THEN
+      RAISE EXCEPTION 'public.customers is missing but public is not empty: is this otto_cxp?';
+    END IF;
+  ELSIF (SELECT relowner FROM pg_class WHERE oid = 'public.customers'::regclass) <> old THEN
+    RAISE EXCEPTION 'old_role % does not own public.customers (%): is it the attach role?',
+      old, (SELECT pg_get_userbyid(relowner) FROM pg_class
+            WHERE oid = 'public.customers'::regclass);
+  END IF;
   IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = old AND datname <> 'otto_cxp')
      OR EXISTS (SELECT 1 FROM pg_tablespace WHERE spcowner = old) THEN
     RAISE EXCEPTION '% owns a database or tablespace besides otto_cxp, which REASSIGN OWNED would move too', old;
@@ -207,9 +234,10 @@ WHERE r.rolcanlogin AND NOT r.rolsuper AND r.rolname <> 'cxp_server'
 GROUP BY r.rolname ORDER BY r.rolname;
 ```
 
-For each row, grant the one database that role's service uses (the database in its
-`DATABASE_URL`, e.g. `fly ssh console -a otto-flags -C 'printenv DATABASE_URL'`), and only that
-one, e.g. `GRANT CONNECT ON DATABASE otto_flags TO <role>;`. Then:
+For each row, find which of those databases that role legitimately uses (the one in its
+service's `DATABASE_URL`, e.g. `fly ssh console -a otto-flags -C 'printenv DATABASE_URL'`, plus
+any other its owner confirms it needs) and grant `CONNECT` on each of them, e.g.
+`GRANT CONNECT ON DATABASE otto_flags TO <role>;`. Never grant to `otto_app` (see above). Then:
 
 ```sql
 REVOKE CONNECT ON DATABASE otto_platform, otto_factory, otto_flags, otto_cxp FROM PUBLIC;
@@ -224,8 +252,17 @@ GROUP BY d.datname ORDER BY d.datname;
 ```
 
 Existing sessions are not dropped by a revoke; a role that was missed fails at its next
-connection, and `GRANT CONNECT` fixes it at once. The `postgres` and `repmgr` databases are
-left as they are (no service data; Fly's tooling uses them).
+connection, and `GRANT CONNECT ON DATABASE <db> TO <role>;` fixes it at once. To undo R3 whole:
+
+```sql
+GRANT CONNECT ON DATABASE otto_platform, otto_factory, otto_flags, otto_cxp TO PUBLIC;
+```
+
+The `postgres` and `repmgr` databases are left as they are: no service data, and Fly's tooling
+(`repmgr`, which also has a role of that name, runs the cluster's replication and failover)
+uses them. A database created later starts with `CONNECT` for `PUBLIC` again, so a new service
+on `otto-db` must run `REVOKE CONNECT ON DATABASE <its db> FROM PUBLIC;` and grant its own role
+as part of its setup.
 
 **R4. Prove the role before using it (read-only).** In a second terminal
 `fly proxy 15499:5432 -a otto-db`, then:
@@ -235,12 +272,19 @@ psql "postgres://cxp_server@localhost:15499/otto_cxp"     # prompts for the R1 p
 ```
 
 ```sql
--- f, f, f, f
-SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb
+-- cxp_server, cxp_server: nothing switched roles on connect
+SELECT session_user, current_user;
+-- f, f, f, f, f
+SELECT rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
 FROM pg_roles WHERE rolname = current_user;
--- 0 rows: what boot checks
-SELECT r.rolname FROM pg_roles r
-WHERE (r.rolsuper OR r.rolbypassrls) AND pg_has_role(current_user, r.oid, 'MEMBER');
+-- 0 rows: what boot checks, for the session user and the current user
+SELECT u.who, u.usr, r.rolname
+FROM (VALUES ('session_user', session_user), ('current_user', current_user)) AS u(who, usr)
+CROSS JOIN pg_roles r
+WHERE (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolreplication
+       OR r.rolname IN ('pg_execute_server_program', 'pg_read_server_files',
+                        'pg_write_server_files', 'pg_read_all_data', 'pg_write_all_data'))
+  AND pg_has_role(u.usr, r.oid, 'MEMBER');
 -- t, t: it can assume otto_app, and migrate
 SELECT pg_has_role(current_user, 'otto_app', 'USAGE') AS assumes_otto_app,
        has_schema_privilege('public', 'CREATE') AS can_migrate;
@@ -253,12 +297,28 @@ FROM pg_database WHERE NOT datistemplate ORDER BY datname;
 \c otto_platform
 ```
 
+If that `\c` succeeds, something still grants `cxp_server` `CONNECT` there. It has no grant of
+its own and the R3 revoke removed `PUBLIC`'s, so the grant is to a role it belongs to, almost
+certainly `otto_app`. In the `fly postgres connect` session, find it and revoke it (and tell
+that database's service, which must not depend on it):
+
+```sql
+SELECT datname, datacl FROM pg_database WHERE datname = 'otto_platform';
+REVOKE CONNECT ON DATABASE otto_platform FROM otto_app;
+```
+
+Then repeat R4 from a fresh `psql`.
+
 **R5. Switch the running release to it.** Keep the host, port, and query string from R0's URL
-(for an attach, `otto-db.flycast:5432` and `?sslmode=disable`):
+(for an attach, `otto-db.flycast:5432` and `?sslmode=disable`). Write the secret to a file only
+you can read, rather than putting the password on a command line, where it would land in shell
+history and the process list:
 
 ```bash
-fly secrets set -a otto-cxp \
-  DATABASE_URL='postgres://cxp_server:<R1 password>@<host>:<port>/otto_cxp<query>'
+(umask 077 && ${EDITOR:-vi} ~/cxp-db.env)     # 0600, without changing your shell's umask
+# one line: DATABASE_URL=postgres://cxp_server:<R1 password>@<host>:<port>/otto_cxp<query>
+fly secrets import -a otto-cxp < ~/cxp-db.env
+rm -f ~/cxp-db.env
 ```
 
 Not `--stage`: this restarts the release already running, before #16 merges, so the role switch
@@ -273,18 +333,25 @@ otto-db`:
 SELECT usename, count(*) FROM pg_stat_activity WHERE datname = 'otto_cxp' GROUP BY 1;
 ```
 
-To undo R5: in `fly postgres connect -a otto-db`, `\password <attach role>` with a fresh
-password, then `fly secrets set -a otto-cxp DATABASE_URL=...` with that user. The attach role
-keeps LOGIN until R7 for this.
+To undo R5, **only before R6**: in `fly postgres connect -a otto-db`, `\password <attach
+role>` with a fresh password, then the same `fly secrets import` with that user in the URL. The
+attach role keeps LOGIN until R7 for this.
 
 **R6. Merge #16.** Its deploy logs
-`database role "cxp_server" is neither a superuser nor BYPASSRLS, nor a member of one` before
+`database role "cxp_server" holds no superuser-equivalent privilege (...)` before
 `applying migrations` (see [Verify](#verify)).
 
-**R7. Retire the attach role** once R6 is verified:
+Rolling back after R6 means rolling back the code: `fly releases -a otto-cxp --image` lists
+the previous image, then `fly deploy -a otto-cxp --image <previous image>`, or revert the PR.
+Never undo R5 while a release with the check is deployed: it refuses the attach role, so the
+app would stop booting.
+
+**R7. Retire the attach role** once R6 is verified. In `fly postgres connect -a otto-db`:
 
 ```sql
-ALTER ROLE otto_cxp NOLOGIN;   -- the attach role from R0
+\set ON_ERROR_STOP on
+\set old_role otto_cxp
+ALTER ROLE :"old_role" NOLOGIN NOSUPERUSER;
 ```
 
 Do not `fly postgres detach`: it would unset `DATABASE_URL`. Dropping the role later (`\c
@@ -311,7 +378,7 @@ fly certs add otto-cxp.savvagent.com -a otto-cxp
 
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL to a superuser,
 #    which a deployment refuses: run "Database role" below before step 5 (on a fresh
-#    setup its step R5 sets the secret with --stage, and R6 and R7 follow the first deploy).
+#    setup its step R5 imports the secret with --stage, and R6 and R7 follow the first deploy).
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
 # 3. Register the resource server at the platform (run on the platform's machine).
@@ -362,7 +429,7 @@ fly logs -a otto-cxp --no-tail
 
 The logs must show, in order:
 
-- `database role "cxp_server" is neither a superuser nor BYPASSRLS, nor a member of one`
+- `database role "cxp_server" holds no superuser-equivalent privilege (...)`
 - `applying migrations`
 - `tenant isolation enforced as role "otto_app"`
 - `the otto platform accepted this service's credential`

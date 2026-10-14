@@ -1987,7 +1987,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     let text = logs.text();
     let mut from = 0;
     for line in [
-        "allowed only because CXP_PUBLIC_URL is a loopback origin",
+        "allowed only because this is not a deployment",
         "applying migrations",
         r#"tenant isolation enforced as role "otto_app""#,
         "the otto platform accepted this service's credential",
@@ -2087,15 +2087,62 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
     database_url_as(pool, Some((role, &password)))
 }
 
-/// Remove `role` again: roles are cluster-wide and outlive the test database.
-async fn drop_least_privilege_owner(pool: &PgPool, role: &str) {
-    for stmt in [
-        format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{role}'"),
-        format!("REASSIGN OWNED BY {role} TO CURRENT_USER"),
-        format!("DROP OWNED BY {role}"),
-        format!("DROP ROLE {role}"),
-    ] {
-        sqlx::query(&stmt).execute(pool).await.unwrap();
+/// Drops `role` when the test ends, failed or not: roles are cluster-wide
+/// and outlive the test database. Runs on its own thread and runtime
+/// (`Drop` cannot await), as the test pool's superuser, before
+/// `#[sqlx::test]` drops the database the role owns.
+struct DropRoleOnExit {
+    options: sqlx::postgres::PgConnectOptions,
+    role: String,
+}
+
+impl DropRoleOnExit {
+    fn new(pool: &PgPool, role: &str) -> Self {
+        Self {
+            options: pool.connect_options().as_ref().clone(),
+            role: role.to_string(),
+        }
+    }
+}
+
+impl Drop for DropRoleOnExit {
+    fn drop(&mut self) {
+        let options = self.options.clone();
+        let role = self.role.clone();
+        let dropped = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to drop the test role");
+            rt.block_on(async move {
+                use sqlx::Connection;
+                let mut conn = sqlx::PgConnection::connect_with(&options).await?;
+                for stmt in [
+                    format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                         WHERE usename = '{role}'"
+                    ),
+                    format!(
+                        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
+                         THEN REASSIGN OWNED BY {role} TO CURRENT_USER; DROP OWNED BY {role}; \
+                         END IF; END $$"
+                    ),
+                    format!("DROP ROLE IF EXISTS {role}"),
+                ] {
+                    sqlx::query(&stmt).execute(&mut conn).await?;
+                }
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("could not drop test role {}: {e}", self.role),
+            Err(_) => eprintln!(
+                "could not drop test role {}: the thread panicked",
+                self.role
+            ),
+        }
     }
 }
 
@@ -2120,6 +2167,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let role = format!("cxp_lp_{}", Uuid::new_v4().simple());
+    let _drop_role = DropRoleOnExit::new(&pool, &role);
     let role_url = least_privilege_owner(&pool, &role).await;
 
     // Migrations, as the role, into the database it owns.
@@ -2278,7 +2326,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
 
     assert!(
         boot.database_role
-            .contains("is neither a superuser nor BYPASSRLS"),
+            .contains("holds no superuser-equivalent privilege"),
         "{}",
         boot.database_role
     );
@@ -2341,7 +2389,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     let text = logs.text();
     let mut from = 0;
     for line in [
-        format!(r#"database role "{role}" is neither a superuser nor BYPASSRLS"#),
+        format!(r#"database role "{role}" holds no superuser-equivalent privilege"#),
         "applying migrations".into(),
         r#"tenant isolation enforced as role "otto_app""#.into(),
         "the otto platform accepted this service's credential".into(),
@@ -2352,8 +2400,6 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
         from += at + line.len();
     }
-
-    drop_least_privilege_owner(&pool, &role).await;
 }
 
 /// A deployment refuses a superuser connection before running anything as

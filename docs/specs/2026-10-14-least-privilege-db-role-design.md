@@ -35,6 +35,14 @@ Acceptance criteria (verbatim from #16):
   new e2e test proves them as the real connecting role, a table owner under FORCE.
 - **Membership matters.** SUPERUSER and BYPASSRLS are never inherited, but a member can
   `SET ROLE` to the role that has them, so the check counts membership.
+- **Two users, not one.** `current_user` alone misses a superuser login whose connections start
+  with `SET ROLE` (`?options=-c role=...`, `ALTER ROLE ... SET role`): `RESET ROLE` returns to
+  the superuser. The check reads `session_user` too.
+- **Superuser-equivalent is more than SUPERUSER and BYPASSRLS.** CREATEROLE (before Postgres 16
+  it grants itself any non-superuser role, BYPASSRLS ones included), REPLICATION, and the
+  predefined roles `pg_execute_server_program`, `pg_read_server_files`,
+  `pg_write_server_files`, `pg_read_all_data`, `pg_write_all_data` all reach past RLS or past
+  `otto_cxp`.
 
 ## Assumptions
 
@@ -48,8 +56,9 @@ Acceptance criteria (verbatim from #16):
 
 ## Goal & success criteria
 
-- A deployment cannot boot as a role that is, or can become, a superuser or BYPASSRLS, and says
-  why; a developer's machine still can, with a warning.
+- A deployment cannot boot on a session whose login user or current user is, or can become,
+  superuser-equivalent, and says which user and which privilege; a developer's machine still
+  can, with a warning.
 - A test proves a role with none of those privileges, owning a fresh database, can migrate it,
   pass the boot checks, serve, apply `org.deleted`, sweep, and ship usage.
 - Rob has a copy-paste runbook that moves production to such a role with no window in which the
@@ -68,35 +77,41 @@ deployment whose role cannot assume `otto_app` (isolation then still holds throu
 
 ### What "production" means
 
-`Config::is_deployment()` (`crates/cxp-server/src/config.rs`): the public URL's host is not
-loopback (`localhost`, `127.0.0.0/8`, `::1`), reusing the `is_loopback` that already gates
-`CXP_PLATFORM_URL`'s plain http. Chosen over a new `CXP_*` key because a key can be unset or
-mistyped in production, silently disabling the check, while a production public URL that were
-loopback would also advertise an audience no platform token carries and fail every request.
-Local development (`.env.example`: `http://localhost:8080`), CI, and the existing e2e boot tests
-(public URL `http://127.0.0.1:<port>`) are loopback and keep working with the test cluster's
-superuser. The cost: running locally with a non-loopback public URL (a tunnel) needs a
-non-superuser local role, which the runbook's R1 to R3 show how to make.
+`Config::is_deployment()` (`crates/cxp-server/src/config.rs`) is true when any of these holds:
+the public URL's host is not loopback (`localhost`, `127.0.0.0/8`, `::1`, the `is_loopback` that
+already gates `CXP_PLATFORM_URL`'s plain http); `CXP_RESOURCE_URI`'s host is not loopback; or
+`FLY_APP_NAME` is set (read with the rest of the config in `Config::from_lookup`, so tests stay
+pure). The public URL alone is not enough: `CXP_RESOURCE_URI` is set independently and
+`CXP_ALLOWED_HOSTS` can admit the real host, so a loopback public URL can still serve real
+tokens. Chosen over a new `CXP_*` key because a key can be unset or mistyped in production,
+silently disabling the check. Local development (`.env.example`: `http://localhost:8080`), CI,
+and the existing e2e boot tests (`http://127.0.0.1:<port>` for both URLs) are loopback and keep
+working with the test cluster's superuser. The cost: running locally behind a tunnel needs a
+non-superuser local role, which `.env.example` shows how to make.
 
 ### The check
 
 - `cxp_core::db_role::inspect(&Db) -> DbRole` (new, `crates/cxp-core/src/db_role.rs`; SQL stays in
-  cxp-core): `current_user`, and every role with `rolsuper OR rolbypassrls` that
-  `pg_has_role(current_user, oid, 'MEMBER')`, itself first, at most 8 (a superuser is a member of
-  every role, so for one only itself is kept). `DbRole::summary()` is the log line.
+  cxp-core): `session_user` and `current_user`, and for each (once when they are equal) every
+  role with `rolsuper`, `rolbypassrls`, `rolcreaterole`, or `rolreplication`, or named in
+  `db_role::SERVER_ROLES`, that `pg_has_role(user, oid, 'MEMBER')`, the user itself first, at
+  most 8 per user (a superuser is a member of every role, so for one only itself is kept).
+  Each entry records which user holds it. `DbRole::summary()` is the log line, naming the
+  session user when it differs.
 - `boot::check_db_role(&DbRole, &Config)` (`crates/cxp-server/src/boot.rs`), called right after
   connecting and before migrations, so a refused role runs nothing:
-  - not privileged: `info`, `database role "cxp_server" is neither a superuser nor BYPASSRLS, nor
-    a member of one`;
+  - not privileged: `info`, `database role "cxp_server" holds no superuser-equivalent privilege
+    (...), directly or through membership`;
   - privileged in a deployment: `error`, and `run` returns `refusing to serve: database role
     "otto_cxp" is SUPERUSER; ...` (the process exits non-zero, the Fly health check fails);
-  - privileged on loopback: `warn`, `... allowed only because CXP_PUBLIC_URL is a loopback
-    origin`.
+  - privileged and not a deployment: `warn`, `... allowed only because this is not a deployment
+    (loopback CXP_PUBLIC_URL and CXP_RESOURCE_URI, no FLY_APP_NAME)`.
 - `Boot` gains `database_role: String` (the summary), as it carries `isolation`.
 
 ### The production role
 
-`cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION; member
+`cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION, in no
+predefined role; member
 of `otto_app` with INHERIT and SET (otto-tenant decides whether to `SET LOCAL ROLE` with
 `pg_has_role(..., 'USAGE')`, which needs INHERIT); owner of `otto_cxp` and, via `REASSIGN OWNED`,
 of every object in it; default privileges for it re-granted to `otto_app`. `CONNECT` on the four
@@ -110,7 +125,8 @@ code change. R6 is the merge. R7 makes the attach role NOLOGIN.
 
 ## Invariants impact
 
-- Tenant isolation: tightened. The connecting role is now proven bound by RLS in a deployment.
+- Tenant isolation: tightened. The connecting role is now proven bound by RLS in a deployment,
+  as long as it does not alter its own tables (see Risks).
 - No SQL outside cxp-core: the catalog query lives in `cxp_core::db_role`.
 - Small shared DB: the query is bounded (`LIMIT 8`).
 - Migrations: none added.
@@ -132,17 +148,22 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
 - Catalog read fails: boot fails with `could not read the database role's privileges`.
 - A superuser lists only itself; a member of a privileged role is named with the role it can
   become.
-- `otto_app` membership is not a privilege (it is neither SUPERUSER nor BYPASSRLS); the test
-  asserts a role holding only that passes.
+- `otto_app` membership is not a privilege (it holds none of the attributes); the test asserts
+  a role holding only that passes.
+- A superuser login that `SET ROLE`s on connect: the session user is named as privileged.
 - A REASSIGN guard failure aborts its transaction; nothing changes.
 
 ## Testing approach
 
-- `cxp-core` `tests/db.rs`: `inspect` under a plain role, a BYPASSRLS role, a member of a
-  BYPASSRLS role, and the superuser test pool.
-- `cxp-server` `config.rs` unit test: loopback hosts are not deployments; everything else is.
-- `cxp-server` `boot.rs` unit test: a deployment refuses superuser, BYPASSRLS, and membership; a
-  loopback public URL only warns.
+- `cxp-core` `tests/db.rs`, logging in as real roles (dropped by a guard even when the test
+  fails): `inspect` under a plain role, a BYPASSRLS role, a member of a BYPASSRLS role, a
+  CREATEROLE role, a REPLICATION role, members of `pg_execute_server_program` and
+  `pg_read_all_data`, and the superuser test pool; and a superuser session that `SET ROLE`s to a
+  plain role on connect.
+- `cxp-server` `config.rs` unit test: loopback URLs without `FLY_APP_NAME` are not deployments;
+  a non-loopback public URL or resource URI, or `FLY_APP_NAME`, is.
+- `cxp-server` `boot.rs` unit test: a deployment refuses every privilege, held by the session or
+  the current user, directly or through membership; a non-deployment only warns.
 - `cxp-server` `tests/e2e.rs`:
   - `the_service_runs_whole_as_a_least_privilege_database_owner`: on an empty test database, a
     fresh LOGIN role set up as the runbook does (owner, `otto_app` member, `CONNECT` revoked from
@@ -155,7 +176,8 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
   - `a_deployment_refuses_a_superuser_database_role`: boot refuses before migrating.
   - The existing boot test now also expects the loopback warning.
 - The runbook SQL was dry-run against a local Postgres 16 with a simulated superuser attach role,
-  including the guard refusing an `old_role` that owns other databases.
+  including the guard refusing an `old_role` that owns other databases or does not own
+  `public.customers`.
 
 ## Risks & open questions
 
@@ -166,3 +188,11 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
   immediately.
 - The other services' attach roles stay superusers; a compromise of one of them still reaches
   `otto_cxp`. Their own issues.
+- **RLS binds `cxp_server` only while it leaves its own tables alone.** As their owner it can
+  `NO FORCE` or `DISABLE ROW LEVEL SECURITY` and `DROP POLICY`, so code execution as
+  `cxp_server` could turn RLS off on `otto_cxp`'s tables (not reach other databases). Fix:
+  separate the migration owner from the runtime role, #27.
+- **`otto_app` is shared by every otto service.** A database-level grant to it (above all
+  `CONNECT`) would open that database to every service's login role. Rule, in
+  `docs/deploy/fly.md`: no service grants `otto_app` any database-level privilege. Fix: a
+  tenant role per service, #28.

@@ -920,11 +920,230 @@ async fn a_tampered_known_migration_still_refuses_to_boot(pool: PgPool) {
     );
 }
 
-/// A `Db` whose every connection runs as `role` (`SET ROLE`, so
-/// `current_user` is `role`, exactly as when it logs in).
-async fn db_as(pool: &PgPool, role: &str) -> Db {
-    let set = format!("SET ROLE {role}");
-    let pool = sqlx::postgres::PgPoolOptions::new()
+/// Roles a test created, dropped when it ends, failed or not: roles are
+/// cluster-wide and outlive the test database. The drop runs on its own
+/// thread and runtime (`Drop` cannot await), as the test pool's superuser.
+struct TestRoles {
+    options: sqlx::postgres::PgConnectOptions,
+    names: Vec<String>,
+}
+
+impl TestRoles {
+    fn new(pool: &PgPool) -> Self {
+        Self {
+            options: pool.connect_options().as_ref().clone(),
+            names: Vec::new(),
+        }
+    }
+
+    /// `CREATE ROLE name LOGIN PASSWORD ... <attributes>`, registered for
+    /// the drop before it is created. Returns a `Db` logged in as it.
+    async fn login(&mut self, pool: &PgPool, prefix: &str, attributes: &str) -> (String, Db) {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        let password = Uuid::new_v4().simple().to_string();
+        self.names.push(name.clone());
+        sqlx::query(&format!(
+            "CREATE ROLE {name} LOGIN PASSWORD '{password}' {attributes}"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let options = self.options.clone().username(&name).password(&password);
+        let as_role = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        (name, Db::from_pool(as_role))
+    }
+
+    /// `CREATE ROLE name NOLOGIN <attributes>`, registered for the drop.
+    async fn nologin(&mut self, pool: &PgPool, prefix: &str, attributes: &str) -> String {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        self.names.push(name.clone());
+        sqlx::query(&format!("CREATE ROLE {name} NOLOGIN {attributes}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        name
+    }
+}
+
+impl Drop for TestRoles {
+    fn drop(&mut self) {
+        let options = self.options.clone();
+        let names = std::mem::take(&mut self.names);
+        let dropped = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to drop test roles");
+            rt.block_on(async move {
+                use sqlx::Connection;
+                let mut conn = sqlx::PgConnection::connect_with(&options).await?;
+                for name in names.iter().rev() {
+                    for stmt in [
+                        format!(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                             WHERE usename = '{name}'"
+                        ),
+                        format!("DROP ROLE IF EXISTS {name}"),
+                    ] {
+                        sqlx::query(&stmt).execute(&mut conn).await?;
+                    }
+                }
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("could not drop test roles: {e}"),
+            Err(_) => eprintln!("could not drop test roles: the drop thread panicked"),
+        }
+    }
+}
+
+/// `(user, role, privileges)` of each privileged role `inspect` found.
+fn found(role: &cxp_core::db_role::DbRole) -> Vec<(&str, &str, &[cxp_core::db_role::Privilege])> {
+    role.privileged
+        .iter()
+        .map(|p| (p.user.as_str(), p.name.as_str(), p.privileges.as_slice()))
+        .collect()
+}
+
+/// The boot check's view of a login role (#16): a plain role (even a member
+/// of `otto_app`) is not privileged; SUPERUSER, BYPASSRLS, CREATEROLE,
+/// REPLICATION, membership in a role with any of them (one `SET ROLE`
+/// away), and membership in a server-access predefined role are, and are
+/// named.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_every_superuser_equivalent(pool: PgPool) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+
+    let su = inspect(&db(pool.clone())).await.unwrap();
+    assert_eq!(su.session_user, su.current_user);
+    // The test pool is a superuser, named alone (whatever else it holds).
+    let [(user, name, privileges)] = found(&su)[..] else {
+        panic!("{}", su.summary())
+    };
+    assert_eq!(
+        (user, name),
+        (su.current_user.as_str(), su.current_user.as_str())
+    );
+    assert!(privileges.contains(&Superuser), "{}", su.summary());
+
+    let bypass_group = roles
+        .nologin(&pool, "cxp_t_bypass_group", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOREPLICATION";
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (bypass, bypass_db) = roles
+        .login(&pool, "cxp_t_bypass", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let (member, member_db) = roles.login(&pool, "cxp_t_member", base).await;
+    let (createrole, createrole_db) = roles
+        .login(&pool, "cxp_t_createrole", "NOSUPERUSER CREATEROLE")
+        .await;
+    let (replication, replication_db) = roles
+        .login(&pool, "cxp_t_replication", "NOSUPERUSER REPLICATION")
+        .await;
+    let (exec, exec_db) = roles.login(&pool, "cxp_t_exec", base).await;
+    let (read_all, read_all_db) = roles.login(&pool, "cxp_t_read_all", base).await;
+    for stmt in [
+        format!("GRANT {bypass_group} TO {member}"),
+        format!("GRANT pg_execute_server_program TO {exec}"),
+        format!("GRANT pg_read_all_data TO {read_all}"),
+        // otto_app is not privileged: membership in it, which every
+        // deployment needs, must not count.
+        format!("GRANT otto_app TO {plain}, {member}, {exec}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let mut seen = Vec::new();
+    for (name, as_role) in [
+        (&plain, plain_db),
+        (&bypass, bypass_db),
+        (&member, member_db),
+        (&createrole, createrole_db),
+        (&replication, replication_db),
+        (&exec, exec_db),
+        (&read_all, read_all_db),
+    ] {
+        let role = inspect(&as_role).await.unwrap();
+        as_role.pool().close().await;
+        assert_eq!((&role.session_user, &role.current_user), (name, name));
+        seen.push(role);
+    }
+    let [plain_r, bypass_r, member_r, createrole_r, replication_r, exec_r, read_all_r] = &seen[..]
+    else {
+        unreachable!()
+    };
+    assert!(!plain_r.is_privileged(), "{}", plain_r.summary());
+    assert_eq!(
+        found(bypass_r),
+        [(bypass.as_str(), bypass.as_str(), &[BypassRls][..])]
+    );
+    assert_eq!(
+        found(member_r),
+        [(member.as_str(), bypass_group.as_str(), &[BypassRls][..])]
+    );
+    assert!(
+        member_r
+            .summary()
+            .contains(&format!("is a member of {bypass_group:?} (BYPASSRLS)")),
+        "{}",
+        member_r.summary()
+    );
+    assert_eq!(
+        found(createrole_r),
+        [(createrole.as_str(), createrole.as_str(), &[CreateRole][..])]
+    );
+    assert_eq!(
+        found(replication_r),
+        [(
+            replication.as_str(),
+            replication.as_str(),
+            &[Replication][..]
+        )]
+    );
+    assert_eq!(
+        found(exec_r),
+        [(
+            exec.as_str(),
+            "pg_execute_server_program",
+            &[ServerRole][..]
+        )]
+    );
+    assert_eq!(
+        found(read_all_r),
+        [(read_all.as_str(), "pg_read_all_data", &[ServerRole][..])]
+    );
+    assert!(
+        read_all_r
+            .summary()
+            .contains(r#"is a member of "pg_read_all_data""#),
+        "{}",
+        read_all_r.summary()
+    );
+}
+
+/// A superuser login whose connections start with `SET ROLE` to a plain
+/// role (`?options=-c role=...`, or `ALTER ROLE ... SET role`) is still a
+/// superuser session, one `RESET ROLE` away: the check reads the session
+/// user too, and names it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_a_superuser_session_behind_set_role(pool: PgPool) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+    let plain = roles
+        .nologin(&pool, "cxp_t_plain", "NOSUPERUSER NOBYPASSRLS")
+        .await;
+
+    let set = format!("SET ROLE {plain}");
+    let as_plain = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .after_connect(move |conn, _meta| {
             let set = set.clone();
@@ -936,79 +1155,24 @@ async fn db_as(pool: &PgPool, role: &str) -> Db {
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .unwrap();
-    Db::from_pool(pool)
-}
+    let role = inspect(&Db::from_pool(as_plain.clone())).await.unwrap();
+    as_plain.close().await;
 
-/// The boot check's view of the connecting role (#16): a plain role is not
-/// privileged; SUPERUSER, BYPASSRLS, and membership in a role with either
-/// (one `SET ROLE` away) are, and are named.
-#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn the_database_role_check_sees_superuser_bypassrls_and_membership(pool: PgPool) {
-    let tag = Uuid::new_v4().simple().to_string();
-    let (plain, bypass, member) = (
-        format!("cxp_t_plain_{tag}"),
-        format!("cxp_t_bypass_{tag}"),
-        format!("cxp_t_member_{tag}"),
-    );
-    for stmt in [
-        format!("CREATE ROLE {plain} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
-        format!("CREATE ROLE {bypass} NOLOGIN NOSUPERUSER BYPASSRLS"),
-        format!("CREATE ROLE {member} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
-        format!("GRANT {bypass} TO {member}"),
-        // otto_app is not privileged: membership in it, which every
-        // deployment needs, must not count.
-        format!("GRANT otto_app TO {plain}, {member}"),
-    ] {
-        sqlx::query(&stmt).execute(&pool).await.unwrap();
-    }
-
-    let su = cxp_core::db_role::inspect(&db(pool.clone())).await.unwrap();
-    assert!(su.is_privileged(), "the test pool is a superuser");
-    assert_eq!(su.privileged.len(), 1, "only itself: {su:?}");
-    assert_eq!(su.privileged[0].name, su.name);
-    assert!(su.privileged[0].superuser);
-
-    let mut seen = Vec::new();
-    for name in [&plain, &bypass, &member] {
-        let as_role = db_as(&pool, name).await;
-        let role = cxp_core::db_role::inspect(&as_role).await.unwrap();
-        as_role.pool().close().await;
-        assert_eq!(&role.name, name);
-        seen.push(role);
-    }
-    let [plain_r, bypass_r, member_r] = &seen[..] else {
-        unreachable!()
+    assert_eq!(role.current_user, plain);
+    assert_ne!(role.session_user, plain);
+    assert!(role.is_privileged(), "{}", role.summary());
+    let session = role.session_user.as_str();
+    // Only the session user is privileged here.
+    let [(user, name, privileges)] = found(&role)[..] else {
+        panic!("{}", role.summary())
     };
-    assert!(!plain_r.is_privileged(), "{}", plain_r.summary());
-    assert_eq!(
-        bypass_r
-            .privileged
-            .iter()
-            .map(|p| (p.name.as_str(), p.superuser, p.bypassrls))
-            .collect::<Vec<_>>(),
-        [(bypass.as_str(), false, true)]
-    );
-    assert_eq!(
-        member_r
-            .privileged
-            .iter()
-            .map(|p| (p.name.as_str(), p.superuser, p.bypassrls))
-            .collect::<Vec<_>>(),
-        [(bypass.as_str(), false, true)]
-    );
+    assert_eq!((user, name), (session, session));
+    assert!(privileges.contains(&Superuser), "{}", role.summary());
     assert!(
-        member_r
-            .summary()
-            .contains(&format!("is a member of {bypass:?} (BYPASSRLS)")),
+        role.summary().contains(&format!(
+            "database role {plain:?} (session user {session:?}): session user {session:?} is SUPERUSER"
+        )),
         "{}",
-        member_r.summary()
+        role.summary()
     );
-
-    for stmt in [
-        format!("DROP ROLE {member}"),
-        format!("DROP ROLE {bypass}"),
-        format!("DROP ROLE {plain}"),
-    ] {
-        sqlx::query(&stmt).execute(&pool).await.unwrap();
-    }
 }

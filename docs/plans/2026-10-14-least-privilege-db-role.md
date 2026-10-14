@@ -5,14 +5,15 @@ Postgres (`DATABASE_URL=postgres://cxp:cxp@localhost:<port>/otto_cxp`).
 
 - [ ] **1. Read the role's privileges (`cxp-core`).**
   - Failing test first: `crates/cxp-core/tests/db.rs`
-    `the_database_role_check_sees_superuser_bypassrls_and_membership` (plain, BYPASSRLS, member of
-    BYPASSRLS, superuser pool).
+    `the_database_role_check_sees_every_superuser_equivalent` (plain, BYPASSRLS, member of
+    BYPASSRLS, CREATEROLE, REPLICATION, `pg_execute_server_program`, `pg_read_all_data`,
+    superuser pool) and `the_database_role_check_sees_a_superuser_session_behind_set_role`.
   - Add `crates/cxp-core/src/db_role.rs` (`DbRole`, `PrivilegedRole`, `inspect`, `summary`, unit
     test of the summary) and `pub mod db_role;` in `lib.rs`.
   - `cargo test -p cxp-core --test db the_database_role`
 
 - [ ] **2. Refuse a privileged role in a deployment (`cxp-server`).**
-  - Failing tests first: `config.rs` `only_a_loopback_public_url_is_not_a_deployment`;
+  - Failing tests first: `config.rs` `only_loopback_urls_without_fly_are_not_a_deployment`;
     `boot.rs` `a_deployment_refuses_a_privileged_database_role`.
   - `Config::is_deployment`; `boot::check_db_role`, called in `run_with` after connecting and
     before migrations; `Boot::database_role`.

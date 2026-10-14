@@ -111,10 +111,11 @@ pub async fn check_platform(platform: &PlatformClient, config: &Config) -> Platf
     check
 }
 
-/// Whether this process may serve on the database role it connected as, and
-/// log what that role is. A role that is, or can `SET ROLE` to, a superuser
-/// or BYPASSRLS escapes every unpinned row-level policy, and on the shared
-/// `otto-db` reaches the other services' databases. A deployment
+/// Whether this process may serve on the database session it connected
+/// with, and log what that session's users are. A session whose login user
+/// or current user is, or can `SET ROLE` to, a superuser-equivalent role
+/// (`cxp_core::db_role`) escapes every unpinned row-level policy, or on the
+/// shared `otto-db` reaches the other services' databases. A deployment
 /// ([`Config::is_deployment`]) refuses it; a developer's machine, whose
 /// local Postgres hands out a superuser, is warned.
 pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
@@ -124,17 +125,19 @@ pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
         return Ok(());
     }
     if config.is_deployment() {
-        tracing::error!(public_url = %config.public_url,
-            "{summary}: refusing to serve. A deployment must connect as a dedicated role that \
-             is neither a superuser nor BYPASSRLS (docs/deploy/fly.md)");
+        tracing::error!(public_url = %config.public_url, resource_uri = %config.resource_uri,
+            fly_app_name = config.fly_app_name.as_deref().unwrap_or(""),
+            "{summary}: refusing to serve. A deployment must log in as a dedicated role that \
+             holds no superuser-equivalent privilege (docs/deploy/fly.md)");
         return Err(anyhow!(
-            "refusing to serve: {summary}; a deployment must connect as a role that is neither a \
-             superuser nor BYPASSRLS, nor a member of one (docs/deploy/fly.md)"
+            "refusing to serve: {summary}; a deployment must log in as a role that is not a \
+             superuser and holds no BYPASSRLS, CREATEROLE, REPLICATION, or server-access \
+             predefined role, directly or through membership (docs/deploy/fly.md)"
         ));
     }
     tracing::warn!(public_url = %config.public_url,
-        "{summary}: allowed only because CXP_PUBLIC_URL is a loopback origin (local \
-         development); a deployment refuses it");
+        "{summary}: allowed only because this is not a deployment (loopback CXP_PUBLIC_URL \
+         and CXP_RESOURCE_URI, no FLY_APP_NAME); a deployment refuses it");
     Ok(())
 }
 
@@ -455,42 +458,48 @@ mod tests {
         assert!(flush_result(Ok(Err(ShipError::Receipt("short".into())))).is_err());
     }
 
-    /// A deployment refuses a superuser, a BYPASSRLS role, and a member of
-    /// either; a loopback public URL (a developer's machine) only warns.
+    /// A deployment refuses every superuser-equivalent privilege, held by
+    /// the login (session) user or the current user, directly or through
+    /// membership; a developer's machine only warns.
     #[test]
     fn a_deployment_refuses_a_privileged_database_role() {
-        use cxp_core::db_role::PrivilegedRole;
-        let role = |privileged: Vec<(&str, bool, bool)>| DbRole {
-            name: "cxp_server".into(),
-            privileged: privileged
-                .into_iter()
-                .map(|(n, s, b)| PrivilegedRole {
-                    name: n.into(),
-                    superuser: s,
-                    bypassrls: b,
-                })
-                .collect(),
-        };
+        use cxp_core::db_role::Privilege::*;
         let deployed = Config::for_test();
         assert!(deployed.is_deployment());
         let mut local = Config::for_test();
         local.public_url = "http://localhost:8080".into();
+        local.resource_uri = "http://localhost:8080/mcp".into();
+        assert!(!local.is_deployment());
 
-        let least = role(vec![]);
+        let least = DbRole::for_test("cxp_server", "cxp_server", &[]);
         assert!(check_db_role(&least, &deployed).is_ok());
         assert!(check_db_role(&least, &local).is_ok());
 
-        for privileged in [
-            vec![("cxp_server", true, false)],
-            vec![("cxp_server", false, true)],
-            vec![("postgres", true, true)],
+        for r in [
+            DbRole::for_test("s", "s", &[("s", "s", &[Superuser])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[BypassRls])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[CreateRole])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[Replication])]),
+            DbRole::for_test("s", "s", &[("s", "postgres", &[Superuser, BypassRls])]),
+            DbRole::for_test("s", "s", &[("s", "pg_read_all_data", &[ServerRole])]),
+            // A superuser login that SET ROLEs to a plain role on connect.
+            DbRole::for_test("otto_cxp", "s", &[("otto_cxp", "otto_cxp", &[Superuser])]),
         ] {
-            let r = role(privileged);
             let err = format!("{:#}", check_db_role(&r, &deployed).unwrap_err());
             assert!(err.contains("refusing to serve"), "{err}");
             assert!(err.contains(&r.summary()), "{err}");
             assert!(check_db_role(&r, &local).is_ok(), "{}", r.summary());
         }
+
+        // Loopback URLs on a Fly machine are still a deployment.
+        let mut on_fly = local.clone();
+        on_fly.fly_app_name = Some("otto-cxp".into());
+        let su = DbRole::for_test("s", "s", &[("s", "s", &[Superuser])]);
+        assert!(check_db_role(&su, &on_fly).is_err());
+        // So is a loopback public URL serving a real audience.
+        let mut real_audience = local.clone();
+        real_audience.resource_uri = "https://otto-cxp.savvagent.com/mcp".into();
+        assert!(check_db_role(&su, &real_audience).is_err());
     }
 
     #[test]
