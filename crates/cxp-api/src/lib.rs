@@ -170,6 +170,10 @@ pub fn router(state: AppState) -> Router {
                 .put(catalog::update_component)
                 .delete(catalog::delete_component),
         )
+        // Inside the bearer layer: an unknown path or method is answered
+        // only to an authenticated caller, and in the JSON error shape.
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
@@ -180,4 +184,20 @@ pub fn router(state: AppState) -> Router {
         .route("/platform/webhooks", post(webhooks::receive))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
+}
+
+async fn not_found() -> ApiError {
+    ApiError::new(
+        http::StatusCode::NOT_FOUND,
+        "not_found",
+        "no such route under /api/v1",
+    )
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(
+        http::StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "this route does not accept that method",
+    )
 }

@@ -350,7 +350,11 @@ async fn no_token_is_401_with_the_discovery_challenge(pool: PgPool) {
             "{challenge}"
         );
         assert!(challenge.contains(&metadata_pointer()), "{challenge}");
-        assert_eq!(r.body["error"], "invalid_token");
+        assert!(
+            !challenge.contains("error="),
+            "no credentials, no error: {challenge}"
+        );
+        assert_eq!(r.body["error"], "unauthenticated");
         assert!(r.body["error_description"].is_string());
     }
     // Another scheme is no token at all.
@@ -377,6 +381,7 @@ async fn a_token_for_another_resource_or_unknown_to_the_platform_is_401(pool: Pg
             "{challenge}"
         );
         assert!(challenge.contains(&metadata_pointer()), "{challenge}");
+        assert_eq!(r.body["error"], "invalid_token");
     }
 }
 
@@ -433,6 +438,10 @@ async fn a_read_only_token_reads_but_cannot_write(pool: PgPool) {
         let r = h.call(method, uri, Some(&ro), Some(body)).await;
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {uri}");
         assert_eq!(r.body["code"], "insufficient_scope");
+        assert_eq!(
+            r.headers["www-authenticate"],
+            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
+        );
         assert!(r.body["error"].as_str().unwrap().contains("cxp:write"));
     }
     // A token with neither scope cannot read.
@@ -446,6 +455,10 @@ async fn a_read_only_token_reads_but_cannot_write(pool: PgPool) {
     let r = h.call("GET", "/api/v1/customers", Some(&none), None).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(r.body["code"], "insufficient_scope");
+    assert_eq!(
+        r.headers["www-authenticate"],
+        r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:read""#
+    );
 
     assert!(
         h.outbox().await.is_empty(),
@@ -587,9 +600,50 @@ async fn routes_answer_in_the_shapes_the_console_reads(pool: PgPool) {
     assert_eq!(after.status, StatusCode::NOT_FOUND);
     assert_eq!(after.body["code"], "not_found");
 
-    // The REST teams routes are gone.
-    let teams = h.call("GET", "/api/v1/teams", Some(&t), None).await;
-    assert_eq!(teams.status, StatusCode::NOT_FOUND);
+    // A JSON body must say it is JSON.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/customers")
+        .header("authorization", format!("Bearer {t}"))
+        .header("content-type", "text/plain")
+        .body(Body::from(r#"{"email": "t@example.com"}"#))
+        .unwrap();
+    let r = h.send(req).await;
+    assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(r.body["code"], "unsupported_media_type");
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn unknown_routes_and_methods_answer_json_and_only_after_auth(pool: PgPool) {
+    let h = harness(pool).await;
+    let (_, _, t) = h.caller(RW);
+
+    // The REST teams routes are gone; unknown paths are a JSON 404.
+    for uri in [
+        "/api/v1/teams",
+        "/api/v1/teams/00000000-0000-0000-0000-000000000000",
+        "/api/v1/nope",
+    ] {
+        let r = h.call("GET", uri, Some(&t), None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(r.body["code"], "not_found", "{uri}");
+        assert!(r.body["error"].is_string());
+    }
+    // A known path with a method it does not take is a JSON 405.
+    for (method, uri) in [
+        ("DELETE", "/api/v1/customers"),
+        ("POST", "/api/v1/feedback"),
+    ] {
+        let r = h.call(method, uri, Some(&t), Some(json!({}))).await;
+        assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        assert_eq!(r.body["code"], "method_not_allowed", "{method} {uri}");
+    }
+    // Without a token the gate answers first.
+    for (method, uri) in [("GET", "/api/v1/nope"), ("DELETE", "/api/v1/customers")] {
+        let r = h.call(method, uri, None, None).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        assert!(r.headers.contains_key("www-authenticate"));
+    }
 }
 
 // ----------------------------------------------------------------- metering
@@ -993,6 +1047,40 @@ async fn webhooks_are_verified_applied_once_and_null_a_deleted_teams_catalog(poo
     let r = h.call("GET", "/api/v1/customers", Some(&t2), None).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     assert!(r.headers.contains_key("www-authenticate"));
+}
+
+/// A delivery the database cannot record is `503`, so the platform redelivers
+/// it; nothing about the failure leaks into the body.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_webhook_that_cannot_be_applied_is_503(pool: PgPool) {
+    let h = harness(pool.clone()).await;
+    // Deterministic failure: the dedupe log every event writes is gone.
+    sqlx::query("DROP TABLE platform_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let org = Uuid::new_v4();
+    for (kind, data) in [
+        (
+            "team.deleted",
+            json!({"org_id": org, "team_id": Uuid::new_v4()}),
+        ),
+        (
+            "member.removed",
+            json!({"org_id": org, "user_id": Uuid::new_v4()}),
+        ),
+    ] {
+        let (body, sig) = signed(kind, data);
+        let r = h.webhook(Some(&sig), &body).await;
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{kind}");
+        assert_eq!(r.headers["retry-after"], "5");
+        assert_eq!(r.body["code"], "unavailable");
+        assert!(
+            !r.body.to_string().contains("platform_events"),
+            "{}",
+            r.body
+        );
+    }
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]

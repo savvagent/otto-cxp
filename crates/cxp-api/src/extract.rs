@@ -41,7 +41,7 @@ where
             Ok(axum::Json(v)) => Ok(Self(v)),
             Err(e @ JsonRejection::MissingJsonContentType(_)) => Err(ApiError::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "invalid_argument",
+                "unsupported_media_type",
                 e.body_text(),
             )),
             Err(e) => Err(rejected(e.status(), e.body_text())),

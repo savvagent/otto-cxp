@@ -60,7 +60,7 @@ fn refuse(public_url: &str, failure: AuthFailure) -> Response {
     let mut res = (
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
-            "error": "invalid_token",
+            "error": error_name(&failure),
             "error_description": failure.reason(),
         })),
     )
@@ -68,6 +68,16 @@ fn refuse(public_url: &str, failure: AuthFailure) -> Response {
     res.headers_mut()
         .insert(header::WWW_AUTHENTICATE, challenge(public_url, &failure));
     res
+}
+
+/// The body's `error`. A request with no credentials is `unauthenticated`,
+/// not `invalid_token`: there was no token to be invalid, and the challenge
+/// header carries no `error` for it either (RFC 6750 §3.1).
+fn error_name(failure: &AuthFailure) -> &'static str {
+    match failure {
+        AuthFailure::Missing => "unauthenticated",
+        _ => "invalid_token",
+    }
 }
 
 fn challenge(public_url: &str, failure: &AuthFailure) -> HeaderValue {

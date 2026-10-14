@@ -8,13 +8,16 @@
 //!
 //! | code | status |
 //! |---|---|
-//! | `not_found` | 404 |
+//! | `not_found` | 404 (also any unknown `/api/v1` path) |
 //! | `invalid_argument`, `unknown_team` | 400 |
 //! | `conflict` | 409 |
-//! | `insufficient_scope` | 403 |
-//! | `access_revoked` | 401 |
+//! | `insufficient_scope` | 403, with `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"` (RFC 6750 §3.1) |
+//! | `access_revoked` | 401, with the `WWW-Authenticate` challenge |
+//! | `invalid_signature` | 401 (`/platform/webhooks` only) |
 //! | `quota_exceeded` | 429 (the org's plan allowance is used up; reads still work) |
 //! | `payload_too_large` | 413 |
+//! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
+//! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
 //! | `unavailable` | 503, with `Retry-After: 5` |
 //! | `internal` | 500 |
 
@@ -28,6 +31,8 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// A `WWW-Authenticate` value to send with the response, if any.
+    challenge: Option<String>,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -38,6 +43,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            challenge: None,
         }
     }
 
@@ -87,7 +93,13 @@ impl From<otto_resource::Error> for ApiError {
 
 impl From<MissingScope> for ApiError {
     fn from(e: MissingScope) -> Self {
-        Self::new(StatusCode::FORBIDDEN, "insufficient_scope", e.to_string())
+        let mut err = Self::new(StatusCode::FORBIDDEN, "insufficient_scope", e.to_string());
+        err.challenge = Some(format!(
+            r#"Bearer realm="{}", error="insufficient_scope", scope="{}""#,
+            cxp_core::scopes::RESOURCE_NAME,
+            e.0
+        ));
+        err
     }
 }
 
@@ -98,6 +110,13 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({ "error": self.message, "code": self.code })),
         )
             .into_response();
+        if let Some(value) = self
+            .challenge
+            .as_deref()
+            .and_then(|c| HeaderValue::from_str(c).ok())
+        {
+            res.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        }
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             res.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
@@ -149,6 +168,11 @@ mod tests {
         assert_eq!(
             (scope.status, scope.code),
             (StatusCode::FORBIDDEN, "insufficient_scope")
+        );
+        let res = scope.into_response();
+        assert_eq!(
+            res.headers()[header::WWW_AUTHENTICATE],
+            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
         );
     }
 }
