@@ -29,6 +29,20 @@ async fn add(db: &Db, org: OrgId, c: NewCustomer) -> Customer {
     c
 }
 
+/// Put a customer in a static segment with raw SQL: nothing in the domain API
+/// writes members.
+async fn member(tx: &mut otto_tenant::Tx<'_>, org: OrgId, segment: Uuid, customer: Uuid) {
+    sqlx::query(
+        "INSERT INTO segment_members (org_id, segment_id, customer_id) VALUES ($1, $2, $3)",
+    )
+    .bind(org)
+    .bind(segment)
+    .bind(customer)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+}
+
 fn page(limit: i64, offset: i64) -> Page {
     Page::new(Some(limit), Some(offset))
 }
@@ -453,6 +467,23 @@ async fn dynamic_segments_evaluate_their_criteria(pool: PgPool) {
     let (one, total) = tx.get_segment_members(past.id, page(1, 0)).await.unwrap();
     assert_eq!((one.len(), total), (1, 3));
 
+    // Any timestamp Postgres reads is accepted: date-only, space-separated,
+    // and with an offset.
+    for (key, value, expect) in [
+        ("created_after", "2000-01-01", 3),
+        ("created_after", "2000-01-01 00:00:00", 3),
+        ("created_after", "2000-01-01T00:00:00+02:00", 3),
+        ("created_before", "2000-01-01", 0),
+        ("created_before", "2999-12-31 23:59:59", 3),
+    ] {
+        let s = tx
+            .create_segment(&seg(json!({ key: value })))
+            .await
+            .unwrap();
+        let (_, total) = tx.get_segment_members(s.id, Page::default()).await.unwrap();
+        assert_eq!(total, expect, "{key} {value}");
+    }
+
     // Empty criteria match everyone.
     let everyone = tx.create_segment(&seg(json!({}))).await.unwrap();
     assert_eq!(
@@ -464,19 +495,15 @@ async fn dynamic_segments_evaluate_their_criteria(pool: PgPool) {
     );
 
     let (listed, total) = tx.list_segments(page(2, 0)).await.unwrap();
-    assert_eq!((listed.len(), total), (2, 5));
+    assert_eq!((listed.len(), total), (2, 10));
     assert_eq!(tx.get_segment(both.id).await.unwrap().id, both.id);
-    tx.delete_segment(both.id).await.unwrap();
     assert!(matches!(
-        tx.get_segment(both.id).await,
+        tx.get_segment(Uuid::new_v4()).await,
         Err(Error::NotFound { kind: "segment" })
     ));
     assert!(matches!(
-        tx.delete_segment(both.id).await,
-        Err(Error::NotFound { kind: "segment" })
-    ));
-    assert!(matches!(
-        tx.get_segment_members(both.id, Page::default()).await,
+        tx.get_segment_members(Uuid::new_v4(), Page::default())
+            .await,
         Err(Error::NotFound { kind: "segment" })
     ));
 }
@@ -498,10 +525,29 @@ async fn segment_input_is_validated(pool: PgPool) {
         make("s", json!({}), Some("weird")),
         make("s", json!({"colour": "red"}), None),
         make("s", json!({"company_eq": 5}), None),
-        make("s", json!({"created_after": "yesterday"}), None),
+        make("s", json!({"created_after": "not a date"}), None),
+        make("s", json!({"created_before": "2024-13-45"}), None),
     ] {
         let e = tx.create_segment(&bad).await.unwrap_err();
         assert_eq!(e.code(), "invalid_argument", "{bad:?}");
+        assert!(!e.to_string().contains("timestamptz"), "{e}");
+    }
+    // The refusals did not abort the transaction.
+    tx.create_segment(&make("ok", json!({}), None))
+        .await
+        .unwrap();
+
+    // Unknown keys and non-string values name the keys that are allowed.
+    for bad in [json!({"colour": "red"}), json!({"company_eq": 5})] {
+        let e = tx.create_segment(&make("s", bad, None)).await.unwrap_err();
+        for key in [
+            "tags_contain",
+            "company_eq",
+            "created_after",
+            "created_before",
+        ] {
+            assert!(e.to_string().contains(key), "{e}");
+        }
     }
     assert_eq!(
         parse_json("criteria", "not json").unwrap_err().code(),
@@ -510,7 +556,7 @@ async fn segment_input_is_validated(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn static_segments_hold_members(pool: PgPool) {
+async fn static_segments_list_their_members(pool: PgPool) {
     let db = db(pool);
     let org = org();
     let mut tx = db.begin(org).await.unwrap();
@@ -520,6 +566,9 @@ async fn static_segments_hold_members(pool: PgPool) {
         .unwrap();
     let c2 = tx
         .create_customer(&new("s2@example.com", "S2"))
+        .await
+        .unwrap();
+    tx.create_customer(&new("s3@example.com", "S3"))
         .await
         .unwrap();
     let seg = tx
@@ -532,32 +581,6 @@ async fn static_segments_hold_members(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(seg.description.as_deref(), Some("hand-picked"));
-
-    tx.add_segment_member(seg.id, c1.id).await.unwrap();
-    tx.add_segment_member(seg.id, c1.id).await.unwrap(); // idempotent
-    tx.add_segment_member(seg.id, c2.id).await.unwrap();
-    let (members, total) = tx
-        .get_segment_members(seg.id, Page::default())
-        .await
-        .unwrap();
-    assert_eq!((members.len(), total), (2, 2));
-
-    tx.remove_segment_member(seg.id, c1.id).await.unwrap();
-    assert!(matches!(
-        tx.remove_segment_member(seg.id, c1.id).await,
-        Err(Error::NotFound {
-            kind: "segment member"
-        })
-    ));
-    let (members, _) = tx
-        .get_segment_members(seg.id, Page::default())
-        .await
-        .unwrap();
-    assert_eq!(members.len(), 1);
-    assert_eq!(members[0].id, c2.id);
-
-    // Deleting a customer drops their membership; deleting the segment keeps customers.
-    tx.delete_customer(c2.id).await.unwrap();
     assert_eq!(
         tx.get_segment_members(seg.id, Page::default())
             .await
@@ -565,24 +588,25 @@ async fn static_segments_hold_members(pool: PgPool) {
             .1,
         0
     );
-    tx.delete_segment(seg.id).await.unwrap();
-    tx.get_customer(c1.id).await.unwrap();
 
-    let dynamic = tx
-        .create_segment(&NewSegment {
-            name: "d".into(),
-            description: None,
-            criteria: json!({}),
-            segment_type: None,
-        })
+    member(&mut tx, org, seg.id, c1.id).await;
+    member(&mut tx, org, seg.id, c2.id).await;
+    let (members, total) = tx
+        .get_segment_members(seg.id, Page::default())
         .await
         .unwrap();
-    let e = tx.add_segment_member(dynamic.id, c1.id).await.unwrap_err();
-    assert_eq!(e.code(), "invalid_argument");
-    assert!(matches!(
-        tx.add_segment_member(Uuid::new_v4(), c1.id).await,
-        Err(Error::NotFound { kind: "segment" })
-    ));
+    assert_eq!((members.len(), total), (2, 2));
+    let (one, total) = tx.get_segment_members(seg.id, page(1, 1)).await.unwrap();
+    assert_eq!((one.len(), total), (1, 2));
+
+    // Deleting a customer drops their membership.
+    tx.delete_customer(c2.id).await.unwrap();
+    let (members, _) = tx
+        .get_segment_members(seg.id, Page::default())
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].id, c1.id);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -705,7 +729,7 @@ async fn one_org_cannot_see_or_touch_anothers_customer_data(pool: PgPool) {
         })
         .await
         .unwrap();
-    tx.add_segment_member(seg.id, cust.id).await.unwrap();
+    member(&mut tx, a, seg.id, cust.id).await;
     tx.commit().await.unwrap();
 
     // Org B sees none of it.
@@ -769,31 +793,9 @@ async fn one_org_cannot_see_or_touch_anothers_customer_data(pool: PgPool) {
             tx.get_segment_members(id, Page::default()).await,
             Err(Error::NotFound { .. })
         ));
-        assert!(matches!(
-            tx.delete_segment(id).await,
-            Err(Error::NotFound { .. })
-        ));
     }
-    assert!(matches!(
-        tx.remove_segment_member(seg.id, cust.id).await,
-        Err(Error::NotFound { .. })
-    ));
 
-    // B's own segment cannot take A's customer, and B's own customer count of
-    // an all-matching dynamic segment excludes A's.
-    let b_seg = tx
-        .create_segment(&NewSegment {
-            name: "B static".into(),
-            description: None,
-            criteria: json!({}),
-            segment_type: Some("static".into()),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(
-        tx.add_segment_member(b_seg.id, cust.id).await,
-        Err(Error::NotFound { kind: "customer" })
-    ));
+    // An all-matching dynamic segment in B excludes A's customers.
     let b_dyn = tx
         .create_segment(&NewSegment {
             name: "B all".into(),

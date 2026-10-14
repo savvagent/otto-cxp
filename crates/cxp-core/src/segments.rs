@@ -4,8 +4,9 @@
 //! A `static` segment's members are the rows in `segment_members`. A `dynamic`
 //! segment's members are the customers its `criteria` match, evaluated when
 //! asked. Criteria keys (all optional, all ANDed): `tags_contain` (a tag),
-//! `company_eq` (exact company), `created_after` / `created_before` (RFC 3339
-//! timestamps). Values are bound, never spliced into SQL.
+//! `company_eq` (exact company), `created_after` / `created_before` (any
+//! timestamp Postgres reads, e.g. `2024-01-01` or `2024-01-01 09:30:00`).
+//! Values are bound, never spliced into SQL.
 
 use std::future::Future;
 
@@ -54,8 +55,8 @@ pub struct NewSegment {
 struct Criteria {
     tag: Option<String>,
     company: Option<String>,
-    after: Option<DateTime<Utc>>,
-    before: Option<DateTime<Utc>>,
+    after: Option<String>,
+    before: Option<String>,
 }
 
 fn invalid(msg: impl Into<String>) -> Error {
@@ -69,25 +70,11 @@ fn criteria_text<'a>(
     match map.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s)),
-        Some(_) => Err(invalid(format!("criteria `{key}` must be a string"))),
+        Some(_) => Err(invalid(format!(
+            "criteria `{key}` must be a string; supported keys: {}",
+            CRITERIA_KEYS.join(", ")
+        ))),
     }
-}
-
-fn criteria_time(
-    map: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<Option<DateTime<Utc>>> {
-    criteria_text(map, key)?
-        .map(|s| {
-            DateTime::parse_from_rfc3339(s)
-                .map(|t| t.with_timezone(&Utc))
-                .map_err(|_| {
-                    invalid(format!(
-                        "criteria `{key}` must be an RFC 3339 timestamp, like 2026-01-31T00:00:00Z"
-                    ))
-                })
-        })
-        .transpose()
 }
 
 impl Criteria {
@@ -104,9 +91,59 @@ impl Criteria {
         Ok(Self {
             tag: criteria_text(map, "tags_contain")?.map(str::to_owned),
             company: criteria_text(map, "company_eq")?.map(str::to_owned),
-            after: criteria_time(map, "created_after")?,
-            before: criteria_time(map, "created_before")?,
+            after: criteria_text(map, "created_after")?.map(str::to_owned),
+            before: criteria_text(map, "created_before")?.map(str::to_owned),
         })
+    }
+}
+
+/// Whether Postgres reads `text` as a `timestamptz`, asked inside a savepoint
+/// so a refusal leaves the transaction usable. The caller sees our message,
+/// never the database's.
+async fn check_timestamp(tx: &mut Tx<'_>, key: &str, text: &str) -> Result<()> {
+    sqlx::query("SAVEPOINT cxp_criteria_time")
+        .execute(tx.conn())
+        .await?;
+    let probe = sqlx::query("SELECT $1::text::timestamptz")
+        .bind(text)
+        .execute(tx.conn())
+        .await;
+    match probe {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT cxp_criteria_time")
+                .execute(tx.conn())
+                .await?;
+            Ok(())
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT cxp_criteria_time")
+                .execute(tx.conn())
+                .await?;
+            let bad_time = e
+                .as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| matches!(c.as_ref(), "22007" | "22008"));
+            if bad_time {
+                Err(invalid(format!(
+                    "criteria `{key}` is not a timestamp; use a date or date and time, \
+                     like 2026-01-31 or 2026-01-31T09:30:00Z"
+                )))
+            } else {
+                Err(Error::Database(e))
+            }
+        }
+    }
+}
+
+impl Criteria {
+    async fn check_times(self, tx: &mut Tx<'_>) -> Result<Self> {
+        if let Some(t) = &self.after {
+            check_timestamp(tx, "created_after", t).await?;
+        }
+        if let Some(t) = &self.before {
+            check_timestamp(tx, "created_before", t).await?;
+        }
+        Ok(self)
     }
 }
 
@@ -124,32 +161,12 @@ pub trait SegmentsExt {
         page: Page,
     ) -> impl Future<Output = Result<(Vec<Segment>, i64)>> + Send;
 
-    /// Delete a segment; its memberships go with it, its customers stay.
-    fn delete_segment(&mut self, id: Uuid) -> impl Future<Output = Result<()>> + Send;
-
     /// The segment's customers, newest first, with the total.
     fn get_segment_members(
         &mut self,
         id: Uuid,
         page: Page,
     ) -> impl Future<Output = Result<(Vec<Customer>, i64)>> + Send;
-
-    /// Add a customer to a static segment (adding again changes nothing).
-    /// `Error::Invalid` for a dynamic segment; `Error::NotFound` for a segment
-    /// or customer this organization does not have.
-    fn add_segment_member(
-        &mut self,
-        segment_id: Uuid,
-        customer_id: Uuid,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    /// Remove a customer from a static segment. `Error::NotFound` when they
-    /// were not a member.
-    fn remove_segment_member(
-        &mut self,
-        segment_id: Uuid,
-        customer_id: Uuid,
-    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 impl SegmentsExt for Tx<'_> {
@@ -161,7 +178,7 @@ impl SegmentsExt for Tx<'_> {
         let segment_type = new.segment_type.as_deref().unwrap_or("dynamic");
         match segment_type {
             "dynamic" => {
-                Criteria::parse(&new.criteria)?;
+                Criteria::parse(&new.criteria)?.check_times(self).await?;
             }
             "static" => {
                 if !new.criteria.is_object() {
@@ -214,19 +231,6 @@ impl SegmentsExt for Tx<'_> {
         Ok((rows, total))
     }
 
-    async fn delete_segment(&mut self, id: Uuid) -> Result<()> {
-        let org = self.org();
-        let done = sqlx::query("DELETE FROM segments WHERE org_id = $1 AND id = $2")
-            .bind(org)
-            .bind(id)
-            .execute(self.conn())
-            .await?;
-        if done.rows_affected() == 0 {
-            return Err(Error::NotFound { kind: "segment" });
-        }
-        Ok(())
-    }
-
     async fn get_segment_members(&mut self, id: Uuid, page: Page) -> Result<(Vec<Customer>, i64)> {
         let segment = self.get_segment(id).await?;
         let org = self.org();
@@ -252,12 +256,14 @@ impl SegmentsExt for Tx<'_> {
             return Ok((rows, total));
         }
 
-        let c = Criteria::parse(&segment.criteria)?;
+        let c = Criteria::parse(&segment.criteria)?
+            .check_times(self)
+            .await?;
         const MATCH: &str = "org_id = $1 \
              AND ($2::text IS NULL OR $2 = ANY(tags)) \
              AND ($3::text IS NULL OR company = $3) \
-             AND ($4::timestamptz IS NULL OR created_at > $4) \
-             AND ($5::timestamptz IS NULL OR created_at < $5)";
+             AND ($4::text IS NULL OR created_at > $4::text::timestamptz) \
+             AND ($5::text IS NULL OR created_at < $5::text::timestamptz)";
         let rows = sqlx::query_as(&format!(
             "SELECT {CUSTOMER_COLS} FROM customers WHERE {MATCH} \
              ORDER BY created_at DESC, id LIMIT $6 OFFSET $7"
@@ -265,8 +271,8 @@ impl SegmentsExt for Tx<'_> {
         .bind(org)
         .bind(&c.tag)
         .bind(&c.company)
-        .bind(c.after)
-        .bind(c.before)
+        .bind(&c.after)
+        .bind(&c.before)
         .bind(page.limit())
         .bind(page.offset())
         .fetch_all(self.conn())
@@ -276,58 +282,10 @@ impl SegmentsExt for Tx<'_> {
                 .bind(org)
                 .bind(&c.tag)
                 .bind(&c.company)
-                .bind(c.after)
-                .bind(c.before)
+                .bind(&c.after)
+                .bind(&c.before)
                 .fetch_one(self.conn())
                 .await?;
         Ok((rows, total))
-    }
-
-    async fn add_segment_member(&mut self, segment_id: Uuid, customer_id: Uuid) -> Result<()> {
-        let segment = self.get_segment(segment_id).await?;
-        if segment.segment_type != "static" {
-            return Err(invalid(
-                "only a static segment has stored members; a dynamic segment's members \
-                 are the customers its criteria match",
-            ));
-        }
-        let org = self.org();
-        let customer: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM customers WHERE org_id = $1 AND id = $2")
-                .bind(org)
-                .bind(customer_id)
-                .fetch_optional(self.conn())
-                .await?;
-        if customer.is_none() {
-            return Err(Error::NotFound { kind: "customer" });
-        }
-        sqlx::query(
-            "INSERT INTO segment_members (org_id, segment_id, customer_id) \
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(org)
-        .bind(segment_id)
-        .bind(customer_id)
-        .execute(self.conn())
-        .await?;
-        Ok(())
-    }
-
-    async fn remove_segment_member(&mut self, segment_id: Uuid, customer_id: Uuid) -> Result<()> {
-        let org = self.org();
-        let done = sqlx::query(
-            "DELETE FROM segment_members WHERE org_id = $1 AND segment_id = $2 AND customer_id = $3",
-        )
-        .bind(org)
-        .bind(segment_id)
-        .bind(customer_id)
-        .execute(self.conn())
-        .await?;
-        if done.rows_affected() == 0 {
-            return Err(Error::NotFound {
-                kind: "segment member",
-            });
-        }
-        Ok(())
     }
 }
