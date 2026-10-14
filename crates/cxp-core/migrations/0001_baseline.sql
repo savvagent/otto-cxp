@@ -214,8 +214,10 @@ CREATE INDEX customers_org_page_idx ON customers (org_id, page_id);
 CREATE INDEX customers_org_component_idx ON customers (org_id, component_id);
 CREATE INDEX customers_metadata_idx ON customers USING GIN (metadata);
 CREATE INDEX customers_tags_idx ON customers USING GIN (tags);
--- Fuzzy name lookup (`similarity(name, $q)`, `name ILIKE`).
+-- Customer search: the trigram operator `name % $q` and the substring matches
+-- `name ILIKE` / `email ILIKE '%…%'` (a plain `similarity()` call cannot use these).
 CREATE INDEX customers_name_trgm_idx ON customers USING GIN (name gin_trgm_ops);
+CREATE INDEX customers_email_trgm_idx ON customers USING GIN (email gin_trgm_ops);
 
 -- A customer's journey: page views, purchases, logins, and so on.
 CREATE TABLE interactions (
