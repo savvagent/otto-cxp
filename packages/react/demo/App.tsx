@@ -73,14 +73,19 @@ export default function App() {
   // Bearer token for the resource server: VITE_CXP_TOKEN, or pasted below.
   // VITE_* variables are inlined into the built bundle: local development only,
   // never build or deploy this demo with a real token.
-  const [token, setToken] = useState<string>(
+  const envToken =
     (import.meta as unknown as { env?: Record<string, string> }).env
-      ?.VITE_CXP_TOKEN ?? ""
-  );
-  const [connectNonce, setConnectNonce] = useState(0);
+      ?.VITE_CXP_TOKEN ?? "";
+  // `token` is the text field; `connectRequest` holds the token submitted by
+  // the Connect/Reconnect button. Only the latter drives a connection, so
+  // typing never reconnects.
+  const [token, setToken] = useState<string>(envToken);
+  const [connectRequest, setConnectRequest] = useState<
+    { token: string; nonce: number } | null
+  >(envToken ? { token: envToken, nonce: 0 } : null);
 
   useEffect(() => {
-    if (!token) {
+    if (!connectRequest) {
       setCxpClient(null);
       setConnectionStatus("failed");
       return;
@@ -91,7 +96,7 @@ export default function App() {
 
     connectCxp({
       url: new URL("/mcp", window.location.origin),
-      token,
+      token: connectRequest.token,
       name: "cxp-demo",
     })
       .then((conn) => {
@@ -114,7 +119,7 @@ export default function App() {
       cancelled = true;
       void close?.();
     };
-  }, [token, connectNonce]);
+  }, [connectRequest]);
 
   const isDemo = connectionStatus !== "connected";
 
@@ -177,7 +182,7 @@ export default function App() {
             ? "Connected to server"
             : connectionStatus === "connecting"
               ? "Connecting..."
-              : "Demo mode (set a bearer token to connect)"}
+              : "Demo mode (enter a bearer token and press Connect)"}
         </div>
 
         {/* Bearer token */}
@@ -194,6 +199,14 @@ export default function App() {
               type="password"
               value={token}
               onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && token) {
+                  setConnectRequest((prev) => ({
+                    token,
+                    nonce: (prev?.nonce ?? 0) + 1,
+                  }));
+                }
+              }}
               placeholder="otto platform access token"
               style={{
                 display: "block",
@@ -208,11 +221,16 @@ export default function App() {
             />
           </label>
           <button
-            onClick={() => setConnectNonce((n) => n + 1)}
-            disabled={!token}
+            onClick={() =>
+              setConnectRequest((prev) => ({
+                token,
+                nonce: (prev?.nonce ?? 0) + 1,
+              }))
+            }
+            disabled={!token || connectionStatus === "connecting"}
             style={{ marginTop: 6, fontSize: 11 }}
           >
-            Reconnect
+            {cxpClient ? "Reconnect" : "Connect"}
           </button>
         </div>
 

@@ -11,6 +11,7 @@ import type {
   Customer360,
   CsatResult,
   NpsResult,
+  SentimentResult,
 } from "../types.js";
 
 function reply(payload: unknown) {
@@ -143,6 +144,23 @@ describe("tool argument contract", () => {
     expect((await feedback.calculateCsat()).csat).toBeNull();
   });
 
+  it("analyze_sentiment sends text and returns the camelCase result", async () => {
+    const payload: SentimentResult = {
+      score: 0.5,
+      label: "positive",
+      positiveWords: ["great"],
+      negativeWords: [],
+    };
+    vi.mocked(client.callTool).mockResolvedValue(reply(payload));
+    const result = await feedback.analyzeSentiment("great product");
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "analyze_sentiment",
+      arguments: { text: "great product" },
+    });
+    expect(result).toEqual(payload);
+    expect(result.positiveWords).toEqual(["great"]);
+  });
+
   it("calculate_csat sends feedback_type and returns counts", async () => {
     const payload: CsatResult = {
       csat: 75,
@@ -165,8 +183,15 @@ describe("tool argument contract", () => {
       customer: {
         id: "c",
         email: "a@b.c",
+        name: null,
+        phone: null,
+        company: null,
         metadata: {},
         tags: [],
+        experienceId: null,
+        applicationId: null,
+        pageId: null,
+        componentId: null,
         createdAt: "t",
         updatedAt: "t",
       },

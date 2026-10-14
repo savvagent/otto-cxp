@@ -2,17 +2,23 @@
  * Core data types for the CXP SDK
  */
 
+import type { JsonValue } from "./type-utils.js";
+
 /**
  * Customer entity
  */
 export interface Customer {
   id: string;
   email: string;
-  name?: string;
-  phone?: string;
-  company?: string;
+  name: string | null;
+  phone: string | null;
+  company: string | null;
   metadata: Record<string, unknown>;
   tags: string[];
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -24,14 +30,18 @@ export interface Ticket {
   id: string;
   customerId: string;
   subject: string;
-  description?: string;
+  description: string | null;
   status: string;
   priority: string;
-  channel?: string;
-  assignedTo?: string;
+  channel: string | null;
+  assignedTo: string | null;
   tags: string[];
   metadata: Record<string, unknown>;
-  resolvedAt?: string;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
+  resolvedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -54,13 +64,13 @@ export interface Feedback {
   id: string;
   customerId: string;
   feedbackType: string;
-  subject?: string;
-  body?: string;
-  rating?: number;
-  experienceId?: string;
-  applicationId?: string;
-  pageId?: string;
-  componentId?: string;
+  subject: string | null;
+  body: string | null;
+  rating: number | null;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
 }
@@ -71,9 +81,17 @@ export interface Feedback {
 export interface Survey {
   id: string;
   title: string;
-  description?: string;
-  questions: SurveyQuestion[];
+  description: string | null;
+  /**
+   * Stored as free-form JSON by the server. Questions created through this
+   * SDK are `SurveyQuestion[]`, but other writers may store any JSON value.
+   */
+  questions: JsonValue;
   active: boolean;
+  experienceId: string | null;
+  applicationId: string | null;
+  pageId: string | null;
+  componentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -96,8 +114,9 @@ export interface SurveyResponse {
   id: string;
   surveyId: string;
   customerId: string;
-  answers: SurveyAnswer[];
-  completedAt?: string;
+  /** Free-form JSON as stored; responses submitted through this SDK are `SurveyAnswer[]`. */
+  answers: JsonValue;
+  completedAt: string | null;
   createdAt: string;
 }
 
@@ -116,7 +135,7 @@ export interface KnowledgeArticle {
   id: string;
   title: string;
   content: string;
-  category?: string;
+  category: string | null;
   tags: string[];
   published: boolean;
   createdAt: string;
@@ -129,7 +148,7 @@ export interface KnowledgeArticle {
 export interface Segment {
   id: string;
   name: string;
-  description?: string;
+  description: string | null;
   criteria: Record<string, unknown>;
   segmentType: string;
   createdAt: string;
@@ -145,7 +164,7 @@ export interface ChatSession {
   status: string;
   metadata: Record<string, unknown>;
   startedAt: string;
-  endedAt?: string;
+  endedAt: string | null;
 }
 
 /**

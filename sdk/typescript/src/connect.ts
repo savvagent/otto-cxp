@@ -61,11 +61,32 @@ export class CxpAuthorizationRequired extends CxpError {
     this.name = "CxpAuthorizationRequired";
     this.transport = transport;
     this.finishAuth = async (authorizationCode) => {
-      await transport.finishAuth(authorizationCode);
-      // The provider now holds the tokens; connect on a fresh transport.
-      return connectCxp(options);
+      try {
+        await transport.finishAuth(authorizationCode);
+        // The provider now holds the tokens; connect on a fresh transport.
+        return await connectCxp(options);
+      } finally {
+        // This transport only served the auth exchange. Release it whether the
+        // exchange succeeded (the new connection has its own) or failed.
+        await transport.close().catch(() => undefined);
+      }
     };
   }
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/**
+ * A static bearer token is a long-lived secret: refuse to send it in clear
+ * text. Plain `http:` is only allowed to a loopback host (local development).
+ */
+function assertTokenSafeUrl(url: URL): void {
+  if (url.protocol === "https:") return;
+  if (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname)) return;
+  throw new Error(
+    `createCxpTransport: refusing to send a static \`token\` to ${url.protocol}//${url.host}; ` +
+      "use an https URL (plain http is only allowed for localhost, 127.0.0.1 and ::1)"
+  );
 }
 
 /**
@@ -83,8 +104,15 @@ export function createCxpTransport(
   if (!token && !authProvider) {
     throw new Error("createCxpTransport: a `token` or an `authProvider` is required");
   }
+  const target = typeof url === "string" ? new URL(url) : url;
+  if (token) {
+    if (/[\r\n]/.test(token)) {
+      throw new Error("createCxpTransport: `token` must not contain CR or LF characters");
+    }
+    assertTokenSafeUrl(target);
+  }
   return new StreamableHTTPClientTransport(
-    typeof url === "string" ? new URL(url) : url,
+    target,
     authProvider
       ? { authProvider }
       : { requestInit: { headers: { Authorization: `Bearer ${token}` } } }
@@ -125,6 +153,8 @@ export async function connectCxp(options: ConnectCxpOptions): Promise<CxpConnect
     // The transport's `sessionId?: string` clashes with exactOptionalPropertyTypes.
     await client.connect(transport as Transport);
   } catch (e) {
+    // Release the unused client (and its transport) before surfacing the error.
+    await client.close().catch(() => undefined);
     if (e instanceof UnauthorizedError && options.authProvider) {
       throw new CxpAuthorizationRequired(options, transport);
     }

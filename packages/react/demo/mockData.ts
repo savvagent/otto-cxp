@@ -1,13 +1,5 @@
 import type { CxpClient } from "@cxp/sdk";
 
-// Placeholder catalog IDs. The server expects UUIDs of existing catalog
-// entities for feedback context; replace these with real ones when seeding a
-// server whose catalog has them.
-const WEB_APP_ID = "00000000-0000-4000-8000-000000000001";
-const ONBOARDING_PAGE_ID = "00000000-0000-4000-8000-000000000002";
-const SETTINGS_PAGE_ID = "00000000-0000-4000-8000-000000000003";
-const NOTIFICATIONS_PAGE_ID = "00000000-0000-4000-8000-000000000004";
-
 export interface SeededIds {
   customerId: string;
   surveyId: string;
@@ -78,30 +70,25 @@ export async function seedMockData(cxp: CxpClient): Promise<SeededIds> {
     topic: "billing",
   });
 
-  // 5. Submit feedback
+  // 5. Submit feedback. Catalog ids (experience/application/page/component)
+  // are omitted on purpose: they must reference existing catalog rows, and
+  // each submission is billable.
   await cxp.feedback.submitFeedback(customer.id, "praise", {
     subject: "Love the new onboarding flow",
     body: "The step-by-step setup wizard made it really easy to get started. Great job!",
     rating: 5,
-    applicationId: WEB_APP_ID,
-    pageId: ONBOARDING_PAGE_ID,
   });
 
   await cxp.feedback.submitFeedback(customer.id, "feature_request", {
     subject: "Dark mode support",
     body: "Would love a dark mode option for the dashboard. I work late at night and the bright UI is harsh.",
     rating: 4,
-    applicationId: WEB_APP_ID,
-    pageId: SETTINGS_PAGE_ID,
   });
 
   await cxp.feedback.submitFeedback(customer.id, "bug_report", {
     subject: "Notification bell count is off",
     body: "The notification badge shows 3 but there are actually 5 unread notifications.",
     rating: 2,
-    applicationId: WEB_APP_ID,
-    pageId: NOTIFICATIONS_PAGE_ID,
-    component: "NotificationBell",
   });
 
   // 6. Create a survey with questions

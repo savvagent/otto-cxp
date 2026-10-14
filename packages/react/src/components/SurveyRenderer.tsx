@@ -55,6 +55,10 @@ const DEMO_SURVEY: Survey = {
   description:
     "We'd love to hear about your experience. Your feedback helps us improve!",
   active: true,
+  experienceId: null,
+  applicationId: null,
+  pageId: null,
+  componentId: null,
   questions: [
     {
       id: "q1",
@@ -79,6 +83,22 @@ const DEMO_SURVEY: Survey = {
   createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };
+
+/**
+ * The server stores survey questions as free-form JSON. Keep only the entries
+ * that have the shape this component can render.
+ */
+function parseQuestions(value: Survey["questions"]): SurveyQuestion[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((q) => {
+    if (typeof q !== "object" || q === null || Array.isArray(q)) return false;
+    return (
+      typeof q["id"] === "string" &&
+      typeof q["text"] === "string" &&
+      typeof q["questionType"] === "string"
+    );
+  }) as unknown as SurveyQuestion[];
+}
 
 /**
  * Component for rendering and completing surveys.
@@ -381,7 +401,7 @@ export function SurveyRenderer({
       )}
 
       <form onSubmit={handleSubmit}>
-        {survey.questions.map(renderQuestion)}
+        {parseQuestions(survey.questions).map(renderQuestion)}
 
         <button
           type="submit"
