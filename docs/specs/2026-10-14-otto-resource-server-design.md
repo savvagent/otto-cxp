@@ -1,6 +1,6 @@
 # otto-cxp as an otto platform resource server — design
 
-**Status:** IN PROGRESS
+**Status:** IMPLEMENTED (#19). Production deploy is a human hand-off (`docs/deploy/fly.md`); no separate plan document — the decomposition is the Stories section.
 **Epic:** #1
 **Reference implementation:** otto-flags (`savvagent/otto-flags`, local checkout
 `/home/robhicks/dev/otto-flags`). Where this document is silent, do what otto-flags does.
