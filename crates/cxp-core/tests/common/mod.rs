@@ -7,9 +7,8 @@
 //! names, connecting as a superuser. A superuser bypasses row-level
 //! security, so a plain pool query proves nothing about isolation: tenant
 //! work goes through [`db`]'s `Db::begin` (which assumes the tenant role,
-//! `cxp_app`), and
-//! unpinned checks go through [`as_app_unpinned`], [`as_app_maintenance`], or
-//! [`tenant_role_db`].
+//! `cxp_app`), and unpinned checks go through [`as_app_unpinned`],
+//! [`as_app_maintenance`], or [`tenant_role_db`].
 
 #![allow(dead_code)]
 
@@ -41,7 +40,6 @@ pub fn user() -> UserId {
 /// so sqlx can drop the test database.
 pub async fn tenant_role_db(pool: &PgPool) -> Db {
     let set_role = format!("SET ROLE {}", cxp_core::TENANT_ROLE);
-    Box::leak(format!("SET ROLE {}", cxp_core::TENANT_ROLE).into_boxed_str());
     let app_pool = PgPoolOptions::new()
         .max_connections(2)
         .after_connect(move |conn, _meta| {

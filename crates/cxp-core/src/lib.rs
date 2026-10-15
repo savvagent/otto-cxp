@@ -7,9 +7,8 @@
 //! This is otto-cxp's own database, separate from the platform's. Tenant
 //! isolation comes from `otto_tenant::{Db, Tx}`: every tenant query is a
 //! method on an [`otto_tenant::Tx`], which cannot exist without an org, and
-//! runs under row-level security as `cxp_app`
-//! ([`TENANT_ROLE`]). Query methods are extension
-//! traits (`customers::CustomersExt`, `tickets::TicketsExt`, ...) because `Tx`
+//! runs under row-level security as `cxp_app` ([`TENANT_ROLE`]). Query
+//! methods are extension traits (`customers::CustomersExt`, `tickets::TicketsExt`, ...) because `Tx`
 //! is defined in otto-tenant. Request paths open their transactions with
 //! `platform_events::begin_live`, never `Db::begin` directly, so a deleted org
 //! or removed member is refused.
