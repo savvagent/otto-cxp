@@ -59,7 +59,7 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false }
 # The console's sign-in: the cookie's SHA-256 (what is stored), its random
 # bytes, base64url for cookies and PKCE, and constant-time comparison of the
-# OAuth state. All already in the tree through otto-tenant and otto-resource.
+# OAuth state; sha2 and base64 also pin the install page's CSP hashes. All already in the tree through otto-tenant and otto-resource.
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"

@@ -36,9 +36,10 @@ Per-package: `cd sdk/typescript && pnpm build`.
 
 One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api/v1/...`,
 `/auth/...` (the web console's sign-in), `POST /platform/webhooks`,
-`/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, and the built web console
-(`CXP_CONSOLE_DIR`) under `/console/` only (`GET`/`HEAD`; `index.html` for browser navigations
-there; `/console` redirects to `/console/`). Everything else, `/` included, is a JSON 404.
+`/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, `/` (a connector install page for
+browsers only), and the built web console (`CXP_CONSOLE_DIR`) under `/console/` only (`GET`/`HEAD`;
+`index.html` for browser navigations there; `/console` redirects to `/console/`). Everything else
+is a JSON 404.
 
 **Crates (`crates/`):**
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
