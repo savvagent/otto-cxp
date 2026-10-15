@@ -1548,6 +1548,14 @@ impl Drop for TestRoles {
                             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                              WHERE usename = '{name}'"
                         ),
+                        // A role that owns objects here (the ownership
+                        // checks make some) cannot be dropped until they
+                        // go back to the test superuser.
+                        format!(
+                            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{name}') \
+                             THEN REASSIGN OWNED BY {name} TO CURRENT_USER; DROP OWNED BY {name}; \
+                             END IF; END $$"
+                        ),
                         format!("DROP ROLE IF EXISTS {name}"),
                     ] {
                         sqlx::query(&stmt).execute(&mut conn).await?;
@@ -2010,4 +2018,229 @@ async fn the_outbox_tables_carry_a_meter_quantity_pair_kept_together_by_a_check(
                 .unwrap_or_else(|e| panic!("{table}: meter {meter}, quantity {quantity}: {e}"));
         }
     }
+}
+
+/// `(kind, name, owner)` of each object `inspect` found owned.
+fn owned(role: &cxp_core::db_role::DbRole) -> Vec<(&str, &str, &str)> {
+    role.owned
+        .iter()
+        .map(|o| (o.kind, o.name.as_str(), o.owner.as_str()))
+        .collect()
+}
+
+/// What the runtime role owns and may TRUNCATE or add a TRIGGER to (#27):
+/// each is a way around row-level security (an owner may `NO FORCE` RLS or
+/// drop a policy; TRUNCATE ignores RLS; a trigger runs as whoever fires
+/// it), so the check names every one, however it is held.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: PgPool) {
+    use cxp_core::db_role::inspect;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    // The superuser pool owns everything; its ownership is not read.
+    let su = inspect(&db(pool.clone())).await.unwrap();
+    assert!(su.owned.is_empty(), "{}", su.summary());
+    assert!(su.table_privileges.is_empty(), "{}", su.summary());
+
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (table_owner, table_owner_db) = roles.login(&pool, "cxp_t_tbl_owner", base).await;
+    let group_owner = roles.nologin(&pool, "cxp_t_grp_owner", base).await;
+    let (member, member_db) = roles.login(&pool, "cxp_t_member", base).await;
+    let (truncate, truncate_db) = roles.login(&pool, "cxp_t_truncate", base).await;
+    let (trigger, trigger_db) = roles.login(&pool, "cxp_t_trigger", base).await;
+    let (db_owner, db_owner_db) = roles.login(&pool, "cxp_t_db_owner", base).await;
+    for stmt in [
+        format!("GRANT otto_app TO {plain}, {table_owner}, {member}, {truncate}, {trigger}"),
+        format!("ALTER TABLE tickets OWNER TO {table_owner}"),
+        format!("ALTER TABLE segments OWNER TO {group_owner}"),
+        format!("GRANT {group_owner} TO {member}"),
+        format!("GRANT TRUNCATE ON customers TO {truncate}"),
+        format!("GRANT TRIGGER ON feedback TO {trigger}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    // A member of otto_app only: nothing owned, nothing to truncate.
+    let role = inspect(&plain_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
+    assert_eq!(role.owned_total, 0);
+    assert!(role.table_privileges.is_empty(), "{}", role.summary());
+    assert!(!role.owns_objects());
+    assert!(!role.can_alter_tables());
+    assert!(
+        role.summary().ends_with(
+            "; it owns nothing in this database and can TRUNCATE or add a TRIGGER to no table"
+        ),
+        "{}",
+        role.summary()
+    );
+    plain_db.pool().close().await;
+
+    // The owner of one table (and, with it, its indexes).
+    let role = inspect(&table_owner_db).await.unwrap();
+    assert!(
+        owned(&role).contains(&("table", "tickets", table_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(role.owned.iter().all(|o| o.user == table_owner));
+    // Its indexes come with it: more than are listed, all counted, the
+    // table first (kinds in order, indexes last).
+    assert_eq!(role.owned.len(), 8, "{}", role.summary());
+    assert!(role.owned_total > 8, "{}", role.summary());
+    assert!(role.owned.iter().skip(1).all(|o| o.kind == "index"));
+    assert!(role.owns_objects());
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"table "tickets""#),
+        "{}",
+        role.summary()
+    );
+    table_owner_db.pool().close().await;
+
+    // A member of a NOLOGIN owner: one SET ROLE away, named as the owner.
+    let role = inspect(&member_db).await.unwrap();
+    assert!(
+        owned(&role).contains(&("table", "segments", group_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(role.owned.iter().all(|o| o.user == member));
+    assert!(role.can_alter_tables());
+    member_db.pool().close().await;
+
+    // TRUNCATE and TRIGGER, held without owning the table.
+    let role = inspect(&truncate_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
+    let privileges: Vec<_> = role
+        .table_privileges
+        .iter()
+        .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+        .collect();
+    assert_eq!(
+        privileges,
+        [(truncate.as_str(), "customers", vec!["TRUNCATE"])]
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"can TRUNCATE table "customers""#),
+        "{}",
+        role.summary()
+    );
+    truncate_db.pool().close().await;
+    let role = inspect(&trigger_db).await.unwrap();
+    let privileges: Vec<_> = role
+        .table_privileges
+        .iter()
+        .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+        .collect();
+    assert_eq!(
+        privileges,
+        [(trigger.as_str(), "feedback", vec!["TRIGGER"])]
+    );
+    assert!(role.can_alter_tables());
+    trigger_db.pool().close().await;
+
+    // The database's owner: the database, and schema public through
+    // pg_database_owner, which every database owner is implicitly in.
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{database}\" OWNER TO {db_owner}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&db_owner_db).await.unwrap();
+    let found = owned(&role);
+    assert!(
+        found.contains(&("database", database.as_str(), db_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(
+        found.contains(&("schema", "public", "pg_database_owner")),
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary()
+            .contains(&format!("it owns database {database:?}")),
+        "{}",
+        role.summary()
+    );
+    db_owner_db.pool().close().await;
+}
+
+/// The runtime role needs, beyond `otto_app`, only `INSERT` on
+/// `deleted_orgs` (the `org.deleted` tombstone, written as itself), which
+/// migration 0005 grants to `cxp_runtime` (#27).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
+    use cxp_core::db_role::missing_runtime_grants;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    assert!(missing_runtime_grants(&db(pool.clone()))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let (login, as_login) = roles.login(&pool, "cxp_t_runtime", base).await;
+    sqlx::query(&format!("GRANT otto_app TO {login}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_runtime_grants(&as_login).await.unwrap(),
+        ["INSERT on deleted_orgs"]
+    );
+
+    // cxp_runtime is cluster-wide and shared by concurrent tests: created
+    // if missing, never dropped.
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        "GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string(),
+        format!("GRANT cxp_runtime TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(missing_runtime_grants(&as_login).await.unwrap().is_empty());
+    as_login.pool().close().await;
+}
+
+/// Before migrations there is no `deleted_orgs` to need a grant on.
+#[sqlx::test(migrations = false)]
+async fn missing_runtime_grants_is_empty_before_migrations(pool: PgPool) {
+    assert!(cxp_core::db_role::missing_runtime_grants(&db(pool))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Where `cxp_runtime` exists before migrating (the runbook creates it),
+/// migration 0005 grants it the tombstone insert.
+#[sqlx::test(migrations = false)]
+async fn migration_0005_grants_the_tombstone_insert_to_cxp_runtime(pool: PgPool) {
+    sqlx::query(
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    cxp_core::migrate(&db(pool.clone())).await.unwrap();
+    let granted: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('cxp_runtime', 'public.deleted_orgs', 'INSERT')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(granted);
 }
