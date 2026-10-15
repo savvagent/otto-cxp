@@ -182,7 +182,10 @@ pub struct SearchLimiter(Arc<Semaphore>);
 /// require. Only [`SearchLimiter::acquire`] makes one; dropping it frees the
 /// permit.
 #[derive(Debug)]
-pub struct SearchPermit(#[allow(dead_code)] OwnedSemaphorePermit);
+pub struct SearchPermit {
+    /// Held only for its `Drop`, which frees the permit.
+    _permit: OwnedSemaphorePermit,
+}
 
 impl SearchLimiter {
     /// A limiter with `permits` concurrent searches. Panics on 0.
@@ -202,7 +205,7 @@ impl SearchLimiter {
     /// [`Error::Unavailable`] (retriable: REST 503 with `Retry-After`).
     pub async fn acquire(&self) -> Result<SearchPermit> {
         match tokio::time::timeout(SEARCH_WAIT, self.0.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(SearchPermit(permit)),
+            Ok(Ok(permit)) => Ok(SearchPermit { _permit: permit }),
             // The semaphore is never closed; read a closed one as busy.
             Ok(Err(_)) | Err(_) => {
                 tracing::warn!("a search found every search permit taken and was turned away");

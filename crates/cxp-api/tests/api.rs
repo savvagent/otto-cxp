@@ -1472,16 +1472,17 @@ async fn flood(
 async fn a_search_flood_cannot_starve_a_write(opts: PgPoolOptions, connect: PgConnectOptions) {
     let (write, searches) = flood(opts, connect, SearchLimiter::for_pool(5), 8, 2).await;
     assert_eq!(write, StatusCode::OK, "the write was starved: {searches:?}");
-    assert!(
-        searches.iter().all(
-            |s| *s == StatusCode::SERVICE_UNAVAILABLE || *s == StatusCode::UNPROCESSABLE_ENTITY
-        ),
-        "{searches:?}"
-    );
-    assert!(
-        searches.contains(&StatusCode::SERVICE_UNAVAILABLE),
-        "nothing was turned away: {searches:?}"
-    );
+    // The two searches with a permit block until their statement_timeout
+    // (422 query_too_broad); the rest are turned away (503 unavailable).
+    let blocked = searches
+        .iter()
+        .filter(|s| **s == StatusCode::UNPROCESSABLE_ENTITY)
+        .count();
+    let refused = searches
+        .iter()
+        .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
+        .count();
+    assert_eq!((blocked, refused), (2, 6), "{searches:?}");
 }
 
 /// The control: with a limiter as large as the pool, the same flood does
@@ -1492,12 +1493,12 @@ async fn without_the_cap_a_search_flood_starves_a_write(
     connect: PgConnectOptions,
 ) {
     let (write, searches) = flood(opts, connect, SearchLimiter::new(5), 8, 5).await;
-    // Starved of a connection, the write is turned away as unavailable
-    // (its auth or its transaction times out on the pool).
-    assert_eq!(
-        write,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "without the cap the write should find no connection: {searches:?}"
+    // Starved of a connection, the write fails on the pool timeout: 503 when
+    // its authentication is what times out, 500 if it got past auth and its
+    // transaction timed out instead.
+    assert!(
+        write == StatusCode::SERVICE_UNAVAILABLE || write == StatusCode::INTERNAL_SERVER_ERROR,
+        "without the cap the write should find no connection, got {write}: {searches:?}"
     );
 }
 
