@@ -1264,6 +1264,9 @@ async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
         customers.push(c.body["id"].as_str().unwrap().parse::<Uuid>().unwrap());
     }
 
+    // No REST route submits a response (that is MCP only), so seed through the
+    // domain API on an org-pinned transaction, under RLS like a request. Test
+    // setup only: request paths open with `begin_live`.
     let db = Db::from_pool(h.pool.clone());
     let mut tx = db.begin(otto_tenant::ids::OrgId::from(org)).await.unwrap();
     for customer in [customers[0], customers[1], customers[0]] {

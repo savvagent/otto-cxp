@@ -80,8 +80,11 @@ export function responsesCount(shown: number, total: number): string {
 export function SurveyDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { data: survey, isLoading: surveyLoading } = useSurvey(id);
-  const { data: responsesData, isLoading: responsesLoading } =
-    useSurveyResponses(id);
+  const {
+    data: responsesData,
+    isLoading: responsesLoading,
+    isError: responsesError,
+  } = useSurveyResponses(id);
   const updateSurvey = useUpdateSurvey();
 
   const [editing, setEditing] = useState(false);
@@ -312,6 +315,11 @@ export function SurveyDetailPage() {
         </h3>
         {responsesLoading ? (
           <LoadingTable />
+        ) : responsesError ? (
+          <EmptyState
+            title="Failed to load responses"
+            description="Check your connection and try again."
+          />
         ) : responses.length === 0 ? (
           <EmptyState
             icon={ClipboardList}
