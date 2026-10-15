@@ -1,14 +1,17 @@
 -- Benchmark data for search under RLS (#17): one org of 300k customers and
 -- 300k knowledge-base articles (90% published), plus three smaller orgs so
 -- row-level security has other orgs' rows to filter. Deterministic (setseed).
+-- With `-v size=mid` (#41) the org under test has 30k customers and 3k
+-- articles instead, the mid-size range where generic plans once read the
+-- whole org (one 200-customer org among the others); about a minute.
 --
 --   createdb -h localhost -p <port> -U cxp bench
 --   # apply crates/cxp-core/migrations in order (or boot cxp-server once against it)
---   psql postgres://cxp:cxp@localhost:<port>/bench -f scripts/bench-search/seed.sql \
---     < /usr/share/dict/words
+--   psql postgres://cxp:cxp@localhost:<port>/bench [-v size=mid] \
+--     -f scripts/bench-search/seed.sql < /usr/share/dict/words
 --
 -- LOCAL POSTGRES ONLY, as a superuser (it disables triggers and bypasses
--- RLS to load fast). About 15 minutes and 15 GB on a laptop. Article text is
+-- RLS to load fast). About 15 minutes and 15 GB on a laptop at full size. Article text is
 -- drawn Zipf-like from the lowercase words read on standard input (any word
 -- list, one word per line); customer names from common first and last names plus
 -- invented surnames. The search index tables are filled in bulk at the end,
@@ -69,11 +72,27 @@ CREATE TEMP TABLE sa AS SELECT array_agg(s) a FROM syl;
 CREATE TEMP TABLE da AS SELECT array_agg(d) a FROM domains;
 
 CREATE TEMP TABLE orgs (org uuid, n int, articles int);
+\if :{?size}
+\else
+\set size big
+\endif
+SELECT :'size' = 'mid' AS mid \gset
+\if :mid
+-- The mid-size benchmark (#41): the org under test has 30k customers and
+-- 3k articles, where the planner's generic plans once flattened the
+-- per-candidate lookups into whole-org scans.
+INSERT INTO orgs VALUES
+  ('00000000-0000-0000-0000-00000000000a', 30000, 3000),
+  ('00000000-0000-0000-0000-00000000000b', 10000, 1000),
+  ('00000000-0000-0000-0000-00000000000c', 10000, 1000),
+  ('00000000-0000-0000-0000-00000000000d', 200, 50);
+\else
 INSERT INTO orgs VALUES
   ('00000000-0000-0000-0000-00000000000a', 300000, 300000),
   ('00000000-0000-0000-0000-00000000000b', 50000, 20000),
   ('00000000-0000-0000-0000-00000000000c', 50000, 20000),
   ('00000000-0000-0000-0000-00000000000d', 20000, 5000);
+\endif
 
 -- Customers: a last name from the list for 60%, an invented one (2-3
 -- syllables) for the rest, so name trigrams have a long tail.

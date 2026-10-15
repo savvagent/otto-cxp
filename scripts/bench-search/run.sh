@@ -16,6 +16,11 @@
 # them: host pgbench 16 against Postgres 18 behind podman's pasta added a
 # steady ~200 ms to every multi-kilobyte result (not server time).
 #
+# Mid-size orgs (#41): seed a database with `seed.sql -v size=mid` (the org
+# under test then has 30k customers and 3k articles) and run this against it
+# as usual; plans.py checks the same statements' generic plans stay per
+# candidate there.
+#
 # LOCAL POSTGRES ONLY.
 set -euo pipefail
 
