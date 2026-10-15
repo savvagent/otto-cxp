@@ -17,8 +17,10 @@ schemars.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 # Captures log lines the tests assert on.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full"] }

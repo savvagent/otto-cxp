@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b tsconfig.json tsconfig.test.json && vite build",
     "preview": "vite preview",
     "test": "vitest run"
   },
@@ -45,6 +45,7 @@
     "typescript": "^5.7.0",
     "vite": "^6.0.0",
     "vitest": "^3.0.0",
-    "vite-plugin-pwa": "^0.21.0"
+    "vite-plugin-pwa": "^0.21.0",
+    "@types/node": "^22.0.0"
   }
 }

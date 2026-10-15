@@ -188,6 +188,17 @@ pub async fn authenticate(
     authorization: Option<&str>,
 ) -> Result<Principal, AuthFailure> {
     let token = bearer(authorization).ok_or(AuthFailure::Missing)?;
+    authenticate_token(db, platform, token).await
+}
+
+/// [`authenticate`] for a token already in hand: the platform's
+/// introspection (audienced for this service) and the tombstones. The console
+/// session cookie's stored token goes through here, exactly as a bearer does.
+pub async fn authenticate_token(
+    db: &Db,
+    platform: &PlatformClient,
+    token: &str,
+) -> Result<Principal, AuthFailure> {
     let claims = match platform.introspect(token).await {
         Ok(Some(claims)) => claims,
         Ok(None) => return Err(AuthFailure::Inactive),

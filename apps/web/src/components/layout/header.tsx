@@ -1,6 +1,7 @@
 import { useLocation } from "react-router";
-import { Menu, Search } from "lucide-react";
+import { LogOut, Menu, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { signOut } from "@/lib/session";
 
 const routeNames: Record<string, string> = {
   "/dashboard": "Dashboard",
@@ -50,6 +51,15 @@ export function Header({
           <kbd className="pointer-events-none rounded border bg-muted px-1.5 py-0.5 text-xs">
             ⌘K
           </kbd>
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          title="Sign out"
+          aria-label="Sign out"
+          onClick={() => void signOut()}
+        >
+          <LogOut className="h-4 w-4" />
         </Button>
       </div>
     </header>

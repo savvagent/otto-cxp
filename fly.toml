@@ -14,6 +14,8 @@
 #   DATABASE_URL                    from `fly postgres attach`
 #   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
 #   CXP_PLATFORM_WEBHOOK_SECRET     otto_whsec_... from `resource set-webhook`
+#   CXP_ENCRYPTION_KEY              32 bytes base64 (`openssl rand -base64 32`); seals the
+#                                   web console's sessions. Needed once CXP_CONSOLE_CLIENT_ID is set.
 
 app = "otto-cxp"
 primary_region = "iad"
@@ -34,6 +36,10 @@ kill_timeout = 30
   CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
   # Small: otto-db is a shared 512 MB instance.
   CXP_DB_MAX_CONNECTIONS = "5"
+  # The web console's sign-in is off until the first-party client is registered at the
+  # platform and CXP_ENCRYPTION_KEY is set (docs/deploy/fly.md, "Web console sign-in"); then
+  # set the printed client id here.
+  # CXP_CONSOLE_CLIENT_ID = ""
   CXP_LOG_FORMAT = "json"
   RUST_LOG = "info,cxp_server=info,cxp_mcp=info,cxp_api=info"
 

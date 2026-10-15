@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "sonner";
 import { RootLayout } from "@/components/layout/root-layout";
 import { DashboardPage } from "@/pages/dashboard";
@@ -15,20 +15,14 @@ import { ApplicationsPage } from "@/pages/catalog/applications";
 import { PagesPage } from "@/pages/catalog/pages-page";
 import { ComponentsPage } from "@/pages/catalog/components-page";
 import { CommandPalette } from "@/components/command-palette";
+import { queryClient } from "@/lib/query-client";
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 30_000,
-      retry: 1,
-    },
-  },
-});
 
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      {/* The console is served under /console/ (vite `base`); every route is relative to it. */}
+      <BrowserRouter basename="/console">
         <Routes>
           <Route element={<RootLayout />}>
             <Route index element={<Navigate to="/dashboard" replace />} />

@@ -12,7 +12,7 @@
  */
 
 import { useState } from "react";
-import { useParams, Link } from "react-router";
+import { useParams, Link, useNavigate } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -542,6 +542,7 @@ function InteractionsTab({ interactions }: { interactions: Interaction[] }) {
 
 export function CustomerDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [editOpen, setEditOpen] = useState(false);
 
   const {
@@ -597,7 +598,7 @@ export function CustomerDetailPage() {
           title="Customer not found"
           description="This customer may have been deleted or the link is invalid."
           action="View all customers"
-          onAction={() => window.location.assign("/customers")}
+          onAction={() => navigate("/customers")}
         />
       </div>
     );
