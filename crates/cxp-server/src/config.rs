@@ -34,6 +34,9 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub enforce_quotas: bool,
     pub log_format: LogFormat,
+    /// `FLY_APP_NAME`, which Fly sets on every machine: its presence alone
+    /// makes this process a deployment ([`Self::is_deployment`]).
+    pub fly_app_name: Option<String>,
     /// The web console's sign-in, or `None` while `CXP_CONSOLE_CLIENT_ID` is
     /// unset: then `/auth/login` answers `503 console_login_disabled` and the
     /// session cookie is no credential anywhere.
@@ -82,6 +85,7 @@ impl std::fmt::Debug for Config {
             .field("allowed_origins", &self.allowed_origins)
             .field("enforce_quotas", &self.enforce_quotas)
             .field("log_format", &self.log_format)
+            .field("fly_app_name", &self.fly_app_name)
             .field(
                 "console_client_id",
                 &self.console.as_ref().map(|c| c.client_id.as_str()),
@@ -160,6 +164,7 @@ impl Config {
                 "json" => Ok(LogFormat::Json),
                 _ => Err(anyhow!("text or json")),
             })?,
+            fly_app_name: vars.optional("FLY_APP_NAME"),
             console,
             // Relative to the working directory: right for a `cargo run` from
             // the repository root. The image sets /srv/console.
@@ -177,6 +182,31 @@ impl Config {
             "{}/settings/billing",
             self.platform_url.trim_end_matches('/')
         )
+    }
+
+    /// Whether this is a deployment rather than a developer's machine. It is
+    /// one when any of these holds:
+    ///
+    /// - the public URL's host is not loopback (`localhost`, `127.0.0.0/8`,
+    ///   `::1`);
+    /// - the token audience (`CXP_RESOURCE_URI`) is not loopback: it is set
+    ///   independently of the public URL, and `CXP_ALLOWED_HOSTS` can admit
+    ///   the real host, so a loopback public URL alone does not mean real
+    ///   tokens cannot arrive;
+    /// - `FLY_APP_NAME` is set (Fly sets it on every machine).
+    ///
+    /// Only a process with all three pointing at a developer's machine is
+    /// not a deployment. A URL that does not parse counts as a deployment.
+    /// A deployment refuses to serve on a database role that is, or can
+    /// become, superuser-equivalent (`boot::check_db_role`).
+    ///
+    /// Derived rather than a setting of its own so it cannot be switched off
+    /// by a missing or mistyped key.
+    pub fn is_deployment(&self) -> bool {
+        let off_loopback = |v: &str| url::Url::parse(v).map_or(true, |u| !is_loopback(&u));
+        off_loopback(&self.public_url)
+            || off_loopback(&self.resource_uri)
+            || self.fly_app_name.is_some()
     }
 
     /// The `Host` headers `/mcp` accepts: the public URL's host (with its
@@ -222,6 +252,7 @@ impl Config {
             allowed_origins: vec![],
             enforce_quotas: false,
             log_format: LogFormat::Text,
+            fly_app_name: None,
             console: None,
             console_dir: "apps/web/dist".into(),
         }
@@ -523,6 +554,63 @@ mod tests {
         assert_eq!(c.resource_uri, "http://localhost:8080/mcp");
         let c = load(&env(&[("CXP_PUBLIC_URL", "https://cxp.example.com:443")])).unwrap();
         assert_eq!(c.allowed_hosts(), ["cxp.example.com"]);
+    }
+
+    #[test]
+    fn only_loopback_urls_without_fly_are_not_a_deployment() {
+        for local in [
+            "http://localhost:8080",
+            "http://LOCALHOST:8080",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", local)])).unwrap();
+            assert_eq!(c.resource_uri, format!("{local}/mcp"));
+            assert!(!c.is_deployment(), "{local}");
+        }
+        for deployed in [
+            "https://otto-cxp.savvagent.com",
+            "https://otto-cxp.fly.dev",
+            "http://10.0.0.5:8080",
+            "http://0.0.0.0:8080",
+            "http://localhost.example.com",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", deployed)])).unwrap();
+            assert!(c.is_deployment(), "{deployed}");
+        }
+        assert!(Config::for_test().is_deployment());
+
+        // A loopback public URL does not hide a real audience: tokens for
+        // it can still arrive through CXP_ALLOWED_HOSTS.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("CXP_RESOURCE_URI", "https://otto-cxp.savvagent.com/mcp"),
+            ("CXP_ALLOWED_HOSTS", "otto-cxp.savvagent.com"),
+        ]))
+        .unwrap();
+        assert!(c.is_deployment());
+
+        // On Fly, whatever the URLs say.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("FLY_APP_NAME", "otto-cxp"),
+        ]))
+        .unwrap();
+        assert_eq!(c.fly_app_name.as_deref(), Some("otto-cxp"));
+        assert!(c.is_deployment());
+        // Blank is unset, like every other variable.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("FLY_APP_NAME", "  "),
+        ]))
+        .unwrap();
+        assert!(!c.is_deployment());
+
+        // Unparseable counts as a deployment (load refuses one, so set it).
+        let mut c = load(&env(&[("CXP_PUBLIC_URL", "http://localhost:8080")])).unwrap();
+        c.resource_uri = "not a url".into();
+        assert!(c.is_deployment());
     }
 
     #[test]

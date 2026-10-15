@@ -1,6 +1,8 @@
 //! The process lifecycle, as a library function so a test can run it whole:
-//! connect, migrate, prove tenant isolation (or refuse to serve), check the
-//! platform credential, start the background tasks, serve until told to
+//! connect, check the database role (a deployment refuses a privileged one,
+//! or one that reaches another service's database),
+//! migrate, prove tenant isolation (or refuse to serve), check the platform
+//! credential, start the background tasks, serve until told to
 //! stop, then drain and flush within bounds.
 //!
 //! Fly gives a stopping machine `kill_timeout = 30` seconds before SIGKILL;
@@ -11,6 +13,7 @@ use std::future::{Future, IntoFuture};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use cxp_core::db_role::DbRole;
 use cxp_core::usage::{ShipError, ShipperConfig};
 use otto_resource::{PlatformClient, TokenClaims};
 use otto_tenant::Db;
@@ -31,6 +34,8 @@ pub const PLATFORM_EVENT_RETENTION_DAYS: i32 = 30;
 /// What boot found, returned when the server stops cleanly.
 #[derive(Debug, Clone)]
 pub struct Boot {
+    /// [`DbRole::summary`] of the role this process connects as, as logged.
+    pub database_role: String,
     /// [`otto_tenant::IsolationReport::summary`], as logged.
     pub isolation: String,
     pub platform: PlatformCheck,
@@ -107,6 +112,44 @@ pub async fn check_platform(platform: &PlatformClient, config: &Config) -> Platf
     check
 }
 
+/// Whether this process may serve on the database session it connected
+/// with, and log what that session's users are. A session whose login user
+/// or current user is, or can `SET ROLE` to, a superuser-equivalent role, or
+/// can connect to another service's database (`cxp_core::db_role`), escapes
+/// every unpinned row-level policy, or on the shared `otto-db` reaches the
+/// other services' data. A deployment refuses it; a developer's machine,
+/// whose local Postgres hands out a superuser, is warned.
+///
+/// A deployment is [`Config::is_deployment`], or an instance that also hosts
+/// another otto service's database ([`DbRole::shares_the_instance`]): a
+/// local run pointed at `otto-db` through `fly proxy` has loopback URLs but
+/// production's data.
+pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
+    let summary = role.summary();
+    if !role.is_refused_in_a_deployment() {
+        tracing::info!("{summary}");
+        return Ok(());
+    }
+    if config.is_deployment() || role.shares_the_instance() {
+        tracing::error!(public_url = %config.public_url, resource_uri = %config.resource_uri,
+            fly_app_name = config.fly_app_name.as_deref().unwrap_or(""),
+            "{summary}: refusing to serve. A deployment must log in as a dedicated role that \
+             holds no superuser-equivalent privilege and can connect to no other service's \
+             database (docs/deploy/fly.md)");
+        return Err(anyhow!(
+            "refusing to serve: {summary}; a deployment must log in as a role that is not a \
+             superuser, holds no BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or cross-service \
+             predefined role, directly or through membership, and can connect to no other \
+             service's database (docs/deploy/fly.md)"
+        ));
+    }
+    tracing::warn!(public_url = %config.public_url,
+        "{summary}: allowed only because this is not a deployment (loopback CXP_PUBLIC_URL \
+         and CXP_RESOURCE_URI, no FLY_APP_NAME, and no other otto service's database on the \
+         instance); a deployment refuses it");
+    Ok(())
+}
+
 /// Run the server on `listener` until `shutdown` completes, then drain
 /// in-flight requests (at most [`DRAIN_TIMEOUT`]) and flush usage (at most
 /// [`FLUSH_TIMEOUT`]).
@@ -146,6 +189,12 @@ where
         .await
         .context("could not connect to the database")?;
     let db = Db::from_pool(pool);
+
+    // Before anything runs as this role, migrations included.
+    let role = cxp_core::db_role::inspect(&db)
+        .await
+        .context("could not read the database role's privileges")?;
+    check_db_role(&role, &config)?;
 
     if config.run_migrations {
         tracing::info!("applying migrations");
@@ -263,6 +312,7 @@ where
     match failure {
         Some(e) => Err(e),
         None => Ok(Boot {
+            database_role: role.summary(),
             isolation,
             platform: check,
         }),
@@ -415,6 +465,82 @@ mod tests {
         assert!(err.contains("final usage flush failed"), "{err}");
         assert!(flush_result(Ok(Err(ShipError::Db(sqlx::Error::PoolClosed)))).is_err());
         assert!(flush_result(Ok(Err(ShipError::Receipt("short".into())))).is_err());
+    }
+
+    /// A deployment refuses every superuser-equivalent privilege, held by
+    /// the login (session) user or the current user, directly or through
+    /// membership; a developer's machine only warns.
+    #[test]
+    fn a_deployment_refuses_a_privileged_database_role() {
+        use cxp_core::db_role::Privilege::*;
+        let deployed = Config::for_test();
+        assert!(deployed.is_deployment());
+        let mut local = Config::for_test();
+        local.public_url = "http://localhost:8080".into();
+        local.resource_uri = "http://localhost:8080/mcp".into();
+        assert!(!local.is_deployment());
+
+        let least = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        assert!(check_db_role(&least, &deployed).is_ok());
+        assert!(check_db_role(&least, &local).is_ok());
+
+        for r in [
+            DbRole::for_test("s", "s", &[("s", "s", &[Superuser])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[BypassRls])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[CreateRole])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[Replication])]),
+            DbRole::for_test("s", "s", &[("s", "postgres", &[Superuser, BypassRls])]),
+            DbRole::for_test("s", "s", &[("s", "s", &[CreateDb])]),
+            DbRole::for_test("s", "s", &[("s", "pg_read_all_data", &[PredefinedRole])]),
+            DbRole::for_test("s", "s", &[("s", "pg_signal_backend", &[PredefinedRole])]),
+            // A superuser login that SET ROLEs to a plain role on connect.
+            DbRole::for_test("otto_cxp", "s", &[("otto_cxp", "otto_cxp", &[Superuser])]),
+        ] {
+            let err = format!("{:#}", check_db_role(&r, &deployed).unwrap_err());
+            assert!(err.contains("refusing to serve"), "{err}");
+            assert!(err.contains(&r.summary()), "{err}");
+            assert!(check_db_role(&r, &local).is_ok(), "{}", r.summary());
+        }
+
+        // Loopback URLs on a Fly machine are still a deployment.
+        let mut on_fly = local.clone();
+        on_fly.fly_app_name = Some("otto-cxp".into());
+        let su = DbRole::for_test("s", "s", &[("s", "s", &[Superuser])]);
+        assert!(check_db_role(&su, &on_fly).is_err());
+        // So is a loopback public URL serving a real audience.
+        let mut real_audience = local.clone();
+        real_audience.resource_uri = "https://otto-cxp.savvagent.com/mcp".into();
+        assert!(check_db_role(&su, &real_audience).is_err());
+
+        // Another service's database within reach is refused like a
+        // privilege, and only warned about locally.
+        let mut reach = DbRole::for_test("s", "s", &[]);
+        reach.other_databases = vec![cxp_core::db_role::DatabaseAccess {
+            user: "s".into(),
+            database: "otto_platform".into(),
+            through: "otto_app".into(),
+        }];
+        let err = format!("{:#}", check_db_role(&reach, &deployed).unwrap_err());
+        assert!(
+            err.contains(r#"can connect to database "otto_platform""#),
+            "{err}"
+        );
+        assert!(check_db_role(&reach, &local).is_ok());
+
+        // An instance shared with another otto service is a deployment,
+        // whatever the URLs say (a local run through `fly proxy`)...
+        let mut proxied = su.clone();
+        proxied.shared_with = vec!["otto_platform".into()];
+        let err = format!("{:#}", check_db_role(&proxied, &local).unwrap_err());
+        assert!(
+            err.contains(r#"the instance also hosts "otto_platform""#),
+            "{err}"
+        );
+        // ...where a least-privilege role still serves.
+        let mut clean = least.clone();
+        clean.shared_with = vec!["otto_platform".into()];
+        assert!(check_db_role(&clean, &local).is_ok());
+        assert!(check_db_role(&clean, &deployed).is_ok());
     }
 
     #[test]

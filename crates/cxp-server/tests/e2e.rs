@@ -15,6 +15,9 @@
 //!    shipment is accepted;
 //! 4. lifecycle webhooks are verified and applied once.
 //!
+//! And for #16: the whole service runs as a least-privilege database owner,
+//! and a deployment refuses a superuser.
+//!
 //! Needs `DATABASE_URL` (see `compose.yaml`).
 
 use std::collections::{HashMap, HashSet};
@@ -2000,9 +2003,12 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     );
 
     // The lines docs/deploy/fly.md tells an operator to look for, in order.
+    // The test cluster's role is a superuser, allowed here only because the
+    // public URL is loopback.
     let text = logs.text();
     let mut from = 0;
     for line in [
+        "allowed only because this is not a deployment",
         "applying migrations",
         r#"tenant isolation enforced as role "otto_app""#,
         "the otto platform accepted this service's credential",
@@ -2060,4 +2066,451 @@ async fn the_server_refuses_to_serve_when_tenant_isolation_is_broken(pool: PgPoo
     assert!(err.contains("refusing to serve"), "{err}");
     // Nothing listens: the listener was dropped with the refusal.
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+}
+
+// ================================================== least privilege (#16)
+
+/// The URL of the test database, as `user`.
+fn database_url_as(pool: &PgPool, user: Option<(&str, &str)>) -> String {
+    let mut url = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    url.set_path(pool.connect_options().get_database().unwrap());
+    if let Some((name, password)) = user {
+        url.set_username(name).unwrap();
+        url.set_password(Some(password)).unwrap();
+    }
+    url.to_string()
+}
+
+/// What docs/deploy/fly.md sets up on `otto-db`, on this test's (empty)
+/// database: a login role that is not a superuser, not BYPASSRLS, cannot
+/// create roles or databases, is a member of `otto_app`, may set the
+/// console lookup's parameter, and owns the database, which only it may
+/// connect to. Returns its connection URL.
+async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    let password = Uuid::new_v4().simple().to_string();
+    for stmt in [
+        format!(
+            "CREATE ROLE {role} LOGIN PASSWORD '{password}' \
+             NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
+        ),
+        // The runbook assumes otto_app exists (another service's migrations
+        // or this one's created it); on a fresh cluster this test creates it.
+        "DO $$ BEGIN CREATE ROLE otto_app NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        format!("GRANT otto_app TO {role}"),
+        // 0003's console_session_org sets this custom parameter in its SET
+        // clause, which only a superuser, or a role granted SET on it, may
+        // define (Postgres 15+). The runbook's R1 grants the same.
+        format!("GRANT SET ON PARAMETER app.console_session_lookup TO {role}"),
+        format!("ALTER DATABASE \"{database}\" OWNER TO {role}"),
+        format!("REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"),
+        format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
+    ] {
+        sqlx::query(&stmt).execute(pool).await.unwrap();
+    }
+    database_url_as(pool, Some((role, &password)))
+}
+
+/// Drops `role` when the test ends, failed or not: roles are cluster-wide
+/// and outlive the test database. Runs on its own thread and runtime
+/// (`Drop` cannot await), as the test pool's superuser, before
+/// `#[sqlx::test]` drops the database the role owns.
+struct DropRoleOnExit {
+    options: sqlx::postgres::PgConnectOptions,
+    role: String,
+}
+
+impl DropRoleOnExit {
+    fn new(pool: &PgPool, role: &str) -> Self {
+        Self {
+            options: pool.connect_options().as_ref().clone(),
+            role: role.to_string(),
+        }
+    }
+}
+
+impl Drop for DropRoleOnExit {
+    fn drop(&mut self) {
+        let options = self.options.clone();
+        let role = self.role.clone();
+        let dropped = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to drop the test role");
+            rt.block_on(async move {
+                use sqlx::Connection;
+                let mut conn = sqlx::PgConnection::connect_with(&options).await?;
+                for stmt in [
+                    format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                         WHERE usename = '{role}'"
+                    ),
+                    format!(
+                        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
+                         THEN REASSIGN OWNED BY {role} TO CURRENT_USER; DROP OWNED BY {role}; \
+                         END IF; END $$"
+                    ),
+                    format!("DROP ROLE IF EXISTS {role}"),
+                ] {
+                    sqlx::query(&stmt).execute(&mut conn).await?;
+                }
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("could not drop test role {}: {e}", self.role),
+            Err(_) => eprintln!(
+                "could not drop test role {}: the thread panicked",
+                self.role
+            ),
+        }
+    }
+}
+
+/// The whole service as the least-privilege role production connects as
+/// (#16), in a deployment (a non-loopback public URL, where boot refuses a
+/// privileged role): that role migrates a fresh database it owns (the
+/// baseline's role, extension, and SECURITY DEFINER statements included),
+/// passes the boot checks, serves requests as `otto_app`, applies an
+/// `org.deleted` (the tombstone is written as the role itself), and runs the
+/// retention sweep and the usage shipper, both of which row-level security
+/// now binds (FORCE applies to the table owner), through their maintenance
+/// policies.
+#[sqlx::test(migrations = false)]
+async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool) {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let role = format!("cxp_lp_{}", Uuid::new_v4().simple());
+    let _drop_role = DropRoleOnExit::new(&pool, &role);
+    let role_url = least_privilege_owner(&pool, &role).await;
+
+    // Migrations, as the role, into the database it owns.
+    let as_role = Db::connect(&role_url).await.unwrap();
+    cxp_core::migrate(&as_role)
+        .await
+        .expect("the owner migrates");
+    let owner: String =
+        sqlx::query_scalar("SELECT tableowner::text FROM pg_tables WHERE tablename = 'customers'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owner, role);
+
+    // Rows only the background maintenance may remove, across orgs.
+    let (stale_org, stale_event) = (Uuid::new_v4(), Uuid::new_v4());
+    for stmt in [
+        "INSERT INTO platform_events (event_id, org_id, kind, received_at) \
+         VALUES ($1, $2, 'member.removed', now() - interval '90 days')",
+        "INSERT INTO removed_members (org_id, user_id, removed_at) \
+         VALUES ($2, $1, now() - interval '1 hour')",
+        "INSERT INTO usage_outbox_rejected \
+           (event_id, org_id, tool, billable, occurred_at, reason, rejected_at) \
+         VALUES ($1, $2, 'submit_feedback', true, now(), 'test', now() - interval '200 days')",
+    ] {
+        sqlx::query(stmt)
+            .bind(stale_event)
+            .bind(stale_org)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let stale = |pool: PgPool| async move {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM platform_events WHERE org_id = $1) \
+                  + (SELECT count(*) FROM removed_members WHERE org_id = $1) \
+                  + (SELECT count(*) FROM usage_outbox_rejected WHERE org_id = $1)",
+        )
+        .bind(stale_org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        n
+    };
+    assert_eq!(stale(pool.clone()).await, 3);
+
+    let (base, mock) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = Config::for_test();
+    config.database_url = role_url;
+    config.bind = addr;
+    config.platform_url = base;
+    // A deployment, served here on a loopback socket.
+    assert_eq!(config.public_url, PUBLIC_URL);
+    assert!(config.is_deployment());
+    config.extra_allowed_hosts = vec![addr.to_string()];
+
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let token = |org: Uuid| {
+        let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+        mock.lock().unwrap().tokens.insert(
+            t.clone(),
+            (
+                org,
+                Uuid::new_v4(),
+                vec!["cxp:write".into()],
+                RESOURCE.into(),
+            ),
+        );
+        t
+    };
+    let (token_a, token_b) = (token(a), token(b));
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run_with(
+        config,
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        // Only the final flush ships: it runs as the role, under RLS.
+        cxp_core::usage::ShipperConfig {
+            poll: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    let check_pool = pool.clone();
+    let client = async move {
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status().as_u16(), 200);
+        let call = |token: &str, name: &str, args: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}});
+            http.post(format!("{base}/mcp"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(body.to_string())
+                .send()
+        };
+        for (token, name, args) in [
+            (
+                &token_a,
+                "create_customer",
+                json!({"email": "a@example.com"}),
+            ),
+            (
+                &token_a,
+                "submit_feedback",
+                json!({"customer_id": "a@example.com", "feedback_type": "praise"}),
+            ),
+            (
+                &token_b,
+                "create_customer",
+                json!({"email": "b@example.com"}),
+            ),
+        ] {
+            let res = call(token, name, args).await.unwrap();
+            assert_eq!(res.status().as_u16(), 200, "{name}");
+            let v: Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+            assert!(
+                v["result"]["isError"] != true && v.get("error").is_none(),
+                "{name}: {v}"
+            );
+        }
+
+        // org.deleted for B: the tombstone is written as the role itself,
+        // the purge as otto_app pinned to B.
+        let (body, sig) = signed(Uuid::new_v4(), "org.deleted", json!({"org_id": b}));
+        let res = http
+            .post(format!("{base}/platform/webhooks"))
+            .header("content-type", "application/json")
+            .header(otto_resource::webhook::SIGNATURE_HEADER, sig)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+
+        // The sweep's first pass runs at boot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while stale(check_pool.clone()).await != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retention sweep did not remove the stale rows as the role"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        stop.send(()).unwrap();
+    };
+    let (boot, ()) = tokio::join!(server, client);
+    let boot = boot.expect("a clean stop");
+
+    // Not privileged, and the per-test databases beside its own (PUBLIC's
+    // default CONNECT, not another service's) do not count.
+    assert!(
+        boot.database_role.contains(
+            "holds no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, \
+             CREATEDB, REPLICATION, or a cross-service predefined role), directly or through \
+             membership, and can connect to no other service's database"
+        ),
+        "{}",
+        boot.database_role
+    );
+    assert!(
+        boot.isolation
+            .contains(r#"tenant isolation enforced as role "otto_app""#),
+        "{}",
+        boot.isolation
+    );
+    // The shipper drained the outbox as the role, through the maintenance
+    // policy.
+    let received = mock.lock().unwrap().received.clone();
+    assert_eq!(
+        received
+            .iter()
+            .map(|e| (e.tool.as_str(), e.org_id))
+            .collect::<Vec<_>>(),
+        [("submit_feedback", a)]
+    );
+    let count = |sql: &'static str, org: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            n
+        }
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM usage_outbox WHERE org_id = $1", a).await,
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM deleted_orgs WHERE org_id = $1", b).await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM customers WHERE org_id = $1", b).await,
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM customers WHERE org_id = $1", a).await,
+        1
+    );
+
+    // The console's cookie lookup, the one unpinned read a request makes:
+    // console_session_org runs as its owner, the role, which FORCE binds,
+    // and console_sessions_lookup admits it because it owns the function.
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, role);
+    let cookie = "e2e-least-privilege-cookie";
+    cxp_core::console_sessions::create(
+        &Db::from_pool(pool.clone()),
+        &otto_tenant::crypto::Cipher::from_base64_key(
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        )
+        .unwrap(),
+        &cxp_core::console_sessions::NewSession {
+            id_hash: cxp_core::console_sessions::hash_cookie(cookie),
+            org_id: a.into(),
+            user_id: Uuid::new_v4().into(),
+            access_token: "otto_at_e2e",
+            refresh_token: "otto_rt_e2e",
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            expires_at: Utc::now() + chrono::Duration::days(1),
+        },
+    )
+    .await
+    .unwrap();
+    let org_of = |cookie: &'static str| {
+        let as_role = as_role.clone();
+        async move {
+            cxp_core::console_sessions::org_of(
+                &as_role,
+                &cxp_core::console_sessions::hash_cookie(cookie),
+            )
+            .await
+            .unwrap()
+            .map(|o| o.as_uuid())
+        }
+    };
+    assert_eq!(org_of(cookie).await, Some(a), "the lookup as the owner");
+    assert_eq!(org_of("no-such-cookie").await, None);
+
+    // Row-level security binds the role itself: unpinned and unmarked, the
+    // owner sees none of A's rows, and cannot reach the bookkeeping either.
+    for table in [
+        "customers",
+        "feedback",
+        "platform_events",
+        "usage_outbox",
+        "console_sessions",
+    ] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(as_role.pool())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} as the unpinned owner");
+    }
+    as_role.pool().close().await;
+
+    // What docs/deploy/fly.md tells an operator to look for, in order.
+    let text = logs.text();
+    let mut from = 0;
+    for line in [
+        format!(r#"database role "{role}" holds no superuser-equivalent privilege"#),
+        "applying migrations".into(),
+        r#"tenant isolation enforced as role "otto_app""#.into(),
+        "the otto platform accepted this service's credential".into(),
+        "cxp-server listening".into(),
+    ] {
+        let at = text[from..]
+            .find(&line)
+            .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
+        from += at + line.len();
+    }
+}
+
+/// A deployment refuses a superuser connection before running anything as
+/// it, migrations included; the error names the privilege.
+#[sqlx::test(migrations = false)]
+async fn a_deployment_refuses_a_superuser_database_role(pool: PgPool) {
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = Config::for_test();
+    // The test pool's own role: a superuser.
+    config.database_url = database_url_as(&pool, None);
+    config.bind = addr;
+    config.platform_url = base;
+    assert!(config.is_deployment());
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(err.contains("refusing to serve"), "{err}");
+    assert!(err.contains("SUPERUSER"), "{err}");
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    let migrated: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!migrated, "nothing ran as the refused role");
 }

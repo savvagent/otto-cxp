@@ -6,12 +6,15 @@
 #
 # Database: `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with
 # otto-platform, otto-factory, and otto-flags (shared for cost; split before
-# real customers, since each app's attach role is a superuser on the whole
-# instance). Isolation rests on `SET LOCAL ROLE otto_app` under row-level
-# security; cxp-server proves that at boot.
+# real customers). otto-cxp connects as `cxp_server`, which owns only
+# `otto_cxp` and holds no superuser-equivalent privilege; boot refuses a
+# privileged role, or one that can connect to another service's database, here
+# (FLY_APP_NAME is set on every Fly machine). Isolation
+# rests on `SET LOCAL ROLE otto_app` under row-level security; cxp-server
+# proves that at boot.
 #
 # Secrets (`fly secrets set`, never here):
-#   DATABASE_URL                    from `fly postgres attach`
+#   DATABASE_URL                    as cxp_server (docs/deploy/fly.md, "Database role")
 #   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
 #   CXP_PLATFORM_WEBHOOK_SECRET     otto_whsec_... from `resource set-webhook`
 #   CXP_ENCRYPTION_KEY              32 bytes base64 (`openssl rand -base64 32`); seals the

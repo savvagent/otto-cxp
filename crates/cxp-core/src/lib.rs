@@ -22,6 +22,7 @@ pub mod chat;
 pub mod console_sessions;
 pub mod customers;
 pub mod dashboard;
+pub mod db_role;
 pub mod error;
 pub mod feedback;
 pub mod interactions;
