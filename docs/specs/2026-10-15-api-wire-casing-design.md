@@ -63,14 +63,14 @@ Run brief: keep the change additive for existing callers; update `@cxp/sdk`, `@c
   Sending both spellings of one field is a `400 invalid_argument` (serde's duplicate-field error),
   as `team_id` + `teamId` already is.
 - **`/dashboard/metrics` answers both spellings for now:** the six camelCase keys plus the six
-  legacy snake_case keys, the latter deprecated. Removing them is a follow-up issue filed by this
+  legacy snake_case keys, the latter deprecated. Removing them is #35, filed by this
   run (it needs a window in which no reader uses them; the console stops in this PR).
 - **The `X-Total-Count` / `X-Total-Capped` headers go.** Once the count is in the body they are
   the third convention the comment objects to; they shipped with #33 a day ago, and keeping them
   would not save a reader of the bare array from the body change anyway.
 - **`GET /surveys/{id}/responses` stays a plain array in this PR.** It is the same envelope
   question as search but was not asked for, and changing it is a second breaking change. The
-  module docs name it as the one list without the envelope; a follow-up issue tracks moving it.
+  module docs name it as the one list without the envelope; #36 tracks moving it.
 - Run Profile values all come from the section; none assumed.
 
 ## Goal & Success Criteria
@@ -171,8 +171,11 @@ honours `rename_all` and `alias` (no `flatten` is involved).
   `customersApi.search` returns `CappedPaginatedResponse<Customer>`.
 - Callers updated: the dashboard page reads camelCase metrics; the command palette reads
   `.data` from search; every page/hook that builds request objects (`experience_id:` →
-  `experienceId:` etc.) uses the new keys. The pages keep reading their *browser* URL params
-  (`searchParams.get("experience_id")`) and map them to the camelCase API params.
+  `experienceId:` etc.) uses the new keys. `CatalogFilterValues` (the filter bar's value) becomes
+  camelCase; two helpers in `catalog-filter-bar.tsx` map it to and from the pages' *browser* URL
+  params, which keep their snake_case names (`?experience_id=`), so existing console links work.
+  The ticket detail page's `updateField` sends `assignedTo`. (These two are spread / computed-key
+  callers `tsc` does not check, so the plan names them.)
 - `lib/types.test.ts`: key lists for `dashboardMetrics` (camelCase, plus a check that the
   fixture's legacy keys equal the snake_case spelling of each and carry the same values) and the
   new `customerSearch` envelope.

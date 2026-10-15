@@ -267,9 +267,9 @@ pub struct ListParams {
 ```
 
   Update the catalog module doc's **The team field** paragraph: bodies take `teamId` (the
-  convention) and `team_id` as an alias (sending both is a `400`). Rename the existing catalog
-  unit test to `the_team_field_tells_absent_from_null_and_accepts_both_spellings` (keep the name;
-  its assertions already cover both spellings and still pass unchanged).
+  convention) and `team_id` as an alias (sending both is a `400`). The existing catalog unit test
+  `the_team_field_tells_absent_from_null_and_accepts_both_spellings` stays as it is (its
+  assertions already cover both spellings). Run `cargo fmt --all` before the format gate.
 
 - [ ] **Step 4: Run to verify it passes.**
   Run: `cargo test -p cxp-api --locked --lib` — Expected: all pass, including the six `casing::*`
@@ -459,7 +459,8 @@ impl<T: Serialize> CappedPaginated<T> {
   `crates/cxp-core/src/lib.rs`.)
 
   In `routes/customers.rs`, delete `TOTAL_COUNT`, `TOTAL_CAPPED`, the `http::{HeaderName,
-  HeaderValue}` import, and rewrite `search`:
+  HeaderValue}` import, change `use super::{deleted, Paginated};` to
+  `use super::{deleted, CappedPaginated, Paginated};`, and rewrite `search`:
 
 ```rust
 /// The best matches first, in the list envelope plus `totalCapped`
@@ -497,7 +498,7 @@ pub struct Metrics {
 
 /// Deprecated: the pre-#24 snake_case keys, the same values as `current`.
 /// Kept so consumers that read `total_customers` keep working; removal is
-/// tracked in #<follow-up issue number, filled in by Task 4>.
+/// tracked in #35.
 #[derive(Debug, Serialize)]
 pub struct LegacyMetrics {
     pub total_customers: i64,
@@ -526,8 +527,8 @@ impl From<DashboardMetrics> for Metrics {
 ```
 
   with `use cxp_core::dashboard::{DashboardExt, DashboardMetrics};` and the handler returning
-  `Ok(Json(Metrics::from(m)))`. Write the doc line as `tracked in a follow-up issue` if no number
-  is given yet; Task 4 fills in the number.
+  `Ok(Json(Metrics::from(m)))`. The follow-up issues already exist: #35 (drop the legacy dashboard
+  keys) and #36 (survey responses envelope).
 
   In `wire_fixture::payloads()`: build `"dashboardMetrics"` as
   `super::dashboard::Metrics::from(cxp_core::dashboard::DashboardMetrics { total_customers: 1,
@@ -561,6 +562,8 @@ Refs #24"
 - Modify: `apps/web/src/lib/types.ts`
 - Modify: `apps/web/src/lib/types.test.ts`
 - Modify: `apps/web/src/lib/api/{customers,tickets,feedback,surveys,experiences,applications,pages,components}.ts`
+- Modify: `apps/web/src/components/shared/catalog-filter-bar.tsx` (`CatalogFilterValues` camelCase; URL mapping helpers)
+- Modify: `apps/web/src/pages/tickets/ticket-detail.tsx:130-137,307` (`updateField` union)
 - Modify: callers that `tsc` flags, expected at least `apps/web/src/hooks/use-{tickets,customers,applications,pages,components,experiences,surveys,feedback}.ts`, `apps/web/src/pages/catalog/{experiences,applications,pages-page,components-page}.tsx`, `apps/web/src/pages/{customers,surveys,tickets,feedback}/*.tsx`, `apps/web/src/pages/dashboard/index.tsx`, `apps/web/src/components/command-palette.tsx`
 
 **Interfaces:** consumes `wire.json` (`dashboardMetrics`, `customerSearch`) from Task 2 and the camelCase request contract from Task 1.
@@ -576,6 +579,8 @@ Refs #24"
   - add `cappedPaginated: { data: true, total: true, totalCapped: true, limit: true, offset: true } satisfies Record<keyof CappedPaginatedResponse<unknown>, true>`;
   - add to `typed`: `dashboardMetrics: wire.dashboardMetrics satisfies DashboardMetrics` (if not
     already present) and `customerSearch: wire.customerSearch satisfies CappedPaginatedResponse<Customer>`;
+  - the existing test that checks only the dashboard keeps snake_case keys (it excludes
+    `dashboardMetrics` from the camelCase sweep) stays, still excluding `dashboardMetrics`;
   - wherever the file asserts `sameKeys(wire.dashboardMetrics, keys.dashboardMetrics)`, replace it
     with a test that the fixture holds exactly the camelCase keys plus their legacy snake_case
     twins with equal values:
@@ -638,8 +643,57 @@ export interface CappedPaginatedResponse<T> extends PaginatedResponse<T> {
     names such as `searchParams.get("experience_id")` as they are — they are not the API wire),
     the dashboard page (`metrics?.totalCustomers`, …), and the command palette
     (`setCustomers(customerResults.value.data.slice(0, 5))`).
-  - `grep -rn "_id\b\|_type\b\|assigned_to\|total_" apps/web/src/lib/api apps/web/src/hooks` must
-    show no API-wire snake_case key afterwards (form state and browser URL params excepted).
+  - **Callers `tsc` cannot catch** (spread members and computed keys are not excess-property
+    checked, so these compile either way and must be changed by hand):
+    - `components/shared/catalog-filter-bar.tsx`: `CatalogFilterValues` becomes
+      `{ experienceId?; applicationId?; pageId?; componentId? }` (update the component's reads and
+      `setFilter` keys). Add and export two helpers there that own the mapping between the
+      console's *browser* URL parameters (which keep their snake_case names, so existing links
+      work) and the camelCase values:
+
+```ts
+/** The console's own URL parameter for each catalog filter (router state, not the API wire). */
+const URL_PARAM: Record<keyof CatalogFilterValues, string> = {
+  experienceId: "experience_id",
+  applicationId: "application_id",
+  pageId: "page_id",
+  componentId: "component_id",
+};
+
+export function catalogFiltersFromUrl(params: URLSearchParams): CatalogFilterValues {
+  const out: CatalogFilterValues = {};
+  for (const [key, name] of Object.entries(URL_PARAM) as [keyof CatalogFilterValues, string][]) {
+    const v = params.get(name);
+    if (v) out[key] = v;
+  }
+  return out;
+}
+
+export function withCatalogFilters(prev: URLSearchParams, values: CatalogFilterValues): URLSearchParams {
+  const next = new URLSearchParams(prev);
+  for (const [key, name] of Object.entries(URL_PARAM) as [keyof CatalogFilterValues, string][]) {
+    const v = values[key];
+    if (v) next.set(name, v);
+    else next.delete(name);
+  }
+  return next;
+}
+```
+
+      In `pages/{customers,tickets,feedback,surveys}/index.tsx`, replace the hand-built
+      `catalogFilters` object with `catalogFiltersFromUrl(searchParams)` and the body of
+      `handleCatalogChange`'s `setSearchParams` callback with `withCatalogFilters(prev, values)`;
+      update any direct reads (`catalogFilters.experience_id` → `catalogFilters.experienceId`,
+      e.g. `pages/tickets/index.tsx:248-251`). Add a unit test
+      `apps/web/src/components/shared/catalog-filter-bar.test.ts` round-tripping both helpers
+      (snake URL params in, camelCase values out; values back to the same URL params; a cleared
+      value deletes its param; unrelated params survive).
+    - `pages/tickets/ticket-detail.tsx`: `updateField(field: "status" | "priority" |
+      "assigned_to", …)` sends `{ [field]: value }`; change the union member to `"assignedTo"`
+      and its call site (around line 307).
+  - `grep -rnE "\b(experience|application|page|component|customer|team)_id\b|feedback_type|component_type|assigned_to|total_(customers|tickets|feedback|surveys|experiences)|open_tickets" apps/web/src --include='*.ts' --include='*.tsx'`
+    afterwards may show only: zod form-field names and their form wiring, the `URL_PARAM` table,
+    and `types.test.ts`'s legacy-key test. Anything else on the API wire is a miss.
 
 - [ ] **Step 4: Run to verify it passes.**
   Run from the worktree root: `pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test`.
@@ -671,7 +725,7 @@ Refs #24"
 
 **Model:** orchestrator, directly (docs plus two `gh issue create` calls).
 
-- [ ] **Step 1: File the follow-ups** with `gh issue create --repo savvagent/otto-cxp --label enhancement --body-file <file>`:
+- [x] **Step 1: File the follow-ups** (done: #35, #36) with `gh issue create --repo savvagent/otto-cxp --label enhancement --body-file <file>`:
   (a) remove `/dashboard/metrics`'s deprecated snake_case keys once no consumer reads them;
   (b) move `GET /api/v1/surveys/{id}/responses` into the `Paginated` envelope. Each body cites
   #24 and states the change and its acceptance criterion.
@@ -680,10 +734,10 @@ Refs #24"
   request keys also accept their pre-#24 snake_case spelling as an alias (both at once is `400`);
   enum values and caller-owned JSON (`metadata`, `questions`, `answers`) are untouched; lists are
   `Paginated` `{data, total, limit, offset}`, search is `CappedPaginated` (adds `totalCapped`),
-  and `GET /surveys/{id}/responses` is the one plain array (follow-up #b); `GET /dashboard/metrics`
-  also sends deprecated snake_case keys (follow-up #a); errors are `{error, code}` and the auth
+  and `GET /surveys/{id}/responses` is the one plain array (#36); `GET /dashboard/metrics`
+  also sends deprecated snake_case keys (#35); errors are `{error, code}` and the auth
   layer's `401`/`403` use the RFC 6750 names `error`/`error_description`. Update the `responses`
-  doc in `surveys.rs` to cite follow-up #b, and `LegacyMetrics`' doc to cite #a.
+  doc in `surveys.rs` to cite #36, and `LegacyMetrics`' doc to cite #35.
 - [ ] **Step 3: Design doc.** In the REST section replace "Request bodies are snake_case
   (`team_id`), and catalog bodies also accept `teamId` as a permanent alias; responses are
   camelCase. The casing mismatch is resolved by #15 (the console reads camelCase); the broader
@@ -692,10 +746,21 @@ Refs #24"
   `/api/v1` is #24" with "`/api/v1` uses one camelCase convention (#24)". Also fix the sentence
   "Catalog create/update with a `teamId` …" only if it now contradicts.
 - [ ] **Step 4: Run** `cargo test -p cxp-api --locked --lib`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `cargo doc -p cxp-api --no-deps` (no broken intra-doc links).
-- [ ] **Step 5: Commit** `docs(api): state the one /api/v1 wire convention` with body `Refs #24`.
+  Add one line under the title of `docs/specs/2026-10-14-search-under-rls-design.md`:
+  `> The X-Total-* headers described here were replaced by the search envelope's totalCapped (#24).`
+- [ ] **Step 5: Commit.**
+
+```bash
+git add crates/cxp-api/src/routes docs/specs
+git commit -m "docs(api): state the one /api/v1 wire convention" \
+  -m "The route module docs and the resource-server design described the old three-way split. They now state the camelCase convention, its aliases, and the two tracked exceptions (#35, #36).
+
+Refs #24"
+```
 
 ---
 
-### Task 5: full gate run
+### Task 5: full gate run and record as shipped
 
+- [ ] After the PR exists and before merge (orchestrator): set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes, in a final `docs:` commit.
 - [ ] Run every gate in Global Constraints from the worktree, including `podman build -t otto-cxp:check .`, and record per-binary counts and `git rev-parse HEAD`.
