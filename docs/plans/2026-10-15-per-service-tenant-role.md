@@ -459,7 +459,8 @@ changes above.)
 
 **Interfaces:** consumes `TENANT_ROLE`, `db_role::{RUNTIME_GRANTS, holds_shared_tenant_role,
 SHARED_TENANT_ROLE}`. Produces `pub fn check_tenant_role(report: &otto_tenant::isolation::IsolationReport,
-login: &str, deployment: bool) -> anyhow::Result<()>`.
+login: &str) -> anyhow::Result<()>`. It refuses on every machine, not only in a deployment
+(spec: "no local exception").
 
 **Out-of-band / invariants:** tenant isolation proven at boot; no database text in a response
 (these are logs and boot errors only).
@@ -481,18 +482,19 @@ login: &str, deployment: bool) -> anyhow::Result<()>`.
     }
 
     #[test]
-    fn a_deployment_refuses_tenant_transactions_that_did_not_assume_cxp_app() {
-        assert!(check_tenant_role(&report("cxp_app", true), "cxp_server", true).is_ok());
-        assert!(check_tenant_role(&report("cxp_app", true), "cxp_server", false).is_ok());
-        let err = check_tenant_role(&report("cxp_server", false), "cxp_server", true)
+    fn boot_refuses_tenant_transactions_that_did_not_assume_cxp_app() {
+        assert!(check_tenant_role(&report("cxp_app", true), "cxp_server").is_ok());
+        // cxp_app missing, or the login not a member: otto-tenant skipped SET LOCAL ROLE.
+        let err = check_tenant_role(&report("cxp_server", false), "cxp_server")
             .unwrap_err()
             .to_string();
         assert!(err.contains(r#"tenant transactions run as "cxp_server""#), "{err}");
         assert!(err.contains(r#"GRANT cxp_app TO "cxp_server""#), "{err}");
         // Assumed, but landing somewhere else, is refused too.
-        assert!(check_tenant_role(&report("otto_app", true), "cxp_server", true).is_err());
-        // A developer's machine is only warned.
-        assert!(check_tenant_role(&report("cxp_server", false), "cxp_server", false).is_ok());
+        assert!(check_tenant_role(&report("otto_app", true), "cxp_server").is_err());
+        // Not assumed but the effective role happens to be named cxp_app (a login called
+        // cxp_app): refused, since nothing dropped privileges.
+        assert!(check_tenant_role(&report("cxp_app", false), "cxp_app").is_err());
     }
 ```
 
@@ -500,8 +502,9 @@ login: &str, deployment: bool) -> anyhow::Result<()>`.
 
 Then, still before implementing, write the e2e tests of Step 4 below and run them:
 `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test -p cxp-server --test e2e --locked rollout_shape`
-→ FAIL (no `still a member of otto_app` warning yet). The refusal test already passes through the
-runtime-grant check (Task 2); note that in the report.
+and `… a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally` → both FAIL (no
+warning yet; locally the runtime-grant check only warns, so nothing refuses yet). The deployment
+refusal test already passes through the runtime-grant check (Task 2); note that in the report.
 
 - [ ] **Step 2: Run to see them fail**
 
@@ -514,13 +517,14 @@ runtime-grant check (Task 2); note that in the report.
 /// `SET LOCAL ROLE cxp_app` only when the role exists and the login holds it, and otherwise
 /// runs tenant transactions as the login itself, which `verify_tenant_isolation` accepts for any
 /// role that is neither superuser nor BYPASSRLS. That login also holds the background grants
-/// (the tombstone), and would serve every request with them, silently. So a deployment refuses
-/// unless the report says the role was assumed and is the effective role; a developer's machine
-/// is warned.
+/// (the tombstone), and would serve every request with them, silently. So boot refuses unless
+/// the report says the role was assumed and is the effective role, on every machine: unlike the
+/// privilege checks (which only warn locally, where Postgres hands out a superuser), a local
+/// superuser passes this one (0007 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
+/// a local exception would only ever admit the silent fallback this exists to stop.
 pub fn check_tenant_role(
     report: &otto_tenant::isolation::IsolationReport,
     login: &str,
-    deployment: bool,
 ) -> Result<()> {
     if report.tenant_role_assumed && report.effective_role == cxp_core::TENANT_ROLE {
         return Ok(());
@@ -534,12 +538,8 @@ pub fn check_tenant_role(
         sql_identifier(login),
         sql_identifier(login),
     );
-    if deployment {
-        tracing::error!("{why}: refusing to serve");
-        return Err(anyhow!("refusing to serve: {why}"));
-    }
-    tracing::warn!("{why}: allowed only because this is not a deployment");
-    Ok(())
+    tracing::error!("{why}: refusing to serve");
+    Err(anyhow!("refusing to serve: {why}"))
 }
 ```
 
@@ -552,7 +552,7 @@ In `run_with`, replace the isolation block with:
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     let isolation = report.summary();
     tracing::info!("{isolation}");
-    check_tenant_role(&report, &role.current_user, deployment)?;
+    check_tenant_role(&report, &role.current_user)?;
 ```
 
 After the runtime-grant block (before the isolation proof), in a deployment only:
@@ -585,6 +585,11 @@ it (deployment config, `split_with`, captured logs, "nothing listens"):
     &["otto_app", "cxp_runtime"])` (the shape before runbook T1), owner migrates via
     `boot::migrate`, then `run_with` as the runtime login with `run_migrations = false` in a
     deployment config: `Err` whose text contains `cxp_app` and `GRANT cxp_app TO`; nothing listens.
+  - `a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally`: the same roles
+    (`split_with(&pool, &["otto_app", "cxp_runtime"])`), but a LOCAL config (loopback URLs, no
+    `FLY_APP_NAME`; the runtime-grant check only warns there): `run_with` returns `Err` naming
+    `tenant transactions run as` the runtime login and `GRANT cxp_app TO`; nothing listens. This is
+    the test that reaches `check_tenant_role` itself end to end.
   - `the_rollout_shape_serves_and_warns_about_otto_app`: `split_with(&pool, &["otto_app",
     "cxp_app", "cxp_runtime"])` (between the deploy and runbook T5): serves (`/readyz` ready),
     the captured log contains `is still a member of otto_app` and
