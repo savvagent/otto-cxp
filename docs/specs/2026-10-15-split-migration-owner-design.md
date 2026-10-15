@@ -1,6 +1,6 @@
 # Separate the migration owner from otto-cxp's runtime database role — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#46)
 **Issue:** #27
 **Plan:** `docs/plans/2026-10-15-split-migration-owner.md`
 
