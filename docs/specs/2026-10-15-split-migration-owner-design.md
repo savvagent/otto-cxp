@@ -418,6 +418,31 @@ revoked), after which the new binary serves as `cxp_server`.
   - Mutation check (manual, recorded in the ledger): with `can_alter_tables()` dropped from the
     serving verdict, `a_deployment_refuses_an_owner_as_its_runtime_role` fails.
 
+## Review round 1 (PR #46)
+
+- **Temporary tables and `CREATE`.** The blind security audit found that `PUBLIC`'s default
+  `TEMPORARY` on the database lets the runtime role create a temporary table named like a tenant
+  table; unqualified names resolve through `pg_temp` first, so every later transaction on that
+  pooled connection would use it, with no RLS. `CREATE` on a schema (a cluster upgraded from 14
+  or earlier) would let it plant an overload a `SECURITY DEFINER` function resolves
+  (CVE-2018-1058). The check now reads `CREATE` and `TEMPORARY` on the database and `CREATE` on
+  every non-system schema, for every role the user can `SET ROLE` to (`PUBLIC` included), and
+  refuses them for a serving role; the runbook's S3 revokes `TEMPORARY` (and `CREATE` on `public`)
+  from `PUBLIC`; migration `0006_security_definer_search_path.sql` recreates both `SECURITY
+  DEFINER` functions with every call schema-qualified and `search_path = pg_catalog, public,
+  pg_temp`. The clean summary clause is now `it owns nothing in this database, can TRUNCATE or
+  add a TRIGGER to no table, and can create no schema, object, or temporary table in it`.
+- **The owner's credential is staged, not imported, in the runbook,** so the pre-#27 release,
+  which cannot shed it, never receives it.
+- **The runtime grants include inheriting `otto_app`** (the background tasks use its grants as the
+  runtime role itself); the hint names both fixes. The hourly pass re-checks them (logging
+  `error`, no alarm), gives up after 30 s, and escalates to `error` after three failures in a row.
+- **What the split does not stop.** Tenancy rests on transaction settings (`app.org_id`,
+  `app.maintenance`) any session may set, so whoever holds the runtime credential, or runs SQL as
+  it, can still read and write any org's rows within RLS's rules. The split stops schema
+  tampering, `TRUNCATE`, and shadowing, which would turn isolation off silently for every request;
+  it does not make a compromised runtime credential harmless.
+
 ## Risks & open questions
 
 - **The owner credential reaches every machine** (Fly secrets are app-wide). The serving process
