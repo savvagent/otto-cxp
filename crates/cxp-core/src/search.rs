@@ -180,7 +180,9 @@ pub struct SearchLimiter(Arc<Semaphore>);
 
 /// Leave to run one search: what `search_customers` and `search_articles`
 /// require. Only [`SearchLimiter::acquire`] makes one; dropping it frees the
-/// permit.
+/// permit. It proves a permit from *a* limiter, not which one: the server's
+/// one limiter is the only one outside tests (tests build their own so they
+/// never compete).
 #[derive(Debug)]
 pub struct SearchPermit {
     /// Held only for its `Drop`, which frees the permit.
@@ -206,8 +208,14 @@ impl SearchLimiter {
     pub async fn acquire(&self) -> Result<SearchPermit> {
         match tokio::time::timeout(SEARCH_WAIT, self.0.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Ok(SearchPermit { _permit: permit }),
-            // The semaphore is never closed; read a closed one as busy.
-            Ok(Err(_)) | Err(_) => {
+            // Nothing closes the semaphore, so this arm is unreachable
+            // today; if it ever runs it is a bug, not a busy server, and
+            // must not read as retriable load.
+            Ok(Err(_)) => {
+                tracing::error!("the search limiter's semaphore was closed");
+                Err(Error::Internal("search limiter closed".into()))
+            }
+            Err(_) => {
                 tracing::warn!("a search found every search permit taken and was turned away");
                 Err(Error::Unavailable)
             }

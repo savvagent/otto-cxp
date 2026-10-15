@@ -1372,13 +1372,34 @@ async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
 // ------------------------------------------------------------ search permits
 
 /// A pool sized as production's (5) with an acquire timeout well under the
-/// searches' 2 s statement_timeout.
+/// searches' 2 s statement_timeout. The 500 ms limit also bounds a first
+/// connect, which can be slow under load, so the pool is built lazily and
+/// its five connections opened up front, retrying; during the flood the
+/// limit then applies only to waiting for an idle connection.
 async fn pool_of_five(opts: PgPoolOptions, connect: PgConnectOptions) -> PgPool {
-    opts.max_connections(5)
+    let pool = opts
+        .max_connections(5)
         .acquire_timeout(std::time::Duration::from_millis(500))
-        .connect_with(connect)
-        .await
-        .unwrap()
+        .connect_lazy_with(connect);
+    let mut warm = Vec::new();
+    for _ in 0..5 {
+        let mut attempts = 0;
+        loop {
+            match pool.acquire().await {
+                Ok(c) => {
+                    warm.push(c);
+                    break;
+                }
+                Err(e) => {
+                    attempts += 1;
+                    assert!(attempts < 50, "could not open a connection: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+    drop(warm);
+    pool
 }
 
 /// Fires `n` customer searches that block on a table lock until their
@@ -1482,6 +1503,9 @@ async fn a_search_flood_cannot_starve_a_write(opts: PgPoolOptions, connect: PgCo
         .iter()
         .filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE)
         .count();
+    // The exact count is load-bearing: with the permit taken after the
+    // transaction, the write can still squeeze through as waiting searches
+    // time out, and only this count catches it.
     assert_eq!((blocked, refused), (2, 6), "{searches:?}");
 }
 
@@ -1503,16 +1527,24 @@ async fn without_the_cap_a_search_flood_starves_a_write(
 }
 
 /// A search that cannot get a permit answers 503 unavailable with
-/// Retry-After, and never reaches the database.
+/// Retry-After, and holds no pooled connection while it waits (#42): the
+/// permit comes before the transaction.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn a_search_without_a_permit_is_unavailable(pool: PgPool) {
     let limiter = SearchLimiter::new(1);
     let h = harness_opts(pool, SECRET, false, limiter.clone()).await;
     let (_, _, t) = h.caller(RO);
     let _held = limiter.acquire().await.unwrap();
-    let r = h
-        .call("GET", "/api/v1/customers/search?q=grace", Some(&t), None)
-        .await;
+    // Halfway through the permit wait (500 ms), nothing is checked out.
+    let sample = async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        h.pool.size() - h.pool.num_idle() as u32
+    };
+    let (r, busy) = tokio::join!(
+        h.call("GET", "/api/v1/customers/search?q=grace", Some(&t), None),
+        sample
+    );
+    assert_eq!(busy, 0, "a search waiting for a permit held a connection");
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.body["code"], "unavailable", "{}", r.body);
     assert!(r.headers.contains_key("retry-after"));

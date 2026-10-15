@@ -88,12 +88,12 @@ pub fn router(
     db: Db,
     platform: Arc<PlatformClient>,
     meter: Arc<Meter>,
+    search: cxp_core::search::SearchLimiter,
     config: &Config,
     platform_check: PlatformCheck,
 ) -> Result<Router> {
-    // One limiter for the whole process, so `/api` and `/mcp` together hold
-    // at most half the pool with searches (#42).
-    let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
+    // `search` is one limiter for the whole process, so `/api` and `/mcp`
+    // together hold at most half the pool with searches (#42).
     // cxp-mcp refuses an empty host list itself (rmcp reads one as "accept
     // any"); the only way to get one here is a public URL with no host.
     let mcp = cxp_mcp::router(
@@ -454,6 +454,7 @@ mod tests {
             Db::from_pool(pool),
             platform.clone(),
             meter(platform, &config),
+            cxp_core::search::SearchLimiter::for_pool(config.db_max_connections),
             &config,
             check,
         )
@@ -1039,6 +1040,7 @@ mod tests {
             Db::from_pool(pool),
             platform.clone(),
             meter(platform, &config),
+            cxp_core::search::SearchLimiter::for_pool(config.db_max_connections),
             &config,
             PlatformCheck::Accepted,
         )

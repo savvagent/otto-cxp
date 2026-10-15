@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use cxp_core::auth::{MissingScope, Principal};
-use cxp_core::search::SearchLimiter;
+use cxp_core::search::{SearchLimiter, SearchPermit};
 use cxp_core::usage::Meter;
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
@@ -94,12 +94,6 @@ impl Cxp {
         &self.meter
     }
 
-    /// The search cap: a search tool takes its permit from it, after the
-    /// scope check and before [`Cxp::tx`], so waiting holds no connection.
-    pub(crate) fn search(&self) -> &SearchLimiter {
-        &self.search
-    }
-
     /// The principal for the HTTP request this call arrived on.
     pub fn caller(&self, parts: &http::request::Parts) -> Result<Principal, ErrorData> {
         crate::auth::principal_from(parts).ok_or_else(error::unauthenticated)
@@ -124,6 +118,18 @@ impl Cxp {
         cxp_core::platform_events::begin_live(&self.db, caller.org_id, Some(caller.user_id))
             .await
             .mcp()
+    }
+
+    /// A search permit, then the caller's transaction, in that order (#42):
+    /// waiting for the permit must not hold a pooled connection. Bind the
+    /// pair as `let (permit, mut tx)` so the transaction drops first.
+    pub async fn search_tx(
+        &self,
+        caller: &Principal,
+    ) -> Result<(SearchPermit, Tx<'static>), ErrorData> {
+        let permit = self.search.acquire().await.mcp()?;
+        let tx = self.tx(caller).await?;
+        Ok((permit, tx))
     }
 
     /// Look the org's quota standing up at the platform, before a billable

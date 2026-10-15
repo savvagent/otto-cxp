@@ -45,7 +45,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, MethodRouter};
 use axum::{middleware, Router};
 use cxp_core::auth::Principal;
-use cxp_core::search::SearchLimiter;
+use cxp_core::search::{SearchLimiter, SearchPermit};
 use cxp_core::usage::Meter;
 use http::Method;
 use otto_resource::PlatformClient;
@@ -124,6 +124,18 @@ impl AppState {
     /// deleted or the caller removed.
     pub(crate) async fn begin(&self, caller: &Principal) -> cxp_core::Result<Tx<'static>> {
         cxp_core::platform_events::begin_live(&self.db, caller.org_id, Some(caller.user_id)).await
+    }
+
+    /// A search permit, then the caller's transaction, in that order (#42):
+    /// waiting for the permit must not hold a pooled connection. Bind the
+    /// pair as `let (permit, mut tx)` so the transaction drops first.
+    pub(crate) async fn begin_search(
+        &self,
+        caller: &Principal,
+    ) -> cxp_core::Result<(SearchPermit, Tx<'static>)> {
+        let permit = self.search.acquire().await?;
+        let tx = self.begin(caller).await?;
+        Ok((permit, tx))
     }
 }
 

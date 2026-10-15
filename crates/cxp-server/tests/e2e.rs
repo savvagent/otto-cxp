@@ -204,6 +204,7 @@ struct Server {
     db: Db,
     pool: PgPool,
     platform: Arc<PlatformClient>,
+    search: cxp_core::search::SearchLimiter,
     mock: Shared,
 }
 
@@ -217,10 +218,12 @@ async fn server(pool: PgPool) -> Server {
     assert_eq!(config.platform_webhook_secret, WEBHOOK_SECRET);
     let db = Db::from_pool(pool.clone());
     let platform = platform_client(&config).unwrap();
+    let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
     let app = router(
         db.clone(),
         platform.clone(),
         meter(platform.clone(), &config),
+        search.clone(),
         &config,
         cxp_server::PlatformCheck::Accepted,
     )
@@ -230,6 +233,7 @@ async fn server(pool: PgPool) -> Server {
         db,
         pool,
         platform,
+        search,
         mock,
     }
 }
@@ -1679,6 +1683,45 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
     let p = s.mock.lock().unwrap();
     assert_eq!(p.received.len(), received.len() + 1);
     assert_eq!(p.counted.len(), received.len(), "counted once");
+}
+
+/// #42: `/api` and `/mcp` take their search permits from the one limiter
+/// `router` is given, so holding every permit turns away a search on each
+/// surface, and releasing them lets each succeed.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn one_search_limiter_serves_both_surfaces(pool: PgPool) {
+    let s = server(pool).await;
+    let t = s.caller().token;
+    let rest = || s.api("GET", "/api/v1/customers/search?q=grace", Some(&t), None);
+    let held: Vec<_> = {
+        let mut v = Vec::new();
+        for _ in 0..s.search.available() {
+            v.push(s.search.acquire().await.unwrap());
+        }
+        v
+    };
+    assert_eq!(s.search.available(), 0);
+
+    let r = rest().await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    assert_eq!(r.body["code"], "unavailable", "{}", r.body);
+    for (tool, args) in [
+        ("search_customers", json!({"query": "grace"})),
+        ("search_knowledge_base", json!({"query": "reset"})),
+    ] {
+        let e = s.tool(&t, tool, args).await.unwrap_err();
+        assert_eq!(e["data"]["code"], "unavailable", "{tool}: {e}");
+    }
+
+    drop(held);
+    let r = rest().await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    for (tool, args) in [
+        ("search_customers", json!({"query": "grace"})),
+        ("search_knowledge_base", json!({"query": "reset"})),
+    ] {
+        s.ok(&t, tool, args).await;
+    }
 }
 
 // ============================================================ criterion 4

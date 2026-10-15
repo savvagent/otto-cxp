@@ -911,7 +911,7 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
 }
 
 /// #42: a search tool that cannot get a permit fails as retriable
-/// `unavailable` rather than waiting on the pool.
+/// `unavailable`, holding no pooled connection while it waits.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn a_search_tool_without_a_permit_is_unavailable(pool: PgPool) {
     let limiter = SearchLimiter::new(1);
@@ -922,7 +922,14 @@ async fn a_search_tool_without_a_permit_is_unavailable(pool: PgPool) {
         ("search_customers", json!({"query": "grace"})),
         ("search_knowledge_base", json!({"query": "reset"})),
     ] {
-        let failed = h.tool(&t, tool, args).await.unwrap_err();
+        // Halfway through the permit wait (500 ms), nothing is checked out.
+        let sample = async {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            h.pool.size() - h.pool.num_idle() as u32
+        };
+        let (failed, busy) = tokio::join!(h.tool(&t, tool, args), sample);
+        let failed = failed.unwrap_err();
+        assert_eq!(busy, 0, "{tool} waited for a permit holding a connection");
         assert_eq!(code(&failed), "unavailable", "{tool}: {failed}");
         assert_eq!(failed["data"]["retriable"], true, "{tool}: {failed}");
     }

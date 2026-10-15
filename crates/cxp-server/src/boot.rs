@@ -189,6 +189,8 @@ where
         .await
         .context("could not connect to the database")?;
     let db = Db::from_pool(pool);
+    // Sized from the same setting as the pool: one limiter for the process.
+    let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
 
     // Before anything runs as this role, migrations included.
     let role = cxp_core::db_role::inspect(&db)
@@ -219,6 +221,7 @@ where
         db.clone(),
         platform.clone(),
         meter(platform.clone(), &config),
+        search,
         &config,
         check.clone(),
     )?;

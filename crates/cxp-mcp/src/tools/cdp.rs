@@ -232,8 +232,7 @@ impl Cxp {
     ) -> Result<Json<List<Customer>>, ErrorData> {
         let caller = self.caller(&parts)?;
         caller.require_read().mcp()?;
-        let permit = self.search().acquire().await.mcp()?;
-        let mut tx = self.tx(&caller).await?;
+        let (permit, mut tx) = self.search_tx(&caller).await?;
         let found = tx
             .search_customers(&permit, &p.query, Page::default())
             .await
