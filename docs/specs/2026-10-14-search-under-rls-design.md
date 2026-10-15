@@ -1,5 +1,7 @@
 # Search under row-level security — design
 
+> The `X-Total-*` headers described here were replaced by the search envelope's `totalCapped` (#24).
+
 **Status:** IMPLEMENTED (#33)
 **Issue:** #17 "Make customer and knowledge-base search fast under row-level security"
 **Plan:** `docs/plans/2026-10-14-search-under-rls.md`

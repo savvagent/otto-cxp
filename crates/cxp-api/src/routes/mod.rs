@@ -1,9 +1,23 @@
 //! The `/api/v1` handlers, one module per resource.
-//! Casing rule: response models are camelCase (the `cxp-core` models' serde
-//! shape), except `GET /dashboard/metrics`, which keeps its snake_case keys.
-//! Request bodies and query parameters are snake_case; catalog bodies also
-//! accept `teamId` as a permanent alias of `team_id`. The web console's types
-//! follow this (#15); a single convention for `/api/v1` is tracked in #24.
+//!
+//! **The wire convention (#24).** Every JSON key in a request body or a
+//! response, and every query-parameter name, is camelCase (`customerId`,
+//! `teamId`, `createdAt`), the `cxp-core` models' serde shape. Request structs
+//! say so with `rename_all = "camelCase"`, and each multi-word field also
+//! takes its pre-#24 snake_case spelling (`customer_id`) as a serde `alias`,
+//! so older callers keep working; sending both spellings of one field is a
+//! `400 invalid_argument`. The convention covers keys, not values: enum values
+//! stay as stored (`in_progress`, `page_view`), and JSON the caller owns
+//! (`metadata`, `questions`, `answers`) passes through untouched.
+//!
+//! Lists answer [`Paginated`] `{data, total, limit, offset}`; search answers
+//! [`CappedPaginated`], which adds `totalCapped`. Two exceptions remain, each
+//! tracked: `GET /surveys/{id}/responses` is a plain array (#36), and
+//! `GET /dashboard/metrics` also sends its deprecated snake_case keys
+//! (`total_customers`, ...) beside the camelCase ones (#35). Errors are
+//! `{"error", "code"}`; the auth layer's `401`/`403` use the RFC 6750 names
+//! `error` and `error_description`. The web console's types follow this, and
+//! the `wire_fixture` test below pins the shapes it reads.
 
 pub mod catalog;
 pub mod customers;

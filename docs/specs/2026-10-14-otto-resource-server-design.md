@@ -361,10 +361,14 @@ Same routes and JSON shapes as `server/src/api` today minus `/teams`, behind `re
 create/update with a `teamId` verifies it with `cxp_core::catalog::verify_team(platform, org, id)`
 (unknown, or another org's → 400 `unknown_team`; platform down → 503), which returns the
 `VerifiedTeam` the catalog write requires, so no route can store an unverified team id. On update, an absent team
-field leaves the team unchanged and an explicit `null` clears it. Request bodies are snake_case
-(`team_id`), and catalog bodies also accept `teamId` as a permanent alias; responses are
-camelCase. The casing mismatch is resolved by #15 (the console reads camelCase); the broader
-question of one convention for `/api/v1` is tracked in #24. `POST /api/v1/surveys` charges `create_survey`.
+field leaves the team unchanged and an explicit `null` clears it. `/api/v1` has one
+wire convention (#24): every JSON key in request bodies and responses, and every query-parameter
+name, is camelCase (`teamId`, `customerId`, `createdAt`); multi-word request keys also accept
+their earlier snake_case spelling (`team_id`) as an alias, and both at once is a 400. Enum values
+and caller-owned JSON (`metadata`) are untouched. Lists are `{data, total, limit, offset}`;
+`GET /api/v1/customers/search` adds `totalCapped`. The tracked exceptions are survey responses
+(a plain array, #36) and `GET /api/v1/dashboard/metrics`, which also sends its deprecated
+snake_case keys (#35). `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
 `invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until
@@ -416,7 +420,7 @@ not application SQL, so "no SQL outside cxp-core" does not cover it, and running
 `otto-db` is a production write: human-only.
 
 Out of scope (own tickets): the web console's platform OAuth sign-in. The web app's types now
-read the server's camelCase JSON (#15); one casing convention for `/api/v1` is #24.
+read the server's camelCase JSON (#15); `/api/v1` uses one camelCase convention (#24).
 
 ## Out-of-band and hand-offs
 
