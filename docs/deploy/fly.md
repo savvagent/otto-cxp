@@ -53,9 +53,8 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   search index tables (migration 0004), read a bounded number of rows per query, and count
   matches up to 1000 (`docs/specs/2026-10-14-search-under-rls-design.md`). The index costs about
   7 kB per customer and 25 kB per published article as measured on a bulk-loaded benchmark;
-  indexes grown a row at a time run 25-30% larger. Searches also index, a batch at a time, the
-  rows written before migration 0004. Watching that size, and retiring the backlog path once
-  production has none left, is [#34](https://github.com/savvagent/otto-cxp/issues/34). The pool is
+  indexes grown a row at a time run 25-30% larger. When to act on that size, and the query that
+  watches it, are in [Search index storage](#search-index-storage-34). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
@@ -519,6 +518,180 @@ Do not `fly postgres detach`: it would unset `DATABASE_URL`. Dropping the role l
 otto_cxp`, `DROP OWNED BY <attach role>;` to clear its leftover grants and default privileges
 there, then `DROP ROLE <attach role>;`) is optional; `DROP ROLE` refuses while it still holds
 anything elsewhere.
+
+## Search index storage (#34)
+
+Customer and knowledge-base search keep their own index tables, `customer_search_grams` and
+`knowledge_search_terms` (migration 0004, design in
+`docs/specs/2026-10-14-search-under-rls-design.md`). They cost about 7 kB per customer and 25 kB
+per published article when bulk-loaded, and 25 to 30% more when grown a row at a time.
+`otto-db` has a single **1 GB** volume
+(`fly volumes list -a otto-db`), shared with `otto_platform`, `otto_factory`, and `otto_flags`.
+
+### When to act
+
+Act when **any** of these holds:
+
+- the two index tables together pass **100 MB**, a tenth of the volume. That is roughly 10k
+  customers or 3k published articles in all orgs combined, and fewer once grown a row at a time;
+- `otto_cxp` passes **250 MB**;
+- the volume passes **60%** used (`fly ssh console -a otto-db -C "df -h /data"`, read-only),
+  leaving headroom for WAL spikes on the shared volume and for a rebuild (below).
+
+What to do, in order of preference:
+
+1. **Move otto-cxp to a dedicated Postgres instance.** This adds recurring cost, so it is Rob's
+   decision. This doc already says to split before real customers arrive.
+2. **Slim the index** with the LEAKPROOF route (below), which lets a later migration serve fuzzy
+   name search from a GIN index and drop the trigram rows: about a quarter of
+   `customer_search_grams`. Dropping the article lexeme and title rows as well would need `@@`
+   and `ILIKE` leakproof too, which this route does not cover.
+
+Growing the volume is a stopgap, not a fix. It also adds recurring cost (Rob).
+
+### Watch query (SELECT-only)
+
+Run it as the superuser in a read-only transaction. It reads statistics and sizes and writes
+nothing. It must be the superuser: as `cxp_server` (bound by forced RLS) the two "missing"
+counts silently read 0, and `pg_database_size` fails on the other services' databases.
+
+```sh
+fly postgres connect -a otto-db -d otto_cxp
+```
+
+```sql
+BEGIN TRANSACTION READ ONLY;
+SELECT s.relname, s.n_live_tup AS live_rows,
+       pg_size_pretty(pg_total_relation_size(s.relid)) AS total,
+       pg_size_pretty(pg_relation_size(s.relid)) AS heap,
+       pg_size_pretty(pg_indexes_size(s.relid)) AS indexes
+FROM pg_stat_user_tables s
+WHERE s.relname IN ('customer_search_grams', 'knowledge_search_terms',
+                    'customers', 'knowledge_articles')
+ORDER BY pg_total_relation_size(s.relid) DESC;
+SELECT i.relname, i.indexrelname, i.idx_scan,
+       pg_size_pretty(pg_relation_size(i.indexrelid)) AS size
+FROM pg_stat_user_indexes i
+WHERE i.relname IN ('customer_search_grams', 'knowledge_search_terms')
+   OR i.indexrelname LIKE '%search_backlog%'  -- 0004's partial indexes; unused since #34, kept (additive)
+ORDER BY pg_relation_size(i.indexrelid) DESC;
+SELECT pg_size_pretty(sum(pg_total_relation_size(relid))) AS search_index_total
+FROM pg_stat_user_tables
+WHERE relname IN ('customer_search_grams', 'knowledge_search_terms');
+SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size
+FROM pg_database WHERE NOT datistemplate ORDER BY pg_database_size(datname) DESC;
+SELECT count(*) AS customers_missing_from_index FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g
+                  WHERE g.org_id = c.org_id AND g.customer_id = c.id);
+SELECT count(*) AS articles_missing_from_index FROM knowledge_articles a
+WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector)
+  AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t
+                  WHERE t.org_id = a.org_id AND t.article_id = a.id);
+ROLLBACK;
+```
+
+The baseline on 2026-10-15: 0 customers and 0 articles in every org, the index tables 56 kB in
+all, `otto_cxp` 9.5 MB, and 0 rows missing from the index. `n_live_tup` is an estimate; the sizes are exact.
+
+### No backlog
+
+Every row is in the index. Migration 0004's `BEFORE INSERT OR UPDATE` trigger
+(`search_mark_indexed`) sets `search_indexed` on every write, and the sync triggers write the
+index rows. Only rows that existed when 0004 ran could read `false`, and production had none.
+Since #34, search no longer reads or writes `search_indexed`: a row is found through the index
+only if its index rows exist (a customer without them can still turn up through the newest-first
+scan of a broad query, but not reliably). The column and its two partial indexes stay only
+because migrations are additive.
+
+The way to lose index rows is loading data with triggers disabled: a restore with
+`--disable-triggers` or `session_replication_role = replica`, or a data-only `COPY` of the base
+tables without the index tables. Such rows usually still read `search_indexed = true` (the
+column's default, or the dumped value), so the flag does not show them; the last two statements
+of the watch query find them by their missing index rows. If either count is nonzero, rebuild.
+This is a human-only production write (Rob), run as the superuser in `otto_cxp`. Step 1 marks
+the rows unindexed with triggers off (the `BEFORE` trigger would otherwise force the flag back
+to `true`); step 2, with triggers on, sets it again, which fires the sync triggers (their `WHEN`
+includes `NOT OLD.search_indexed`) to write the index rows.
+
+Before you start: both steps rewrite every affected row (not HOT: the flag is in the partial
+indexes' predicate), and step 2 writes about 50 index rows per customer and 160 per article, all
+as WAL. Check free space on the volume first: at least three times the expected index size
+(about 9 kB per customer and 30 kB per published article). For more than a few thousand rows,
+run step 2 one org at a time (add `AND org_id = '<org>'` to both statements) with a `VACUUM` of
+the two base tables between orgs, rather than as one statement.
+
+```sql
+BEGIN;
+SET LOCAL session_replication_role = replica;
+UPDATE customers c SET search_indexed = false
+WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g
+                  WHERE g.org_id = c.org_id AND g.customer_id = c.id);
+UPDATE knowledge_articles a SET search_indexed = false
+WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector)
+  AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t
+                  WHERE t.org_id = a.org_id AND t.article_id = a.id);
+COMMIT;
+UPDATE customers SET search_indexed = true WHERE NOT search_indexed;
+UPDATE knowledge_articles SET search_indexed = true WHERE NOT search_indexed;
+```
+
+Then re-run the watch query; both counts read 0. (The article count leaves out published articles
+with an empty title and only stop words in their content: correctly indexed, they have no index
+rows.)
+
+### Search timeouts
+
+Each search runs under `statement_timeout = 2s`. A search past it answers `query_too_broad`,
+which is not retriable (REST 422 with no `Retry-After`; MCP `INVALID_PARAMS` with `data.code`
+and `retriable: false`): repeating a broad query would hold one of the five pooled connections
+for the whole timeout again, so the caller is told to narrow it. Expect it rarely: from a broad
+query in a very large org, or occasionally from a search that reads a cold cache (after
+`otto-db` restarts, or after a long idle stretch on the shared instance). A cold-cache timeout is
+acceptable: the caller's next, narrower search runs warm. The service logs each one at `warn` as
+`search hit its statement_timeout`, naming the search but never the query (an operator's
+`pg_cancel_backend` on a search logs the same way). If these appear often, or an org nears the
+threshold above, time one cold search from the console or an agent.
+
+### LEAKPROOF re-evaluation (human-only, Rob)
+
+Under forced row-level security, Postgres uses an index only through leakproof operators, and
+pg_trgm's `%` (`similarity_op`) is not marked leakproof. Marking it LEAKPROOF in `otto_cxp`
+would let a GIN `(name gin_trgm_ops)` index serve fuzzy search directly. That makes long fuzzy
+queries exact in large orgs, and lets the trigram rows go. Reasoning:
+`docs/specs/2026-10-14-search-under-rls-design.md` ("Human hand-off").
+
+**Re-evaluate when** the index passes the threshold above, or users report fuzzy name search
+missing customers (results with `totalCapped: true` on long name queries in a large org).
+
+**The change** is made by a superuser, connected to `otto_cxp` only:
+
+```sql
+ALTER FUNCTION public.similarity_op(text, text) LEAKPROOF;
+```
+
+It must be followed by a migration that adds the GIN index and a release whose search uses it.
+
+**What loses the flag:** `ALTER EXTENSION pg_trgm UPDATE`, dropping and recreating the extension,
+and a dump and restore. Each can recreate the function without the flag (an extension update
+does when its script replaces `similarity_op`). RLS then silently stops
+using the GIN index, and every fuzzy search scans the org again.
+
+**The boot check that release must add:** at startup, as `boot::check_db_role` does for the
+role, run
+
+```sql
+SELECT proleakproof FROM pg_proc WHERE oid = 'public.similarity_op(text,text)'::regprocedure;
+```
+
+and refuse to boot if it is false while the GIN path is compiled in. A lost flag then fails the
+deploy loudly instead of degrading search to scans.
+
+**Setting the flag changes query planning at once**, whether or not that release exists: the
+planner may then evaluate `name % $3` (today's customer search uses it) on other orgs' rows
+before the RLS policy filters them. So before Rob marks it, check on the installed pg_trgm
+version that `similarity_op` and the trigram functions it calls cannot raise an error that
+quotes their input, since its return value must be its only signal. Set it in the same change
+window as the GIN release, not earlier.
 
 ## First deploy
 

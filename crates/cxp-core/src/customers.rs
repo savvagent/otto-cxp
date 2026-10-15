@@ -15,8 +15,8 @@ use crate::error::{on_unique, Error, Result};
 use crate::interactions::{Interaction, INTERACTION_COLS};
 use crate::paging::Page;
 use crate::search::{
-    self, Hits, Indexed, SearchPage, BACKLOG_READ, DF_PROBE, FUZZY_CHECKED,
-    FUZZY_CHECKED_PAST_READ, FUZZY_READ, MAX_QUERY_CHARS, NEWEST_READ, SUBSTRING_READ, TOTAL_CAP,
+    self, Hits, SearchPage, DF_PROBE, FUZZY_CHECKED, FUZZY_CHECKED_PAST_READ, FUZZY_READ,
+    MAX_QUERY_CHARS, NEWEST_READ, SUBSTRING_READ, TOTAL_CAP,
 };
 
 /// Longest customer email, in characters (RFC 5321's 64 + 1 + 255, with
@@ -74,14 +74,17 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 ///   [`FUZZY_CHECKED`] candidates are checked, most shared trigrams first.
 ///   A threshold of 0 or below makes every named customer a match, so the
 ///   candidates are then simply the org's customers. `fp` reads the
-///   threshold with `current_setting`, which knows the setting only once
-///   pg_trgm is loaded in the session: `fp` evaluates `b` (and so
-///   `show_trgm`, in `fq`) before it, which loads it.
-/// - `backlog`: customers that predate the index (`search_indexed` false;
-///   see [`crate::search::index_backlog`]), up to [`BACKLOG_READ`].
+///   threshold with `current_setting(..., true)`, which is NULL (or '', for
+///   a placeholder set and reset) until pg_trgm is loaded in the session, so
+///   it falls back to pg_trgm's default
+///   of 0.3 (a value set earlier, as a placeholder, is what pg_trgm adopts
+///   when it loads, and is read as set); it no longer depends on the order
+///   the CTEs are evaluated in.
 ///
 /// `matches` checks candidates (substring ones first, as they rank first)
-/// until [`TOTAL_CAP`] + 1 match, so the count stops at the cap.
+/// until [`TOTAL_CAP`] + 1 match, so the count stops at the cap. The count
+/// of the org's customers (up to [`NEWEST_READ`] + 1) runs only when the
+/// matches have not already capped the result.
 pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
     let cap = TOTAL_CAP;
     format!(
@@ -126,7 +129,8 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            SELECT b, th, greatest(1, ceil(th * b - 0.001), \
                                   ceil(th * (2 + b) / (1 + th) - 0.001))::int AS kmin \
            FROM (SELECT (SELECT count(*) FROM fq)::int AS b, \
-                        current_setting('pg_trgm.similarity_threshold')::float8 AS th) AS x \
+                        coalesce(nullif(current_setting('pg_trgm.similarity_threshold', true), '')::float8, \
+                                 0.3) AS th) AS x \
          ), fz_read AS MATERIALIZED ( \
            SELECT c.customer_id, c.name_grams \
            FROM (SELECT fz.gram FROM ( \
@@ -147,12 +151,8 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            LIMIT {fz_checked} \
          ), fz_all AS MATERIALIZED ( \
            SELECT id AS customer_id FROM customers \
-           WHERE org_id = $1 AND (SELECT th FROM fp) <= 0 AND search_indexed \
+           WHERE org_id = $1 AND (SELECT th FROM fp) <= 0 \
            LIMIT {fz_checked} \
-         ), backlog AS MATERIALIZED ( \
-           SELECT id AS customer_id FROM customers \
-           WHERE org_id = $1 AND NOT search_indexed \
-           LIMIT {backlog} \
          ), matches AS MATERIALIZED ( \
            SELECT m.id, m.em, m.sim, m.created_at \
            FROM (SELECT customer_id FROM sub_all \
@@ -164,9 +164,6 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
                              THEN {FUZZY_CHECKED_PAST_READ} ELSE {fz_checked} END) \
                  UNION ALL \
                  SELECT customer_id FROM fz_all \
-                 WHERE customer_id NOT IN (SELECT customer_id FROM sub_all) \
-                 UNION ALL \
-                 SELECT customer_id FROM backlog \
                  WHERE customer_id NOT IN (SELECT customer_id FROM sub_all)) AS c \
            CROSS JOIN LATERAL ( \
              SELECT id, email ILIKE $2 AS em, similarity(name, $3) AS sim, created_at \
@@ -176,14 +173,13 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            LIMIT {cap_read} \
          ) \
          SELECT least((SELECT count(*) FROM matches), {cap}) AS total, \
-                (SELECT count(*) FROM matches) > {cap} \
-                  OR ((SELECT count(*) FROM sub_read) > {SUBSTRING_READ} \
-                      AND (SELECT count(*) FROM (SELECT 1 FROM customers WHERE org_id = $1 \
-                                                 LIMIT {newest_read}) AS n) > {NEWEST_READ}) \
+                CASE WHEN (SELECT count(*) FROM matches) > {cap} THEN true ELSE ( \
+                  ((SELECT count(*) FROM sub_read) > {SUBSTRING_READ} \
+                   AND (SELECT count(*) FROM (SELECT 1 FROM customers WHERE org_id = $1 \
+                                              LIMIT {newest_read}) AS n) > {NEWEST_READ}) \
                   OR (SELECT count(*) FROM fz_read) > {FUZZY_READ} \
                   OR (SELECT count(*) FROM fz_hits) > {FUZZY_CHECKED} \
-                  OR (SELECT count(*) FROM fz_all) > {FUZZY_CHECKED} \
-                  OR (SELECT count(*) FROM backlog) > {BACKLOG_READ} AS capped, \
+                  OR (SELECT count(*) FROM fz_all) > {FUZZY_CHECKED}) END AS capped, \
                 ARRAY(SELECT id FROM matches \
                       ORDER BY em DESC, sim DESC NULLS LAST, created_at DESC, id \
                       LIMIT least($4, greatest({cap} - $5, 0)) OFFSET $5) AS ids",
@@ -191,7 +187,6 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
         newest_read = NEWEST_READ + 1,
         fz_read = FUZZY_READ + 1,
         fz_checked = FUZZY_CHECKED + 1,
-        backlog = BACKLOG_READ + 1,
         cap_read = cap + 1,
     )
 });
@@ -506,7 +501,7 @@ impl CustomersExt for Tx<'_> {
             )));
         }
         let org = self.org();
-        search::prepare(self, Indexed::Customers).await?;
+        search::prepare(self).await?;
         let hits: Hits = sqlx::query_as(&SEARCH_CUSTOMERS_SQL)
             .bind(org)
             .bind(contains_pattern(query))
@@ -514,14 +509,16 @@ impl CustomersExt for Tx<'_> {
             .bind(page.limit())
             .bind(page.offset())
             .fetch_one(self.conn())
-            .await?;
+            .await
+            .map_err(search::on_timeout("search_customers"))?;
         let rows: Vec<Customer> = sqlx::query_as(&format!(
             "SELECT {CUSTOMER_COLS} FROM customers WHERE org_id = $1 AND id = ANY ($2)"
         ))
         .bind(org)
         .bind(&hits.ids)
         .fetch_all(self.conn())
-        .await?;
+        .await
+        .map_err(search::on_timeout("search_customers"))?;
         Ok(SearchPage {
             items: search::in_order(&hits.ids, rows, |c| c.id),
             total: hits.total,

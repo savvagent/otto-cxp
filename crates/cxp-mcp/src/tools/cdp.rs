@@ -221,7 +221,8 @@ impl Cxp {
                        and items are exactly the best matches. totalCapped true: total is a \
                        lower bound (1000 when more than 1000 match, or fewer when the search \
                        stopped before counting every match), and items are the best-ranked of \
-                       the matches found: narrow the query to reach others.",
+                       the matches found: narrow the query to reach others. A search too \
+                       broad to finish in time fails with code query_too_broad: narrow it.",
         annotations(read_only_hint = true)
     )]
     pub async fn search_customers(

@@ -1261,6 +1261,233 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
     );
 }
 
+/// Migration 0004's `search_mark_indexed` trigger sets `search_indexed` on
+/// every insert and update, whatever the statement says, and the sync
+/// triggers write the row's index rows with it: no ordinary write can leave
+/// a row unindexed. That is why search reads no backlog of unindexed rows
+/// (#34); only rows written before 0004, or loaded with triggers off (see
+/// `the_rebuild_runbook_restores_lost_index_rows`), can be.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
+    use cxp_core::knowledge::KnowledgeExt;
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    sqlx::query(
+        "INSERT INTO customers (org_id, email, name, search_indexed) \
+         VALUES ($1, 'flag@example.com', 'Flag Person', false)",
+    )
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    let indexed: bool = sqlx::query_scalar("SELECT search_indexed FROM customers")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(indexed, "the insert's false was overridden");
+    let grams: i64 = sqlx::query_scalar("SELECT count(*) FROM customer_search_grams")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(grams > 0, "the customer has index rows");
+    sqlx::query("UPDATE customers SET search_indexed = false WHERE org_id = $1")
+        .bind(a)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    let indexed: bool = sqlx::query_scalar("SELECT search_indexed FROM customers")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(indexed, "the update's false was overridden");
+    let found = tx.search_customers("flag", Page::default()).await.unwrap();
+    assert_eq!(
+        (found.items.len(), found.total, found.total_capped),
+        (1, 1, false)
+    );
+
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published, search_indexed) \
+         VALUES ($1, 'Flag waving', 'How to wave a flag', true, false)",
+    )
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    let indexed: bool = sqlx::query_scalar("SELECT search_indexed FROM knowledge_articles")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(indexed, "the article insert's false was overridden");
+    sqlx::query("UPDATE knowledge_articles SET search_indexed = false")
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    let indexed: bool = sqlx::query_scalar("SELECT search_indexed FROM knowledge_articles")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(indexed, "the article update's false was overridden");
+    let terms: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(terms > 0, "the article has index rows");
+    let found = tx.search_articles("flag").await.unwrap();
+    assert_eq!(
+        (found.items.len(), found.total, found.total_capped),
+        (1, 1, false)
+    );
+}
+
+/// The detection and rebuild runbook in docs/deploy/fly.md ("No backlog"),
+/// statement for statement: rows whose index rows were lost (a load with
+/// triggers off) still read `search_indexed = true`, so the runbook finds
+/// them by their missing index rows and rebuilds them in two steps. If the
+/// sync triggers' `WHEN` clauses change, this and the runbook change
+/// together.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_rebuild_runbook_restores_lost_index_rows(pool: PgPool) {
+    use cxp_core::knowledge::KnowledgeExt;
+    const MISSING_CUSTOMERS: &str = "SELECT count(*) FROM customers c \
+         WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g \
+                           WHERE g.org_id = c.org_id AND g.customer_id = c.id)";
+    const MISSING_ARTICLES: &str = "SELECT count(*) FROM knowledge_articles a \
+         WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector) \
+           AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t \
+                           WHERE t.org_id = a.org_id AND t.article_id = a.id)";
+    let su = pool.clone();
+    let db = db(pool);
+    let org = org();
+    add(&db, org, new("lost@example.com", "Lost Person")).await;
+    let mut tx = db.begin(org).await.unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published) \
+         VALUES ($1, 'Lost article', 'Some lost content', true)",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // What a load without the index tables leaves: the rows, flagged
+    // indexed, with no index rows.
+    sqlx::query("DELETE FROM customer_search_grams")
+        .execute(&su)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM knowledge_search_terms")
+        .execute(&su)
+        .await
+        .unwrap();
+    let count = |sql: &'static str| {
+        let su = su.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&su)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        (
+            count(MISSING_CUSTOMERS).await,
+            count(MISSING_ARTICLES).await
+        ),
+        (1, 1)
+    );
+    let flagged: i64 = sqlx::query_scalar("SELECT count(*) FROM customers WHERE search_indexed")
+        .fetch_one(&su)
+        .await
+        .unwrap();
+    assert_eq!(flagged, 1, "the flag does not show the loss");
+
+    let mut step1 = su.begin().await.unwrap();
+    for stmt in [
+        "SET LOCAL session_replication_role = replica",
+        "UPDATE customers c SET search_indexed = false \
+         WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g \
+                           WHERE g.org_id = c.org_id AND g.customer_id = c.id)",
+        "UPDATE knowledge_articles a SET search_indexed = false \
+         WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector) \
+           AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t \
+                           WHERE t.org_id = a.org_id AND t.article_id = a.id)",
+    ] {
+        sqlx::query(stmt).execute(&mut *step1).await.unwrap();
+    }
+    step1.commit().await.unwrap();
+    for stmt in [
+        "UPDATE customers SET search_indexed = true WHERE NOT search_indexed",
+        "UPDATE knowledge_articles SET search_indexed = true WHERE NOT search_indexed",
+    ] {
+        sqlx::query(stmt).execute(&su).await.unwrap();
+    }
+
+    assert_eq!(
+        (
+            count(MISSING_CUSTOMERS).await,
+            count(MISSING_ARTICLES).await
+        ),
+        (0, 0)
+    );
+    let mut tx = db.begin(org).await.unwrap();
+    let found = tx.search_customers("lost", Page::default()).await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1, false));
+    let found = tx.search_articles("lost").await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1, false));
+}
+
+/// A search that runs past its `statement_timeout` (here, waiting on a lock
+/// on the index table that only the search statement reads) is
+/// `query_too_broad`: not retriable, and saying nothing of statements or
+/// cancellation, rather than an internal error.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
+    let su = pool.clone();
+    let db = db(pool);
+    let org = org();
+    // Committed first: an uncommitted insert would hold a lock on the index
+    // table, and the `LOCK TABLE` below would wait on it.
+    add(&db, org, new("timeout@example.com", "Time Out")).await;
+
+    let mut lock = su.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE customer_search_grams IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let mut tx = db.begin(org).await.unwrap();
+    let started = std::time::Instant::now();
+    // Bounded, so a search that stopped setting its timeout fails here
+    // instead of waiting on the lock for good.
+    let e = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tx.search_customers("anything", Page::default()),
+    )
+    .await
+    .expect("the search waited past its own timeout")
+    .unwrap_err();
+    let waited = started.elapsed();
+    drop(tx);
+    lock.rollback().await.unwrap();
+
+    assert_eq!(e.code(), "query_too_broad", "{e:?}");
+    assert!(!e.retriable());
+    let text = e.to_string();
+    assert!(!text.contains("statement"), "{text}");
+    assert!(!text.contains("cancel"), "{text}");
+    assert!(
+        waited >= std::time::Duration::from_millis(1900),
+        "failed after {waited:?}, before the timeout"
+    );
+}
+
 /// Many near-identical names, so plenty of candidates sit right at the
 /// similarity threshold: a candidate bound that dropped one would show here.
 /// Names and queries are drawn from a few syllables by a fixed generator.
@@ -1600,168 +1827,6 @@ async fn a_cut_fuzzy_read_is_capped(pool: PgPool) {
     assert!(found.capped);
 }
 
-/// More not-yet-indexed rows than search reads directly: capped, and each
-/// search indexes a batch, until the backlog is gone and search is exact.
-#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_backlog_larger_than_its_read_is_capped_until_indexed(pool: PgPool) {
-    let su = pool.clone();
-    let db = db(pool);
-    let org = org();
-    insert_untriggered(
-        &su,
-        org,
-        "INSERT INTO customers (org_id, email, name, search_indexed) \
-         SELECT $1, 'backlog' || n || '@b.example', 'Backlog Person', false \
-         FROM generate_series(1, 300) AS n",
-    )
-    .await;
-    let mut tx = db.begin(org).await.unwrap();
-    let found = assert_capped_within_contract(&mut tx, "backlog").await;
-    assert!(found.capped);
-    tx.commit().await.unwrap();
-    // 50 a search: after three searches 150 are left, and the fourth
-    // indexes 50 and reads the other 100 directly.
-    for _ in 0..2 {
-        let mut tx = db.begin(org).await.unwrap();
-        tx.search_customers("backlog", Page::default())
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-    }
-    let mut tx = db.begin(org).await.unwrap();
-    let (found, scanned) = customers_both_ways(&mut tx, "backlog", page(500, 0))
-        .await
-        .unwrap();
-    assert_eq!((found.total, found.capped), (300, false));
-    assert_eq!(found, scanned);
-}
-
-/// A backlog row that cannot be indexed does not fail the search: the batch
-/// is rolled back to its savepoint, logged by SQLSTATE alone, and the row is
-/// read directly.
-#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_failing_backlog_batch_does_not_fail_search(pool: PgPool) {
-    let su = pool.clone();
-    let db = db(pool);
-    let org = org();
-    sqlx::query(
-        "CREATE FUNCTION refuse_boom() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN \
-           IF NEW.email = 'boom@example.com' THEN \
-             RAISE EXCEPTION 'cannot index secret-customer-text %', NEW.email; \
-           END IF; \
-           RETURN NEW; \
-         END $$",
-    )
-    .execute(&su)
-    .await
-    .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER refuse_boom BEFORE UPDATE ON customers \
-         FOR EACH ROW EXECUTE FUNCTION refuse_boom()",
-    )
-    .execute(&su)
-    .await
-    .unwrap();
-    insert_untriggered(
-        &su,
-        org,
-        "INSERT INTO customers (org_id, email, name, search_indexed) \
-         VALUES ($1, 'boom@example.com', 'Boom Person', false)",
-    )
-    .await;
-
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let mut tx = db.begin(org).await.unwrap();
-    let (found, scanned) = customers_both_ways(&mut tx, "boom", Page::default())
-        .await
-        .unwrap();
-    assert_eq!(found, scanned);
-    assert_eq!(found.total, 1);
-    tx.commit().await.unwrap();
-    let still: bool = sqlx::query_scalar("SELECT search_indexed FROM customers")
-        .fetch_one(&su)
-        .await
-        .unwrap();
-    assert!(!still, "the failed batch was rolled back");
-
-    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("WARN"), "{text}");
-    assert!(text.contains("P0001"), "{text}");
-    assert!(!text.contains("secret-customer-text"), "{text}");
-    assert!(!text.contains("boom@example.com"), "{text}");
-}
-
-#[derive(Clone, Default)]
-struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Indexing the backlog locks its rows `FOR NO KEY UPDATE`, which lets a
-/// concurrent insert that references one of them (an interaction, a ticket)
-/// proceed instead of waiting for the search.
-#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn indexing_the_backlog_does_not_block_references_to_it(pool: PgPool) {
-    use cxp_core::search::{index_backlog, Indexed};
-    let su = pool.clone();
-    let db = db(pool);
-    let org = org();
-    insert_untriggered(
-        &su,
-        org,
-        "INSERT INTO customers (org_id, email, search_indexed) \
-         VALUES ($1, 'locked@example.com', false)",
-    )
-    .await;
-    let id: Uuid = sqlx::query_scalar("SELECT id FROM customers")
-        .fetch_one(&su)
-        .await
-        .unwrap();
-
-    let mut indexing = db.begin(org).await.unwrap();
-    assert_eq!(
-        index_backlog(&mut indexing, Indexed::Customers, 10)
-            .await
-            .unwrap(),
-        1
-    );
-    let mut other = db.begin(org).await.unwrap();
-    sqlx::query("SET LOCAL lock_timeout = '2s'")
-        .execute(other.conn())
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO interactions (org_id, customer_id, interaction_type) \
-         VALUES ($1, $2, 'page_view')",
-    )
-    .bind(org)
-    .bind(id)
-    .execute(other.conn())
-    .await
-    .expect("the insert waited on the backlog lock");
-    other.commit().await.unwrap();
-    indexing.commit().await.unwrap();
-}
-
 /// Random customers and queries (substrings, syllable runs, typos) against
 /// the scan, at several pages: every answer is identical when uncapped, and
 /// within the contract when capped.
@@ -1815,6 +1880,9 @@ async fn random_corpora_search_like_the_scan(pool: PgPool) {
         texts.push(email);
         texts.extend(name);
     }
+    // Queries search answered on the first page, and how many of those were
+    // uncapped (exact): a corpus that capped most of them would prove little.
+    let (mut run, mut uncapped) = (0, 0);
     for i in 0..250 {
         let text = texts[rng.below(texts.len())].clone();
         let mut q = match i % 4 {
@@ -1842,6 +1910,10 @@ async fn random_corpora_search_like_the_scan(pool: PgPool) {
             let Some((found, scanned)) = customers_both_ways(&mut tx, &q, pg).await else {
                 continue;
             };
+            if pg == Page::default() {
+                run += 1;
+                uncapped += usize::from(!found.capped);
+            }
             if found.capped {
                 let matches = common::customer_matches(&mut tx, &q).await;
                 assert!(
@@ -1853,4 +1925,7 @@ async fn random_corpora_search_like_the_scan(pool: PgPool) {
             }
         }
     }
+    // Measured when this bound was set (#34): 249 of 249 uncapped.
+    // The corpus is fixed-seed, so the bound cannot flake: at least 95%.
+    assert!(uncapped * 20 >= run * 19, "{uncapped} of {run} uncapped");
 }

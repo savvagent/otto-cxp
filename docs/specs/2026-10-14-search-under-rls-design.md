@@ -5,6 +5,9 @@
 **Status:** IMPLEMENTED (#33)
 **Issue:** #17 "Make customer and knowledge-base search fast under row-level security"
 **Plan:** `docs/plans/2026-10-14-search-under-rls.md`
+**Superseded in part by #34** (`docs/specs/2026-10-15-search-index-upkeep-design.md`): the backlog
+path described below (`index_backlog`, the `backlog` CTEs, `BACKLOG_READ`) is retired, and a search
+past its timeout is `query_too_broad`.
 **Decision:** Rob chose option (c) on 2026-10-14: accept a search-semantics change above a cap so
 that broad queries are fast too.
 

@@ -61,6 +61,16 @@ pub enum Error {
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
+    /// A search ran past its `statement_timeout` (SQLSTATE 57014), almost
+    /// always because the query is too broad for this org. Not retriable:
+    /// repeating the same broad query would hold one of the small pool's
+    /// connections for the whole timeout again; a narrower query succeeds.
+    #[error(
+        "this search ran longer than otto-cxp allows; narrow the query (more characters \
+         or more specific words) and try again"
+    )]
+    QueryTooBroad,
+
     /// A call to the otto platform failed. The text is ours, never the
     /// platform's, and depends on whether the failure can pass:
     ///
@@ -181,6 +191,7 @@ impl Error {
             Error::AccessRevoked => "access_revoked",
             Error::QuotaExceeded { .. } => "quota_exceeded",
             Error::Unavailable => "unavailable",
+            Error::QueryTooBroad => "query_too_broad",
             Error::Platform(p) if p.is_retriable() => "unavailable",
             Error::Platform(otto_resource::Error::NotFound) => "access_revoked",
             Error::Platform(_) | Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => {
@@ -389,6 +400,7 @@ mod tests {
             (Error::AccessRevoked, "access_revoked"),
             (quota(), "quota_exceeded"),
             (Error::Unavailable, "unavailable"),
+            (Error::QueryTooBroad, "query_too_broad"),
             (
                 Error::Platform(otto_resource::Error::Status {
                     status: 503,
@@ -451,6 +463,17 @@ mod tests {
     }
 
     #[test]
+    fn a_search_past_its_timeout_reads_as_too_broad() {
+        let e = Error::QueryTooBroad;
+        assert!(!e.is_internal());
+        // Repeating the same broad query cannot help, and would hold a
+        // pooled connection for the whole timeout again.
+        assert!(!e.retriable());
+        let text = e.to_string();
+        assert!(text.contains("narrow the query"), "{text}");
+    }
+
+    #[test]
     fn retriable_marks_what_an_agent_may_simply_retry() {
         for yes in [
             Error::Database(db("23505")),
@@ -466,6 +489,7 @@ mod tests {
         }
         for no in [
             Error::NotFound { kind: "customer" },
+            Error::QueryTooBroad,
             Error::Invalid("bad".into()),
             Error::Conflict("dup".into()),
             Error::UnknownTeam,

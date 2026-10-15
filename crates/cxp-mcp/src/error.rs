@@ -3,8 +3,8 @@
 //! The branch point is machine-readable: `data.code` is stable
 //! (`insufficient_scope`, `not_found`, `invalid_argument`, `conflict`,
 //! `unknown_team`, `access_revoked`, `quota_exceeded`, `unavailable`,
-//! `internal`, and `unauthenticated` for a surface mounted without its
-//! middleware) and `data.retriable` says whether repeating the call unchanged
+//! `query_too_broad`, `internal`, and `unauthenticated` for a surface mounted
+//! without its middleware) and `data.retriable` says whether repeating the call unchanged
 //! could succeed.
 //!
 //! `cxp_core::Error`'s `Display` never carries database or platform text, so
@@ -145,6 +145,7 @@ mod tests {
                 upgrade_url: "https://otto.example.com/settings/billing".into(),
             },
             Error::Unavailable,
+            Error::QueryTooBroad,
             pg_error(),
             Error::Tenant(otto_tenant::Error::Config("secret".into())),
         ] {
@@ -194,6 +195,7 @@ mod tests {
         assert_eq!(code(Error::UnknownTeam), "unknown_team");
         assert_eq!(code(Error::AccessRevoked), "access_revoked");
         assert_eq!(code(Error::Unavailable), "unavailable");
+        assert_eq!(code(Error::QueryTooBroad), "query_too_broad");
         assert_eq!(code(pg_error()), "internal");
         assert_eq!(
             from_scope(&MissingScope("cxp:write")).data.unwrap()["code"],
