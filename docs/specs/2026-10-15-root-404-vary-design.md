@@ -93,7 +93,10 @@ None. No config key, secret, scope, migration, or role change.
 Router-level unit tests in `crates/cxp-server/src/lib.rs` `mod tests`:
 
 - `programs_at_the_root_still_get_the_json_404`: assert `vary == "Accept, Authorization"`
-  instead of absent, keeping the byte-for-byte body check, and add a `HEAD` case.
+  instead of absent, keeping the byte-for-byte body check, and add `HEAD /` and `GET /?from=agent`
+  cases. `not_found` itself doesn't change, so `root_404_bytes()` still pins the old body. The
+  tests assert the literal value rather than `install_page::VARY`, so a wrong value in the
+  constant fails them.
 - `other_methods_and_paths_stay_json_404_for_a_browser`: assert no `vary` on every case
   (`POST /`, `GET /nope`, `GET //`, and the rest).
 
