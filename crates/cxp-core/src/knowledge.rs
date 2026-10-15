@@ -65,6 +65,15 @@ const ARTICLE_COLS: &str =
 /// [`TOTAL_CAP`], or on the [`RANKED_PAST_CAP`] with the highest `tf` of the
 /// rarest lexeme past it; that includes title-only matches, which `ts_rank`
 /// scores above zero when they hold some of the query's lexemes.
+///
+/// Each correlated `EXISTS` and `NOT EXISTS` probe of `knowledge_search_terms`
+/// or `knowledge_articles` (in `title_hits`, `fts_hits`, and `matches`' `fts`
+/// check and title check) ends in `OFFSET 0` (#41): without it a generic plan
+/// may hash the probe into a read of every index row or published article of
+/// the org (the title check's `EXISTS (... a.title ILIKE $3)` even read every
+/// org's articles). `OFFSET 0` keeps each a per-candidate btree probe
+/// (`LIMIT` would not: Postgres drops it from an `EXISTS`) and changes no
+/// result. `tests/search_plans.rs` checks them.
 pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
     let cap = TOTAL_CAP;
     format!(
@@ -107,13 +116,15 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
            SELECT DISTINCT r.article_id FROM title_read r \
            WHERE NOT EXISTS (SELECT 1 FROM tw WHERE tw.rk IN (2, 3) AND NOT EXISTS ( \
                    SELECT 1 FROM knowledge_search_terms t \
-                   WHERE t.org_id = $1 AND t.term = tw.gram AND t.article_id = r.article_id)) \
+                   WHERE t.org_id = $1 AND t.term = tw.gram AND t.article_id = r.article_id \
+                   OFFSET 0)) \
          ), fts_hits AS MATERIALIZED ( \
            SELECT r.article_id, r.tf FROM fts_read r \
            WHERE NOT EXISTS (SELECT 1 FROM lxr WHERE lxr.rk > 1 AND NOT EXISTS ( \
                    SELECT 1 FROM knowledge_search_terms t \
                    WHERE t.org_id = $1 AND t.term = lxr.term \
-                     AND t.article_id = r.article_id)) \
+                     AND t.article_id = r.article_id \
+                   OFFSET 0)) \
            ORDER BY r.tf DESC, r.article_id \
          ), matches AS MATERIALIZED ( \
            SELECT article_id, fts, tf FROM ( \
@@ -126,7 +137,8 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
                         SELECT 1 FROM lxr WHERE lxr.rk > 1 AND NOT EXISTS ( \
                           SELECT 1 FROM knowledge_search_terms t \
                           WHERE t.org_id = $1 AND t.term = lxr.term \
-                            AND t.article_id = h.article_id)) AS fts \
+                            AND t.article_id = h.article_id \
+                          OFFSET 0)) AS fts \
                FROM (SELECT (SELECT t.tf FROM knowledge_search_terms t \
                              WHERE t.org_id = $1 AND t.term = (SELECT term FROM lxr WHERE rk = 1) \
                                AND t.article_id = h.article_id) AS tf) AS y) AS x \
@@ -134,7 +146,8 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
                AND (x.fts OR EXISTS ( \
                  SELECT 1 FROM knowledge_articles a \
                  WHERE a.org_id = $1 AND a.id = h.article_id AND a.published \
-                   AND a.title ILIKE $3))) AS u \
+                   AND a.title ILIKE $3 \
+                 OFFSET 0))) AS u \
            LIMIT {cap_read} \
          ), ranked AS ( \
            SELECT m.article_id, a.created_at, \
@@ -167,6 +180,14 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
         cap_read = cap + 1,
     )
 });
+
+/// [`SEARCH_ARTICLES_SQL`]'s text, for the generic-plan shape tests
+/// (`tests/search_plans.rs`, #41). Not an interface: it may change or go
+/// without notice.
+#[doc(hidden)]
+pub fn search_articles_sql() -> &'static str {
+    &SEARCH_ARTICLES_SQL
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

@@ -3,9 +3,9 @@
 # database scripts/bench-search/seed.sql filled, exactly as a request runs
 # them: one client, prepared statements (as sqlx sends them, so the plan
 # cache moves to a generic plan after five runs), as otto_app pinned to the
-# big org. Prints p50/p95/max of whole-transaction latency in ms, after six
-# warm-up runs. after-*.sql come from gen.py (the search and the page's
-# rows, as cxp_core runs them).
+# org under test (...0a). Prints p50/p95/max of whole-transaction latency in
+# ms, after six warm-up runs. after-*.sql come from gen.py (the search and
+# the page's rows, as cxp_core runs them).
 #
 #   scripts/bench-search/run.sh postgres://cxp:cxp@localhost:<port>/bench [runs]
 #
@@ -15,6 +15,11 @@
 # pgbench is older than the server or a rootless port forward sits between
 # them: host pgbench 16 against Postgres 18 behind podman's pasta added a
 # steady ~200 ms to every multi-kilobyte result (not server time).
+#
+# Mid-size orgs (#41): seed a database with `seed.sql -v size=mid` (the org
+# under test then has 30k customers and 3k articles) and run this against it
+# as usual; plans.py checks the same statements' generic plans stay per
+# candidate there.
 #
 # LOCAL POSTGRES ONLY.
 set -euo pipefail
