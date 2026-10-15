@@ -2230,3 +2230,67 @@ async fn migration_0005_grants_the_tombstone_insert_to_cxp_runtime(pool: PgPool)
     .unwrap();
     assert!(granted);
 }
+
+/// Migration 0006 pins both SECURITY DEFINER functions' search_path with
+/// `pg_temp` last and schema-qualifies every call in them, so nothing a
+/// lesser role creates (an overload in a schema it may CREATE in, a
+/// temporary object) is resolved as the owner (#27).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0006_pins_the_security_definer_functions(pool: PgPool) {
+    let rows: Vec<(String, bool, Vec<String>, String, bool)> = sqlx::query_as(
+        "SELECT p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'), p.prosrc, \
+                EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a \
+                        WHERE a.grantee = 0) \
+         FROM pg_proc p WHERE p.prosecdef AND p.pronamespace = 'public'::regnamespace \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        names,
+        ["console_session_org(bytea)", "expire_removed_members()"],
+        "every SECURITY DEFINER function is covered here"
+    );
+    for (name, definer, config, src, public_execute) in &rows {
+        assert!(definer, "{name}");
+        assert!(
+            config
+                .iter()
+                .any(|c| c == "search_path=pg_catalog, public, pg_temp"),
+            "{name}: {config:?}"
+        );
+        assert!(!public_execute, "{name}: PUBLIC may execute it");
+        // Every now(), make_interval(, and count( is pg_catalog's.
+        for call in ["now()", "make_interval(", "count("] {
+            let unqualified = src
+                .match_indices(call)
+                .filter(|(at, _)| !src[..*at].ends_with("pg_catalog."))
+                .count();
+            assert_eq!(unqualified, 0, "{name} calls {call} unqualified: {src}");
+        }
+    }
+    let lookup = rows
+        .iter()
+        .find(|r| r.0.starts_with("console_session_org"))
+        .unwrap();
+    assert!(
+        lookup
+            .2
+            .iter()
+            .any(|c| c == "app.console_session_lookup=on"),
+        "{:?}",
+        lookup.2
+    );
+    assert!(lookup.3.contains("pg_catalog.now()"), "{}", lookup.3);
+    let expire = rows
+        .iter()
+        .find(|r| r.0.starts_with("expire_removed_members"))
+        .unwrap();
+    assert!(
+        expire.3.contains("pg_catalog.make_interval(secs => 600)"),
+        "{}",
+        expire.3
+    );
+}
