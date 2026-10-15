@@ -137,7 +137,7 @@ pub async fn delete(
     Ok(deleted())
 }
 
-/// A plain array (not the [`Paginated`](super::Paginated) envelope; moving it
+/// A plain array (not the [`Paginated`] envelope; moving it
 /// there is #36); paged by `limit`/`offset` (default 50).
 /// `404` when the survey is not in the caller's org.
 pub async fn responses(
