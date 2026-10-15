@@ -58,7 +58,7 @@ pub const TENANT_ROLE: &str = "cxp_app";
 /// so production and every test pin [`TENANT_ROLE`] alike.
 ///
 /// otto-tenant skips `SET LOCAL ROLE` when the role is missing or not assumable rather than
-/// failing; `cxp-server`'s boot refuses that in a deployment (`boot::check_tenant_role`).
+/// failing; `cxp-server`'s boot refuses that on every machine (`boot::check_tenant_role`).
 pub fn tenant_db(pool: sqlx::PgPool) -> otto_tenant::Db {
     #[allow(clippy::disallowed_methods)] // the one sanctioned constructor
     otto_tenant::Db::from_pool(pool)
