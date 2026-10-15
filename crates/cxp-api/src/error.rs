@@ -19,6 +19,7 @@
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
 //! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]): only a failure that can pass |
+//! | `query_too_broad` | 503, with `Retry-After`: a search ran past its time limit; narrow the query or retry |
 //! | `internal` | 500, never with `Retry-After` (including a platform failure a retry cannot fix, such as this service's credential being refused) |
 
 use axum::response::{IntoResponse, Response};
@@ -82,6 +83,8 @@ fn status_for(e: &cxp_core::Error) -> StatusCode {
         Error::AccessRevoked => StatusCode::UNAUTHORIZED,
         Error::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
         Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        // Retriable, so a 503 (which carries `Retry-After`).
+        Error::QueryTooBroad => StatusCode::SERVICE_UNAVAILABLE,
         // Split by retriability: only a failure that can pass is a 503 (and
         // so gets `Retry-After`); a platform that no longer knows the org is a
         // revocation; anything else is ours to fix, not the caller's to retry.
@@ -177,6 +180,7 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
             ),
             (Error::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+            (Error::QueryTooBroad, StatusCode::SERVICE_UNAVAILABLE),
             (
                 Error::Platform(otto_resource::Error::Status {
                     status: 503,
@@ -226,6 +230,14 @@ mod tests {
     #[test]
     fn unavailable_tells_the_client_when_to_retry() {
         let res = ApiError::from(Error::Unavailable).into_response();
+        assert_eq!(
+            res.headers()[header::RETRY_AFTER],
+            cxp_core::auth::RETRY_AFTER_SECONDS
+        );
+        let err = ApiError::from(Error::QueryTooBroad);
+        assert_eq!(err.code, "query_too_broad");
+        let res = err.into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             res.headers()[header::RETRY_AFTER],
             cxp_core::auth::RETRY_AFTER_SECONDS

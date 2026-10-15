@@ -61,6 +61,15 @@ pub enum Error {
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
+    /// A search ran past its `statement_timeout` (SQLSTATE 57014): too broad
+    /// for this org, or the first search on a cold cache. A narrower query or
+    /// a plain retry can succeed.
+    #[error(
+        "this search ran longer than otto-cxp allows; narrow the query (more characters \
+         or more specific words), or retry"
+    )]
+    QueryTooBroad,
+
     /// A call to the otto platform failed. The text is ours, never the
     /// platform's, and depends on whether the failure can pass:
     ///
@@ -181,6 +190,7 @@ impl Error {
             Error::AccessRevoked => "access_revoked",
             Error::QuotaExceeded { .. } => "quota_exceeded",
             Error::Unavailable => "unavailable",
+            Error::QueryTooBroad => "query_too_broad",
             Error::Platform(p) if p.is_retriable() => "unavailable",
             Error::Platform(otto_resource::Error::NotFound) => "access_revoked",
             Error::Platform(_) | Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => {
@@ -196,6 +206,7 @@ impl Error {
         }
         match self {
             Error::Unavailable => true,
+            Error::QueryTooBroad => true,
             Error::Platform(p) => p.is_retriable(),
             _ => false,
         }
@@ -389,6 +400,7 @@ mod tests {
             (Error::AccessRevoked, "access_revoked"),
             (quota(), "quota_exceeded"),
             (Error::Unavailable, "unavailable"),
+            (Error::QueryTooBroad, "query_too_broad"),
             (
                 Error::Platform(otto_resource::Error::Status {
                     status: 503,
@@ -451,12 +463,22 @@ mod tests {
     }
 
     #[test]
+    fn a_search_past_its_timeout_reads_as_too_broad() {
+        let e = Error::QueryTooBroad;
+        assert!(!e.is_internal());
+        let text = e.to_string();
+        assert!(text.contains("narrow the query"), "{text}");
+        assert!(text.contains("retry"), "{text}");
+    }
+
+    #[test]
     fn retriable_marks_what_an_agent_may_simply_retry() {
         for yes in [
             Error::Database(db("23505")),
             Error::Database(sqlx::Error::PoolTimedOut),
             Error::Tenant(otto_tenant::Error::Db(db("40001"))),
             Error::Unavailable,
+            Error::QueryTooBroad,
             Error::Platform(otto_resource::Error::Status {
                 status: 503,
                 body: String::new(),
