@@ -13,12 +13,14 @@ Deploy and ops: `docs/deploy/fly.md`.
 podman compose up -d                     # Postgres 16 on :15435 (cxp/cxp/otto_cxp)
 cp .env.example .env                     # fill in the platform settings
 cargo run -p cxp-server                  # serves on 0.0.0.0:8080 (CXP_BIND)
+cargo run -p cxp-server -- migrate       # migrations only, as CXP_MIGRATION_DATABASE_URL (Fly's release command)
 cargo build --workspace
 DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace --locked
 cargo test -p cxp-core test_name         # one test
 ```
 `cargo test` needs `DATABASE_URL` (a local Postgres only) and panics without it. Migrations run at
-server start (`cxp_core::migrate`). `cargo run` serves the web console at `/console/` only after
+server start (`cxp_core::migrate`) while `CXP_RUN_MIGRATIONS` is `true` (local default); a deployment
+migrates only through `cxp-server migrate`. `cargo run` serves the web console at `/console/` only after
 `pnpm build` has produced `apps/web/dist` (the default `CXP_CONSOLE_DIR`); without it `/console/`
 is a JSON 404 and everything else works. `pnpm build` in `apps/web` also type-checks
 `apps/web/test` (`tsconfig.test.json`), and `pnpm test` there needs the build's `dist/sw.js`.
@@ -60,8 +62,9 @@ is a JSON 404.
 - `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` route behind
   `cxp_http::require_bearer`. Holds no SQL.
 - `cxp-api` - REST `/api/v1` and `/platform/webhooks`. Holds no SQL.
-- `cxp-server` - the binary: `config.rs`, boot sequence (migrate, verify tenant isolation, check the
-  platform credential, spawn the usage shipper and sweeper), health routes, router (mounts
+- `cxp-server` - the binary: `config.rs`, boot sequence (check the database role, migrate unless a
+  deployment, check the runtime grants, verify tenant isolation, check the platform credential, spawn
+  the usage shipper and the sweeper, which re-checks the role hourly), `migrate` (the release command), health routes, router (mounts
   `/.well-known/oauth-protected-resource`), `tests/e2e.rs`.
 
 **SDKs:**
@@ -146,7 +149,8 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 | `CXP_PLATFORM_WEBHOOK_SECRET` | required (secret) | `otto_whsec_...` |
 | `CXP_DATABASE_URL` | falls back to `DATABASE_URL` | `postgres://cxp:cxp@localhost:15435/otto_cxp` locally |
 | `CXP_DB_MAX_CONNECTIONS` | `5` | 2 to 20; the production database is shared and small |
-| `CXP_RUN_MIGRATIONS` | `true` | |
+| `CXP_RUN_MIGRATIONS` | `true` | migrate at boot as the serving role; a deployment refuses `true` (`fly.toml` sets `false`; also a secret in production, for rollbacks) |
+| `CXP_MIGRATION_DATABASE_URL` | unset (secret) | the owner (`cxp_owner`), read only by `cxp-server migrate` (Fly `release_command = "migrate"`); required there in a deployment, which never falls back to the runtime URL |
 | `CXP_BIND` | `0.0.0.0:8080` | |
 | `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts, as `host` or `host:port`; the `CXP_PUBLIC_URL` host is always allowed |
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
@@ -245,7 +249,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - version files: crates/*/Cargo.toml (workspace version), sdk/typescript/package.json, packages/react/package.json
 
 ### Out-of-band
-- Migrations (agent): apply at boot under sqlx's advisory lock; confirm in the boot logs.
+- Migrations (agent): apply in Fly's release command (`cxp-server migrate`, as `cxp_owner`) under sqlx's advisory lock; confirm `applying migrations` / `migrations applied` in the release command's log. A privilege the runtime needs beyond `otto_app` is granted to `cxp_runtime` in the migration.
 - New non-secret config key (agent, in the PR): `fly.toml` `[env]`, `.env.example`, and `crates/cxp-server/src/config.rs`.
 - New secret (human: Rob, before merge): `fly secrets set -a otto-cxp --stage NAME=…`; the PR updates `.env.example` and the secrets table in `docs/deploy/fly.md`.
 - New scope (human: Rob, before merge): the PR updates `cxp_core::scopes::KNOWN`/`DEFAULT`; Rob re-runs `otto-platform-server resource register …` from `docs/deploy/fly.md`.
@@ -263,8 +267,8 @@ Hand these to Rob with the exact command; never run them:
 
 ### Invariants
 Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
-- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`. Migrations run as the non-superuser `cxp_server`, so a function `SET` clause naming a custom parameter (as 0003's `app.console_session_lookup`) needs `GRANT SET ON PARAMETER` to it first: a human step in the runbook's R1 (`docs/deploy/fly.md`) and in the e2e owner's setup.
-- **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, `FLY_APP_NAME` set, or an instance that also hosts `otto_platform`, `otto_factory`, or `otto_flags`) refuses to boot unless both the session (login) user and the current user hold no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined role, `db_role::PREDEFINED_ROLES`), directly or through membership, and can `CONNECT` to no other service's database (`cxp_core::db_role`, `boot::check_db_role`); production's is `cxp_server`, owner of `otto_cxp` only, set up by the runbook in `docs/deploy/fly.md` ("Database role"). As the tables' owner, `cxp_server` could still `NO FORCE` RLS, drop their policies, or `TRUNCATE` them (which ignores RLS); splitting the migration owner from the runtime role is #27. No service may grant `CONNECT`, or any database-level privilege, to the shared `otto_app` (#28). Until Rob has run that runbook, production still connects as the superuser attach role, and a release containing the check will not boot there.
+- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`. Migrations run as the non-superuser owner `cxp_owner` (#27), so a function `SET` clause naming a custom parameter (as 0003's `app.console_session_lookup`) needs `GRANT SET ON PARAMETER` to it first: a human step in the split runbook's S1 (`docs/deploy/fly.md`) and in the e2e owner's setup.
+- **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, `FLY_APP_NAME` set, or an instance that also hosts `otto_platform`, `otto_factory`, or `otto_flags`) refuses to boot unless both the session (login) user and the current user hold no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined role, `db_role::PREDEFINED_ROLES`), directly or through membership, and can `CONNECT` to no other service's database (`cxp_core::db_role`, `boot::check_db_role`); production's is `cxp_server`, set up by the runbooks in `docs/deploy/fly.md` ("Database role"). A serving process in a deployment also refuses a role that owns anything in its database or may `TRUNCATE` or add a `TRIGGER` to a table, directly or through any role it can `SET ROLE` to (#27), refuses `CXP_RUN_MIGRATIONS=true`, and requires `INSERT` on `deleted_orgs` (through `cxp_runtime`); migrations run as the separate owner `cxp_owner` through `cxp-server migrate` (Fly's release command, `CXP_MIGRATION_DATABASE_URL`). The hourly sweep re-runs the role check; a refused role fails `/readyz` (`database role refused`) until fixed. No service may grant `CONNECT`, or any database-level privilege, to the shared `otto_app` (#28). Until Rob has run the split runbook (S0 to S4), production's `cxp_server` still owns the tables, and a release containing the ownership check will not boot there.
 - **Composite `(org_id, id)` foreign keys** between tenant tables (FK checks bypass RLS).
 - **Request paths open transactions with `platform_events::begin_live`** (or `begin_live_bounded`, the same with transaction-local timeouts), never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events`, on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`), and on `console_sessions` admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker. The one exception is `console_sessions_lookup`, a `SELECT`-only policy that admits the `console_session_org` function (via `app.console_session_lookup`, which only that function's own `SET` clause sets).
 - **No SQL outside `cxp-core`**, and only runtime `sqlx::query`/`query_as`, never the `query!` macros.
