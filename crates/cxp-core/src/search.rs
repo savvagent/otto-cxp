@@ -122,7 +122,8 @@ pub(crate) async fn prepare(tx: &mut Tx<'_>) -> Result<()> {
 /// 57014) it is [`Error::QueryTooBroad`], logged at `warn` with the search
 /// it was (never the query, which may be customer data); anything else is
 /// a database error. An operator's `pg_cancel_backend` raises 57014 too and
-/// reads the same way, which is harmless: retrying it is right.
+/// reads the same way: the caller is told to narrow the query rather than
+/// retry, which errs toward the safe side.
 pub(crate) fn on_timeout(search: &'static str) -> impl FnOnce(sqlx::Error) -> Error {
     move |e| {
         let timed_out =

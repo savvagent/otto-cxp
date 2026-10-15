@@ -683,12 +683,15 @@ role, run
 SELECT proleakproof FROM pg_proc WHERE oid = 'public.similarity_op(text,text)'::regprocedure;
 ```
 
-and refuse to boot if it is false while the GIN path is compiled in. Before Rob marks it, check
-on the installed pg_trgm version that `similarity_op` and the trigram functions it calls cannot
-raise an error that quotes their input: under forced RLS a leakproof function may run on other
-orgs' rows before the tenant filter, so its return value must be its only signal. A lost flag then fails the
-deploy loudly instead of degrading search to scans. Until that release exists, nothing reads the
-flag, and setting it changes nothing.
+and refuse to boot if it is false while the GIN path is compiled in. A lost flag then fails the
+deploy loudly instead of degrading search to scans.
+
+**Setting the flag changes query planning at once**, whether or not that release exists: the
+planner may then evaluate `name % $3` (today's customer search uses it) on other orgs' rows
+before the RLS policy filters them. So before Rob marks it, check on the installed pg_trgm
+version that `similarity_op` and the trigram functions it calls cannot raise an error that
+quotes their input, since its return value must be its only signal. Set it in the same change
+window as the GIN release, not earlier.
 
 ## First deploy
 
