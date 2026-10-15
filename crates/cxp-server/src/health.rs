@@ -83,6 +83,15 @@ impl RoleAlarm {
             .is_some()
     }
 
+    /// The role summary it was raised with, if raised: for the log only,
+    /// never a response.
+    pub fn summary(&self) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn is_raised(&self) -> bool {
         self.0
             .read()
@@ -168,10 +177,11 @@ async fn readyz(State(ready): State<Ready>) -> Response {
         );
         return unready(reason);
     }
-    if ready.role.is_raised() {
-        // The summary was logged at error by the re-check; never sent.
+    if let Some(summary) = ready.role.summary() {
+        // Logged, never sent: catalog text stays out of responses.
         tracing::warn!(
             reason = ROLE_REFUSED,
+            role = %summary,
             "readiness check failed: the database role re-check would refuse this role"
         );
         return unready(ROLE_REFUSED);
@@ -263,8 +273,11 @@ mod tests {
         assert!(!alarm.is_raised());
         let readiness = || Readiness::new(PlatformCheck::Accepted).with_role_alarm(alarm.clone());
 
-        alarm.raise("database role \"cxp_server\" can TRUNCATE table \"customers\"".into());
+        let summary = "database role \"cxp_server\" can TRUNCATE table \"customers\"";
+        assert_eq!(alarm.summary(), None);
+        alarm.raise(summary.into());
         assert!(alarm.is_raised());
+        assert_eq!(alarm.summary().as_deref(), Some(summary));
         let (status, body) = probe(readiness()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
