@@ -366,6 +366,13 @@ pub async fn run_with<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Serving never uses the migration owner's credential: drop any copy so
+    // nothing below can reach it (main has already removed it from the
+    // environment, `secret_env`).
+    let config = Config {
+        migration_database_url: None,
+        ..config
+    };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .acquire_timeout(cxp_core::POOL_ACQUIRE_TIMEOUT)
