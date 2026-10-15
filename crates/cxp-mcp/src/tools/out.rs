@@ -11,9 +11,11 @@ use serde::Serialize;
 
 /// Every list tool's envelope. `total` counts every match, not just this
 /// page. The two search tools count only up to
-/// [`cxp_core::search::TOTAL_CAP`] and add `totalCapped`: true when there
-/// are more matches than that (or the search stopped short of seeing them
-/// all), `total` then being a lower bound; the other list tools omit it.
+/// [`cxp_core::search::TOTAL_CAP`] and add `totalCapped`
+/// ([`cxp_core::search::SearchPage`] states the contract): false when
+/// `total` and the items are exact, true when `total` is a lower bound
+/// (more matches than the cap, or the search stopped before counting every
+/// match); the other list tools omit it.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct List<T> {
     pub items: Vec<T>,

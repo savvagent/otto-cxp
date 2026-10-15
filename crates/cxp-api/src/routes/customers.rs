@@ -78,9 +78,11 @@ pub const TOTAL_CAPPED: HeaderName = HeaderName::from_static("x-total-capped");
 
 /// A plain array (not the `{items, total}` envelope), the best matches
 /// first; paged by `limit`/`offset` (default 50). Matches are counted up to
-/// 1000: the count is the `X-Total-Count` header, and `X-Total-Capped: true`
-/// says there may be more (the array is then the requested page of the best
-/// matches found, and a page starting at or past 1000 is empty). The body is
+/// 1000: the count is the `X-Total-Count` header. `X-Total-Capped: false`
+/// means the count and the array are exact; `true` means the count is a
+/// lower bound (more than 1000 match, or the search stopped before counting
+/// every match), the array is then the requested page of the best-ranked
+/// matches found, and a page starting at or past 1000 is empty. The body is
 /// unchanged from before #17; the headers are new.
 pub async fn search(
     State(state): State<AppState>,

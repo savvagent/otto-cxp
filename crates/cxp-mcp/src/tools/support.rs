@@ -237,10 +237,11 @@ impl Cxp {
     #[tool(
         name = "search_knowledge_base",
         description = "Search the published knowledge base articles; best matches first, at most \
-                       20. Returns {items, total, totalCapped}. total counts matches up to 1000; \
-                       totalCapped true means there may be more than total (past 1000, or the \
-                       query was too broad to count), and items are then the best of the matches \
-                       found.",
+                       20. Returns {items, total, totalCapped}. totalCapped false: total is the \
+                       exact count and items are exactly the best matches. totalCapped true: \
+                       total is a lower bound (1000 when more than 1000 match, or fewer when the \
+                       search stopped before counting every match), and items are the \
+                       best-ranked of the matches found.",
         annotations(read_only_hint = true)
     )]
     pub async fn search_knowledge_base(

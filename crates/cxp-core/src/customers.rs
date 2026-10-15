@@ -16,8 +16,17 @@ use crate::interactions::{Interaction, INTERACTION_COLS};
 use crate::paging::Page;
 use crate::search::{
     self, Hits, Indexed, SearchPage, BACKLOG_READ, DF_PROBE, FUZZY_CHECKED,
-    FUZZY_CHECKED_PAST_READ, FUZZY_READ, SUBSTRING_READ, TOTAL_CAP,
+    FUZZY_CHECKED_PAST_READ, FUZZY_READ, MAX_QUERY_CHARS, NEWEST_READ, SUBSTRING_READ, TOTAL_CAP,
 };
+
+/// Longest customer email, in characters (RFC 5321's 64 + 1 + 255, with
+/// room to spare).
+pub const MAX_EMAIL_CHARS: usize = 320;
+/// Longest customer name, in characters (the `name` limit of every other
+/// table). Search indexes every 4-character window of an email and a name,
+/// and every trigram of a name (migration 0004), so these bound a
+/// customer's index rows.
+pub const MAX_NAME_CHARS: usize = 255;
 
 /// Column list for [`Customer`]; never includes `org_id`.
 pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadata, tags, \
@@ -44,6 +53,12 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 ///   also hold the next two rarest are the candidates. A query under four
 ///   characters instead reads up to as many rows of the windows starting
 ///   with it.
+/// - `sub_new`: only when that read reached its bound. The org's newest
+///   [`NEWEST_READ`] customers, each checked with `ILIKE`, until
+///   [`TOTAL_CAP`] + 1 match. Its matches come first in `sub_all`, ahead of
+///   `sub_hits`'s, so a broad query's page favours recent customers, and in
+///   an org of at most [`NEWEST_READ`] customers it finds every substring
+///   match: the read bound then cuts nothing, and `capped` says so.
 /// - `fz_hits`: `name % q` means similarity >= t (pg_trgm's
 ///   `similarity_threshold`): with |A| the name's trigrams, |B| the query's,
 ///   and c those they share, c / (|A| + |B| - c) >= t, so
@@ -58,7 +73,10 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 ///   slack of 0.001 covers pg_trgm's float4 rounding. Up to
 ///   [`FUZZY_CHECKED`] candidates are checked, most shared trigrams first.
 ///   A threshold of 0 or below makes every named customer a match, so the
-///   candidates are then simply the org's customers.
+///   candidates are then simply the org's customers. `fp` reads the
+///   threshold with `current_setting`, which knows the setting only once
+///   pg_trgm is loaded in the session: `fp` evaluates `b` (and so
+///   `show_trgm`, in `fq`) before it, which loads it.
 /// - `backlog`: customers that predate the index (`search_indexed` false;
 ///   see [`crate::search::index_backlog`]), up to [`BACKLOG_READ`].
 ///
@@ -86,6 +104,18 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            WHERE NOT EXISTS (SELECT 1 FROM wr WHERE wr.rk IN (2, 3) AND NOT EXISTS ( \
                    SELECT 1 FROM customer_search_grams c \
                    WHERE c.org_id = $1 AND c.gram = wr.gram AND c.customer_id = r.customer_id)) \
+         ), sub_new AS MATERIALIZED ( \
+           SELECT r.id AS customer_id FROM ( \
+             SELECT id, email, name FROM customers \
+             WHERE org_id = $1 AND (SELECT count(*) FROM sub_read) > {SUBSTRING_READ} \
+             ORDER BY created_at DESC LIMIT {NEWEST_READ}) AS r \
+           WHERE r.email ILIKE $2 OR r.name ILIKE $2 \
+           LIMIT {cap_read} \
+         ), sub_all AS MATERIALIZED ( \
+           SELECT customer_id FROM sub_new \
+           UNION ALL \
+           SELECT customer_id FROM sub_hits \
+           WHERE customer_id NOT IN (SELECT customer_id FROM sub_new) \
          ), fq AS ( \
            SELECT 't' || t AS gram, \
                   (SELECT count(*) FROM (SELECT 1 FROM customer_search_grams c \
@@ -125,18 +155,19 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            LIMIT {backlog} \
          ), matches AS MATERIALIZED ( \
            SELECT m.id, m.em, m.sim, m.created_at \
-           FROM (SELECT customer_id FROM sub_hits \
+           FROM (SELECT customer_id FROM sub_all \
                  UNION ALL \
                  (SELECT customer_id FROM fz_hits \
-                  WHERE customer_id NOT IN (SELECT customer_id FROM sub_hits) \
+                  WHERE customer_id NOT IN (SELECT customer_id FROM sub_all) \
                   ORDER BY p DESC, a, customer_id \
                   LIMIT CASE WHEN (SELECT count(*) FROM fz_read) > {FUZZY_READ} \
                              THEN {FUZZY_CHECKED_PAST_READ} ELSE {fz_checked} END) \
                  UNION ALL \
                  SELECT customer_id FROM fz_all \
-                 WHERE customer_id NOT IN (SELECT customer_id FROM sub_hits) \
+                 WHERE customer_id NOT IN (SELECT customer_id FROM sub_all) \
                  UNION ALL \
-                 SELECT customer_id FROM backlog) AS c \
+                 SELECT customer_id FROM backlog \
+                 WHERE customer_id NOT IN (SELECT customer_id FROM sub_all)) AS c \
            CROSS JOIN LATERAL ( \
              SELECT id, email ILIKE $2 AS em, similarity(name, $3) AS sim, created_at \
              FROM customers \
@@ -146,7 +177,9 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
          ) \
          SELECT least((SELECT count(*) FROM matches), {cap}) AS total, \
                 (SELECT count(*) FROM matches) > {cap} \
-                  OR (SELECT count(*) FROM sub_read) > {SUBSTRING_READ} \
+                  OR ((SELECT count(*) FROM sub_read) > {SUBSTRING_READ} \
+                      AND (SELECT count(*) FROM (SELECT 1 FROM customers WHERE org_id = $1 \
+                                                 LIMIT {newest_read}) AS n) > {NEWEST_READ}) \
                   OR (SELECT count(*) FROM fz_read) > {FUZZY_READ} \
                   OR (SELECT count(*) FROM fz_hits) > {FUZZY_CHECKED} \
                   OR (SELECT count(*) FROM fz_all) > {FUZZY_CHECKED} \
@@ -155,6 +188,7 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
                       ORDER BY em DESC, sim DESC NULLS LAST, created_at DESC, id \
                       LIMIT least($4, greatest({cap} - $5, 0)) OFFSET $5) AS ids",
         sub_read = SUBSTRING_READ + 1,
+        newest_read = NEWEST_READ + 1,
         fz_read = FUZZY_READ + 1,
         fz_checked = FUZZY_CHECKED + 1,
         backlog = BACKLOG_READ + 1,
@@ -271,10 +305,26 @@ fn non_blank_email(email: &str) -> Result<&str> {
     if email.is_empty() {
         return Err(Error::Invalid("a customer needs an email address".into()));
     }
+    if email.chars().count() > MAX_EMAIL_CHARS {
+        return Err(Error::Invalid(format!(
+            "a customer email must be at most {MAX_EMAIL_CHARS} characters"
+        )));
+    }
     Ok(email)
 }
 
+fn checked_name(name: &str) -> Result<&str> {
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(Error::Invalid(format!(
+            "a customer name must be at most {MAX_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name)
+}
+
 pub trait CustomersExt {
+    /// An email over [`MAX_EMAIL_CHARS`] or a name over [`MAX_NAME_CHARS`]
+    /// is `Invalid`, here and in [`CustomersExt::update_customer`].
     fn create_customer(
         &mut self,
         new: &NewCustomer,
@@ -302,7 +352,8 @@ pub trait CustomersExt {
 
     /// Customers whose email or name contains `query` (case-insensitive), or
     /// whose name is similar to it (pg_trgm `%`); email matches first, then
-    /// by name similarity, newest first. Matches are counted up to
+    /// by name similarity, newest first. An empty query, or one over
+    /// [`MAX_QUERY_CHARS`], is `Invalid`. Matches are counted up to
     /// [`TOTAL_CAP`]; past it, or when a bound cut the search short, the page
     /// is the best of the matches found ([`SearchPage`]), and a page starting
     /// at or past the cap is empty. Neither `ILIKE` nor `%` is leakproof, so
@@ -330,6 +381,7 @@ pub trait CustomersExt {
 impl CustomersExt for Tx<'_> {
     async fn create_customer(&mut self, new: &NewCustomer) -> Result<Customer> {
         let email = non_blank_email(&new.email)?;
+        new.name.as_deref().map(checked_name).transpose()?;
         let org = self.org();
         let metadata = new
             .metadata
@@ -365,6 +417,7 @@ impl CustomersExt for Tx<'_> {
 
     async fn update_customer(&mut self, id: Uuid, update: &CustomerUpdate) -> Result<Customer> {
         let email = update.email.as_deref().map(non_blank_email).transpose()?;
+        update.name.as_deref().map(checked_name).transpose()?;
         let org = self.org();
         sqlx::query_as(&format!(
             "UPDATE customers SET \
@@ -446,6 +499,11 @@ impl CustomersExt for Tx<'_> {
             return Err(Error::Invalid(
                 "search for a name or an email; the query was empty".into(),
             ));
+        }
+        if query.chars().count() > MAX_QUERY_CHARS {
+            return Err(Error::Invalid(format!(
+                "query must be at most {MAX_QUERY_CHARS} characters"
+            )));
         }
         let org = self.org();
         search::prepare(self, Indexed::Customers).await?;

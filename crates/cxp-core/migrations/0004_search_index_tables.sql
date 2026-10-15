@@ -43,11 +43,19 @@
 -- through a partial index on them, and indexes them in small batches in the
 -- caller's own pinned transaction (`cxp_core::search::index_backlog`).
 
+-- ALTER TABLE below takes ACCESS EXCLUSIVE locks on customers and
+-- knowledge_articles. Behind a long-running transaction it would queue, and
+-- every request touching those tables would queue behind it; give up instead
+-- (the boot fails, and the next boot retries).
+SET LOCAL lock_timeout = '5s';
+
 -- 4-character windows of `s`, in order (a string shorter than four
--- characters has none).
+-- characters has none). The built-ins are schema-qualified rather than
+-- pinned with SET search_path, which would stop the planner inlining it.
 CREATE FUNCTION search_windows(s text) RETURNS SETOF text
   LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-  SELECT substr(s, i, 4) FROM generate_series(1, length(s) - 3) AS i
+  SELECT pg_catalog.substr(s, i, 4)
+  FROM pg_catalog.generate_series(1, pg_catalog.length(s) OPERATOR(pg_catalog.-) 3) AS i
 $$;
 
 -- Every gram a customer is found by.
@@ -99,6 +107,12 @@ CREATE INDEX knowledge_search_terms_org_article_idx ON knowledge_search_terms (o
 CREATE INDEX knowledge_search_terms_frequent_idx
   ON knowledge_search_terms (org_id, term, tf DESC, article_id) WHERE tf >= 2;
 
+-- Both tables only grow by inserts between rewrites of a row's grams, so
+-- vacuum them (setting visibility-map bits, which keep the lookups
+-- index-only) after 2% new rows rather than the default 20%.
+ALTER TABLE customer_search_grams SET (autovacuum_vacuum_insert_scale_factor = 0.02);
+ALTER TABLE knowledge_search_terms SET (autovacuum_vacuum_insert_scale_factor = 0.02);
+
 -- Tenant tables like every other (`Db::verify_tenant_isolation` finds them by
 -- the policy name). The triggers below run as the writing role, so a pinned
 -- otto_app transaction writes its own org's grams and no other.
@@ -126,8 +140,9 @@ ALTER TABLE customers ALTER COLUMN search_indexed SET DEFAULT true;
 CREATE INDEX customers_search_backlog_idx ON customers (org_id, id) WHERE NOT search_indexed;
 ALTER TABLE knowledge_articles ADD COLUMN search_indexed boolean NOT NULL DEFAULT false;
 ALTER TABLE knowledge_articles ALTER COLUMN search_indexed SET DEFAULT true;
+-- Articles by published first: search reads only the published backlog.
 CREATE INDEX knowledge_articles_search_backlog_idx
-  ON knowledge_articles (org_id, id) WHERE NOT search_indexed;
+  ON knowledge_articles (org_id, published, id) WHERE NOT search_indexed;
 
 -- Any write to a row leaves it indexed: setting the flag here is what lets an
 -- ordinary update (or `index_backlog`'s `SET search_indexed = true`) index a
@@ -149,8 +164,11 @@ BEGIN
     DELETE FROM public.customer_search_grams
     WHERE org_id = OLD.org_id AND customer_id = OLD.id;
   END IF;
+  -- name_grams is a smallint. cxp-core caps names at 255 characters, far
+  -- below 32767 trigrams; a longer name written some other way gets a
+  -- clamped count (which only loosens its fuzzy bound) instead of failing.
   INSERT INTO public.customer_search_grams (org_id, customer_id, gram, name_grams)
-  SELECT NEW.org_id, NEW.id, g, cardinality(show_trgm(coalesce(NEW.name, '')))
+  SELECT NEW.org_id, NEW.id, g, least(cardinality(show_trgm(coalesce(NEW.name, ''))), 32767)
   FROM public.customer_search_grams_of(NEW.email, NEW.name) AS g;
   RETURN NULL;
 END $$;

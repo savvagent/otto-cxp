@@ -311,3 +311,66 @@ pub async fn articles_both_ways(
         as_capped(ids, count),
     ))
 }
+
+/// A small deterministic generator (xorshift64*) for the random-corpus
+/// tests: the same seed gives the same corpus and queries on every run, so a
+/// failure reproduces.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Rng(seed.max(1))
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in `0..n`.
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub fn pick<'a, T: ?Sized>(&mut self, of: &[&'a T]) -> &'a T {
+        of[self.below(of.len())]
+    }
+
+    /// A substring of `s` of 1..=`max` characters, at a random position.
+    pub fn substring(&mut self, s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.is_empty() {
+            return String::new();
+        }
+        let len = 1 + self.below(max.min(chars.len()));
+        let start = self.below(chars.len() - len + 1);
+        chars[start..start + len].iter().collect()
+    }
+}
+
+/// Whether search's answer agrees with the scan's under the contract: when
+/// `total_capped` is false, it is identical; when true, `total` is a lower
+/// bound of the scan's count and every item is a match (`matches`, the ids
+/// of every match the scan finds).
+pub fn within_contract(found: &Searched, scanned_count: i64, matches: &[Uuid]) -> bool {
+    found.capped
+        && found.total <= scanned_count.min(TOTAL_CAP)
+        && found.ids.iter().all(|id| matches.contains(id))
+}
+
+/// Every customer of this org matching `q` under the pre-#17 predicate.
+pub async fn customer_matches(tx: &mut otto_tenant::Tx<'_>, q: &str) -> Vec<Uuid> {
+    let q = q.trim();
+    sqlx::query_scalar(
+        "SELECT id FROM customers \
+         WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3)",
+    )
+    .bind(tx.org())
+    .bind(like_pattern(q))
+    .bind(q)
+    .fetch_all(tx.conn())
+    .await
+    .unwrap()
+}

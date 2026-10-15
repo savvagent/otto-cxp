@@ -479,12 +479,13 @@ async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: P
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles, ["Refund policy", "Billing"]);
 
-    for bad in ["", "   ".to_string().as_str(), &"x".repeat(201)] {
+    let longest = cxp_core::search::MAX_QUERY_CHARS;
+    for bad in ["", "   ".to_string().as_str(), &"x".repeat(longest + 1)] {
         let e = tx.search_articles(bad).await.unwrap_err();
         assert!(matches!(e, Error::Invalid(_)), "{e:?}");
     }
     assert!(tx
-        .search_articles(&"x".repeat(200))
+        .search_articles(&"x".repeat(longest))
         .await
         .unwrap()
         .items
@@ -772,6 +773,30 @@ async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
             true,
         ),
         ("中文 帮助", "如何 重置 密码", true),
+        // "set" (four articles) is commoner than "password" (three), so a
+        // query for both reads "password"'s articles first; "Reset
+        // password" has that lexeme, lacks "set", and matches by title.
+        (
+            "Reset password",
+            "Choose a new one on the sign-in page.",
+            true,
+        ),
+        ("Set up a team", "Set the team name, then set roles.", true),
+        ("Data sets", "Each set holds rows.", true),
+        ("Settings overview", "All settings in one place.", true),
+        // A title-only match for "reset account passw" that holds two of
+        // its lexemes often, so ts_rank ranks it above both full matches.
+        (
+            "Reset account password",
+            "Reset the account, then reset the account again.",
+            true,
+        ),
+        ("Passw field", "The passw field resets accounts.", true),
+        (
+            "Old passw note",
+            "It covers the account and much later a reset.",
+            true,
+        ),
     ];
     for (title, content, published) in articles {
         let a = tx
@@ -853,6 +878,12 @@ const KB_QUERIES: &[&str] = &[
     "x",
     "policy refund",
     "security account",
+    "set password",
+    "set",
+    "settings",
+    "reset account passw",
+    "account passw",
+    "passw",
 ];
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -991,4 +1022,119 @@ async fn article_search_counts_up_to_the_cap(pool: PgPool) {
         assert!(!indexed.capped, "{q:?}");
         assert_eq!(indexed, scanned, "{q:?}");
     }
+}
+
+/// Random articles over a small vocabulary (so words, stems, and title
+/// substrings collide often) and random queries (word runs, title pieces
+/// that span words) against the scan: identical whenever uncapped.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn random_article_corpora_search_like_the_scan(pool: PgPool) {
+    const VOCAB: [&str; 22] = [
+        "reset",
+        "set",
+        "settings",
+        "setup",
+        "password",
+        "passwords",
+        "pass",
+        "word",
+        "account",
+        "accounts",
+        "login",
+        "sign",
+        "in",
+        "the",
+        "of",
+        "refund",
+        "ship",
+        "shipping",
+        "order",
+        "team",
+        "data",
+        "passw",
+    ];
+    let db = db(pool);
+    let org = org();
+    let mut rng = common::Rng::new(0x1717);
+    let mut tx = db.begin(org).await.unwrap();
+    let words = |rng: &mut common::Rng, n: usize| -> String {
+        (0..n)
+            .map(|_| VOCAB[rng.below(VOCAB.len())])
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut titles = Vec::new();
+    for n in 0..150 {
+        let (nt, nc) = (1 + rng.below(4), 3 + rng.below(13));
+        let title = words(&mut rng, nt);
+        let content = words(&mut rng, nc);
+        sqlx::query(
+            "INSERT INTO knowledge_articles (org_id, title, content, published, created_at) \
+             VALUES ($1, $2, $3, $4, now() - make_interval(hours => $5))",
+        )
+        .bind(org)
+        .bind(&title)
+        .bind(&content)
+        .bind(rng.below(7) > 0)
+        .bind(n % 23)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        titles.push(title);
+    }
+    for i in 0..250 {
+        let (nw, t) = (1 + rng.below(3), titles[rng.below(titles.len())].clone());
+        let q = match i % 3 {
+            0 => words(&mut rng, nw),
+            1 => rng.substring(&t, 12),
+            _ => {
+                let at = rng.below(t.len().max(1));
+                t.chars().skip(at).take(4 + rng.below(12)).collect()
+            }
+        };
+        let Some((found, scanned)) = articles_both_ways(&mut tx, &q).await else {
+            continue;
+        };
+        if found.capped {
+            assert!(found.total <= scanned.total, "{q:?}");
+        } else {
+            assert_eq!(found, scanned, "query {q:?}");
+        }
+    }
+}
+
+/// A title must fit its limit, on create and on update.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn article_titles_are_length_limited(pool: PgPool) {
+    use cxp_core::knowledge::MAX_TITLE_CHARS;
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let a = tx
+        .create_article(&NewArticle {
+            title: "t".repeat(MAX_TITLE_CHARS),
+            content: "fits".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let e = tx
+        .create_article(&NewArticle {
+            title: "é".repeat(MAX_TITLE_CHARS + 1),
+            content: "too long".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
+    let e = tx
+        .update_article(
+            a.id,
+            &ArticleUpdate {
+                title: Some("é".repeat(MAX_TITLE_CHARS + 1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
 }
