@@ -7,13 +7,14 @@ mod common;
 
 use chrono::{Duration, Utc};
 use common::{db, org, otto_app_db, user};
-use cxp_core::console_sessions::{self, Claim, NewSession, Refreshed};
+use cxp_core::console_sessions::{self, Claim, Lease, NewSession, Refreshed};
 use cxp_core::platform_events::{self, Outcome};
 use cxp_core::Error;
 use otto_tenant::crypto::Cipher;
 use otto_tenant::ids::{OrgId, UserId};
 use otto_tenant::Db;
 use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -425,6 +426,176 @@ async fn a_lapsed_but_unclaimed_lease_still_stores(pool: PgPool) {
     )
     .await
     .unwrap());
+}
+
+/// A fresh session on `db`, claimed for a refresh: its hash and the lease.
+async fn claimed_session(db: &Db, o: OrgId) -> ([u8; 32], Lease) {
+    let hash = new_session(db, o, user(), Duration::days(1)).await;
+    let soon = Utc::now() + Duration::minutes(60);
+    let Claim::Claimed(_, lease) =
+        console_sessions::claim_refresh(db, o, &hash, soon, Duration::seconds(45))
+            .await
+            .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    (hash, lease)
+}
+
+/// Longer than the store's own bound, short enough that a test which waited
+/// on its lock forever fails rather than hangs.
+const NO_LONGER_THAN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The store runs inside the lease holder's `STORE_ALLOWANCE`; a row lock
+/// held elsewhere must make it fail in time, not wait it out, and the failed
+/// transaction changes nothing and leaves the pool usable.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_store_behind_a_held_row_lock_times_out(pool: PgPool) {
+    let db = db(pool.clone());
+    let o = org();
+    let (hash, lease) = claimed_session(&db, o).await;
+
+    // The pool's superuser bypasses RLS.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM console_sessions WHERE id_hash = $1 FOR UPDATE")
+        .bind(&hash[..])
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let expires = Utc::now() + Duration::days(30);
+    let stored = tokio::time::timeout(
+        NO_LONGER_THAN,
+        console_sessions::store_refreshed(
+            &db,
+            &cipher(),
+            o,
+            &hash,
+            lease,
+            &pair("otto_at_next", "otto_rt_next", expires),
+        ),
+    )
+    .await
+    .expect("the store waited out the row lock");
+    assert!(stored.is_err(), "{stored:?}");
+    holder.rollback().await.unwrap();
+
+    let s = console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
+    assert_eq!(
+        (s.generation, s.refresh_lease_until),
+        (0, Some(lease.until))
+    );
+}
+
+/// Giving a lease back is bounded the same way.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_release_behind_a_held_row_lock_times_out(pool: PgPool) {
+    let db = db(pool.clone());
+    let o = org();
+    let (hash, lease) = claimed_session(&db, o).await;
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM console_sessions WHERE id_hash = $1 FOR UPDATE")
+        .bind(&hash[..])
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let released = tokio::time::timeout(
+        NO_LONGER_THAN,
+        console_sessions::release_lease(&db, o, &hash, lease),
+    )
+    .await
+    .expect("the release waited out the row lock");
+    assert!(released.is_err(), "{released:?}");
+    holder.rollback().await.unwrap();
+
+    let s = console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.refresh_lease_until, Some(lease.until));
+}
+
+/// The org's lifecycle lock, held exclusively (as `org.deleted`,
+/// `member.removed`, and `team.deleted` hold it), makes the store time out
+/// rather than wait; once it is released the same store lands.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_store_behind_the_lifecycle_lock_times_out(pool: PgPool) {
+    let db = db(pool.clone());
+    let o = org();
+    let (hash, lease) = claimed_session(&db, o).await;
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(platform_events::LIFECYCLE_LOCK)
+        .bind(o)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let expires = Utc::now() + Duration::days(30);
+    let next = pair("otto_at_next", "otto_rt_next", expires);
+    let stored = tokio::time::timeout(
+        NO_LONGER_THAN,
+        console_sessions::store_refreshed(&db, &cipher(), o, &hash, lease, &next),
+    )
+    .await
+    .expect("the store waited out the lifecycle lock");
+    assert!(stored.is_err(), "{stored:?}");
+    holder.rollback().await.unwrap();
+
+    assert!(
+        console_sessions::store_refreshed(&db, &cipher(), o, &hash, lease, &next)
+            .await
+            .unwrap()
+    );
+}
+
+/// The timeouts are the transaction's own (`SET LOCAL`): a connection that
+/// ran a store goes back to the pool with the server's defaults, so no other
+/// query on it inherits them.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_store_timeouts_do_not_outlive_its_transaction(pool: PgPool) {
+    let one = Db::from_pool(
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap(),
+    );
+    // As at boot: this resolves the tenant-role probe up front, which
+    // `Db::begin` would otherwise run on a second connection while holding
+    // the only one.
+    one.verify_tenant_isolation().await.expect("isolation");
+    let o = org();
+    let (hash, lease) = claimed_session(&one, o).await;
+    assert!(console_sessions::store_refreshed(
+        &one,
+        &cipher(),
+        o,
+        &hash,
+        lease,
+        &pair(
+            "otto_at_next",
+            "otto_rt_next",
+            Utc::now() + Duration::days(30)
+        )
+    )
+    .await
+    .unwrap());
+    for setting in ["lock_timeout", "statement_timeout"] {
+        let value: String = sqlx::query_scalar(&format!("SHOW {setting}"))
+            .fetch_one(one.pool())
+            .await
+            .unwrap();
+        assert_eq!(value, "0", "{setting}");
+    }
+    one.pool().close().await;
 }
 
 /// Sign-out deletes and hands back what the row held, once.

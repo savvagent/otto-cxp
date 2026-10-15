@@ -184,7 +184,7 @@ where
 {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.db_max_connections)
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(cxp_core::POOL_ACQUIRE_TIMEOUT)
         .connect(&config.database_url)
         .await
         .context("could not connect to the database")?;

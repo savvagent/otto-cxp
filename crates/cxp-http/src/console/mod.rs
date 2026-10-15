@@ -72,12 +72,21 @@
 //! - The platform call is cut off at `PLATFORM_TIMEOUT` (the whole request,
 //!   not just the connect).
 //! - The store then has at least `STORE_ALLOWANCE` = 20 s for its
-//!   compare-and-swap `UPDATE` to take the row: the pool's acquire timeout is
-//!   5 s, and the statements are single-row. Once the `UPDATE` holds the row,
-//!   a competing claim waits on its row lock and then sees the rotated,
-//!   fresh session. The one unbounded wait, the org's lifecycle lock, is held
-//!   exclusively only by an `org.deleted` purge, after which the session is
-//!   gone for every replica alike.
+//!   compare-and-swap `UPDATE` to take the row, and the database enforces
+//!   what it may spend: the pool's acquire timeout
+//!   (`cxp_core::POOL_ACQUIRE_TIMEOUT`, 5 s), then a transaction that sets
+//!   `cxp_core::console_sessions::STORE_TIMEOUTS` (a 3 s `statement_timeout`,
+//!   a 2 s `lock_timeout`) before it waits on anything, and runs
+//!   `STORE_STATEMENTS` = 4 statements under them (the shared lifecycle lock,
+//!   the revocation check, the `UPDATE`, the `COMMIT`): at most 5 + 4 x 3 =
+//!   17 s, checked at compile time. The transaction's opening statements,
+//!   before the bounds are set, wait on nothing; that is assumed, not
+//!   enforced. Once the `UPDATE` holds the row, a competing claim waits on its
+//!   row lock and then sees the rotated, fresh session. The org's lifecycle
+//!   lock is taken exclusively by an `org.deleted`, `member.removed`, or
+//!   `team.deleted` cleanup; the store times out behind one rather than
+//!   waiting it out, and fails as a store against a failed database does
+//!   (below).
 //!
 //! So no second replica can claim, and present the same refresh token, while
 //! the first could still store its result. If the store fails instead (the
@@ -148,8 +157,11 @@ const DEFAULT_ACCESS_TTL_SECS: i64 = 3600;
 pub const LEASE: Duration = Duration::from_secs(45);
 
 /// What a lease holder keeps back for storing the new pair after the platform
-/// answers: the pool's acquire timeout (5 s) and the store's two short
-/// statements, with room to spare.
+/// answers. The store cannot spend more: the pool's acquire timeout
+/// ([`cxp_core::POOL_ACQUIRE_TIMEOUT`]) plus
+/// [`console_sessions::STORE_STATEMENTS`] statements, each cut off by
+/// [`console_sessions::STORE_TIMEOUTS`] in the database, fit inside it
+/// (checked at compile time below).
 pub const STORE_ALLOWANCE: Duration = Duration::from_secs(20);
 
 /// How often a request that found another replica's lease looks again.
@@ -165,6 +177,14 @@ const _: () = {
     assert!(
         budget < LEASE.as_millis(),
         "a claim must leave room for the call and the store"
+    );
+    // u128 milliseconds: `Duration` arithmetic is not const.
+    let store = cxp_core::POOL_ACQUIRE_TIMEOUT.as_millis()
+        + console_sessions::STORE_TIMEOUTS.statement.as_millis()
+            * console_sessions::STORE_STATEMENTS as u128;
+    assert!(
+        store <= STORE_ALLOWANCE.as_millis(),
+        "the store's database bounds must fit in what the holder keeps back"
     );
     assert!(
         LEASE_POLL.as_millis() * LEASE_POLLS as u128 > LEASE.as_millis(),

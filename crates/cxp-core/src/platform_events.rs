@@ -28,6 +28,8 @@
 //! transaction already in flight finishes first and is cleaned up with
 //! everything else; one that starts later sees the tombstone and is refused.
 
+use std::time::Duration;
+
 use otto_resource::webhook::{LifecycleEvent, WebhookEvent};
 use otto_tenant::ids::{OrgId, UserId};
 use otto_tenant::{Db, Tx};
@@ -53,8 +55,9 @@ pub enum Outcome {
 /// the platform itself answers "inactive"; this only has to outlast that.
 pub const REMOVED_MEMBER_TTL_SECS: i64 = 300;
 
-/// The advisory-lock namespace for an org's lifecycle lock ("cxlc").
-const LIFECYCLE_LOCK: i32 = 0x6378_6c63;
+/// The advisory-lock class of an org's lifecycle lock ("cxlc"); the org
+/// is the second key, as `hashtext(org::text)`.
+pub const LIFECYCLE_LOCK: i32 = 0x6378_6c63;
 
 /// Every table holding an org's domain rows, unshipped usage, or console
 /// sessions, children before parents, as `org.deleted` purges them.
@@ -127,9 +130,55 @@ async fn revoked_on(
 /// Open a transaction pinned to `org` that no lifecycle cleanup can
 /// interleave with, refused with [`Error::AccessRevoked`] if the org was
 /// deleted or `user` just removed. Every request path opens its transaction
-/// here, never with `Db::begin`.
+/// here (or with [`begin_live_bounded`]), never with `Db::begin`.
 pub async fn begin_live(db: &Db, org: OrgId, user: Option<UserId>) -> Result<Tx<'static>> {
+    begin_live_inner(db, org, user, None).await
+}
+
+/// Database-side bounds on a transaction's waits: `lock_timeout` and
+/// `statement_timeout`, both transaction-local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// The longest any one lock wait may last (`lock_timeout`).
+    pub lock: Duration,
+    /// The longest any one statement may run, waits included
+    /// (`statement_timeout`).
+    pub statement: Duration,
+}
+
+/// [`begin_live`], with `t` set for the rest of the transaction before it
+/// waits on anything, the org's lifecycle lock included. A wait that runs
+/// past either bound fails the statement, and so the transaction, instead of
+/// waiting on. The settings are `SET LOCAL`: they end with the transaction
+/// and never reach the next user of the connection.
+pub async fn begin_live_bounded(
+    db: &Db,
+    org: OrgId,
+    user: Option<UserId>,
+    t: Timeouts,
+) -> Result<Tx<'static>> {
+    begin_live_inner(db, org, user, Some(t)).await
+}
+
+async fn begin_live_inner(
+    db: &Db,
+    org: OrgId,
+    user: Option<UserId>,
+    timeouts: Option<Timeouts>,
+) -> Result<Tx<'static>> {
     let mut tx = db.begin(org).await?;
+    if let Some(t) = timeouts {
+        // Milliseconds as text: `set_config` takes the setting's string form,
+        // and a bare number is read in the setting's unit, milliseconds.
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true), \
+                    set_config('statement_timeout', $2, true)",
+        )
+        .bind(t.lock.as_millis().to_string())
+        .bind(t.statement.as_millis().to_string())
+        .execute(tx.conn())
+        .await?;
+    }
     sqlx::query("SELECT pg_advisory_xact_lock_shared($1, hashtext($2::text))")
         .bind(LIFECYCLE_LOCK)
         .bind(org)

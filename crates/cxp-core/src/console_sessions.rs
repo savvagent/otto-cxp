@@ -30,6 +30,14 @@
 //!    lease lapsed: a stale holder can neither store over it nor release it
 //!    ([`release_lease`] matches the same pair).
 //!
+//! The store's waits are bounded in the database: [`store_refreshed`] and
+//! [`release_lease`] open with [`STORE_TIMEOUTS`] set (`lock_timeout` and
+//! `statement_timeout`, transaction-local) before they wait on anything, so
+//! a row lock held elsewhere or the org's lifecycle lock held exclusively by
+//! a cleanup makes them fail in time rather than wait on. A store that times
+//! out loses the new pair exactly as a store against a failed database does
+//! (below).
+//!
 //! The lease is set and compared on the database's clock
 //! (`clock_timestamp()`, read when the claiming `UPDATE` runs, so time spent
 //! waiting for a connection is not charged to it), never the caller's, so
@@ -64,12 +72,29 @@ use otto_tenant::{Db, Tx};
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
-use crate::platform_events::begin_live;
+use crate::platform_events::{begin_live, begin_live_bounded, Timeouts};
 use crate::sealed;
 
 /// A session whose access token expires within this long is refreshed before
 /// it is used, so the token is still good for the request that triggered it.
 pub const REFRESH_SKEW_SECS: i64 = 60;
+
+/// The database-side bounds on [`store_refreshed`] and [`release_lease`]:
+/// no lock wait longer than 2 s, no statement longer than 3 s. A lease
+/// holder stores inside the time it kept back for that
+/// (`cxp_http::console::STORE_ALLOWANCE`), which these must fit in.
+pub const STORE_TIMEOUTS: Timeouts = Timeouts {
+    lock: std::time::Duration::from_secs(2),
+    statement: std::time::Duration::from_secs(3),
+};
+
+/// How many statements a store runs under [`STORE_TIMEOUTS`], each bounded
+/// by its `statement` timeout: the shared lifecycle lock, the revocation
+/// check, the compare-and-swap `UPDATE`, and the `COMMIT`. The transaction's
+/// opening statements (`BEGIN`, the role, the org pin, the timeouts
+/// themselves) run before the bounds are set and are assumed, not enforced,
+/// to wait on nothing.
+pub const STORE_STATEMENTS: u32 = 4;
 
 /// The most expired sessions one sweep transaction deletes.
 pub const SWEEP_BATCH: i64 = 1000;
@@ -305,6 +330,9 @@ pub struct Refreshed<'a> {
 /// A lease that lapsed with no one claiming it since still matches, and the
 /// store succeeds: the pair the platform just issued is kept rather than
 /// lost.
+///
+/// Runs under [`STORE_TIMEOUTS`]: an `Err` (the database failed, or a wait
+/// ran past a bound) wrote nothing, and the lease stands until it lapses.
 pub async fn store_refreshed(
     db: &Db,
     cipher: &Cipher,
@@ -315,7 +343,7 @@ pub async fn store_refreshed(
 ) -> Result<bool> {
     let access = seal(cipher, new.access_token)?;
     let refresh = seal(cipher, new.refresh_token)?;
-    let mut tx = begin_live(db, org, None).await?;
+    let mut tx = begin_live_bounded(db, org, None, STORE_TIMEOUTS).await?;
     let n = sqlx::query(
         "UPDATE console_sessions \
          SET access_token_enc = $5, refresh_token_enc = $6, access_expires_at = $7, \
@@ -340,8 +368,9 @@ pub async fn store_refreshed(
 /// Give back `lease` without rotating (the platform could not be reached),
 /// so the next request may try again at once. A no-op once anyone else has
 /// claimed or rotated the session: a stale holder never frees a newer claim.
+/// Runs under [`STORE_TIMEOUTS`], like [`store_refreshed`].
 pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], lease: Lease) -> Result<()> {
-    let mut tx = begin_live(db, org, None).await?;
+    let mut tx = begin_live_bounded(db, org, None, STORE_TIMEOUTS).await?;
     sqlx::query(
         "UPDATE console_sessions SET refresh_lease_until = NULL \
          WHERE org_id = $1 AND id_hash = $2 AND generation = $3 AND refresh_lease_until = $4",
