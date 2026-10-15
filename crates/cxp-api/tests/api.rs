@@ -1398,13 +1398,19 @@ async fn write_during_a_search_flood(
         (0..n).map(|_| h.call("GET", "/api/v1/customers/search?q=grace", Some(token), None)),
     );
     let write = async {
+        let mut saturated = false;
         for _ in 0..100 {
             let held = h.pool.size() - h.pool.num_idle() as u32;
             if h.search.available() == 0 && held >= busy {
+                saturated = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(
+            saturated,
+            "the searches never took every permit and {busy} connections, so the write proves nothing"
+        );
         h.call(
             "POST",
             "/api/v1/tickets",
@@ -1486,9 +1492,12 @@ async fn without_the_cap_a_search_flood_starves_a_write(
     connect: PgConnectOptions,
 ) {
     let (write, searches) = flood(opts, connect, SearchLimiter::new(5), 8, 5).await;
-    assert!(
-        !write.is_success(),
-        "the write got through without the cap: {write} {searches:?}"
+    // Starved of a connection, the write is turned away as unavailable
+    // (its auth or its transaction times out on the pool).
+    assert_eq!(
+        write,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "without the cap the write should find no connection: {searches:?}"
     );
 }
 
