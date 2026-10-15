@@ -1,0 +1,6 @@
+# Every otto_tenant::Db is built by cxp_core::tenant_db, which pins otto-cxp's own tenant role
+# (cxp_core::TENANT_ROLE, #28). Db::from_pool and Db::connect default to the shared otto_app.
+disallowed-methods = [
+  { path = "otto_tenant::db::Db::from_pool", reason = "use cxp_core::tenant_db, which pins cxp_core::TENANT_ROLE (#28)" },
+  { path = "otto_tenant::db::Db::connect", reason = "use cxp_core::tenant_db, which pins cxp_core::TENANT_ROLE (#28)" },
+]

@@ -6,9 +6,10 @@
 //! hands each test a fresh, migrated database on the cluster `DATABASE_URL`
 //! names, connecting as a superuser. A superuser bypasses row-level
 //! security, so a plain pool query proves nothing about isolation: tenant
-//! work goes through [`db`]'s `Db::begin` (which assumes `otto_app`), and
+//! work goes through [`db`]'s `Db::begin` (which assumes the tenant role,
+//! `cxp_app`), and
 //! unpinned checks go through [`as_app_unpinned`], [`as_app_maintenance`], or
-//! [`otto_app_db`].
+//! [`tenant_role_db`].
 
 #![allow(dead_code)]
 
@@ -17,10 +18,10 @@ use otto_tenant::Db;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
-/// The test database as a [`Db`]. `Db::begin(org)` on it runs as `otto_app`
+/// The test database as a [`Db`]. `Db::begin(org)` on it runs as `cxp_app`
 /// pinned to `org`, exactly as a request does.
 pub fn db(pool: PgPool) -> Db {
-    Db::from_pool(pool)
+    cxp_core::tenant_db(pool)
 }
 
 /// A fresh, random org id. The platform issues these; nothing here checks
@@ -34,30 +35,33 @@ pub fn user() -> UserId {
     UserId::new()
 }
 
-/// A `Db` whose every connection runs as `otto_app`, so even unpinned
+/// A `Db` whose every connection runs as the tenant role (`cxp_app`), so even unpinned
 /// statements are subject to RLS (the test pool's superuser bypasses it).
 /// `Db::begin` still pins and works. Close `.pool()` before the test returns
 /// so sqlx can drop the test database.
-pub async fn otto_app_db(pool: &PgPool) -> Db {
+pub async fn tenant_role_db(pool: &PgPool) -> Db {
+    let set_role = format!("SET ROLE {}", cxp_core::TENANT_ROLE);
+    Box::leak(format!("SET ROLE {}", cxp_core::TENANT_ROLE).into_boxed_str());
     let app_pool = PgPoolOptions::new()
         .max_connections(2)
-        .after_connect(|conn, _meta| {
+        .after_connect(move |conn, _meta| {
+            let set_role = set_role.clone();
             Box::pin(async move {
-                sqlx::query("SET ROLE otto_app").execute(conn).await?;
+                sqlx::query(&set_role).execute(conn).await?;
                 Ok(())
             })
         })
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .unwrap();
-    Db::from_pool(app_pool)
+    cxp_core::tenant_db(app_pool)
 }
 
-/// A transaction as `otto_app` with no org pinned, so `current_org()` is
+/// A transaction as the tenant role (`cxp_app`) with no org pinned, so `current_org()` is
 /// NULL. This is what a request path that forgot to pin would see.
 pub async fn as_app_unpinned(pool: &PgPool) -> Transaction<'static, Postgres> {
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL ROLE otto_app")
+    sqlx::query(&format!("SET LOCAL ROLE {}", cxp_core::TENANT_ROLE))
         .execute(&mut *tx)
         .await
         .unwrap();

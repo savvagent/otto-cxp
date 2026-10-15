@@ -276,7 +276,7 @@ mod tests {
             .acquire_timeout(Duration::from_secs(1))
             .connect_lazy("postgres://cxp:cxp@127.0.0.1:1/none")
             .unwrap();
-        let res = router(Db::from_pool(pool), readiness)
+        let res = router(cxp_core::tenant_db(pool), readiness)
             .oneshot(
                 axum::http::Request::get("/readyz")
                     .body(axum::body::Body::empty())

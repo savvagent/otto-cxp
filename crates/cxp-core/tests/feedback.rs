@@ -801,5 +801,5 @@ async fn another_org_cannot_see_or_change_this_orgs_data(pool: PgPool) {
 }
 
 fn db_clone(db: &Db) -> Db {
-    Db::from_pool(db.pool().clone())
+    cxp_core::tenant_db(db.pool().clone())
 }

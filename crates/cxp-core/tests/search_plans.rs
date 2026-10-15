@@ -11,7 +11,7 @@
 //! statistics say.
 //!
 //! The plan tests check the fences, not costs: each plans the statement as
-//! `otto_app` with the org pinned under `force_generic_plan`, with the
+//! `cxp_app` with the org pinned under `force_generic_plan`, with the
 //! planner pushed toward the bad alternative (`enable_nestloop = off` makes
 //! a flattened lateral a hash or merge join; index scans off make a per-row
 //! probe a scan per candidate, so a hashed subplan wins wherever one is

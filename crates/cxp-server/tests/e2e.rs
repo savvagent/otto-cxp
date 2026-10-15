@@ -247,7 +247,7 @@ async fn server(pool: PgPool) -> Server {
     assert_eq!(config.public_url, PUBLIC_URL);
     assert_eq!(config.resource_uri, RESOURCE);
     assert_eq!(config.platform_webhook_secret, WEBHOOK_SECRET);
-    let db = Db::from_pool(pool.clone());
+    let db = cxp_core::tenant_db(pool.clone());
     let platform = platform_client(&config).unwrap();
     let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
     let app = router(
@@ -1187,7 +1187,7 @@ async fn criterion_2_org_b_cannot_read_or_write_org_a_through_any_tool_or_route(
     let report = s.db.verify_tenant_isolation().await.expect("isolation");
     let summary = report.summary();
     assert!(
-        summary.contains(r#"tenant isolation enforced as role "otto_app""#),
+        summary.contains(r#"tenant isolation enforced as role "cxp_app""#),
         "{summary}"
     );
     for table in PURGED_TABLES {
@@ -2074,7 +2074,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     assert_eq!(boot.platform, cxp_server::PlatformCheck::Accepted);
     assert!(
         boot.isolation
-            .contains(r#"tenant isolation enforced as role "otto_app""#),
+            .contains(r#"tenant isolation enforced as role "cxp_app""#),
         "{}",
         boot.isolation
     );
@@ -2109,7 +2109,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     for line in [
         "allowed only because this is not a deployment",
         "applying migrations",
-        r#"tenant isolation enforced as role "otto_app""#,
+        r#"tenant isolation enforced as role "cxp_app""#,
         "the otto platform accepted this service's credential",
         "cxp-server listening",
         "declared usage meters",
@@ -2270,7 +2270,7 @@ async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
 /// A database where one tenant table no longer enforces row-level security
 /// is refused before anything is served: `run` returns the refusal and never
 /// accepts a connection. (`NO FORCE` alone would not break it here: the
-/// tenant role `otto_app` does not own the table, so RLS still applies to it,
+/// tenant role `cxp_app` does not own the table, so RLS still applies to it,
 /// and the boot proof knows that.)
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_server_refuses_to_serve_when_tenant_isolation_is_broken(pool: PgPool) {
@@ -2325,11 +2325,11 @@ fn database_url_as(pool: &PgPool, user: Option<(&str, &str)>) -> String {
     url.to_string()
 }
 
-/// Creates `otto_app` and `cxp_runtime` if they do not exist. Both are
+/// Creates `otto_app`, `cxp_app`, and `cxp_runtime` if they do not exist. All are
 /// cluster-wide and shared by every test (and other services' tests), so
 /// they are never dropped; a concurrent test creating one first is fine.
 async fn shared_roles(pool: &PgPool) {
-    for role in ["otto_app", "cxp_runtime"] {
+    for role in ["otto_app", cxp_core::TENANT_ROLE, "cxp_runtime"] {
         sqlx::query(&format!(
             "DO $$ BEGIN CREATE ROLE {role} NOLOGIN; \
              EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
@@ -2438,9 +2438,9 @@ async fn runtime_role(pool: &PgPool, role: &str, groups: &[&str]) -> String {
     database_url_as(pool, Some((role, &password)))
 }
 
-/// What the runtime role is a member of: `otto_app` (the tenant role) and
-/// `cxp_runtime` (the tombstone grant).
-const RUNTIME_GROUPS: [&str; 2] = ["otto_app", "cxp_runtime"];
+/// What the runtime role is a member of: the tenant role, the tombstone grant (`cxp_runtime`),
+/// and, until the runtime-grant check moves to `cxp_app`, `otto_app`.
+const RUNTIME_GROUPS: [&str; 3] = ["otto_app", cxp_core::TENANT_ROLE, "cxp_runtime"];
 
 /// Production's shape on the test database: an owner and a runtime role
 /// (each dropped when the guard is), created before anything migrates, since
@@ -2576,7 +2576,7 @@ impl Drop for DropRoleOnExit {
 /// non-loopback public URL): `cxp-server migrate` migrates a fresh database
 /// as its owner (the baseline's role, extension, and SECURITY DEFINER
 /// statements included); the service then serves as a runtime role that
-/// owns nothing, passes the boot checks, serves requests as `otto_app`,
+/// owns nothing, passes the boot checks, serves requests as `cxp_app`,
 /// applies an `org.deleted` (the tombstone is written as the runtime role,
 /// through `cxp_runtime`), and runs the retention sweep and the usage
 /// shipper through their maintenance policies, which bind it. The runtime
@@ -2603,7 +2603,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
     .await
     .unwrap();
     assert_eq!(owners, std::slice::from_ref(&roles.owner));
-    let as_role = Db::connect(&roles.runtime_url).await.unwrap();
+    let as_role = cxp_core::tenant_db(sqlx::PgPool::connect(&roles.runtime_url).await.unwrap());
 
     // Rows only the background maintenance may remove, across orgs.
     let (stale_org, stale_event) = (Uuid::new_v4(), Uuid::new_v4());
@@ -2722,7 +2722,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         }
 
         // org.deleted for B: the tombstone is written as the runtime role
-        // (cxp_runtime's grant), the purge as otto_app pinned to B.
+        // (cxp_runtime's grant), the purge as cxp_app pinned to B.
         let (body, sig) = signed(Uuid::new_v4(), "org.deleted", json!({"org_id": b}));
         let res = http
             .post(format!("{base}/platform/webhooks"))
@@ -2774,7 +2774,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
     );
     assert!(
         boot.isolation
-            .contains(r#"tenant isolation enforced as role "otto_app""#),
+            .contains(r#"tenant isolation enforced as role "cxp_app""#),
         "{}",
         boot.isolation
     );
@@ -2830,7 +2830,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
     assert_eq!(owner, roles.owner);
     let cookie = "e2e-least-privilege-cookie";
     cxp_core::console_sessions::create(
-        &Db::from_pool(pool.clone()),
+        &cxp_core::tenant_db(pool.clone()),
         &otto_tenant::crypto::Cipher::from_base64_key(
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         )
@@ -2923,7 +2923,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         // The serving process, as the runtime role.
         format!(r#"database role "{role}" holds no superuser-equivalent privilege"#),
         "not migrating".into(),
-        r#"tenant isolation enforced as role "otto_app""#.into(),
+        r#"tenant isolation enforced as role "cxp_app""#.into(),
         "the otto platform accepted this service's credential".into(),
         "cxp-server listening".into(),
     ] {
@@ -3059,7 +3059,7 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
         .await
         .expect("the owner migrates");
     let config = deployed(&roles.runtime_url, None);
-    let db = Db::connect(&roles.runtime_url).await.unwrap();
+    let db = cxp_core::tenant_db(sqlx::PgPool::connect(&roles.runtime_url).await.unwrap());
     let alarm = cxp_server::health::RoleAlarm::default();
 
     cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
@@ -3098,7 +3098,11 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: PgPool) {
     let _guard = discard_logs();
-    let db = Db::connect(&database_url_as(&pool, None)).await.unwrap();
+    let db = cxp_core::tenant_db(
+        sqlx::PgPool::connect(&database_url_as(&pool, None))
+            .await
+            .unwrap(),
+    );
     let alarm = cxp_server::health::RoleAlarm::default();
     alarm.raise("database role refused at the last pass".into());
     db.pool().close().await;
@@ -3113,7 +3117,11 @@ async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: 
     let mut local = Config::for_test();
     local.public_url = "http://localhost:8080".into();
     local.resource_uri = "http://localhost:8080/mcp".into();
-    let db = Db::connect(&database_url_as(&pool, None)).await.unwrap();
+    let db = cxp_core::tenant_db(
+        sqlx::PgPool::connect(&database_url_as(&pool, None))
+            .await
+            .unwrap(),
+    );
     cxp_server::boot::recheck_db_role(&db, &local, &alarm).await;
     assert_eq!(alarm.consecutive_failures(), 0);
     assert!(!alarm.is_raised());
@@ -3121,13 +3129,13 @@ async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: 
 }
 
 /// A deployment refuses a runtime role that cannot write the `org.deleted`
-/// tombstone (a member of `otto_app` but not `cxp_runtime`): every such
+/// tombstone (a member of the tenant role but not `cxp_runtime`): every such
 /// webhook would fail. The error names what is missing and the role, quoted,
 /// in the statements that fix it; nothing listens.
 #[sqlx::test(migrations = false)]
 async fn a_deployment_refuses_a_runtime_role_without_the_tombstone_grant(pool: PgPool) {
     let _guard = discard_logs();
-    let roles = split_with(&pool, &["otto_app"]).await;
+    let roles = split_with(&pool, &["otto_app", cxp_core::TENANT_ROLE]).await;
     cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
         .await
         .expect("the owner migrates");
@@ -3170,7 +3178,7 @@ async fn a_local_run_warns_about_a_runtime_role_without_the_tombstone_grant(pool
             .with_max_level(tracing::Level::INFO)
             .finish(),
     );
-    let roles = split_with(&pool, &["otto_app"]).await;
+    let roles = split_with(&pool, &["otto_app", cxp_core::TENANT_ROLE]).await;
     cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
         .await
         .expect("the owner migrates");
