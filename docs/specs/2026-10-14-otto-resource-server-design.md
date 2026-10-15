@@ -368,9 +368,9 @@ wire convention (#24): every JSON key in request bodies and responses, and every
 name, is camelCase (`teamId`, `customerId`, `createdAt`); multi-word request keys also accept
 their earlier snake_case spelling (`team_id`) as an alias, and both at once is a 400. Enum values
 and caller-owned JSON (`metadata`) are untouched. Lists are `{data, total, limit, offset}`;
-`GET /api/v1/customers/search` adds `totalCapped`. The tracked exceptions are survey responses
-(a plain array, #36) and `GET /api/v1/dashboard/metrics`, which also sends its deprecated
-snake_case keys (#35). `POST /api/v1/surveys` charges `create_survey`.
+`GET /api/v1/customers/search` adds `totalCapped`. The tracked exception is
+`GET /api/v1/dashboard/metrics`, which also sends its deprecated snake_case keys (#35).
+`POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
 `invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until

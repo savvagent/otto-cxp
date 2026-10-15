@@ -1227,3 +1227,130 @@ async fn an_org_over_its_allowance_cannot_create_a_survey_over_rest(pool: PgPool
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(h.outbox().await.is_empty());
 }
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
+    use cxp_core::feedback::FeedbackExt;
+
+    let h = harness(pool).await;
+    let (org, _, t) = h.caller(RW);
+
+    let mut ids = Vec::new();
+    for title in ["NPS", "Empty"] {
+        let s = h
+            .call(
+                "POST",
+                "/api/v1/surveys",
+                Some(&t),
+                Some(json!({"title": title, "questions": [{"q": "How likely?"}]})),
+            )
+            .await;
+        assert_eq!(s.status, StatusCode::OK, "{}", s.body);
+        ids.push(s.body["id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+    let (survey, empty) = (ids[0], ids[1]);
+
+    let mut customers = Vec::new();
+    for email in ["a@example.com", "b@example.com"] {
+        let c = h
+            .call(
+                "POST",
+                "/api/v1/customers",
+                Some(&t),
+                Some(json!({"email": email})),
+            )
+            .await;
+        assert_eq!(c.status, StatusCode::OK, "{}", c.body);
+        customers.push(c.body["id"].as_str().unwrap().parse::<Uuid>().unwrap());
+    }
+
+    let db = Db::from_pool(h.pool.clone());
+    let mut tx = db.begin(otto_tenant::ids::OrgId::from(org)).await.unwrap();
+    for customer in [customers[0], customers[1], customers[0]] {
+        tx.submit_survey_response(survey, customer, &json!({"q1": 9}))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let r = h
+        .call(
+            "GET",
+            &format!("/api/v1/surveys/{survey}/responses"),
+            Some(&t),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let mut keys: Vec<&str> = r
+        .body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["data", "limit", "offset", "total"]);
+    assert_eq!(r.body["total"], 3);
+    assert_eq!(r.body["limit"], 50);
+    assert_eq!(r.body["offset"], 0);
+    let rows = r.body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["surveyId"], survey.to_string());
+    assert!(rows[0]["customerId"].is_string());
+    assert!(!rows[0]["completedAt"].is_null());
+    assert_eq!(rows[0]["answers"], json!({"q1": 9}));
+    assert!(rows[0].get("survey_id").is_none());
+
+    let r = h
+        .call(
+            "GET",
+            &format!("/api/v1/surveys/{survey}/responses?limit=2&offset=0"),
+            Some(&t),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(r.body["total"], 3);
+    assert_eq!(r.body["limit"], 2);
+
+    let r = h
+        .call(
+            "GET",
+            &format!("/api/v1/surveys/{survey}/responses?offset=10"),
+            Some(&t),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["data"], json!([]));
+    assert_eq!(r.body["total"], 3);
+    assert_eq!(r.body["offset"], 10);
+
+    let r = h
+        .call(
+            "GET",
+            &format!("/api/v1/surveys/{empty}/responses"),
+            Some(&t),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        r.body,
+        json!({"data": [], "total": 0, "limit": 50, "offset": 0})
+    );
+
+    let (_, _, other) = h.caller(RO);
+    let r = h
+        .call(
+            "GET",
+            &format!("/api/v1/surveys/{survey}/responses"),
+            Some(&other),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
+    assert_eq!(r.body["code"], "not_found");
+}

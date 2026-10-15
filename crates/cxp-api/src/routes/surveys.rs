@@ -137,19 +137,19 @@ pub async fn delete(
     Ok(deleted())
 }
 
-/// The survey's responses as a plain JSON array, not the [`Paginated`]
-/// envelope (moving it there is #36, which also returns the total this drops),
-/// paged by `limit`/`offset` (default 50). `404` when the survey is not in the
+/// One page of the survey's responses, newest first, in the [`Paginated`]
+/// envelope (`limit`/`offset`, default 50). `404` when the survey is not in the
 /// caller's org.
 pub async fn responses(
     State(state): State<AppState>,
     Extension(caller): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
     ApiQuery(q): ApiQuery<PageParams>,
-) -> ApiResult<Json<Vec<SurveyResponse>>> {
+) -> ApiResult<Json<Paginated<SurveyResponse>>> {
     caller.require_read()?;
+    let page = q.page();
     let mut tx = state.begin(&caller).await?;
-    let (rows, _total) = tx.list_survey_responses(id, q.page()).await?;
+    let found = tx.list_survey_responses(id, page).await?;
     tx.commit().await?;
-    Ok(Json(rows))
+    Ok(Json(Paginated::new(found, page)))
 }
