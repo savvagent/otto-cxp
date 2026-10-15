@@ -73,13 +73,19 @@ Model: opus
   (c) a second connection holds `SELECT pg_advisory_xact_lock($1, hashtext($2::text))` with
   `platform_events::LIFECYCLE_LOCK` and the org; `store_refreshed` returns `Err` within 10 s;
   after release, the same store succeeds.
-  Also assert in (a), after the failure, that a following `load` on the pool still works (the
-  connection is not poisoned) and that `SHOW lock_timeout` on a fresh pool connection is the
-  server default (`0`).
-- [ ] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`: (c) fails to compile until `LIFECYCLE_LOCK` is public; once it compiles, (a)-(c) hang to the 10 s timeout and fail.
+  Also assert in (a), after the failure, that a following `load` on the pool still works.
+  (d) no leak: build a separate one-connection `Db` (`PgPoolOptions::new().max_connections(1)`
+  over `pool.connect_options()`); run a successful claim + `store_refreshed` on it, then on that
+  same pool `SHOW lock_timeout` and `SHOW statement_timeout` must both be `0` (proves
+  `set_config(.., true)`, i.e. `SET LOCAL`, not a session setting). Close that pool before the
+  test returns.
+- [ ] 2. Make `LIFECYCLE_LOCK` in `crates/cxp-core/src/platform_events.rs` `pub` (doc: the
+  advisory-lock class of an org's lifecycle lock). Run
+  `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`:
+  (a)-(c) hang to the 10 s timeout and fail; (d) passes or fails depending on nothing yet (it
+  guards the implementation).
 - [ ] 3. Implement: `crates/cxp-core/src/lib.rs` `pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = Duration::from_secs(5);` with a doc line; `crates/cxp-server/src/boot.rs:187` uses it.
-  `platform_events.rs`: make `LIFECYCLE_LOCK` `pub` (doc: the advisory-lock class of an org's
-  lifecycle lock); add
+  `platform_events.rs`: add
   `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Timeouts { pub lock: Duration, pub statement: Duration }`
   (std `Duration`) and `pub async fn begin_live_bounded(db, org, user, t: Timeouts)`; both it and
   `begin_live` call one private `begin_live_inner(db, org, user, Option<Timeouts>)` that, when
@@ -93,13 +99,15 @@ Model: opus
   `begin_live_bounded(db, org, None, STORE_TIMEOUTS)`; module docs say the store's waits are
   bounded in the database.
   `cxp-http/src/console/mod.rs`: in the `const _` block assert
-  `POOL_ACQUIRE_TIMEOUT + STORE_TIMEOUTS.statement * STORE_STATEMENTS <= STORE_ALLOWANCE`
-  (compare `as_millis()`); update `STORE_ALLOWANCE`'s doc and the module docs' bullet ("the
-  statements are single-row") to describe the enforced bound and that an `org.deleted` purge
-  now makes the store time out rather than wait.
+  `POOL_ACQUIRE_TIMEOUT.as_millis() + STORE_TIMEOUTS.statement.as_millis() * STORE_STATEMENTS as u128 <= STORE_ALLOWANCE.as_millis()`
+  (u128 milliseconds: `Duration` arithmetic is not const); update `STORE_ALLOWANCE`'s doc and the module docs' bullet ("the
+  statements are single-row", and "held exclusively only by an `org.deleted` purge") to describe
+  the enforced bound; the lifecycle lock is taken exclusively by `org.deleted`, `member.removed`,
+  and `team.deleted` (`exclude_requests`), and the store now times out rather than waits behind
+  them; the opening statements before the timeouts are set are assumed, not enforced.
 - [ ] 4. Run the test command from step 2: all pass. Then
   `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`,
-  clippy, fmt.
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
 - [ ] 5. Commit `fix(core): bound the console refresh store's waits in the database` with a why
   body ending `Refs #31`.
 
@@ -110,13 +118,16 @@ Model: sonnet
 - [ ] 1. In `crates/cxp-core/tests/console_sessions.rs` add a test: claim with a 200 ms lease,
   sleep 400 ms, claim again (newer lease, same generation); `delete_generation` with the stale
   lease returns 0 and the session still loads; with the newer lease it returns 1 and the session
-  is gone. Update the two existing calls near line 265 to pass a `Lease`.
+  is gone. Update the two existing calls near line 265: bind the second claim with
+  `let Claim::Claimed(_, current) = .. else { panic!() }`; the generation-0 call passes
+  `Lease { generation: 0, until: current.until }` (still a generation mismatch), the other
+  `current`.
 - [ ] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`: fails to compile (signature).
 - [ ] 3. Change `delete_generation(db, org, id_hash, lease: Lease)` to add
   `AND refresh_lease_until = $4` and bind `lease.until`; doc: a stale holder never deletes a
   session someone else has claimed anew. Update the caller in
   `crates/cxp-http/src/console/mod.rs` (`InvalidGrant` arm) to pass `lease`.
-- [ ] 4. Run the step 2 command, then the workspace test, clippy, fmt.
+- [ ] 4. Run the step 2 command, then `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
 - [ ] 5. Commit `fix(core): delete a refused console session only under its own lease`, why body,
   `Refs #31`.
 
@@ -137,7 +148,7 @@ Model: sonnet
   `DROP ROLE IF EXISTS` both), as the existing ownership test does.
 - [ ] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test db --locked console_lookup`: passes (it guards behavior that already holds; verify it can
   fail by temporarily giving the lookup policy `TO old` in the test only, see it fail, revert).
-- [ ] 3. Workspace test, clippy, fmt.
+- [ ] 3. `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
 - [ ] 4. Commit `test(core): prove the console lookup policy survives drop owned by`, why body,
   `Refs #31`.
 
