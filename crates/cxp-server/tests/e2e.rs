@@ -2438,9 +2438,8 @@ async fn runtime_role(pool: &PgPool, role: &str, groups: &[&str]) -> String {
     database_url_as(pool, Some((role, &password)))
 }
 
-/// What the runtime role is a member of: the tenant role, the tombstone grant (`cxp_runtime`),
-/// and, until the runtime-grant check moves to `cxp_app`, `otto_app`.
-const RUNTIME_GROUPS: [&str; 3] = ["otto_app", cxp_core::TENANT_ROLE, "cxp_runtime"];
+/// What the runtime role is a member of: the tenant role and the tombstone grant.
+const RUNTIME_GROUPS: [&str; 2] = [cxp_core::TENANT_ROLE, "cxp_runtime"];
 
 /// Production's shape on the test database: an owner and a runtime role
 /// (each dropped when the guard is), created before anything migrates, since
@@ -3135,7 +3134,7 @@ async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: 
 #[sqlx::test(migrations = false)]
 async fn a_deployment_refuses_a_runtime_role_without_the_tombstone_grant(pool: PgPool) {
     let _guard = discard_logs();
-    let roles = split_with(&pool, &["otto_app", cxp_core::TENANT_ROLE]).await;
+    let roles = split_with(&pool, &[cxp_core::TENANT_ROLE]).await;
     cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
         .await
         .expect("the owner migrates");
@@ -3178,7 +3177,7 @@ async fn a_local_run_warns_about_a_runtime_role_without_the_tombstone_grant(pool
             .with_max_level(tracing::Level::INFO)
             .finish(),
     );
-    let roles = split_with(&pool, &["otto_app", cxp_core::TENANT_ROLE]).await;
+    let roles = split_with(&pool, &[cxp_core::TENANT_ROLE]).await;
     cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
         .await
         .expect("the owner migrates");
