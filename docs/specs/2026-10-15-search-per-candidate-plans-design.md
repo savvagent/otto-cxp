@@ -96,8 +96,9 @@ whatever the org size, so a narrow search costs what its candidates cost, with r
 - In forced generic plans on the mid-size seed, no `matches` node reads `customers` other than by
   index, and no hashed subplan reads `customers`, `customer_search_grams`, `knowledge_articles` or
   `knowledge_search_terms`; `scripts/bench-search/plans.py` reports this per query.
-- `grace`, `hoppr` and the email query run in generic plans within about 1.5x of their custom
-  plans on the mid-size seed (measured: 22/26, 5/3, 66/53 ms).
+- `grace`, `hoppr` and the email query run in generic plans within 1.5x or 5 ms of their custom
+  plans, whichever is looser, on the mid-size seed (measured generic/custom: 22/26, 5/3,
+  66/53 ms).
 - A new test fails on the current statements and passes on the new ones, by checking generic plan
   shape with the planner pushed toward the flattened/hashed alternatives.
 - The equivalence and random-corpus tests in `crates/cxp-core/tests/customers.rs` and
@@ -127,9 +128,9 @@ Out:
 
 ## Architecture
 
-Both statements are `LazyLock<String>` constants in `cxp-core` (`customers.rs:89`,
-`knowledge.rs:69`), run by `search_customers` (`customers.rs:491`) and `search_articles`
-(`knowledge.rs:~300`). The change is text inside those constants:
+Both statements are `LazyLock<String>` constants in `cxp-core` (`SEARCH_CUSTOMERS_SQL` in
+`customers.rs`, `SEARCH_ARTICLES_SQL` in `knowledge.rs`), run by `CustomersExt::search_customers`
+and `KnowledgeExt::search_articles`. The change is text inside those constants:
 
 1. `customers.rs`, `matches`:
    ```sql
@@ -168,12 +169,21 @@ asserts:
 - customers: inside the `CTE matches` subtree, every plan node that reads `customers` is an
   `Index Scan` or `Index Only Scan`, and no `Hash Join` or `Merge Join` appears there;
 - both statements: no subplan the plan marks `hashed SubPlan N` (in any node's filter or
-  condition text) reads one of the four search tables.
+  condition text) reads one of the four search tables, where "reads" means a scan node in that
+  subplan's own subtree whose `Relation Name` is the table (a `CTE Scan` has none, so the
+  expected hashed `NOT IN (SELECT ... FROM sub_all)` / `fts_hits` subplans over CTEs pass).
+
+On the current statements the hashed-subplan check fails on the article title `EXISTS` (the only
+probe the planner hashed in the prototype runs, even with index scans off); the `sub_hits`,
+`title_hits` and `fts_hits` fences are defence in depth that this check would catch if a planner
+change ever hashed them. The PR records which assertions failed before the fences.
 
 `plans.py` applies the same two rules to `EXPLAIN (ANALYZE, FORMAT JSON)` of forced generic plans
 against a seeded benchmark database, with no planner knobs, and prints per query the execution
 time and `per-candidate` or the offending node. It reads the generated `after-*.sql` (so it runs
-exactly the statements `gen.py` extracted) and turns their pgbench variables back into `$n`.
+exactly the statements `gen.py` extracted): the search statement is the one line starting
+`WITH ` (the page-rows `SELECT` after it is ignored), and its pgbench variables are turned back
+into `$n`.
 
 No public interface (route, tool, wire field, config key) changes. The two `pub fn`s are additive.
 
@@ -222,6 +232,7 @@ through CI (`ci-auto`, when `FLY_DEPLOY` is `enabled`).
 - clippy, fmt, the append-only migration check, and the `podman build` gate (crates changed).
 - Benchmark evidence, recorded in the PR: `plans.py` and `run.sh` on the mid-size seed, before
   and after.
+- Review: CLAUDE.md's extra reviewer `database-optimizer` runs on the PR (SQL changes).
 
 ## Risks & Open Questions
 
