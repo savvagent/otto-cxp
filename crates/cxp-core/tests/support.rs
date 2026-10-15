@@ -1202,3 +1202,42 @@ async fn article_titles_are_length_limited(pool: PgPool) {
         .unwrap_err();
     assert_eq!(e.code(), "invalid_argument");
 }
+
+/// Content must fit its limit, on create and on update, counted in
+/// characters (not bytes); a refused update changes nothing.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn article_content_is_length_limited(pool: PgPool) {
+    use cxp_core::knowledge::MAX_CONTENT_CHARS;
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let a = tx
+        .create_article(&NewArticle {
+            title: "At the limit".into(),
+            content: "é".repeat(MAX_CONTENT_CHARS),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let e = tx
+        .create_article(&NewArticle {
+            title: "Too long".into(),
+            content: "é".repeat(MAX_CONTENT_CHARS + 1),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
+    let e = tx
+        .update_article(
+            a.id,
+            &ArticleUpdate {
+                content: Some("é".repeat(MAX_CONTENT_CHARS + 1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
+    let unchanged = tx.get_article(a.id).await.unwrap();
+    assert_eq!(unchanged.content.chars().count(), MAX_CONTENT_CHARS);
+}

@@ -21,6 +21,12 @@ pub const SEARCH_LIMIT: i64 = 20;
 /// window of a title (migration 0004), so its length is what an article's
 /// title index rows grow with.
 pub const MAX_TITLE_CHARS: usize = 500;
+/// Longest article content, in characters (about 30 printed pages). Search
+/// indexes one row per distinct lexeme of a published article (migration
+/// 0004), and `to_tsvector` runs over the content on every write, so this
+/// bounds both. No route or tool writes articles yet; the limit is in place
+/// before one does (#34).
+pub const MAX_CONTENT_CHARS: usize = 100_000;
 
 const ARTICLE_COLS: &str =
     "id, title, content, category, tags, metadata, published, created_at, updated_at";
@@ -201,7 +207,8 @@ pub struct ArticleUpdate {
 }
 
 pub trait KnowledgeExt {
-    /// A title over [`MAX_TITLE_CHARS`] is `Invalid`, here and in
+    /// A title over [`MAX_TITLE_CHARS`], or content over
+    /// [`MAX_CONTENT_CHARS`], is `Invalid`, here and in
     /// [`KnowledgeExt::update_article`].
     fn create_article(
         &mut self,
@@ -255,9 +262,20 @@ fn checked_title(title: &str) -> Result<&str> {
     Ok(title)
 }
 
+/// Content search can index: at most [`MAX_CONTENT_CHARS`].
+fn checked_content(content: &str) -> Result<&str> {
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(Error::Invalid(format!(
+            "an article's content must be at most {MAX_CONTENT_CHARS} characters"
+        )));
+    }
+    Ok(content)
+}
+
 impl KnowledgeExt for Tx<'_> {
     async fn create_article(&mut self, new: &NewArticle) -> Result<KnowledgeArticle> {
         checked_title(&new.title)?;
+        checked_content(&new.content)?;
         let org = self.org();
         Ok(sqlx::query_as(&format!(
             "INSERT INTO knowledge_articles \
@@ -354,6 +372,7 @@ impl KnowledgeExt for Tx<'_> {
         update: &ArticleUpdate,
     ) -> Result<KnowledgeArticle> {
         update.title.as_deref().map(checked_title).transpose()?;
+        update.content.as_deref().map(checked_content).transpose()?;
         let org = self.org();
         sqlx::query_as(&format!(
             "UPDATE knowledge_articles SET \
