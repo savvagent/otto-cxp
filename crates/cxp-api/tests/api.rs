@@ -547,6 +547,10 @@ async fn routes_answer_in_the_shapes_the_console_reads(pool: PgPool) {
         .call("GET", "/api/v1/customers/search?q=ada", Some(&t), None)
         .await;
     assert_eq!(found.body.as_array().unwrap().len(), 1);
+    // The body is still the plain array; the count and whether it is capped
+    // ride in headers (#17).
+    assert_eq!(found.headers["x-total-count"], "1");
+    assert_eq!(found.headers["x-total-capped"], "false");
 
     let ticket = h
         .call(

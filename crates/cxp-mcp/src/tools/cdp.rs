@@ -217,7 +217,11 @@ impl Cxp {
     #[tool(
         name = "search_customers",
         description = "Search customers by name or email; best matches first, at most 50. Returns \
-                       {items}.",
+                       {items, total, totalCapped}. totalCapped false: total is the exact count \
+                       and items are exactly the best matches. totalCapped true: total is a \
+                       lower bound (1000 when more than 1000 match, or fewer when the search \
+                       stopped before counting every match), and items are the best-ranked of \
+                       the matches found: narrow the query to reach others.",
         annotations(read_only_hint = true)
     )]
     pub async fn search_customers(
@@ -230,7 +234,7 @@ impl Cxp {
         let mut tx = self.tx(&caller).await?;
         let found = tx.search_customers(&p.query, Page::default()).await.mcp()?;
         tx.commit().await.mcp()?;
-        Ok(Json(List::uncounted(found)))
+        Ok(Json(List::searched(found)))
     }
 
     #[tool(

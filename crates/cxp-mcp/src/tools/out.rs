@@ -10,13 +10,19 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Every list tool's envelope. `total` counts every match, not just this
-/// page; it is omitted where the underlying search does not count (the two
-/// search tools, which return their best matches only).
+/// page. The two search tools count only up to
+/// [`cxp_core::search::TOTAL_CAP`] and add `totalCapped`
+/// ([`cxp_core::search::SearchPage`] states the contract): false when
+/// `total` and the items are exact, true when `total` is a lower bound
+/// (more matches than the cap, or the search stopped before counting every
+/// match); the other list tools omit it.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct List<T> {
     pub items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total: Option<i64>,
+    #[serde(rename = "totalCapped", skip_serializing_if = "Option::is_none")]
+    pub total_capped: Option<bool>,
 }
 
 impl<T> List<T> {
@@ -24,11 +30,16 @@ impl<T> List<T> {
         Self {
             items,
             total: Some(total),
+            total_capped: None,
         }
     }
 
-    pub fn uncounted(items: Vec<T>) -> Self {
-        Self { items, total: None }
+    pub fn searched(found: cxp_core::search::SearchPage<T>) -> Self {
+        Self {
+            items: found.items,
+            total: Some(found.total),
+            total_capped: Some(found.total_capped),
+        }
     }
 }
 

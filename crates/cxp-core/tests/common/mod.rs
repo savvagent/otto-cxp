@@ -173,3 +173,204 @@ impl TeamPlatform {
         self.state.down.store(down, Ordering::SeqCst);
     }
 }
+
+// ------------------------------------------------- the search oracle (#17)
+
+use cxp_core::customers::CustomersExt;
+use cxp_core::knowledge::KnowledgeExt;
+use cxp_core::search::TOTAL_CAP;
+use cxp_core::{Error, Page};
+
+/// `search_customers` as it was before #17: the match predicate evaluated on
+/// every customer of the org, ordered as search orders. `$2` is the `ILIKE`
+/// pattern, `$3` the query, `$4`/`$5` limit and offset.
+const CUSTOMERS_BY_SCAN: &str = "SELECT id FROM customers \
+     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
+     ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
+              similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
+     LIMIT $4 OFFSET $5";
+const CUSTOMERS_BY_SCAN_COUNT: &str = "SELECT count(*) FROM customers \
+     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3)";
+
+/// `search_articles` as it was before #17. `$2` is the query, `$3` the title
+/// pattern, `$4` the limit.
+const ARTICLES_BY_SCAN: &str = "SELECT id FROM knowledge_articles \
+     WHERE org_id = $1 AND published = true \
+       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
+     ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, created_at DESC, id \
+     LIMIT $4";
+const ARTICLES_BY_SCAN_COUNT: &str = "SELECT count(*) FROM knowledge_articles \
+     WHERE org_id = $1 AND published = true \
+       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3)";
+
+/// `cxp_core::contains_pattern`, which is crate-private.
+pub fn like_pattern(q: &str) -> String {
+    let mut out = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// What a search gave, or what the scan gives: the page's ids, the count,
+/// and whether the count is capped.
+#[derive(Debug, PartialEq)]
+pub struct Searched {
+    pub ids: Vec<Uuid>,
+    pub total: i64,
+    pub capped: bool,
+}
+
+/// The scan's answer, as search must give it: every match counted up to
+/// the cap, `capped` exactly when there are more.
+fn as_capped(ids: Vec<Uuid>, count: i64) -> Searched {
+    Searched {
+        ids,
+        total: count.min(TOTAL_CAP),
+        capped: count > TOTAL_CAP,
+    }
+}
+
+/// `search_customers` and the pre-#17 scan, for one query and page, in the
+/// same transaction. `None` when search refuses the query as invalid.
+pub async fn customers_both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    q: &str,
+    page: Page,
+) -> Option<(Searched, Searched)> {
+    let org = tx.org();
+    let found = match tx.search_customers(q, page).await {
+        Ok(found) => found,
+        Err(Error::Invalid(_)) => return None,
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let ids: Vec<Uuid> = sqlx::query_scalar(CUSTOMERS_BY_SCAN)
+        .bind(org)
+        .bind(like_pattern(q))
+        .bind(q)
+        .bind(page.limit().min((TOTAL_CAP - page.offset()).max(0)))
+        .bind(page.offset())
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(CUSTOMERS_BY_SCAN_COUNT)
+        .bind(org)
+        .bind(like_pattern(q))
+        .bind(q)
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    Some((
+        Searched {
+            ids: found.items.iter().map(|c| c.id).collect(),
+            total: found.total,
+            capped: found.total_capped,
+        },
+        as_capped(ids, count),
+    ))
+}
+
+/// `search_articles` and the pre-#17 scan, as [`customers_both_ways`].
+pub async fn articles_both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    q: &str,
+) -> Option<(Searched, Searched)> {
+    let org = tx.org();
+    let found = match tx.search_articles(q).await {
+        Ok(found) => found,
+        Err(Error::Invalid(_)) => return None,
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let ids: Vec<Uuid> = sqlx::query_scalar(ARTICLES_BY_SCAN)
+        .bind(org)
+        .bind(q)
+        .bind(like_pattern(q))
+        .bind(cxp_core::knowledge::SEARCH_LIMIT)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(ARTICLES_BY_SCAN_COUNT)
+        .bind(org)
+        .bind(q)
+        .bind(like_pattern(q))
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    Some((
+        Searched {
+            ids: found.items.iter().map(|a| a.id).collect(),
+            total: found.total,
+            capped: found.total_capped,
+        },
+        as_capped(ids, count),
+    ))
+}
+
+/// A small deterministic generator (xorshift64*) for the random-corpus
+/// tests: the same seed gives the same corpus and queries on every run, so a
+/// failure reproduces.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Rng(seed.max(1))
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in `0..n`.
+    pub fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub fn pick<'a, T: ?Sized>(&mut self, of: &[&'a T]) -> &'a T {
+        of[self.below(of.len())]
+    }
+
+    /// A substring of `s` of 1..=`max` characters, at a random position.
+    pub fn substring(&mut self, s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.is_empty() {
+            return String::new();
+        }
+        let len = 1 + self.below(max.min(chars.len()));
+        let start = self.below(chars.len() - len + 1);
+        chars[start..start + len].iter().collect()
+    }
+}
+
+/// Whether search's answer agrees with the scan's under the contract: when
+/// `total_capped` is false, it is identical; when true, `total` is a lower
+/// bound of the scan's count and every item is a match (`matches`, the ids
+/// of every match the scan finds).
+pub fn within_contract(found: &Searched, scanned_count: i64, matches: &[Uuid]) -> bool {
+    found.capped
+        && found.total <= scanned_count.min(TOTAL_CAP)
+        && found.ids.iter().all(|id| matches.contains(id))
+}
+
+/// Every customer of this org matching `q` under the pre-#17 predicate.
+pub async fn customer_matches(tx: &mut otto_tenant::Tx<'_>, q: &str) -> Vec<Uuid> {
+    let q = q.trim();
+    sqlx::query_scalar(
+        "SELECT id FROM customers \
+         WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3)",
+    )
+    .bind(tx.org())
+    .bind(like_pattern(q))
+    .bind(q)
+    .fetch_all(tx.conn())
+    .await
+    .unwrap()
+}

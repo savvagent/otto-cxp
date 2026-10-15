@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{db, org};
+use common::{articles_both_ways, db, org};
 use cxp_core::chat::ChatExt;
 use cxp_core::knowledge::{ArticleUpdate, KnowledgeExt, NewArticle};
 use cxp_core::tickets::{NewTicket, TicketFilter, TicketUpdate, TicketsExt};
@@ -423,7 +423,7 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
         ids.insert(title, a.id);
     }
 
-    let found = tx.search_articles("password").await.unwrap();
+    let found = tx.search_articles("password").await.unwrap().items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles.len(), 2, "{titles:?}");
     assert!(
@@ -433,14 +433,17 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
     assert!(!titles.contains(&"Shipping"));
 
     // Stemming: "ships" matches "ship"; a title substring matches too.
-    assert_eq!(tx.search_articles("ships").await.unwrap().len(), 1);
-    assert_eq!(tx.search_articles("Account sec").await.unwrap().len(), 1);
-    assert!(tx.search_articles("zebra").await.unwrap().is_empty());
+    assert_eq!(tx.search_articles("ships").await.unwrap().items.len(), 1);
+    assert_eq!(
+        tx.search_articles("Account sec").await.unwrap().items.len(),
+        1
+    );
+    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
     // LIKE wildcards are literal.
-    let pct = tx.search_articles("%").await.unwrap();
+    let pct = tx.search_articles("%").await.unwrap().items;
     assert_eq!(pct.len(), 1);
     assert_eq!(pct[0].id, ids["100% off"]);
-    assert!(tx.search_articles("_").await.unwrap().is_empty());
+    assert!(tx.search_articles("_").await.unwrap().items.is_empty());
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -472,18 +475,20 @@ async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: P
         .await
         .unwrap();
     }
-    let found = tx.search_articles("refund").await.unwrap();
+    let found = tx.search_articles("refund").await.unwrap().items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles, ["Refund policy", "Billing"]);
 
-    for bad in ["", "   ".to_string().as_str(), &"x".repeat(201)] {
+    let longest = cxp_core::search::MAX_QUERY_CHARS;
+    for bad in ["", "   ".to_string().as_str(), &"x".repeat(longest + 1)] {
         let e = tx.search_articles(bad).await.unwrap_err();
         assert!(matches!(e, Error::Invalid(_)), "{e:?}");
     }
     assert!(tx
-        .search_articles(&"x".repeat(200))
+        .search_articles(&"x".repeat(longest))
         .await
         .unwrap()
+        .items
         .is_empty());
 }
 
@@ -500,7 +505,7 @@ async fn knowledge_search_is_capped(pool: PgPool) {
     .execute(tx.conn())
     .await
     .unwrap();
-    assert_eq!(tx.search_articles("gadget").await.unwrap().len(), 20);
+    assert_eq!(tx.search_articles("gadget").await.unwrap().items.len(), 20);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -657,7 +662,7 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
     not_found(tx.delete_ticket(ticket.id).await, "ticket");
     // Articles.
     not_found(tx.get_article(article.id).await, "article");
-    assert!(tx.search_articles("zebra").await.unwrap().is_empty());
+    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
     assert_eq!(tx.list_articles(None, Page::default()).await.unwrap().1, 0);
     not_found(
         tx.update_article(
@@ -713,4 +718,423 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(msgs[0].id, msg.id);
+}
+
+// ------------------------------------------------- search under RLS (#17)
+
+async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
+    let articles: &[(&str, &str, bool)] = &[
+        (
+            "Reset your password",
+            "Open settings, then security, and choose reset password.",
+            true,
+        ),
+        (
+            "Password policy",
+            "Passwords need twelve characters. Resetting is free.",
+            true,
+        ),
+        ("Draft: passwords", "passwords passwords passwords", false),
+        (
+            "Refund policy",
+            "A refund can be requested within a month of purchase.",
+            true,
+        ),
+        (
+            "Shipping times",
+            "Orders ship in two days; express shipping ships overnight.",
+            true,
+        ),
+        (
+            "100% off coupons",
+            "How the coupon_code field works with 50% discounts.",
+            true,
+        ),
+        (
+            "E-mail setup",
+            "Configure e-mail forwarding and the e-mail signature.",
+            true,
+        ),
+        (
+            "Über die Rückgabe",
+            "Rückgabe innerhalb von 30 Tagen. Straße und Hausnummer.",
+            true,
+        ),
+        ("Café menu", "The café serves crème brûlée.", true),
+        (
+            "API v2 webhooks",
+            "POST https://api.example.com/v2/hooks with JSON; see RFC-7231.",
+            true,
+        ),
+        ("The and of or", "the a an and of or to in", true),
+        (
+            "Account security",
+            "Two-factor authentication keeps accounts safe.",
+            true,
+        ),
+        ("中文 帮助", "如何 重置 密码", true),
+        // "set" (four articles) is commoner than "password" (three), so a
+        // query for both reads "password"'s articles first; "Reset
+        // password" has that lexeme, lacks "set", and matches by title.
+        (
+            "Reset password",
+            "Choose a new one on the sign-in page.",
+            true,
+        ),
+        ("Set up a team", "Set the team name, then set roles.", true),
+        ("Data sets", "Each set holds rows.", true),
+        ("Settings overview", "All settings in one place.", true),
+        // A title-only match for "reset account passw" that holds two of
+        // its lexemes often, so ts_rank ranks it above both full matches.
+        (
+            "Reset account password",
+            "Reset the account, then reset the account again.",
+            true,
+        ),
+        ("Passw field", "The passw field resets accounts.", true),
+        (
+            "Old passw note",
+            "It covers the account and much later a reset.",
+            true,
+        ),
+    ];
+    for (title, content, published) in articles {
+        let a = tx
+            .create_article(&NewArticle {
+                title: (*title).into(),
+                content: (*content).into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if *published && published_too {
+            tx.update_article(
+                a.id,
+                &ArticleUpdate {
+                    published: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+/// Full-text matches (stemming, several words, stop words, hyphenated and
+/// URL-like tokens, non-ASCII), title substrings of every length (one and
+/// two characters take the prefix path), LIKE wildcards, and misses.
+const KB_QUERIES: &[&str] = &[
+    "password",
+    "passwords",
+    "reset password",
+    "password reset",
+    "resetting",
+    "PASSWORD",
+    "refund",
+    "refunds policy",
+    "ship",
+    "ships",
+    "shipping overnight",
+    "express",
+    "the",
+    "the and",
+    "of or",
+    "e-mail",
+    "email",
+    "e-mail signature",
+    "mail",
+    "über",
+    "Über",
+    "rückgabe",
+    "strasse",
+    "straße",
+    "café",
+    "cafe",
+    "crème brûlée",
+    "https://api.example.com/v2/hooks",
+    "api.example.com",
+    "v2",
+    "rfc-7231",
+    "7231",
+    "json",
+    "100%",
+    "%",
+    "_",
+    "coupon_code",
+    "50%",
+    "Account sec",
+    "acc",
+    "ac",
+    "a",
+    "r",
+    "Re",
+    "two-factor",
+    "factor",
+    "中文",
+    "密码",
+    "帮",
+    "zebra",
+    "x",
+    "policy refund",
+    "security account",
+    "set password",
+    "set",
+    "settings",
+    "reset account passw",
+    "account passw",
+    "passw",
+];
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn indexed_article_search_returns_exactly_what_the_scan_returns(pool: PgPool) {
+    let db = db(pool);
+    let (a, b) = (org(), org());
+    for o in [a, b] {
+        let mut tx = db.begin(o).await.unwrap();
+        seed_kb_corpus(&mut tx, true).await;
+        tx.commit().await.unwrap();
+    }
+    let mut tx = db.begin(a).await.unwrap();
+    // Twice over, so most comparisons run on the generic plan.
+    for _ in 0..2 {
+        for q in KB_QUERIES {
+            if let Some((indexed, scanned)) = articles_both_ways(&mut tx, q).await {
+                assert_eq!(indexed, scanned, "query {q:?}");
+            }
+        }
+    }
+    let mine: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM knowledge_articles WHERE org_id = $1")
+        .bind(a)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let found = tx.search_articles("password").await.unwrap().items;
+    assert!(!found.is_empty());
+    assert!(
+        found.iter().all(|x| mine.contains(&x.id)),
+        "org B's articles leaked"
+    );
+}
+
+/// Editing an article's title or content re-indexes it; publishing does not
+/// need to; deleting it removes its terms.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_search_index_follows_article_writes(pool: PgPool) {
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let art = tx
+        .create_article(&NewArticle {
+            title: "Gift cards".into(),
+            content: "Gift cards never expire".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Unpublished: indexed, but search still hides it.
+    assert!(tx.search_articles("gift").await.unwrap().items.is_empty());
+    tx.update_article(
+        art.id,
+        &ArticleUpdate {
+            published: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(tx.search_articles("expire").await.unwrap().items.len(), 1);
+
+    tx.update_article(
+        art.id,
+        &ArticleUpdate {
+            title: Some("Store credit".into()),
+            content: Some("Store credit lasts a year".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(tx.search_articles("expire").await.unwrap().items.is_empty());
+    assert!(tx.search_articles("Gift c").await.unwrap().items.is_empty());
+    assert_eq!(tx.search_articles("lasts").await.unwrap().items.len(), 1);
+    assert_eq!(tx.search_articles("re cr").await.unwrap().items.len(), 1);
+
+    tx.delete_article(art.id).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "deleting the article leaves terms behind");
+}
+
+/// Past the cap, article search counts to it and says so. For a one-word
+/// query whose matches all fit the read bound, the articles are still
+/// exactly the scan's (they are chosen by the word's count of positions,
+/// which orders `ts_rank` for one word); a several-word query's are matches
+/// in `ts_rank` order. Below the cap, among the same articles, it is exact.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn article_search_counts_up_to_the_cap(pool: PgPool) {
+    let db = db(pool);
+    let org = org();
+    let mut tx = db.begin(org).await.unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published, created_at) \
+         SELECT $1, 'Guide ' || n, repeat('gadget ', 1 + n % 40) || 'widget manual', true, \
+                now() - make_interval(secs => n) \
+         FROM generate_series(1, 1100) AS n",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published) \
+         VALUES ($1, 'Rare gadget', 'the only sprocket', true)",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+
+    let (indexed, scanned) = articles_both_ways(&mut tx, "gadget").await.unwrap();
+    assert_eq!((indexed.total, indexed.capped), (1000, true));
+    assert_eq!(indexed.ids, scanned.ids, "one word: the scan's best");
+
+    let found = tx.search_articles("gadget widget").await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1000, true));
+    let ids: Vec<Uuid> = found.items.iter().map(|a| a.id).collect();
+    assert_eq!(ids.len(), 20);
+    let ordered: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM knowledge_articles WHERE org_id = $1 AND id = ANY ($2) \
+           AND search_tsv @@ plainto_tsquery('english', 'gadget widget') \
+         ORDER BY ts_rank(search_tsv, plainto_tsquery('english', 'gadget widget')) DESC, \
+                  created_at DESC, id",
+    )
+    .bind(org)
+    .bind(&ids)
+    .fetch_all(tx.conn())
+    .await
+    .unwrap();
+    assert_eq!(ordered, ids, "matches, in ts_rank order");
+
+    for q in ["sprocket", "rare", "Guide 1099", "gadget sprocket"] {
+        let (indexed, scanned) = articles_both_ways(&mut tx, q).await.unwrap();
+        assert!(!indexed.capped, "{q:?}");
+        assert_eq!(indexed, scanned, "{q:?}");
+    }
+}
+
+/// Random articles over a small vocabulary (so words, stems, and title
+/// substrings collide often) and random queries (word runs, title pieces
+/// that span words) against the scan: identical whenever uncapped.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn random_article_corpora_search_like_the_scan(pool: PgPool) {
+    const VOCAB: [&str; 22] = [
+        "reset",
+        "set",
+        "settings",
+        "setup",
+        "password",
+        "passwords",
+        "pass",
+        "word",
+        "account",
+        "accounts",
+        "login",
+        "sign",
+        "in",
+        "the",
+        "of",
+        "refund",
+        "ship",
+        "shipping",
+        "order",
+        "team",
+        "data",
+        "passw",
+    ];
+    let db = db(pool);
+    let org = org();
+    let mut rng = common::Rng::new(0x1717);
+    let mut tx = db.begin(org).await.unwrap();
+    let words = |rng: &mut common::Rng, n: usize| -> String {
+        (0..n)
+            .map(|_| VOCAB[rng.below(VOCAB.len())])
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut titles = Vec::new();
+    for n in 0..150 {
+        let (nt, nc) = (1 + rng.below(4), 3 + rng.below(13));
+        let title = words(&mut rng, nt);
+        let content = words(&mut rng, nc);
+        sqlx::query(
+            "INSERT INTO knowledge_articles (org_id, title, content, published, created_at) \
+             VALUES ($1, $2, $3, $4, now() - make_interval(hours => $5))",
+        )
+        .bind(org)
+        .bind(&title)
+        .bind(&content)
+        .bind(rng.below(7) > 0)
+        .bind(n % 23)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        titles.push(title);
+    }
+    for i in 0..250 {
+        let (nw, t) = (1 + rng.below(3), titles[rng.below(titles.len())].clone());
+        let q = match i % 3 {
+            0 => words(&mut rng, nw),
+            1 => rng.substring(&t, 12),
+            _ => {
+                let at = rng.below(t.len().max(1));
+                t.chars().skip(at).take(4 + rng.below(12)).collect()
+            }
+        };
+        let Some((found, scanned)) = articles_both_ways(&mut tx, &q).await else {
+            continue;
+        };
+        if found.capped {
+            assert!(found.total <= scanned.total, "{q:?}");
+        } else {
+            assert_eq!(found, scanned, "query {q:?}");
+        }
+    }
+}
+
+/// A title must fit its limit, on create and on update.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn article_titles_are_length_limited(pool: PgPool) {
+    use cxp_core::knowledge::MAX_TITLE_CHARS;
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let a = tx
+        .create_article(&NewArticle {
+            title: "t".repeat(MAX_TITLE_CHARS),
+            content: "fits".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let e = tx
+        .create_article(&NewArticle {
+            title: "é".repeat(MAX_TITLE_CHARS + 1),
+            content: "too long".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
+    let e = tx
+        .update_article(
+            a.id,
+            &ArticleUpdate {
+                title: Some("é".repeat(MAX_TITLE_CHARS + 1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "invalid_argument");
 }

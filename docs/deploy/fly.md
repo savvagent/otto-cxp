@@ -48,8 +48,14 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   ([#16](https://github.com/savvagent/otto-cxp/issues/16)), so the role `fly postgres attach`
   creates, a superuser on the whole instance, is refused.
   Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
-  planner off some index paths; fine at today's volumes, slow at scale. Making them fast is
-  tracked in [#17](https://github.com/savvagent/otto-cxp/issues/17). The pool is
+  planner off index paths for `ILIKE`, `%`, and `@@`; since
+  [#17](https://github.com/savvagent/otto-cxp/issues/17) they look candidates up in their own
+  search index tables (migration 0004), read a bounded number of rows per query, and count
+  matches up to 1000 (`docs/specs/2026-10-14-search-under-rls-design.md`). The index costs about
+  7 kB per customer and 25 kB per published article as measured on a bulk-loaded benchmark;
+  indexes grown a row at a time run 25-30% larger. Searches also index, a batch at a time, the
+  rows written before migration 0004. Watching that size, and retiring the backlog path once
+  production has none left, is [#34](https://github.com/savvagent/otto-cxp/issues/34). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
