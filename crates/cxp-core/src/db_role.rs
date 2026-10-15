@@ -97,9 +97,8 @@ pub const PREDEFINED_ROLES: [&str; 10] = [
 /// instance means it is shared with them, which makes this process a
 /// deployment whatever its URLs say (a local run through `fly proxy` looks
 /// like loopback). `CONNECT` to one of them counts however it is held,
-/// `PUBLIC` included: `otto_app`, which this service's login may still belong to (until runbook
-/// T5), holds
-/// table privileges there.
+/// `PUBLIC` included: `otto_app`, which this service's login may still
+/// belong to (until runbook T5), holds table privileges there.
 ///
 /// `otto_cxp` itself is not in the list: the test cluster's `otto_cxp`
 /// database sits beside the per-test databases `#[sqlx::test]` creates, and
@@ -841,7 +840,8 @@ pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>> {
 
 /// Whether the session's login or current user is still a member of [`SHARED_TENANT_ROLE`]
 /// (false where it does not exist). Boot warns in a deployment while it is: nothing in this
-/// release uses it, and a grant another service makes to it would reach this login.
+/// release uses it, and a grant another service makes to it would reach this login. Always
+/// true for a superuser (a member of every role), which a deployment refuses anyway.
 pub async fn holds_shared_tenant_role(db: &Db) -> Result<bool> {
     let member: bool = sqlx::query_scalar(
         "SELECT coalesce((SELECT pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER') \
