@@ -217,14 +217,20 @@ async fn customer_matches_probe_each_candidate(pool: PgPool) {
             "matches joins its candidates to customers with a {kind}: {matches:#}"
         );
     }
-    for read in search_table_reads(matches) {
-        if read["Relation Name"] == "customers" {
-            let kind = read["Node Type"].as_str().unwrap_or_default();
-            assert!(
-                kind == "Index Scan" || kind == "Index Only Scan",
-                "matches reads customers with a {kind}: {matches:#}"
-            );
-        }
+    let customer_reads: Vec<&Value> = search_table_reads(matches)
+        .into_iter()
+        .filter(|n| n["Relation Name"] == "customers")
+        .collect();
+    assert!(
+        !customer_reads.is_empty(),
+        "matches reads no customers, so this test checks nothing: {matches:#}"
+    );
+    for read in customer_reads {
+        let kind = read["Node Type"].as_str().unwrap_or_default();
+        assert!(
+            kind == "Index Scan" || kind == "Index Only Scan",
+            "matches reads customers with a {kind}: {matches:#}"
+        );
     }
 }
 

@@ -69,7 +69,8 @@ const ARTICLE_COLS: &str =
 /// Each correlated `EXISTS` and `NOT EXISTS` probe (`title_hits`,
 /// `fts_hits`, `matches`) ends in `OFFSET 0` (#41): without it a generic
 /// plan may hash the probe into a read of every index row or published
-/// article of the org (the title check's even read every org's articles).
+/// article of the org (the title check's subplan even read every org's
+/// articles).
 /// `OFFSET 0` keeps each a per-candidate btree probe (`LIMIT` would not:
 /// Postgres drops it from an `EXISTS`) and changes no result.
 /// `tests/search_plans.rs` checks the plans.
