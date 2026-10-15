@@ -77,7 +77,7 @@ root table. No out-of-band steps.
 
 **Model:** sonnet — fully specified code.
 
-- [ ] **Step 1: Add the dev-dependencies.** In the root `Cargo.toml` `[workspace.dependencies]`,
+- [x] **Step 1: Add the dev-dependencies.** In the root `Cargo.toml` `[workspace.dependencies]`,
   after the `reqwest` entry, add:
 
 ```toml
@@ -92,7 +92,7 @@ base64 = "0.22"
   records the edges in `Cargo.lock`; confirm `git diff Cargo.lock` only adds `"base64"` and
   `"sha2"` to the `cxp-server` package's dependency list (no new package versions).
 
-- [ ] **Step 2: Create the template** `crates/cxp-server/src/install_page.html` with exactly this
+- [x] **Step 2: Create the template** `crates/cxp-server/src/install_page.html` with exactly this
   content (the `<style>` and `<script>` bodies are hashed byte for byte; do not reformat them):
 
 ````html
@@ -281,7 +281,7 @@ for (const button of document.querySelectorAll("button[data-copy]")) {
 </html>
 ````
 
-- [ ] **Step 3: Write the module with its failing tests.** Create
+- [x] **Step 3: Write the module with its failing tests.** Create
   `crates/cxp-server/src/install_page.rs`:
 
 ```rust
@@ -593,26 +593,26 @@ mod tests {
   `crates/cxp-server/src/lib.rs` after `pub mod health;`. (The response test is synchronous; the
   HEAD body is checked through the router in Task 2.)
 
-- [ ] **Step 4: Run the tests and see the CSP test fail.**
+- [x] **Step 4: Run the tests and see the CSP test fail.**
 
   Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p cxp-server --lib install_page`
   Expected: `the_csp_pins_exactly_the_embedded_style_and_script` FAILS (its message shows the
   expected CSP); every other `install_page` test passes.
 
-- [ ] **Step 5: Pin the real hashes.** Replace `STYLE_HASH` and `SCRIPT_HASH` with the values the
+- [x] **Step 5: Pin the real hashes.** Replace `STYLE_HASH` and `SCRIPT_HASH` with the values the
   failing assertion printed. For the template above they are
   `STYLE_HASH = BkQgInaa3iWX2Xuf68SM2cweJB6VPvma0ftoW9fc5Xg=` and
   `SCRIPT_HASH = 92nC2BTT6TmRZ5qPmaPC1O/48G4lO5YPK+97QWumpW0=` (computed with
   `python3 -c` over the exact block text); use what the test prints if they differ.
 
-- [ ] **Step 6: Run the tests and see them pass.**
+- [x] **Step 6: Run the tests and see them pass.**
 
   Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p cxp-server --lib install_page`
   Expected: 8 passed, 0 failed, 0 ignored. Then `cargo fmt --all` and
   `cargo clippy --workspace --all-targets --locked -- -D warnings` (clean; fix any finding without
   adding an `allow`).
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/cxp-server/Cargo.toml crates/cxp-server/src/install_page.html crates/cxp-server/src/install_page.rs crates/cxp-server/src/lib.rs
@@ -636,7 +636,7 @@ are matched before the fallback). No out-of-band steps.
 
 **Model:** sonnet — fully specified wiring and tests.
 
-- [ ] **Step 1: Write the failing router tests.** In `crates/cxp-server/src/lib.rs`'s `tests`
+- [x] **Step 1: Write the failing router tests.** In `crates/cxp-server/src/lib.rs`'s `tests`
   module:
 
   (a) Replace the body of `app_with` so a test can pass its own config:
@@ -808,14 +808,14 @@ are matched before the fallback). No out-of-band steps.
 
   Add `use axum::body::Bytes;` to the `tests` module's imports.
 
-- [ ] **Step 2: Run the tests and see them fail.**
+- [x] **Step 2: Run the tests and see them fail.**
 
   Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p cxp-server --lib`
   Expected: `a_browser_at_the_root_gets_the_install_page` and
   `head_at_the_root_gets_the_headers_and_no_body` FAIL with 404; the other new tests and all
   existing ones pass.
 
-- [ ] **Step 3: Wire the fallback.** In `crates/cxp-server/src/lib.rs`:
+- [x] **Step 3: Wire the fallback.** In `crates/cxp-server/src/lib.rs`:
 
   - Change the imports: `use http::{HeaderMap, Method, StatusCode, Uri};` and add
     `use install_page::InstallPage;`.
@@ -861,21 +861,21 @@ async fn fallback(page: InstallPage, method: Method, uri: Uri, headers: HeaderMa
 //!   everything else                   JSON 404
 ```
 
-- [ ] **Step 4: Run the tests and see them pass.**
+- [x] **Step 4: Run the tests and see them pass.**
 
   Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p cxp-server --lib`
   Expected: all pass (0 failed, 0 ignored).
 
-- [ ] **Step 5: Update CLAUDE.md.** In the Architecture paragraph, replace
+- [x] **Step 5: Update CLAUDE.md.** In the Architecture paragraph, replace
   ``POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`.``
   with
   ``POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, and `/`
   (a connector install page for browsers only; JSON 404 for everything else).``
 
-- [ ] **Step 6: Run every gate.** test, lint, format, extra, and the container build (exact
+- [x] **Step 6: Run every gate.** test, lint, format, extra, and the container build (exact
   commands in Global Constraints). Report pass counts per test binary.
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 git add crates/cxp-server/src/lib.rs CLAUDE.md

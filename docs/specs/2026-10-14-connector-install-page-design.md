@@ -1,6 +1,6 @@
 # A connector install page at `/` for browsers
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#29)
 **Ticket:** #25
 
 ## Brief
