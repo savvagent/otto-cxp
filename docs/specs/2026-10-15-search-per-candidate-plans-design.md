@@ -62,10 +62,16 @@ Out of scope (#41): changing the search semantics or the caps.
   of them, not only the two observed.
 - **`sub_new` also reads the whole org in generic plans** (the newest-first read for broad
   substring queries: a Bitmap Heap Scan and an on-disk sort of all 30k customers instead of the
-  `(org_id, created_at DESC)` index; `ab`: 111 ms generic against 58 ms custom). It is bounded by
-  design (`NEWEST_READ`), runs only for a broad query whose rarest window has more than
-  `SUBSTRING_READ` rows, and no rewrite keeps its results identical while forcing the index order.
-  Out of scope here; listed as a follow-up.
+  `(org_id, created_at DESC)` index; `ab`: 111 ms generic against 58 ms custom). Its output is
+  bounded (`NEWEST_READ` rows checked, 1,001 matches kept), but its read is not: the generic plan
+  sizes the read by the average org, below `NEWEST_READ`, so it reads and sorts the whole org, and
+  the read grows with the org beyond `NEWEST_READ`. It runs only for a broad query whose rarest
+  window has more than `SUBSTRING_READ` rows. No fence forces the index order, and a rewrite that
+  changes which rows it reads is a semantics change (#41 rules those out); listed as a follow-up.
+  Two joins are also unfenced and per candidate in every plan seen: `fz_read`'s lateral (a nested
+  loop over a few trigrams; a hash join would read all of the org's grams) and `ranked`'s join to
+  `knowledge_articles` (a nested loop on about 160 estimated rows). Neither is a fence target
+  here.
 
 ## Assumptions
 
@@ -75,8 +81,8 @@ Out of scope (#41): changing the search semantics or the caps.
   `EXISTS` into a semi/anti join or a hashed `ANY` subplan only after `simplify_EXISTS_query`,
   which refuses a subquery with an `OFFSET` clause (`LIMIT` alone is stripped, so `LIMIT 1` would
   not fence an `EXISTS`). With `OFFSET 0` the check stays a per-row subplan: one btree probe per
-  candidate. `OFFSET 0` changes no result. This holds in Postgres 16 (CI and local) and in every
-  later release so far (the same function in 17 and 18).
+  candidate. `OFFSET 0` changes no result. This holds in Postgres 16 (CI and local), and the same
+  function in the 17 and 18 sources (checked 2026-10-15).
 - **`LIMIT 1` is the fence for the `matches` lateral**, as the issue proposes: a subquery with a
   `LIMIT` is never pulled up into the outer join tree. The lookup is `org_id = $1 AND id = c.id`
   and `id` is the table's primary key, so it returns at most one row and `LIMIT 1` changes no
@@ -237,9 +243,12 @@ through CI (`ci-auto`, when `FLY_DEPLOY` is `enabled`).
 
 ## Risks & Open Questions
 
-- **The plan test leans on planner knobs.** If a future Postgres chose differently under them,
-  the test could fail without a real regression; the failure message prints the offending node so
-  it is quick to judge.
+- **The plan test leans on planner knobs and statistics.** Postgres keeps either the hashed or the
+  per-row form of an unfenced probe by estimated cost, so a plan shows a missing fence only when
+  the statistics favour the bad form: with the test's seed every fence but the article `matches`
+  `fts` check's fails a plan test when removed. `every_probe_keeps_its_fence` therefore checks all
+  six fences by their text too. If a future Postgres chose differently under the knobs, a plan
+  test could fail without a real regression; the failure message prints the offending node.
 - **`sub_new`** stays a whole-org read in generic plans for broad queries (follow-up).
 - **Production's Postgres major version** is not checked here; the fences rely on planner rules
   that are the same from 16 through 18.

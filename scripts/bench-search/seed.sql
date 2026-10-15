@@ -3,7 +3,7 @@
 -- row-level security has other orgs' rows to filter. Deterministic (setseed).
 -- With `-v size=mid` (#41) the org under test has 30k customers and 3k
 -- articles instead, the mid-size range where generic plans once read the
--- whole org (one 200-customer org among the others); about a minute.
+-- whole org (one 200-customer org among the others); about 80 s on a laptop.
 --
 --   createdb -h localhost -p <port> -U cxp bench
 --   # apply crates/cxp-core/migrations in order (or boot cxp-server once against it)
@@ -11,8 +11,8 @@
 --     -f scripts/bench-search/seed.sql < /usr/share/dict/words
 --
 -- LOCAL POSTGRES ONLY, as a superuser (it disables triggers and bypasses
--- RLS to load fast). About 15 minutes and 15 GB on a laptop at full size. Article text is
--- drawn Zipf-like from the lowercase words read on standard input (any word
+-- RLS to load fast). About 15 minutes and 15 GB on a laptop at full size.
+-- Article text is drawn Zipf-like from the lowercase words read on standard input (any word
 -- list, one word per line); customer names from common first and last names plus
 -- invented surnames. The search index tables are filled in bulk at the end,
 -- from migration 0004's own gram functions (the triggers write the same rows
@@ -20,6 +20,16 @@
 -- inserts one at a time do, so production's index will be that much larger
 -- per row than this database's.
 \set ON_ERROR_STOP 1
+\if :{?size}
+\else
+\set size big
+\endif
+SELECT :'size' = 'mid' AS mid, :'size' IN ('mid', 'big') AS known_size \gset
+\if :known_size
+\else
+\echo 'size must be mid or big'
+\quit
+\endif
 SELECT setseed(0.17);
 SET maintenance_work_mem = '1GB';
 SET max_parallel_maintenance_workers = 0;
@@ -72,11 +82,6 @@ CREATE TEMP TABLE sa AS SELECT array_agg(s) a FROM syl;
 CREATE TEMP TABLE da AS SELECT array_agg(d) a FROM domains;
 
 CREATE TEMP TABLE orgs (org uuid, n int, articles int);
-\if :{?size}
-\else
-\set size big
-\endif
-SELECT :'size' = 'mid' AS mid \gset
 \if :mid
 -- The mid-size benchmark (#41): the org under test has 30k customers and
 -- 3k articles, where the planner's generic plans once flattened the

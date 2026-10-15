@@ -86,13 +86,17 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 /// of the org's customers (up to [`NEWEST_READ`] + 1) runs only when the
 /// matches have not already capped the result.
 ///
-/// Each per-candidate step is fenced so a generic plan keeps it per
+/// Two per-candidate steps are fenced so a generic plan keeps them per
 /// candidate (#41): `LIMIT 1` in `matches`' lateral (a primary-key lookup,
 /// so at most one row anyway) stops the planner flattening it into a join
 /// over all of the org's customers, and `OFFSET 0` in `sub_hits`' probe
 /// stops it hashing the probe into a read of all of the org's index rows
 /// (`LIMIT` alone would not: Postgres drops it from an `EXISTS`). Neither
-/// changes a result. `tests/search_plans.rs` checks the plans.
+/// changes a result. `tests/search_plans.rs` checks them. Not fenced:
+/// `fz_read`'s lateral, a nested loop over a few trigrams in practice, and
+/// `sub_new`, which in a generic plan reads and sorts the whole org instead
+/// of walking `(org_id, created_at)` (the planner sizes it by the average
+/// org); it runs only for a broad substring query.
 pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
     let cap = TOTAL_CAP;
     format!(
@@ -202,7 +206,8 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// [`SEARCH_CUSTOMERS_SQL`]'s text, for the generic-plan shape tests
-/// (`tests/search_plans.rs`, #41). Not an interface.
+/// (`tests/search_plans.rs`, #41). Not an interface: it may change or go
+/// without notice.
 #[doc(hidden)]
 pub fn search_customers_sql() -> &'static str {
     &SEARCH_CUSTOMERS_SQL

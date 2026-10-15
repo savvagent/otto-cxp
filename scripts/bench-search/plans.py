@@ -18,6 +18,13 @@
 #
 #   python3 scripts/bench-search/plans.py postgres://cxp:cxp@localhost:<port>/bench
 #
+# The queries are narrow ones, the case #41 is about; `ab` (run.sh's broad
+# query) is left out because sub_new, its newest-first read, still reads the
+# whole org in a generic plan (see SEARCH_CUSTOMERS_SQL's doc comment), so
+# "per-candidate" here says nothing about it. Parallel workers are off, so
+# times are not comparable with run.sh's. The statement is the `WITH ` line
+# of each after-*.sql, as gen.py writes it.
+#
 # LOCAL POSTGRES ONLY.
 import json, os, re, subprocess, sys
 
@@ -64,6 +71,9 @@ def problems(root, customer):
         for v in n.values():
             if isinstance(v, str):
                 for name in re.findall(r'hashed (SubPlan \d+)', v):
+                    if name not in by_name:
+                        found.append(f"hashed {name} is not in the plan")
+                        continue
                     for r in nodes(by_name[name]):
                         if r.get('Relation Name') in TABLES and r.get('Actual Loops', 0) > 0:
                             found.append(f"hashed {name} reads {r['Relation Name']}")

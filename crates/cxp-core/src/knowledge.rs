@@ -66,14 +66,14 @@ const ARTICLE_COLS: &str =
 /// rarest lexeme past it; that includes title-only matches, which `ts_rank`
 /// scores above zero when they hold some of the query's lexemes.
 ///
-/// Each correlated `EXISTS` and `NOT EXISTS` probe (`title_hits`,
-/// `fts_hits`, `matches`) ends in `OFFSET 0` (#41): without it a generic
-/// plan may hash the probe into a read of every index row or published
-/// article of the org (the title check's subplan even read every org's
-/// articles).
-/// `OFFSET 0` keeps each a per-candidate btree probe (`LIMIT` would not:
-/// Postgres drops it from an `EXISTS`) and changes no result.
-/// `tests/search_plans.rs` checks the plans.
+/// Each correlated `EXISTS` and `NOT EXISTS` probe of `knowledge_search_terms`
+/// or `knowledge_articles` (in `title_hits`, `fts_hits`, and `matches`' `fts`
+/// check and title check) ends in `OFFSET 0` (#41): without it a generic plan
+/// may hash the probe into a read of every index row or published article of
+/// the org (the title check's `EXISTS (... a.title ILIKE $3)` even read every
+/// org's articles). `OFFSET 0` keeps each a per-candidate btree probe
+/// (`LIMIT` would not: Postgres drops it from an `EXISTS`) and changes no
+/// result. `tests/search_plans.rs` checks them.
 pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
     let cap = TOTAL_CAP;
     format!(
@@ -182,7 +182,8 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// [`SEARCH_ARTICLES_SQL`]'s text, for the generic-plan shape tests
-/// (`tests/search_plans.rs`, #41). Not an interface.
+/// (`tests/search_plans.rs`, #41). Not an interface: it may change or go
+/// without notice.
 #[doc(hidden)]
 pub fn search_articles_sql() -> &'static str {
     &SEARCH_ARTICLES_SQL

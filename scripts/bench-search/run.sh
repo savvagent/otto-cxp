@@ -3,9 +3,9 @@
 # database scripts/bench-search/seed.sql filled, exactly as a request runs
 # them: one client, prepared statements (as sqlx sends them, so the plan
 # cache moves to a generic plan after five runs), as otto_app pinned to the
-# big org. Prints p50/p95/max of whole-transaction latency in ms, after six
-# warm-up runs. after-*.sql come from gen.py (the search and the page's
-# rows, as cxp_core runs them).
+# org under test (...0a). Prints p50/p95/max of whole-transaction latency in
+# ms, after six warm-up runs. after-*.sql come from gen.py (the search and
+# the page's rows, as cxp_core runs them).
 #
 #   scripts/bench-search/run.sh postgres://cxp:cxp@localhost:<port>/bench [runs]
 #

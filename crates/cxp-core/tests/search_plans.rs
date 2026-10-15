@@ -1,20 +1,27 @@
-//! The search statements' generic plans keep every per-candidate step a
-//! per-candidate probe (#41). sqlx prepares each statement once per
-//! connection, and Postgres moves to a generic plan after five runs; in orgs
-//! of a few thousand to about 100k rows the planner then flattened the
-//! customer `matches` lateral into a hash join over all of the org's
-//! customers, and turned the article title check into a hashed subplan over
-//! every published article. The statements fence those steps (`LIMIT 1` in
-//! the lateral, `OFFSET 0` in each correlated `EXISTS`), which the planner
-//! cannot see through whatever the statistics say.
+//! The search statements' generic plans keep their per-candidate probes per
+//! candidate (#41). sqlx prepares each statement once per connection, and
+//! after five runs Postgres moves to a generic plan when it looks no costlier
+//! than the custom ones; in orgs of a few thousand to about 100k rows the
+//! planner then flattened the customer `matches` lateral into a hash join
+//! over all of the org's customers, and hashed index-table probes and the
+//! article title check into reads of the whole org (the title check's, of
+//! every org's articles). The statements fence those steps (`LIMIT 1` in the
+//! lateral, `OFFSET 0` in each correlated `EXISTS`/`NOT EXISTS` probe of a
+//! search table), which the planner cannot see through whatever the
+//! statistics say.
 //!
-//! These tests check the fences, not costs: each plans the statement as a
-//! request does (as `otto_app`, org pinned, `force_generic_plan`) with the
+//! The plan tests check the fences, not costs: each plans the statement as
+//! `otto_app` with the org pinned under `force_generic_plan`, with the
 //! planner pushed toward the bad alternative (`enable_nestloop = off` makes
 //! a flattened lateral a hash or merge join; index scans off make a per-row
 //! probe a scan per candidate, so a hashed subplan wins wherever one is
-//! allowed), and asserts the bad alternative is not there. Without the
-//! fences both tests fail.
+//! allowed), and asserts the bad alternative is not there. Postgres keeps
+//! either the hashed or the per-row form of an unfenced probe by estimated
+//! cost, so whether a missing fence shows in a plan depends on the
+//! statistics: with this seed, removing any fence but the `fts` check's in
+//! the article `matches` fails a plan test. `every_probe_keeps_its_fence`
+//! covers all of them by their text. The `hashed SubPlan N` wording these
+//! tests read is Postgres 16's, and 17's and 18's (`(hashed SubPlan N).colN`).
 
 mod common;
 
@@ -166,8 +173,18 @@ fn search_table_reads(node: &Value) -> Vec<&Value> {
         .collect()
 }
 
-/// No hashed subplan reads a search table.
+/// No hashed subplan reads a search table, and some per-row subplan does
+/// (so the settings took effect and there was something to hash).
 fn assert_no_hashed_search_table(root: &Value, what: &str) {
+    let per_row_probes = subtree(root)
+        .into_iter()
+        .filter(|n| n["Parent Relationship"] == "SubPlan")
+        .filter(|n| !search_table_reads(n).is_empty())
+        .count();
+    assert!(
+        per_row_probes > 0,
+        "{what}: no subplan reads a search table, so this checks nothing: {root:#}"
+    );
     for name in hashed_subplans(root) {
         let reads = search_table_reads(named(root, &name));
         assert!(
@@ -259,4 +276,47 @@ async fn search_index_probes_are_never_hashed(pool: PgPool) {
     )
     .await;
     assert_no_hashed_search_table(&articles, "search_articles");
+}
+
+/// The fences are text, and a plan shows a missing one only when the
+/// statistics favour the bad plan, so their presence is checked as text too:
+/// `LIMIT 1` closing the customer `matches` lateral, `OFFSET 0` closing
+/// `sub_hits`' probe, and `OFFSET 0` closing each article probe of a search
+/// table (`title_hits`, `fts_hits`, the `fts` check and the title `EXISTS`
+/// in `matches`). See the doc comments on the statements.
+#[test]
+fn every_probe_keeps_its_fence() {
+    let customers = cxp_core::customers::search_customers_sql();
+    assert!(
+        customers.contains("LIMIT 1) AS m "),
+        "the customer matches lateral lost its LIMIT 1"
+    );
+    assert_eq!(
+        customers.matches("OFFSET 0))").count(),
+        1,
+        "sub_hits' probe must end in OFFSET 0"
+    );
+    let articles = cxp_core::knowledge::search_articles_sql();
+    for (fence, what) in [
+        (
+            "= r.article_id OFFSET 0)) ",
+            "title_hits' and fts_hits' probes",
+        ),
+        (
+            "= h.article_id OFFSET 0)) AS fts ",
+            "the fts check in matches",
+        ),
+        (
+            "a.title ILIKE $3 OFFSET 0))) AS u ",
+            "the title EXISTS in matches",
+        ),
+    ] {
+        assert!(articles.contains(fence), "{what} lost OFFSET 0");
+    }
+    assert_eq!(
+        articles.matches("OFFSET 0)").count(),
+        4,
+        "every article probe of a search table ends in OFFSET 0"
+    );
+    assert_eq!(articles.matches("= r.article_id OFFSET 0)) ").count(), 2);
 }
