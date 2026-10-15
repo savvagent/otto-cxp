@@ -1,6 +1,6 @@
 # A dedicated non-superuser database role for otto-cxp — design
 
-**Status:** DRAFT (#16)
+**Status:** IMPLEMENTED (#26)
 **Issue:** #16
 **Plan:** `docs/plans/2026-10-14-least-privilege-db-role.md`
 
