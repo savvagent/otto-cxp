@@ -410,14 +410,17 @@ fn missing_grants(missing: &[&str], role: &str) -> String {
     let role = sql_identifier(role);
     let mut fixes = Vec::new();
     // Matched on the constant itself, so rewording an entry cannot drop its fix.
-    let [tombstone, otto_app] = cxp_core::db_role::RUNTIME_GRANTS;
+    let [tombstone, tenant] = cxp_core::db_role::RUNTIME_GRANTS;
     if missing.contains(&tombstone) {
         fixes.push(format!(
             "GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO {role}"
         ));
     }
-    if missing.contains(&otto_app) {
-        fixes.push(format!("GRANT otto_app TO {role} WITH INHERIT TRUE"));
+    if missing.contains(&tenant) {
+        fixes.push(format!(
+            "GRANT {} TO {role} WITH INHERIT TRUE",
+            cxp_core::TENANT_ROLE
+        ));
     }
     format!(
         "the runtime role {role} lacks {} (the org.deleted tombstone and the background tasks \
@@ -1021,15 +1024,15 @@ mod tests {
              deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO \"cxp_server\""
         );
         assert_eq!(
-            missing_grants(&["inheriting otto_app"], "Cxp"),
-            "the runtime role \"Cxp\" lacks inheriting otto_app (the org.deleted tombstone \
-             and the background tasks need them); fix with: GRANT otto_app TO \"Cxp\" WITH \
+            missing_grants(&["inheriting cxp_app"], "Cxp"),
+            "the runtime role \"Cxp\" lacks inheriting cxp_app (the org.deleted tombstone \
+             and the background tasks need them); fix with: GRANT cxp_app TO \"Cxp\" WITH \
              INHERIT TRUE"
         );
         let both = missing_grants(&cxp_core::db_role::RUNTIME_GRANTS, "r");
         assert!(
             both.ends_with(
-                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; GRANT otto_app TO "r" WITH INHERIT TRUE"#
+                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; GRANT cxp_app TO "r" WITH INHERIT TRUE"#
             ),
             "{both}"
         );

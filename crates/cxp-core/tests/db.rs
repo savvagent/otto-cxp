@@ -2340,7 +2340,7 @@ async fn the_database_role_check_sees_where_a_role_may_create(pool: PgPool) {
     noinherit_db.pool().close().await;
 }
 
-/// The runtime role needs, beyond `otto_app`, only `INSERT` on
+/// The runtime role needs, beyond the tenant role (`cxp_app`), only `INSERT` on
 /// `deleted_orgs` (the `org.deleted` tombstone, written as itself), which
 /// migration 0005 grants to `cxp_runtime` (#27).
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -2355,7 +2355,7 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
         .is_empty());
 
     let (login, as_login) = roles.login(&pool, "cxp_t_runtime", base).await;
-    sqlx::query(&format!("GRANT otto_app TO {login}"))
+    sqlx::query(&format!("GRANT {} TO {login}", cxp_core::TENANT_ROLE))
         .execute(&pool)
         .await
         .unwrap();
@@ -2378,21 +2378,21 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
     assert!(missing_runtime_grants(&as_login).await.unwrap().is_empty());
     as_login.pool().close().await;
 
-    // A NOINHERIT login that is a member of otto_app holds none of its
+    // A NOINHERIT login that is a member of cxp_app holds none of its
     // privileges without SET ROLE: reported, with the insert it inherits
     // nothing of either.
     let (noinherit, as_noinherit) = roles
         .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
         .await;
     for stmt in [
-        format!("GRANT otto_app TO {noinherit}"),
+        format!("GRANT {} TO {noinherit}", cxp_core::TENANT_ROLE),
         format!("GRANT cxp_runtime TO {noinherit}"),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
     assert_eq!(
         missing_runtime_grants(&as_noinherit).await.unwrap(),
-        ["INSERT on deleted_orgs", "inheriting otto_app"]
+        ["INSERT on deleted_orgs", "inheriting cxp_app"]
     );
     // A grant directly to the login fixes the insert, not the inheritance.
     sqlx::query(&format!("GRANT INSERT ON deleted_orgs TO {noinherit}"))
@@ -2401,9 +2401,181 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
         .unwrap();
     assert_eq!(
         missing_runtime_grants(&as_noinherit).await.unwrap(),
-        ["inheriting otto_app"]
+        ["inheriting cxp_app"]
     );
     as_noinherit.pool().close().await;
+
+    // A login in otto_app and cxp_runtime but not cxp_app lacks the tenant role.
+    let (other, as_other) = roles.login(&pool, "cxp_t_shared", base).await;
+    for stmt in [
+        format!("GRANT otto_app TO {other}"),
+        format!("GRANT cxp_runtime TO {other}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert_eq!(
+        missing_runtime_grants(&as_other).await.unwrap(),
+        ["inheriting cxp_app"]
+    );
+    as_other.pool().close().await;
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn holds_shared_tenant_role_sees_membership_in_otto_app(pool: PgPool) {
+    use cxp_core::db_role::holds_shared_tenant_role;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let (member, as_member) = roles.login(&pool, "cxp_t_member", base).await;
+    sqlx::query(&format!("GRANT otto_app TO {member}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(holds_shared_tenant_role(&as_member).await.unwrap());
+    as_member.pool().close().await;
+
+    let (own, as_own) = roles.login(&pool, "cxp_t_own", base).await;
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        format!("GRANT {} TO {own}", cxp_core::TENANT_ROLE),
+        format!("GRANT cxp_runtime TO {own}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(!holds_shared_tenant_role(&as_own).await.unwrap());
+    as_own.pool().close().await;
+}
+
+/// Every privilege otto_app holds, cxp_app holds too, and no more: the two are
+/// interchangeable to the schema, which is what lets the previous release run against it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_holds_exactly_what_otto_app_holds(pool: PgPool) {
+    let queries: [(&str, String); 4] = [
+        (
+            "relations",
+            privilege_diff(
+                "SELECT c.oid::regclass::text AS name, p AS privilege FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace, \
+                 unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p \
+                 WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')",
+                "has_table_privilege",
+            ),
+        ),
+        (
+            "sequences",
+            privilege_diff(
+                "SELECT c.oid::regclass::text AS name, p AS privilege FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace, \
+                 unnest(ARRAY['USAGE','SELECT','UPDATE']) p \
+                 WHERE n.nspname = 'public' AND c.relkind = 'S'",
+                "has_sequence_privilege",
+            ),
+        ),
+        (
+            "functions",
+            privilege_diff(
+                "SELECT f.oid::regprocedure::text AS name, 'EXECUTE' AS privilege FROM pg_proc f \
+                 JOIN pg_namespace n ON n.oid = f.pronamespace WHERE n.nspname = 'public'",
+                "has_function_privilege",
+            ),
+        ),
+        (
+            "schema",
+            privilege_diff(
+                "SELECT n.oid::regnamespace::text AS name, p AS privilege FROM pg_namespace n, \
+                 unnest(ARRAY['USAGE','CREATE']) p WHERE n.nspname = 'public'",
+                "has_schema_privilege",
+            ),
+        ),
+    ];
+    for (kind, sql) in &queries {
+        let diff: Vec<(String, String)> = sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
+        assert!(
+            diff.is_empty(),
+            "{kind} differ between cxp_app and otto_app: {diff:?}"
+        );
+    }
+    for f in [
+        "public.console_session_org(bytea)",
+        "public.expire_removed_members()",
+    ] {
+        let (tenant, public): (bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('cxp_app', $1, 'EXECUTE'), \
+                    has_function_privilege('public', $1, 'EXECUTE')",
+        )
+        .bind(f)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(tenant, "cxp_app cannot execute {f}");
+        assert!(!public, "PUBLIC can execute {f}");
+    }
+}
+
+/// The rows of `candidates` (name, privilege) on which `has` answers differently for the two roles.
+fn privilege_diff(candidates: &str, has: &str) -> String {
+    format!(
+        "SELECT name, privilege FROM ({candidates}) AS q(name, privilege) WHERE \
+         {has}('cxp_app', name, privilege) IS DISTINCT FROM {has}('otto_app', name, privilege)"
+    )
+}
+
+/// A tenant transaction runs as cxp_app, which may not write the tombstone; the connecting
+/// login (through cxp_runtime) may.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn tenant_transactions_cannot_write_the_tombstone(pool: PgPool) {
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let (login, as_login) = roles.login(&pool, "cxp_t_tomb", base).await;
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        "GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string(),
+        format!("GRANT {} TO {login}", cxp_core::TENANT_ROLE),
+        format!("GRANT cxp_runtime TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    // begin() needs a second connection beside the transaction's own.
+    let wide = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(as_login.pool().connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    as_login.pool().close().await;
+    let as_login = cxp_core::tenant_db(wide);
+    sqlx::query("INSERT INTO deleted_orgs (org_id) VALUES ($1)")
+        .bind(Uuid::new_v4())
+        .execute(as_login.pool())
+        .await
+        .expect("the connecting role writes the tombstone");
+
+    let mut tx = as_login.begin(org()).await.unwrap();
+    let err = sqlx::query("INSERT INTO deleted_orgs (org_id) VALUES ($1)")
+        .bind(Uuid::new_v4())
+        .execute(tx.conn())
+        .await
+        .expect_err("a tenant transaction may not write a tombstone");
+    assert_eq!(sqlstate(&err), "42501", "{err}");
+    drop(tx);
+    as_login.pool().close().await;
+}
+
+/// The release before #28 builds its Db with otto-tenant's default role. During the rollout,
+/// and after a rollback, it runs against a schema migration 0007 has changed: otto_app keeps
+/// every grant, so isolation still holds as otto_app.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_previous_release_still_isolates_as_otto_app(pool: PgPool) {
+    #[allow(clippy::disallowed_methods)] // deliberately the previous release's construction
+    let previous = otto_tenant::Db::from_pool(pool.clone());
+    let report = previous
+        .verify_tenant_isolation()
+        .await
+        .expect("isolation as otto_app");
+    assert_eq!(report.effective_role, "otto_app");
+    assert!(report.tenant_role_assumed);
 }
 
 /// Before migrations there is no `deleted_orgs` to need a grant on.

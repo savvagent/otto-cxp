@@ -2,7 +2,7 @@
 //! around row-level security or out of its own database, and whether the
 //! instance is shared with the other otto services.
 //!
-//! Tenant transactions drop to `otto_app` and are proven isolated at boot,
+//! Tenant transactions drop to `cxp_app` ([`crate::TENANT_ROLE`]) and are proven isolated at boot,
 //! but everything else (migrations, the maintenance sweep and usage shipper,
 //! the `org.deleted` tombstone, `/readyz`) runs as the connecting role
 //! itself. The unpinned policies bind that role only while it is neither a
@@ -97,7 +97,8 @@ pub const PREDEFINED_ROLES: [&str; 10] = [
 /// instance means it is shared with them, which makes this process a
 /// deployment whatever its URLs say (a local run through `fly proxy` looks
 /// like loopback). `CONNECT` to one of them counts however it is held,
-/// `PUBLIC` included: `otto_app`, which this service's role belongs to, holds
+/// `PUBLIC` included: `otto_app`, which this service's login may still belong to (until runbook
+/// T5), holds
 /// table privileges there.
 ///
 /// `otto_cxp` itself is not in the list: the test cluster's `otto_cxp`
@@ -231,17 +232,21 @@ pub const OWNED_KINDS: [&str; 15] = [
     "index",
 ];
 
-/// What the runtime role needs besides being a member of `otto_app`.
+/// What the runtime role needs besides its own login:
 ///
-/// - `INSERT on deleted_orgs`: what it does as itself rather than as
-///   `otto_app`, on a table it no longer owns once the migration owner is
-///   split from it (#27): the `org.deleted` tombstone. Migration 0005 grants
-///   it to `cxp_runtime`.
-/// - `inheriting otto_app`: the maintenance sweep, the usage shipper, and the
-///   console lookup run as the connecting role and rely on the table
-///   privileges it holds through `otto_app`; a `NOINHERIT` login, or a grant
-///   `WITH INHERIT FALSE`, is a member that holds none of them.
-pub const RUNTIME_GRANTS: [&str; 2] = ["INSERT on deleted_orgs", "inheriting otto_app"];
+/// - `INSERT on deleted_orgs`: what it does as itself and a tenant transaction may not, on a
+///   table it does not own (#27): the `org.deleted` tombstone. Migration 0005 grants it to
+///   `cxp_runtime`.
+/// - `inheriting cxp_app` ([`crate::TENANT_ROLE`]): the maintenance sweep, the usage shipper, and
+///   the console lookup run as the connecting role and use the table and function grants it
+///   inherits from the tenant role (#28); a `NOINHERIT` login, or a grant `WITH INHERIT FALSE`,
+///   holds none of them, and otto-tenant cannot `SET LOCAL ROLE` to a role it does not hold.
+pub const RUNTIME_GRANTS: [&str; 2] = ["INSERT on deleted_orgs", "inheriting cxp_app"];
+
+/// The tenant role the otto services on a shared instance may share. otto-cxp no longer uses it
+/// (#28), but the release before it does, so the runtime login stays a member until that
+/// release cannot come back (docs/deploy/fly.md, runbook T5).
+pub const SHARED_TENANT_ROLE: &str = "otto_app";
 
 /// One privileged role, and which of the session's users holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,10 +816,9 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
 
 /// The [`RUNTIME_GRANTS`] the connecting role lacks, in that order: `INSERT
 /// on deleted_orgs` when that table exists and `current_user` may not insert
-/// into it, and `inheriting otto_app` when that role exists and
-/// `current_user` does not hold its privileges (`pg_has_role(..., 'USAGE')`).
-/// Empty before migrations (no table yet) and for the table's owner where
-/// `otto_app` does not exist.
+/// into it, and `inheriting cxp_app` when `current_user` does not hold the
+/// tenant role's privileges (`pg_has_role(..., 'USAGE')`), or that role does
+/// not exist. Empty for the first before migrations (no table yet).
 pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>> {
     // has_table_privilege and pg_has_role are strict: a NULL oid (no table,
     // no role) gives NULL.
@@ -822,9 +826,10 @@ pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>> {
         "SELECT coalesce(NOT pg_catalog.has_table_privilege(current_user, \
                 pg_catalog.to_regclass('public.deleted_orgs'), 'INSERT'), false), \
                 coalesce(NOT pg_catalog.pg_has_role(current_user, \
-                (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'otto_app'), 'USAGE'), \
-                false)",
+                (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1), 'USAGE'), \
+                true)",
     )
+    .bind(crate::TENANT_ROLE)
     .fetch_one(db.pool())
     .await?;
     Ok([no_insert, no_inherit]
@@ -834,10 +839,33 @@ pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>> {
         .collect())
 }
 
+/// Whether the session's login or current user is still a member of [`SHARED_TENANT_ROLE`]
+/// (false where it does not exist). Boot warns in a deployment while it is: nothing in this
+/// release uses it, and a grant another service makes to it would reach this login.
+pub async fn holds_shared_tenant_role(db: &Db) -> Result<bool> {
+    let member: bool = sqlx::query_scalar(
+        "SELECT coalesce((SELECT pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER') \
+                              OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') \
+                          FROM pg_catalog.pg_roles r WHERE r.rolname = $1), false)",
+    )
+    .bind(SHARED_TENANT_ROLE)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(member)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Privilege::*;
     use super::*;
+
+    #[test]
+    fn the_inheritance_grant_names_the_tenant_role() {
+        assert_eq!(
+            RUNTIME_GRANTS[1],
+            format!("inheriting {}", crate::TENANT_ROLE)
+        );
+    }
 
     #[test]
     fn the_summary_names_every_privilege_and_where_it_comes_from() {
