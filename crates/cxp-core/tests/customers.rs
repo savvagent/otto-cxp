@@ -1319,6 +1319,15 @@ async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
         .await
         .unwrap();
     assert!(indexed, "the article insert's false was overridden");
+    sqlx::query("UPDATE knowledge_articles SET search_indexed = false")
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    let indexed: bool = sqlx::query_scalar("SELECT search_indexed FROM knowledge_articles")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert!(indexed, "the article update's false was overridden");
     let terms: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
         .fetch_one(tx.conn())
         .await
@@ -1356,10 +1365,15 @@ async fn a_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
 
     let mut tx = db.begin(org).await.unwrap();
     let started = std::time::Instant::now();
-    let e = tx
-        .search_customers("anything", Page::default())
-        .await
-        .unwrap_err();
+    // Bounded, so a search that stopped setting its timeout fails here
+    // instead of waiting on the lock for good.
+    let e = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tx.search_customers("anything", Page::default()),
+    )
+    .await
+    .expect("the search waited past its own timeout")
+    .unwrap_err();
     let waited = started.elapsed();
     drop(tx);
     lock.rollback().await.unwrap();

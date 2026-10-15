@@ -119,7 +119,8 @@ pub(crate) async fn prepare(tx: &mut Tx<'_>) -> Result<()> {
 /// A search statement's failure: past [`STATEMENT_TIMEOUT`] (SQLSTATE
 /// 57014) it is [`Error::QueryTooBroad`], logged at `warn` with the search
 /// it was (never the query, which may be customer data); anything else is
-/// a database error.
+/// a database error. An operator's `pg_cancel_backend` raises 57014 too and
+/// reads the same way, which is harmless: retrying it is right.
 pub(crate) fn on_timeout(search: &'static str) -> impl FnOnce(sqlx::Error) -> Error {
     move |e| {
         let timed_out =

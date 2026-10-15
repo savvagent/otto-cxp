@@ -1151,7 +1151,13 @@ async fn an_article_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
 
     let mut tx = db.begin(org).await.unwrap();
     let started = std::time::Instant::now();
-    let e = tx.search_articles("anything").await.unwrap_err();
+    let e = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tx.search_articles("anything"),
+    )
+    .await
+    .expect("the search waited past its own timeout")
+    .unwrap_err();
     let waited = started.elapsed();
     drop(tx);
     lock.rollback().await.unwrap();
