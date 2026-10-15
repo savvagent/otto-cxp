@@ -122,7 +122,7 @@ None.
 
 ## Out-of-band
 
-None for this change. Enabling sign-in remains Rob's (#31): client register,
+None for this change, and no recurring cost. Enabling sign-in remains Rob's (#31): client register,
 `fly secrets set --stage`, then the `fly.toml` PR, then live verification.
 
 ## Error handling & edge cases
@@ -132,9 +132,14 @@ None for this change. Enabling sign-in remains Rob's (#31): client register,
   refresh token is spent, so the next claim signs the person out. This is the
   issue's stated worst case: nothing leaks, nothing is presented twice by this
   holder.
-- An `org.deleted` purge holding the lifecycle lock exclusively: the store now
-  times out after 2 s instead of waiting for the purge; the session is being
-  deleted anyway.
+- A lifecycle webhook holding the org's lifecycle lock exclusively
+  (`exclude_requests`: `org.deleted`, `member.removed`, `team.deleted`): the
+  store now times out after 2 s instead of waiting. After `org.deleted` the
+  session is gone anyway; `member.removed` and `team.deleted` are short
+  single-org transactions (a few bounded deletes), so a store that loses that
+  race is rare, and its cost is the stated worst case (that one person signs in
+  again; nothing leaks). The existing module docs' claim that only
+  `org.deleted` takes the lock exclusively is corrected.
 - `release_lease` times out: logged at `warn` (existing), lease lapses on its
   own.
 - `delete_generation` with a stale lease: returns 0, the newer holder's session
@@ -149,10 +154,16 @@ None for this change. Enabling sign-in remains Rob's (#31): client register,
   second connection) and assert `store_refreshed` and `release_lease` return
   `Err` within a few seconds and the row is unchanged afterwards; hold the
   org's lifecycle lock exclusively and assert the same for `store_refreshed`;
-  assert the settings do not leak to the next transaction on the connection.
+  assert the settings do not leak to the next transaction on the connection
+  (a `max_connections(1)` pool, so the next transaction reuses it). The
+  lifecycle lock is held with `platform_events::LIFECYCLE_LOCK`, made `pub`.
+  The `set_config` values are bound as text (`set_config(text, text, bool)`).
+  The existing `delete_generation` calls in that file move to a `Lease`.
 - `console_sessions.rs`: `delete_generation` with a lease superseded at the
   same generation deletes nothing; with the current lease deletes the row.
-- `db.rs`: the `DROP OWNED BY` survival test with the control policy.
+- `db.rs`: the `DROP OWNED BY` survival test with the control policy, moving
+  ownership from one non-superuser, non-`BYPASSRLS` role to a second (never
+  to the superuser test runner, which would bypass RLS and prove nothing).
 - `cxp-http` budget: compile-time assertion.
 
 ## Risks & open questions
