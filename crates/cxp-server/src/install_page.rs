@@ -22,6 +22,11 @@ use axum::body::{Body, Bytes};
 use axum::response::Response;
 use http::{header, HeaderMap, HeaderValue};
 
+/// The request headers that choose between this page and the JSON 404 at
+/// `/` (see [`wants_page`]). Both answers carry it, so no shared cache hands
+/// one to a request that should get the other (#32).
+pub const VARY: &str = "Accept, Authorization";
+
 /// The page, with `{{CONNECTOR_URL}}`, `{{GUIDE_URL}}`, and `{{CONSOLE_URL}}`
 /// still in it.
 const TEMPLATE: &str = include_str!("install_page.html");
@@ -78,7 +83,7 @@ impl InstallPage {
             (header::CACHE_CONTROL, "public, max-age=3600"),
             // The same URL answers JSON to programs: no cache may hand this
             // to a request with another Accept or with credentials.
-            (header::VARY, "Accept, Authorization"),
+            (header::VARY, VARY),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::REFERRER_POLICY, "no-referrer"),
             (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),

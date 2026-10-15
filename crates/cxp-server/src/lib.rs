@@ -261,7 +261,7 @@ fn percent_decode(path: &str) -> Option<String> {
 /// Everything no route serves. Under `/console/`, a `GET` or `HEAD` is a file
 /// of the built console, or `index.html` for a browser navigation the console
 /// routes itself; `/console` redirects to `/console/`. Everything else is
-/// the JSON `404` ([`fallback`] has already served `/` to a browser), so an
+/// the JSON `404` ([`fallback`] has already answered `GET`/`HEAD /`), so an
 /// agent or script that guessed a path still gets a machine-readable answer.
 async fn console_or_not_found(assets: Option<ConsoleAssets>, req: Request) -> Response {
     let path = req.uri().path().to_string();
@@ -374,15 +374,19 @@ async fn json_payload_too_large(res: Response) -> Response {
 
 /// Everything no route serves. A browser opening `/` gets the connector
 /// install page ([`install_page`]); serving it here rather than from a `/`
-/// route keeps `POST /` a 404 instead of a 405. Anything else goes to
-/// [`console_or_not_found`].
+/// route keeps `POST /` a 404 instead of a 405. Any other `GET`/`HEAD /` gets
+/// the JSON 404 with the page's `Vary`, since `Accept` and `Authorization`
+/// chose between the two. Anything else goes to [`console_or_not_found`].
 async fn fallback(page: InstallPage, assets: Option<ConsoleAssets>, req: Request) -> Response {
     let head = *req.method() == Method::HEAD;
-    if req.uri().path() == "/"
-        && (head || *req.method() == Method::GET)
-        && install_page::wants_page(req.headers())
-    {
-        return page.response(head);
+    if req.uri().path() == "/" && (head || *req.method() == Method::GET) {
+        if install_page::wants_page(req.headers()) {
+            return page.response(head);
+        }
+        let mut res = not_found("/");
+        res.headers_mut()
+            .insert(header::VARY, HeaderValue::from_static(install_page::VARY));
+        return res;
     }
     console_or_not_found(assets, req).await
 }
@@ -563,7 +567,10 @@ mod tests {
     }
 
     /// curl (`*/*`), agents (`application/json`), and anything presenting
-    /// credentials keep exactly the JSON 404 they got before the page.
+    /// credentials keep exactly the JSON 404 they got before the page, now
+    /// with the page's `Vary`: both answers share one URL, so a shared cache
+    /// that stored this 404 must not hand it to a browser, nor the page to a
+    /// program (#32).
     #[tokio::test]
     async fn programs_at_the_root_still_get_the_json_404() {
         let expected = root_404_bytes().await;
@@ -583,29 +590,46 @@ mod tests {
             let (status, h, body) = send_raw(app(), request("GET", "/", headers)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{headers:?}");
             assert_eq!(h["content-type"], "application/json", "{headers:?}");
-            assert!(h.get("vary").is_none(), "{headers:?}");
+            assert_eq!(h["vary"], "Accept, Authorization", "{headers:?}");
             assert_eq!(body, expected, "{headers:?}");
+        }
+        // HEAD chooses between the same two answers; a query string does
+        // not change the path.
+        for (method, path) in [("HEAD", "/"), ("GET", "/?from=agent")] {
+            let (status, h, body) =
+                send_raw(app(), request(method, path, &[("accept", "*/*")])).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(h["content-type"], "application/json", "{method} {path}");
+            assert_eq!(h["vary"], "Accept, Authorization", "{method} {path}");
+            if method == "GET" {
+                assert_eq!(body, expected, "{method} {path}");
+            }
         }
     }
 
     /// Only `GET`/`HEAD /` changed: other methods on `/` and every other
-    /// path are the JSON 404 even for a browser.
+    /// path are the JSON 404 even for a browser, with no `Vary`, since
+    /// nothing in the request chooses their answer.
     #[tokio::test]
     async fn other_methods_and_paths_stay_json_404_for_a_browser() {
-        for (method, path) in [
-            ("POST", "/"),
-            ("PUT", "/"),
-            ("DELETE", "/"),
-            ("GET", "/nope"),
-            ("GET", "/index.html"),
-            ("GET", "//"),
-        ] {
-            let (status, h, body) =
-                send_raw(app(), request(method, path, &[("accept", BROWSER_ACCEPT)])).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
-            assert_eq!(h["content-type"], "application/json", "{method} {path}");
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["code"], "not_found", "{method} {path}");
+        for accept in [BROWSER_ACCEPT, "*/*"] {
+            for (method, path) in [
+                ("POST", "/"),
+                ("PUT", "/"),
+                ("DELETE", "/"),
+                ("GET", "/nope"),
+                ("GET", "/index.html"),
+                ("GET", "//"),
+            ] {
+                let (status, h, body) =
+                    send_raw(app(), request(method, path, &[("accept", accept)])).await;
+                let case = format!("{method} {path} ({accept})");
+                assert_eq!(status, StatusCode::NOT_FOUND, "{case}");
+                assert_eq!(h["content-type"], "application/json", "{case}");
+                assert!(h.get("vary").is_none(), "{case}");
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["code"], "not_found", "{case}");
+            }
         }
     }
 

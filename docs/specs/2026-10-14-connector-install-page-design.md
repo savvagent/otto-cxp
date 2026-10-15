@@ -47,7 +47,9 @@ Acceptance criteria:
   credentials is a program.
 - **The JSON 404 stays identical, headers included.** It gets no `Vary`. The page response carries
   `Vary: Accept, Authorization`, so no cache reuses the page for a JSON request; the JSON 404 has
-  no freshness information, so no cache reuses it for a browser.
+  no freshness information, so no cache reuses it for a browser. *(Superseded by
+  `2026-10-15-root-404-vary-design.md` (#32): the JSON 404 for `GET`/`HEAD /` now carries the
+  same `Vary`.)*
 - **`HEAD`** returns the page's headers (including `Content-Length` of the GET body) and an empty
   body, built explicitly: fallback handlers get no automatic HEAD body stripping in tests.
 - **Copy buttons are progressive enhancement:** rendered `hidden`, unhidden by the script. Without
