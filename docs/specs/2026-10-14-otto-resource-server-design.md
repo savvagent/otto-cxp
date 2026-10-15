@@ -90,7 +90,7 @@ One binary, `cxp-server`, on `:8080` (`CXP_BIND`), serving:
 | Path | Crate | Auth |
 |---|---|---|
 | `/healthz`, `/readyz` | cxp-server | none |
-| `/.well-known/oauth-protected-resource` | cxp-mcp | none |
+| `/.well-known/oauth-protected-resource` | cxp-http (mounted by cxp-server) | none |
 | `/mcp` (streamable HTTP, stateless, JSON responses) | cxp-mcp | bearer token |
 | `/api/v1/...` | cxp-api | bearer token |
 | `/platform/webhooks` | cxp-api | `Otto-Signature` HMAC |
@@ -98,11 +98,12 @@ One binary, `cxp-server`, on `:8080` (`CXP_BIND`), serving:
 ### Workspace
 
 ```
-Cargo.toml              workspace; members crates/cxp-{core,mcp,api,server}
+Cargo.toml              workspace; members crates/cxp-{core,http,mcp,api,server}
 rust-toolchain.toml     stable, rustfmt + clippy
 compose.yaml            postgres:16 on 15435 (cxp/cxp/otto_cxp)
 crates/cxp-core         all SQL, domain logic, tenancy, auth core, metering, lifecycle
-crates/cxp-mcp          rmcp =2.0.0 server, tools, resources, prompts, /mcp + metadata routes
+crates/cxp-http         axum auth adapter shared by /mcp and /api (require_bearer, refuse), metadata route
+crates/cxp-mcp          rmcp =2.0.0 server, tools, resources, prompts, /mcp route
 crates/cxp-api          REST /api/v1, /platform/webhooks
 crates/cxp-server       binary: config, boot, health, background tasks, router, e2e tests
 ```
@@ -285,7 +286,7 @@ pub fn www_authenticate(public_url: &str, failure: &AuthFailure) -> String;
 pub fn metadata(resource_uri: &str, platform_url: &str) -> ProtectedResourceMetadata;
 ```
 
-HTTP mapping (in cxp-mcp and cxp-api middleware, ~40 lines each): `Missing`/`Inactive`/`Revoked`
+HTTP mapping (once, in `cxp-http`, as `require_bearer` middleware shared by cxp-mcp and cxp-api): `Missing`/`Inactive`/`Revoked`
 → 401 + `WWW-Authenticate` + JSON body `{error, error_description}`; `Unavailable` → 503 +
 `Retry-After: 5`; `Internal` → 500 (`error` `internal`), no `Retry-After`, logged at error. The audience is `CXP_RESOURCE_URI` and is never derived from `Host`.
 
@@ -350,7 +351,7 @@ with `#[tool_router(router = …)]` per file, combined in `tools/mod.rs`; `tools
 `quota_exceeded`, `unavailable`, `internal` (no database text). Resources (3) and prompts (4)
 ported; resources need read scope; `metrics://dashboard` calls `DashboardExt` (S8). `lib.rs` exposes `Config { public_url, resource_uri,
 platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Result<Router, NoAllowedHosts>`
-that mounts `/mcp` behind `require_bearer` and the open metadata route, refusing an empty
+that mounts `/mcp` behind `cxp_http::require_bearer` (the open metadata route is `cxp_http`'s, mounted by cxp-server), refusing an empty
 `allowed_hosts` (rmcp reads one as "accept any Host").
 
 ### REST (`cxp-api`, S10)
@@ -360,9 +361,10 @@ Same routes and JSON shapes as `server/src/api` today minus `/teams`, behind `re
 create/update with a `teamId` verifies it with `cxp_core::catalog::verify_team(platform, org, id)`
 (unknown, or another org's → 400 `unknown_team`; platform down → 503), which returns the
 `VerifiedTeam` the catalog write requires, so no route can store an unverified team id. On update, an absent team
-field leaves the team unchanged and an explicit `null` clears it. The console currently sends
-`team_id` (snake_case, #15); accept both `teamId` and `team_id` on catalog bodies until #15
-lands. `POST /api/v1/surveys` charges `create_survey`.
+field leaves the team unchanged and an explicit `null` clears it. Request bodies are snake_case
+(`team_id`), and catalog bodies also accept `teamId` as a permanent alias; responses are
+camelCase. The casing mismatch is resolved by #15 (the console reads camelCase); the broader
+question of one convention for `/api/v1` is tracked in #24. `POST /api/v1/surveys` charges `create_survey`.
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
 `invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until
@@ -413,8 +415,8 @@ S12's `scripts/seed-demo.sql` is local-only demo data (a psql `-v org=<uuid>` va
 not application SQL, so "no SQL outside cxp-core" does not cover it, and running it against
 `otto-db` is a production write: human-only.
 
-Out of scope (own tickets): the web console's platform OAuth sign-in; the web app's snake_case
-types vs. the server's camelCase JSON (`apps/web/src/lib/types.ts`).
+Out of scope (own tickets): the web console's platform OAuth sign-in. The web app's types now
+read the server's camelCase JSON (#15); one casing convention for `/api/v1` is #24.
 
 ## Out-of-band and hand-offs
 
@@ -457,5 +459,14 @@ commands live in `docs/deploy/fly.md` (S12).
   index) before an org grows large.
 - Database role (#16): cxp-server connects as the migrating role and assumes `otto_app` per
   tenant transaction; background maintenance and the tombstone write run as the connecting
-  role. The grants narrow what `otto_app` can do, but the connecting role itself is still
-  privileged; #16 tracks a least-privilege login role.
+  role. A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, `FLY_APP_NAME`
+  set, or an instance that also hosts another otto service's database) refuses to boot unless
+  both the session user and the current user hold no superuser-equivalent privilege
+  (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined
+  role), directly or through membership, and can `CONNECT` to no other service's database
+  (`cxp_core::db_role`, `boot::check_db_role`). Production's role is `cxp_server`, owner of
+  `otto_cxp` only, set up by the runbook in `docs/deploy/fly.md` ("Database role"). Residual:
+  as the tables' owner, `cxp_server` can `NO FORCE` RLS, drop policies, or `TRUNCATE` (which
+  ignores RLS) on its own tables, so RLS binds it only while it leaves them alone; splitting the migration owner from the runtime
+  role is #27. `otto_app` is shared by every otto service; no service may grant it `CONNECT` or
+  another database-level privilege, and #28 gives each service its own.

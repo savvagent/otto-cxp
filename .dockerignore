@@ -1,8 +1,18 @@
 target
 node_modules
+# The web console is built in the image (its own stage); only its sources and
+# the workspace manifests pnpm needs to install it go in.
 apps
+!apps/web
+apps/web/node_modules
+apps/web/dist
+apps/web/tsconfig.tsbuildinfo
+# Local Vite env files can hold secrets; the image never needs them.
+apps/web/.env*
 packages
+!packages/react/package.json
 sdk
+!sdk/typescript/package.json
 scripts
 docs
 .git

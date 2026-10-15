@@ -194,8 +194,8 @@ export function FeedbackPage() {
                 {items.map((item) => (
                   <TableRow key={item.id}>
                     <TableCell>
-                      <Badge variant={feedbackTypeBadgeVariant(item.feedback_type)}>
-                        {feedbackTypeLabel(item.feedback_type)}
+                      <Badge variant={feedbackTypeBadgeVariant(item.feedbackType)}>
+                        {feedbackTypeLabel(item.feedbackType)}
                       </Badge>
                     </TableCell>
                     <TableCell className="max-w-[200px] truncate">
@@ -205,10 +205,10 @@ export function FeedbackPage() {
                       <RatingStars rating={item.rating} />
                     </TableCell>
                     <TableCell className="font-mono text-xs">
-                      {item.customer_id?.slice(0, 8) ?? "—"}
+                      {item.customerId?.slice(0, 8) ?? "—"}
                     </TableCell>
                     <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                      {new Date(item.created_at).toLocaleDateString()}
+                      {new Date(item.createdAt).toLocaleDateString()}
                     </TableCell>
                   </TableRow>
                 ))}

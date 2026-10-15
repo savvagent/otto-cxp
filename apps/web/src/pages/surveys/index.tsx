@@ -289,7 +289,7 @@ export function SurveysPage() {
                   </TableCell>
                   <TableCell>{questionCount(survey.questions)}</TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                    {new Date(survey.created_at).toLocaleDateString()}
+                    {new Date(survey.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
                     <Button

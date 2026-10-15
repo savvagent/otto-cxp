@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/cxp-core",
+  "crates/cxp-http",
   "crates/cxp-mcp",
   "crates/cxp-api",
   "crates/cxp-server",
@@ -15,6 +16,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 cxp-core = { path = "crates/cxp-core" }
+cxp-http = { path = "crates/cxp-http" }
 cxp-mcp = { path = "crates/cxp-mcp" }
 cxp-api = { path = "crates/cxp-api" }
 
@@ -34,7 +36,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "fs"] }
 http = "1"
 rmcp = { version = "=2.0.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
 schemars = { version = "1.1", features = ["chrono04", "uuid1"] }
@@ -51,9 +53,20 @@ url = "2"
 # Loads .env for local runs. Never overrides a variable already set, so a
 # deployment's real environment always wins over a file that got shipped.
 dotenvy = "0.15"
-# An HTTP client for cxp-server's lifecycle test, which talks to a real
-# socket. Already in the tree through otto-resource; no default features.
+# An HTTP client for the console's calls to the platform's token endpoint
+# and cxp-server's lifecycle test. Already in the tree through otto-resource
+# (with rustls-tls); no default features here.
 reqwest = { version = "0.12", default-features = false }
+# The console's sign-in: the cookie's SHA-256 (what is stored), its random
+# bytes, base64url for cookies and PKCE, and constant-time comparison of the
+# OAuth state; sha2 and base64 also pin the install page's CSP hashes. All already in the tree through otto-tenant and otto-resource.
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+subtle = "2"
+# Derives the console's two single-use subkeys from CXP_ENCRYPTION_KEY
+# (HKDF-SHA256). Already in the tree through sqlx-postgres.
+hkdf = "0.12"
 
 [profile.release]
 lto = "thin"

@@ -3,10 +3,18 @@
 //! route calls into `cxp-core`; no SQL lives here.
 //!
 //! ```text
-//!   /api/v1/...            bearer token   GET needs cxp:read (or cxp:write),
-//!                                         every other method cxp:write
+//!   /api/v1/...            bearer token,  GET needs cxp:read (or cxp:write),
+//!                          or the web     every other method cxp:write
+//!                          console's
+//!                          session cookie
 //!   POST /platform/webhooks  Otto-Signature HMAC; no bearer token
 //! ```
+//!
+//! The session cookie is accepted only when the binary passes a console
+//! ([`AppState::with_console`]), only for a request with no bearer token, and
+//! a cookie-authenticated write must come from this origin
+//! (`cxp_http::console::same_origin`) or is `403 cross_site_request`. The
+//! cookie's stored platform token is introspected exactly as a bearer is.
 //!
 //! Every `/api/v1` handler does the same five things in order: take the
 //! [`Principal`](cxp_core::auth::Principal) the bearer middleware attached,
@@ -23,10 +31,9 @@
 //! Errors are JSON `{"error": text, "code": code}` (see [`ApiError`]); an
 //! authentication failure is the OAuth-shaped `{"error", "error_description"}`
 //! with `WWW-Authenticate`. Bodies are capped at [`MAX_BODY_BYTES`]. There is
-//! deliberately no CORS layer: `/api` is called with bearer tokens or from the
-//! same origin.
+//! deliberately no CORS layer: `/api` is called with bearer tokens or, by the
+//! console, from the same origin.
 
-mod auth;
 mod error;
 mod extract;
 mod routes;
@@ -80,6 +87,9 @@ pub struct AppState {
     /// Records `create_survey` usage for `POST /api/v1/surveys`.
     pub meter: Arc<Meter>,
     pub config: Arc<Config>,
+    /// The web console's sign-in, when it is configured: its session cookie
+    /// is then a credential on `/api/v1`.
+    pub console: Option<cxp_http::console::Console>,
 }
 
 impl AppState {
@@ -89,7 +99,14 @@ impl AppState {
             platform,
             meter,
             config: Arc::new(config),
+            console: None,
         }
+    }
+
+    /// Accept the web console's session cookie on `/api/v1`.
+    pub fn with_console(mut self, console: cxp_http::console::Console) -> Self {
+        self.console = Some(console);
+        self
     }
 
     /// The caller's transaction: pinned to their org, refused if the org was
@@ -208,16 +225,28 @@ fn api_routes() -> Router<AppState> {
     api
 }
 
-/// `/api/v1/...` behind the bearer middleware, and `POST /platform/webhooks`.
+/// `/api/v1/...` behind the authentication middleware, and `POST
+/// /platform/webhooks`.
 pub fn router(state: AppState) -> Router {
+    // A handler's `401` is `access_revoked`; it carries the same challenge as
+    // a revoked token.
+    let mut authenticator = cxp_http::Authenticator::new(
+        state.db.clone(),
+        state.platform.clone(),
+        state.config.public_url.clone(),
+    )
+    .challenge_handler_401();
+    if let Some(console) = &state.console {
+        authenticator = authenticator.with_console(console.clone());
+    }
     let api = api_routes()
         // Inside the bearer layer: an unknown path or method is answered
         // only to an authenticated caller, and in the JSON error shape.
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_bearer,
+            authenticator,
+            cxp_http::require_bearer,
         ));
 
     Router::new()

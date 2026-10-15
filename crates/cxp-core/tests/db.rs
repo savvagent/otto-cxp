@@ -38,7 +38,12 @@ const DOMAIN_TABLES: [&str; 15] = [
 const SEARCH_INDEX_TABLES: [&str; 2] = ["customer_search_grams", "knowledge_search_terms"];
 
 /// Bookkeeping tables carrying a `<table>_tenant_isolation` policy.
-const BOOKKEEPING_TABLES: [&str; 3] = ["platform_events", "usage_outbox", "usage_outbox_rejected"];
+const BOOKKEEPING_TABLES: [&str; 4] = [
+    "platform_events",
+    "usage_outbox",
+    "usage_outbox_rejected",
+    "console_sessions",
+];
 
 /// Ids of one row in every tenant table, all in one org.
 struct Seeded {
@@ -119,6 +124,11 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
             .to_string(),
         "INSERT INTO usage_outbox_rejected (event_id, org_id, tool, billable, occurred_at, reason) \
          VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(), 'test')"
+            .to_string(),
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), $1, gen_random_uuid(), '\\x00', \
+         '\\x00', now(), now() + interval '1 day')"
             .to_string(),
     ];
     let mut tx = db.begin(org).await.unwrap();
@@ -482,6 +492,309 @@ async fn the_usage_outbox_is_drained_across_orgs_only_under_the_marker(pool: PgP
         assert_eq!(deleted, 2, "the marked shipper deletes from {table}");
         tx.rollback().await.unwrap();
     }
+}
+
+/// A console session is the one row a request reads before it knows the org:
+/// the cookie is how the org is learned. An unpinned transaction (a request
+/// path that forgot to pin) still sees, changes, and deletes nothing; the
+/// org comes only from `console_session_org`, which answers with the org of
+/// the one unexpired row whose hash it is given, and never a token.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_console_session_is_found_before_its_org_only_through_the_lookup_function(pool: PgPool) {
+    let admin = db(pool.clone());
+    let (a, b) = (org(), org());
+    seed(&admin, a).await;
+    seed(&admin, b).await;
+    let live: Vec<u8> = (0..32).collect();
+    let expired: Vec<u8> = (100..132).collect();
+    for (hash, expires) in [(&live, "now() + interval '1 day'"), (&expired, "now()")] {
+        let mut tx = admin.begin(a).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+             refresh_token_enc, access_expires_at, expires_at) \
+             VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), {expires})"
+        ))
+        .bind(hash)
+        .bind(a)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Unpinned, without the function: nothing, whatever the statement.
+    let mut tx = as_app_unpinned(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "console_sessions is readable unpinned");
+    for sql in [
+        "UPDATE console_sessions SET expires_at = now()",
+        "DELETE FROM console_sessions",
+    ] {
+        let changed = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "unpinned: {sql}");
+    }
+    let err = sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now())",
+    )
+    .bind(vec![7u8; 32])
+    .bind(a)
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "unpinned INSERT");
+    tx.rollback().await.unwrap();
+
+    // The marked sweep may delete across orgs, but cannot write one.
+    let mut tx = as_app_maintenance(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 4, "the marked sweep reads across orgs");
+    let err = sqlx::query("UPDATE console_sessions SET org_id = $1")
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "the marked sweep moved a session");
+    tx.rollback().await.unwrap();
+
+    // The function, called as otto_app with no org pinned.
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            // The setting it reads under ends with the call.
+            let after: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('app.console_session_lookup', true)")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_ne!(after.as_deref(), Some("on"), "the lookup setting leaked");
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "the table is readable after the call");
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(lookup(live.clone()).await, Some(a.as_uuid()));
+
+    // Setting the lookup's marker by hand admits otto_app to nothing: the
+    // lookup policy admits only the function's owner.
+    let mut tx = as_app_unpinned(&pool).await;
+    sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "otto_app read sessions by setting the lookup marker");
+    tx.rollback().await.unwrap();
+    // It names no role: who it admits is read from the function's owner at
+    // query time, so moving that ownership needs no ALTER POLICY.
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(roles)::text FROM pg_policies \
+         WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["public".to_string()]);
+    assert_eq!(lookup(expired).await, None, "an expired session");
+    assert_eq!(lookup(vec![9u8; 32]).await, None, "an unknown hash");
+
+    // Its shape: SECURITY DEFINER with a pinned search_path, executable by
+    // otto_app and not by PUBLIC.
+    let (definer, config): (bool, Vec<String>) = sqlx::query_as(
+        "SELECT prosecdef, coalesce(proconfig, '{}') FROM pg_proc \
+         WHERE proname = 'console_session_org'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(definer);
+    assert!(
+        config.iter().any(|c| c.starts_with("search_path=")),
+        "{config:?}"
+    );
+    let grants: (bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE'), \
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) acl \
+                        WHERE p.proname = 'console_session_org' AND acl.grantee = 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, (true, false), "(otto_app may, PUBLIC may not)");
+}
+
+/// Today the migrating role is a superuser, so `console_session_org` bypasses
+/// RLS and the lookup policy is never what admits it. Once it is not (#16),
+/// the policy is the only thing that does, and #26's runbook moves ownership
+/// of the table and the function to a new least-privilege role. Here a fresh
+/// `NOSUPERUSER NOBYPASSRLS` role takes both over with `ALTER ... OWNER TO`
+/// alone (what `REASSIGN OWNED` does, which a per-test database cannot run
+/// against the cluster superuser that migrated it), and no `ALTER POLICY`:
+/// the lookup works; the new owner's plain `SELECT` sees nothing; a non-owner
+/// that sets the lookup's marker by hand sees nothing; and with the policy
+/// gone the lookup finds nothing, so the policy, not the ownership, is what
+/// admits it. The role is cluster-wide, so it is dropped whatever the test
+/// does.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_console_lookup_follows_its_function_to_a_non_superuser_owner(pool: PgPool) {
+    let owner = format!("cxp_test_owner_{}", Uuid::new_v4().simple());
+    let me: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run in a task so a failed assertion still reaches the cleanup below.
+    let outcome = tokio::spawn(lookup_as_non_superuser_owner(pool.clone(), owner.clone())).await;
+
+    for sql in [
+        format!("REASSIGN OWNED BY {owner} TO {me}"),
+        format!("DROP OWNED BY {owner}"),
+        format!("DROP ROLE {owner}"),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
+    let admin = db(pool.clone());
+    let a = org();
+    let hash: Vec<u8> = (0..32).collect();
+    let mut tx = admin.begin(a).await.unwrap();
+    sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now() + interval '1 day')",
+    )
+    .bind(&hash)
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let policy = || async {
+        let (roles, qual): (Vec<String>, String) = sqlx::query_as(
+            "SELECT roles::text[], qual FROM pg_policies \
+             WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (roles, qual)
+    };
+    let before = policy().await;
+    // Ownership only: no ALTER POLICY.
+    for sql in [
+        format!("ALTER TABLE console_sessions OWNER TO {owner}"),
+        format!("ALTER FUNCTION console_session_org(bytea) OWNER TO {owner}"),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    assert_eq!(policy().await, before, "the policy was changed");
+    let (superuser, bypass): (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(&owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((superuser, bypass), (false, false));
+    let owners: (String, String) = sqlx::query_as(
+        "SELECT (SELECT tableowner::text FROM pg_tables WHERE tablename = 'console_sessions'), \
+                pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, (owner.clone(), owner.clone()));
+
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(
+        lookup(hash.clone()).await,
+        Some(a.as_uuid()),
+        "the lookup, run as a non-superuser owner"
+    );
+    assert_eq!(lookup(vec![9u8; 32]).await, None);
+
+    // Plain SELECTs, unpinned: the new owner without the marker, and
+    // otto_app (not the owner) with the marker set by hand. Neither sees a
+    // row.
+    for (role, marker) in [(owner.as_str(), false), ("otto_app", true)] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {role}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if marker {
+            sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{role} (marker set: {marker}) read sessions unpinned");
+        tx.rollback().await.unwrap();
+    }
+
+    // Without the policy, the lookup finds nothing: the policy, not the
+    // ownership, is what admits it.
+    sqlx::query("DROP POLICY console_sessions_lookup ON console_sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup(hash).await,
+        None,
+        "the lookup worked without its policy"
+    );
 }
 
 /// Foreign-key checks bypass row-level security, so only the composite
@@ -978,4 +1291,488 @@ async fn a_tampered_known_migration_still_refuses_to_boot(pool: PgPool) {
         matches!(err, MigrateError::VersionMismatch(1)),
         "expected VersionMismatch(1), got {err:?}"
     );
+}
+
+/// Roles and databases a test created, dropped when it ends, failed or not:
+/// both are cluster-wide and outlive the test database. The drop runs on its
+/// own thread and runtime (`Drop` cannot await), as the test pool's
+/// superuser, databases first (a role that owns one cannot be dropped).
+struct TestRoles {
+    options: sqlx::postgres::PgConnectOptions,
+    names: Vec<String>,
+    databases: Vec<String>,
+}
+
+impl TestRoles {
+    fn new(pool: &PgPool) -> Self {
+        Self {
+            options: pool.connect_options().as_ref().clone(),
+            names: Vec::new(),
+            databases: Vec::new(),
+        }
+    }
+
+    /// `CREATE DATABASE name`, registered for the drop. Returns its name.
+    async fn database(&mut self, pool: &PgPool, prefix: &str) -> String {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        self.databases.push(name.clone());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        name
+    }
+
+    /// `CREATE ROLE name LOGIN PASSWORD ... <attributes>`, registered for
+    /// the drop before it is created. Returns a `Db` logged in as it.
+    async fn login(&mut self, pool: &PgPool, prefix: &str, attributes: &str) -> (String, Db) {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        let password = Uuid::new_v4().simple().to_string();
+        self.names.push(name.clone());
+        sqlx::query(&format!(
+            "CREATE ROLE {name} LOGIN PASSWORD '{password}' {attributes}"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let options = self.options.clone().username(&name).password(&password);
+        let as_role = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        (name, Db::from_pool(as_role))
+    }
+
+    /// `CREATE ROLE name NOLOGIN <attributes>`, registered for the drop.
+    async fn nologin(&mut self, pool: &PgPool, prefix: &str, attributes: &str) -> String {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        self.names.push(name.clone());
+        sqlx::query(&format!("CREATE ROLE {name} NOLOGIN {attributes}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        name
+    }
+}
+
+impl Drop for TestRoles {
+    fn drop(&mut self) {
+        let options = self.options.clone();
+        let names = std::mem::take(&mut self.names);
+        let databases = std::mem::take(&mut self.databases);
+        let dropped = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime to drop test roles");
+            rt.block_on(async move {
+                use sqlx::Connection;
+                let mut conn = sqlx::PgConnection::connect_with(&options).await?;
+                for database in &databases {
+                    sqlx::query(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+                        .execute(&mut conn)
+                        .await?;
+                }
+                for name in names.iter().rev() {
+                    for stmt in [
+                        format!(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                             WHERE usename = '{name}'"
+                        ),
+                        format!("DROP ROLE IF EXISTS {name}"),
+                    ] {
+                        sqlx::query(&stmt).execute(&mut conn).await?;
+                    }
+                }
+                Ok::<_, sqlx::Error>(())
+            })
+        })
+        .join();
+        match dropped {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("could not drop test roles: {e}"),
+            Err(_) => eprintln!("could not drop test roles: the drop thread panicked"),
+        }
+    }
+}
+
+/// `(user, role, privileges)` of each privileged role `inspect` found.
+fn found(role: &cxp_core::db_role::DbRole) -> Vec<(&str, &str, &[cxp_core::db_role::Privilege])> {
+    role.privileged
+        .iter()
+        .map(|p| (p.user.as_str(), p.name.as_str(), p.privileges.as_slice()))
+        .collect()
+}
+
+/// The boot check's view of a login role (#16): a plain role (even a member
+/// of `otto_app`) is not privileged; SUPERUSER, BYPASSRLS, CREATEROLE,
+/// REPLICATION, membership in a role with any of them (one `SET ROLE`
+/// away), and membership in a cross-service predefined role are, and are
+/// named.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_every_superuser_equivalent(pool: PgPool) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+
+    let su = inspect(&db(pool.clone())).await.unwrap();
+    assert_eq!(su.session_user, su.current_user);
+    // The test pool is a superuser, named alone (whatever else it holds).
+    let [(user, name, privileges)] = found(&su)[..] else {
+        panic!("{}", su.summary())
+    };
+    assert_eq!(
+        (user, name),
+        (su.current_user.as_str(), su.current_user.as_str())
+    );
+    assert!(privileges.contains(&Superuser), "{}", su.summary());
+
+    let bypass_group = roles
+        .nologin(&pool, "cxp_t_bypass_group", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOREPLICATION";
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (bypass, bypass_db) = roles
+        .login(&pool, "cxp_t_bypass", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let (member, member_db) = roles.login(&pool, "cxp_t_member", base).await;
+    let (createrole, createrole_db) = roles
+        .login(&pool, "cxp_t_createrole", "NOSUPERUSER CREATEROLE")
+        .await;
+    let (replication, replication_db) = roles
+        .login(&pool, "cxp_t_replication", "NOSUPERUSER REPLICATION")
+        .await;
+    let (exec, exec_db) = roles.login(&pool, "cxp_t_exec", base).await;
+    let (read_all, read_all_db) = roles.login(&pool, "cxp_t_read_all", base).await;
+    for stmt in [
+        format!("GRANT {bypass_group} TO {member}"),
+        format!("GRANT pg_execute_server_program TO {exec}"),
+        format!("GRANT pg_read_all_data TO {read_all}"),
+        // otto_app is not privileged: membership in it, which every
+        // deployment needs, must not count.
+        format!("GRANT otto_app TO {plain}, {member}, {exec}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let mut seen = Vec::new();
+    for (name, as_role) in [
+        (&plain, plain_db),
+        (&bypass, bypass_db),
+        (&member, member_db),
+        (&createrole, createrole_db),
+        (&replication, replication_db),
+        (&exec, exec_db),
+        (&read_all, read_all_db),
+    ] {
+        let role = inspect(&as_role).await.unwrap();
+        as_role.pool().close().await;
+        assert_eq!((&role.session_user, &role.current_user), (name, name));
+        seen.push(role);
+    }
+    let [plain_r, bypass_r, member_r, createrole_r, replication_r, exec_r, read_all_r] = &seen[..]
+    else {
+        unreachable!()
+    };
+    assert!(!plain_r.is_privileged(), "{}", plain_r.summary());
+    assert_eq!(
+        found(bypass_r),
+        [(bypass.as_str(), bypass.as_str(), &[BypassRls][..])]
+    );
+    assert_eq!(
+        found(member_r),
+        [(member.as_str(), bypass_group.as_str(), &[BypassRls][..])]
+    );
+    assert!(
+        member_r
+            .summary()
+            .contains(&format!("is a member of {bypass_group:?} (BYPASSRLS)")),
+        "{}",
+        member_r.summary()
+    );
+    assert_eq!(
+        found(createrole_r),
+        [(createrole.as_str(), createrole.as_str(), &[CreateRole][..])]
+    );
+    assert_eq!(
+        found(replication_r),
+        [(
+            replication.as_str(),
+            replication.as_str(),
+            &[Replication][..]
+        )]
+    );
+    assert_eq!(
+        found(exec_r),
+        [(
+            exec.as_str(),
+            "pg_execute_server_program",
+            &[PredefinedRole][..]
+        )]
+    );
+    assert_eq!(
+        found(read_all_r),
+        [(read_all.as_str(), "pg_read_all_data", &[PredefinedRole][..])]
+    );
+    assert!(
+        read_all_r
+            .summary()
+            .contains(r#"is a member of "pg_read_all_data""#),
+        "{}",
+        read_all_r.summary()
+    );
+}
+
+/// A superuser login whose connections start with `SET ROLE` to a plain
+/// role (`?options=-c role=...`, or `ALTER ROLE ... SET role`) is still a
+/// superuser session, one `RESET ROLE` away: the check reads the session
+/// user too, and names it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_a_superuser_session_behind_set_role(pool: PgPool) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+    let plain = roles
+        .nologin(&pool, "cxp_t_plain", "NOSUPERUSER NOBYPASSRLS")
+        .await;
+
+    let set = format!("SET ROLE {plain}");
+    let as_plain = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let set = set.clone();
+            Box::pin(async move {
+                sqlx::query(&set).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let role = inspect(&Db::from_pool(as_plain.clone())).await.unwrap();
+    as_plain.close().await;
+
+    assert_eq!(role.current_user, plain);
+    assert_ne!(role.session_user, plain);
+    assert!(role.is_privileged(), "{}", role.summary());
+    let session = role.session_user.as_str();
+    // Only the session user is privileged here.
+    let [(user, name, privileges)] = found(&role)[..] else {
+        panic!("{}", role.summary())
+    };
+    assert_eq!((user, name), (session, session));
+    assert!(privileges.contains(&Superuser), "{}", role.summary());
+    assert!(
+        role.summary().contains(&format!(
+            "database role {plain:?} (session user {session:?}): session user {session:?} is SUPERUSER"
+        )),
+        "{}",
+        role.summary()
+    );
+}
+
+/// The rest of what a deployment refuses (#16, round 2): CREATEDB, the
+/// predefined roles that reach other sessions (`pg_signal_backend`,
+/// `pg_monitor`, `pg_read_all_stats`, `pg_create_subscription`, and
+/// `pg_maintain` where the server has it), and a Postgres 16 membership that
+/// grants `SET` without `INHERIT`, still one `SET ROLE` from BYPASSRLS.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_the_cross_service_roles_and_set_only_membership(
+    pool: PgPool,
+) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    let (createdb, createdb_db) = roles
+        .login(&pool, "cxp_t_createdb", "NOSUPERUSER CREATEDB")
+        .await;
+    let role = inspect(&createdb_db).await.unwrap();
+    createdb_db.pool().close().await;
+    assert_eq!(
+        found(&role),
+        [(createdb.as_str(), createdb.as_str(), &[CreateDb][..])]
+    );
+    assert!(role.summary().contains("is CREATEDB"), "{}", role.summary());
+
+    // Looked up by name: whichever this server has (pg_maintain is 17+).
+    let present: Vec<String> = sqlx::query_scalar(
+        "SELECT rolname::text FROM pg_roles WHERE rolname = ANY($1) ORDER BY rolname",
+    )
+    .bind(
+        [
+            "pg_signal_backend",
+            "pg_monitor",
+            "pg_read_all_stats",
+            "pg_create_subscription",
+            "pg_maintain",
+        ]
+        .map(String::from)
+        .to_vec(),
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for required in [
+        "pg_signal_backend",
+        "pg_monitor",
+        "pg_read_all_stats",
+        "pg_create_subscription",
+    ] {
+        assert!(present.iter().any(|r| r == required), "{required} missing");
+    }
+    for predefined in &present {
+        let (login, as_role) = roles.login(&pool, "cxp_t_predefined", base).await;
+        sqlx::query(&format!("GRANT {predefined} TO {login}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let role = inspect(&as_role).await.unwrap();
+        as_role.pool().close().await;
+        // pg_monitor brings pg_read_all_stats (and more) with it: the
+        // granted role is among those named.
+        assert!(
+            found(&role)
+                .iter()
+                .any(|&(u, n, p)| u == login && n == predefined && p == [PredefinedRole]),
+            "{predefined}: {}",
+            role.summary()
+        );
+    }
+
+    // GRANT ... WITH INHERIT FALSE, SET TRUE (Postgres 16): none of the
+    // group's privileges apply until SET ROLE, which the member may do.
+    let bypass_group = roles
+        .nologin(&pool, "cxp_t_bypass_group", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let (set_only, set_only_db) = roles.login(&pool, "cxp_t_set_only", base).await;
+    sqlx::query(&format!(
+        "GRANT {bypass_group} TO {set_only} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (inherits, set_ok): (bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role($1::text::name, $2::text::name, 'USAGE'), \
+                pg_has_role($1::text::name, $2::text::name, 'SET')",
+    )
+    .bind(&set_only)
+    .bind(&bypass_group)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((inherits, set_ok), (false, true), "the grant is SET-only");
+    let role = inspect(&set_only_db).await.unwrap();
+    set_only_db.pool().close().await;
+    assert_eq!(
+        found(&role),
+        [(set_only.as_str(), bypass_group.as_str(), &[BypassRls][..])]
+    );
+
+    // A database owner is implicitly a member of pg_database_owner, which
+    // is not refused: the e2e least-privilege test owns its database and
+    // boots; here, the predefined role itself is not flagged.
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT rolname = ANY($1) FROM pg_roles WHERE rolname = 'pg_database_owner'",
+    )
+    .bind(
+        cxp_core::db_role::PREDEFINED_ROLES
+            .map(String::from)
+            .to_vec(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!flagged);
+}
+
+/// Cross-database `CONNECT` and the shared-instance signal (#16, round 2),
+/// with uniquely named databases standing in for the other services'
+/// (`inspect_with`), so the shared test cluster never looks like `otto-db`
+/// to the tests running beside this one.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_other_databases_and_a_shared_instance(pool: PgPool) {
+    use cxp_core::db_role::{inspect, inspect_with, DatabaseAccess};
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let service = roles.database(&pool, "cxp_t_svc").await;
+    let other = roles.database(&pool, "cxp_t_other").await;
+    let services = [service.as_str()];
+    let (login, as_role) = roles.login(&pool, "cxp_t_reach", base).await;
+    let group = roles.nologin(&pool, "cxp_t_group", base).await;
+    let owner = roles.nologin(&pool, "cxp_t_owner", base).await;
+    sqlx::query(&format!("GRANT {group} TO {login}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let access = |database: &str, through: &str| DatabaseAccess {
+        user: login.clone(),
+        database: database.into(),
+        through: through.into(),
+    };
+
+    // The real list finds no other service here, so nothing is shared, and
+    // PUBLIC's default CONNECT on the per-test databases is not counted.
+    let role = inspect(&as_role).await.unwrap();
+    assert!(!role.shares_the_instance(), "{}", role.summary());
+    assert!(!role.is_refused_in_a_deployment(), "{}", role.summary());
+
+    // Another service's database counts through PUBLIC; any other database
+    // does not.
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert_eq!(role.shared_with, std::slice::from_ref(&service));
+    assert_eq!(role.other_databases, [access(&service, "PUBLIC")]);
+    assert!(role.is_refused_in_a_deployment());
+    assert!(!role.is_privileged());
+
+    // Revoked from PUBLIC (R3): out of reach, still a shared instance.
+    sqlx::query(&format!("REVOKE CONNECT ON DATABASE {service} FROM PUBLIC"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert!(role.other_databases.is_empty(), "{}", role.summary());
+    assert!(role.shares_the_instance());
+    assert!(!role.is_refused_in_a_deployment());
+
+    // A grant to a role it belongs to (a later grant to otto_app) counts on
+    // any database, and on another service's after the revoke too.
+    for stmt in [
+        format!("GRANT CONNECT ON DATABASE {other} TO {group}"),
+        format!("GRANT CONNECT ON DATABASE {service} TO {group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    let mut expected = vec![access(&other, &group), access(&service, &group)];
+    expected.sort_by(|a, b| a.database.cmp(&b.database));
+    assert_eq!(role.other_databases, expected);
+    for stmt in [
+        format!("REVOKE CONNECT ON DATABASE {other} FROM {group}"),
+        format!("REVOKE CONNECT ON DATABASE {service} FROM {group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(inspect_with(&as_role, &services)
+        .await
+        .unwrap()
+        .other_databases
+        .is_empty());
+
+    // Membership in a database's owning role counts.
+    for stmt in [
+        format!("ALTER DATABASE {other} OWNER TO {owner}"),
+        format!("GRANT {owner} TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert_eq!(role.other_databases, [access(&other, &owner)]);
+    assert!(
+        role.summary().contains(&format!(
+            "can connect to database {other:?} (through {owner:?})"
+        )),
+        "{}",
+        role.summary()
+    );
+    as_role.pool().close().await;
 }

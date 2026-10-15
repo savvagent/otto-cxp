@@ -1,0 +1,33 @@
+[package]
+name = "cxp-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cxp-core.workspace = true
+otto-tenant.workspace = true
+otto-resource.workspace = true
+axum.workspace = true
+http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+url.workspace = true
+tracing.workspace = true
+# The console's calls to the platform's token endpoint, over TLS.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+sha2.workspace = true
+rand.workspace = true
+base64.workspace = true
+subtle.workspace = true
+hkdf.workspace = true
+# The in-process single flight for a session's token refresh.
+futures.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true, features = ["util"] }

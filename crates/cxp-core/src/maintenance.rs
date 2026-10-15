@@ -1,9 +1,10 @@
 //! Unpinned, cross-org background access: `begin` opens a transaction with no
 //! org pinned and `app.maintenance = 'on'` set, the marker the unpinned
-//! row-level policies on `platform_events`, `usage_outbox`, and
-//! `usage_outbox_rejected` require. The only way background code reaches more
-//! than one org's rows: the retention sweep and the usage shipper both go
-//! through it.
+//! row-level policies on `platform_events`, `usage_outbox`,
+//! `usage_outbox_rejected`, and `console_sessions` require. The only way
+//! background code reaches more than one org's rows: the retention sweep
+//! (expired console sessions included) and the usage shipper both go through
+//! it.
 //!
 //! Those policies grant unpinned access only when no org is pinned **and**
 //! the transaction carries the marker. Unpinned alone is not enough: a
@@ -11,7 +12,8 @@
 //! change, and delete nothing.
 //!
 //! **Only background maintenance code may call [`begin`]**: the retention
-//! sweep ([`crate::platform_events::sweep`]) and the usage shipper
+//! sweep ([`crate::platform_events::sweep`], which runs
+//! [`crate::console_sessions::sweep_expired`]) and the usage shipper
 //! ([`crate::usage::ship_once`]). Never a request handler or a
 //! tool, which always go through a pinned transaction
 //! ([`crate::platform_events::begin_live`]). It is `pub(crate)` so nothing

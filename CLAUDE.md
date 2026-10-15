@@ -18,7 +18,10 @@ DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test --workspace 
 cargo test -p cxp-core test_name         # one test
 ```
 `cargo test` needs `DATABASE_URL` (a local Postgres only) and panics without it. Migrations run at
-server start (`cxp_core::migrate`).
+server start (`cxp_core::migrate`). `cargo run` serves the web console at `/console/` only after
+`pnpm build` has produced `apps/web/dist` (the default `CXP_CONSOLE_DIR`); without it `/console/`
+is a JSON 404 and everything else works. `pnpm build` in `apps/web` also type-checks
+`apps/web/test` (`tsconfig.test.json`), and `pnpm test` there needs the build's `dist/sw.js`.
 
 ### TypeScript/React (pnpm monorepo: `sdk/typescript`, `packages/react`, `apps/web`)
 ```bash
@@ -32,18 +35,32 @@ Per-package: `cd sdk/typescript && pnpm build`.
 ## Architecture
 
 One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api/v1/...`,
-`POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`.
+`/auth/...` (the web console's sign-in), `POST /platform/webhooks`,
+`/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, `/` (a connector install page for
+browsers only), and the built web console (`CXP_CONSOLE_DIR`) under `/console/` only (`GET`/`HEAD`;
+`index.html` for browser navigations there; `/console` redirects to `/console/`). Everything else
+is a JSON 404.
 
 **Crates (`crates/`):**
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
   (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
-  `begin_live`), `usage` (metering, outbox shipper), `maintenance` (the only cross-org access).
-- `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` and metadata routes.
-  Holds no SQL.
+  `begin_live`), `usage` (metering, outbox shipper), `console_sessions` (the web console's sign-in
+  sessions; tokens sealed with an HKDF subkey of `CXP_ENCRYPTION_KEY`; refresh by lease +
+  compare-and-swap), `sealed` (`nonce || ciphertext`), `maintenance` (the only cross-org access).
+- `cxp-http` - the axum side of auth, shared by `/mcp` and `/api/v1`: `Authenticator`, `require_bearer`,
+  `refuse`, and the `/.well-known/oauth-protected-resource` router; `console/` (the PKCE sign-in
+  against the platform, `/auth/*`, the session cookie, a token refresh coalesced in memory and
+  leased across replicas that holds no connection across the platform call). Holds no SQL.
+  The console session cookie is opt-in per surface (`Authenticator::with_console`): `/api` only,
+  a bearer wins over it, and a cookie write must carry this origin (`Origin`, else
+  `Sec-Fetch-Site: same-origin`) or is `403 cross_site_request`; `/mcp` stays bearer-only.
+- `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` route behind
+  `cxp_http::require_bearer`. Holds no SQL.
 - `cxp-api` - REST `/api/v1` and `/platform/webhooks`. Holds no SQL.
 - `cxp-server` - the binary: `config.rs`, boot sequence (migrate, verify tenant isolation, check the
-  platform credential, spawn the usage shipper and sweeper), health routes, router, `tests/e2e.rs`.
+  platform credential, spawn the usage shipper and sweeper), health routes, router (mounts
+  `/.well-known/oauth-protected-resource`), `tests/e2e.rs`.
 
 **SDKs:**
 - `sdk/typescript/` - `@cxp/sdk` (MIT): `connectCxp({ url, token | authProvider })` returns `{ cxp }` with
@@ -69,7 +86,12 @@ Domain operations are methods on extension traits implemented for `otto_tenant::
 `impl CustomersExt for Tx<'_>`), binding `self.org()` and executing on `self.conn()`. Request paths open
 the transaction with `platform_events::begin_live` (it also refuses revoked orgs and members), never
 `Db::begin`. Cross-org access exists only in `cxp_core::maintenance`. Never take an org id from
-anywhere but the verified token.
+anywhere but the verified token. The one pre-org lookup is a console cookie's session:
+`console_sessions::org_of` calls the `SECURITY DEFINER` function `console_session_org`, which
+returns only the org of the one row whose hash it is given; the row is then read pinned. The
+`console_sessions_lookup` policy that admits it names no role: it admits whichever role owns the
+function at query time (read from `pg_proc`), so it follows an `ALTER FUNCTION … OWNER TO` or
+`REASSIGN OWNED` with nothing else to change.
 
 ### PostgreSQL enum handling
 The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_channel`, `feedback_type`,
@@ -97,7 +119,7 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CXP_PUBLIC_URL` | required | public origin, no path (e.g. `https://otto-cxp.savvagent.com`) |
+| `CXP_PUBLIC_URL` | required | public origin, no path (e.g. `https://otto-cxp.savvagent.com`); a non-loopback host here or in `CXP_RESOURCE_URI`, or a set `FLY_APP_NAME`, makes the process a deployment, which refuses a superuser-equivalent database role |
 | `CXP_RESOURCE_URI` | `{public}/mcp` | token audience; must equal the URI registered at the platform |
 | `CXP_PLATFORM_URL` | required | the otto platform; `https` unless the host is loopback |
 | `CXP_INTROSPECTION_SECRET` | required (secret) | `otto_rs_...` |
@@ -110,6 +132,9 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
 | `CXP_ENFORCE_QUOTAS` | `false` | fails open |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
+| `CXP_CONSOLE_CLIENT_ID` | unset | the web console's first-party client at the platform (redirect `{public}/auth/callback`); unset turns console sign-in off |
+| `CXP_ENCRYPTION_KEY` | unset (secret) | base64 of 32 bytes; never used directly: HKDF-SHA256 derives the session-token and OAuth-flow subkeys; required only with `CXP_CONSOLE_CLIENT_ID`, validated whenever set; rotating it signs everyone out of the console |
+| `CXP_CONSOLE_DIR` | `apps/web/dist` | the built console, served under `/console/`; set only by the Dockerfile's `ENV` (`/srv/console`), which a deployment's own env would override; no `index.html` there means no console |
 | `RUST_LOG` | `info` | |
 
 ## Conventions
@@ -168,7 +193,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - lint: cargo clippy --workspace --all-targets --locked -- -D warnings
 - format: cargo fmt --all -- --check
 - extra: `git diff --name-status --diff-filter=MDR origin/main...HEAD -- 'crates/*/migrations/*'` must print nothing
-- when Dockerfile, .dockerignore, Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/**: podman build -t otto-cxp:check .   (only once a `Dockerfile` exists)
+- when Dockerfile, .dockerignore, Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/**, apps/web/**, package.json, pnpm-lock.yaml, pnpm-workspace.yaml, sdk/typescript/package.json, packages/react/package.json: podman build -t otto-cxp:check .   (only once a `Dockerfile` exists)
 - when package.json, pnpm-lock.yaml, pnpm-workspace.yaml, sdk/typescript/**, packages/react/**, apps/web/**: pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 - evidence: report pass counts per test binary; `cargo test` without `DATABASE_URL` panics rather than skipping, so a panic there is a missing variable, not a test failure; `DATABASE_URL` points only at a local Postgres, never at a Fly database
 - toolchain: stable via `rust-toolchain.toml`; CI floats stable
@@ -186,7 +211,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 ### Reviews
 - language reviewers: crates/** -> rust-pro, sdk/typescript/** -> typescript-pro, packages/react/** -> typescript-pro, apps/web/** -> typescript-pro
 - extra reviewers: database-optimizer when SQL, migrations, indexes, or RLS policies change
-- security focus: tenant isolation (RLS under `otto_app`, composite foreign keys, org ids trusted from the request); bearer-token audience, expiry, and scope checks; team ids verified at the platform before they are stored; platform webhook signature verification and idempotency; untrusted input (SQL built from strings, unbounded bodies, customer-supplied text reaching an agent, database error text in responses); secret handling (logging, echoing, timing-safe compare); customer PII
+- security focus: tenant isolation (RLS under `otto_app`, composite foreign keys, org ids trusted from the request); bearer-token audience, expiry, and scope checks; team ids verified at the platform before they are stored; platform webhook signature verification and idempotency; untrusted input (SQL built from strings, unbounded bodies, customer-supplied text reaching an agent, database error text in responses); secret handling (logging, echoing, timing-safe compare); customer PII; the console session cookie (`__Host-`, `HttpOnly`, `SameSite=Lax`, same-origin check on cookie writes, never a credential on `/mcp`); OAuth state and PKCE (sealed flow cookie, constant-time state compare, `next` confined to `/console/`); platform tokens encrypted at rest (HKDF subkeys of `CXP_ENCRYPTION_KEY`, never logged) and what rotating that key does (signs everyone out)
 - automated reviewer: none
 
 ### Parallelism
@@ -205,6 +230,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - New secret (human: Rob, before merge): `fly secrets set -a otto-cxp --stage NAME=…`; the PR updates `.env.example` and the secrets table in `docs/deploy/fly.md`.
 - New scope (human: Rob, before merge): the PR updates `cxp_core::scopes::KNOWN`/`DEFAULT`; Rob re-runs `otto-platform-server resource register …` from `docs/deploy/fly.md`.
 - otto-platform pin (agent, own PR): `otto-tenant` and `otto-resource` move to the same rev together.
+- Database role change (human: Rob, before merge): a change to the role otto-cxp connects as, or to what it may connect to, ships with a runbook in `docs/deploy/fly.md` ("Database role") that Rob runs before the PR merges; the PR body lists the steps.
 
 ### Human-only
 Hand these to Rob with the exact command; never run them:
@@ -217,12 +243,12 @@ Hand these to Rob with the exact command; never run them:
 
 ### Invariants
 Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
-- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`.
-- **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). In production it is still a superuser until #16 gives it a least-privilege login role.
+- **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`. Migrations run as the non-superuser `cxp_server`, so a function `SET` clause naming a custom parameter (as 0003's `app.console_session_lookup`) needs `GRANT SET ON PARAMETER` to it first: a human step in the runbook's R1 (`docs/deploy/fly.md`) and in the e2e owner's setup.
+- **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, `FLY_APP_NAME` set, or an instance that also hosts `otto_platform`, `otto_factory`, or `otto_flags`) refuses to boot unless both the session (login) user and the current user hold no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined role, `db_role::PREDEFINED_ROLES`), directly or through membership, and can `CONNECT` to no other service's database (`cxp_core::db_role`, `boot::check_db_role`); production's is `cxp_server`, owner of `otto_cxp` only, set up by the runbook in `docs/deploy/fly.md` ("Database role"). As the tables' owner, `cxp_server` could still `NO FORCE` RLS, drop their policies, or `TRUNCATE` them (which ignores RLS); splitting the migration owner from the runtime role is #27. No service may grant `CONNECT`, or any database-level privilege, to the shared `otto_app` (#28). Until Rob has run that runbook, production still connects as the superuser attach role, and a release containing the check will not boot there.
 - **Composite `(org_id, id)` foreign keys** between tenant tables (FK checks bypass RLS).
-- **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events` and on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`) admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker.
+- **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events`, on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`), and on `console_sessions` admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker. The one exception is `console_sessions_lookup`, a `SELECT`-only policy that admits the `console_session_org` function (via `app.console_session_lookup`, which only that function's own `SET` clause sets).
 - **No SQL outside `cxp-core`**, and only runtime `sqlx::query`/`query_as`, never the `query!` macros.
-- **Auth.** `/mcp` and `/api` require a platform token whose audience equals `CXP_RESOURCE_URI` exactly; every route, and every tool except `whoami` and `usage` (no scope), checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
+- **Auth.** `/mcp` requires a bearer platform token whose audience equals `CXP_RESOURCE_URI` exactly, and nothing else. `/api` takes that bearer or, with no `Authorization` header, the web console's session cookie (whose stored platform token is introspected exactly as a bearer is, and must be the session's own org and user); a bearer, when present, decides the request, and a cookie-authenticated write must come from this origin or is `403 cross_site_request`. `/auth/*` is unauthenticated by design (it is the sign-in). Every route, and every tool except `whoami` and `usage` (no scope), checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
 - **Metering:** exactly the tools `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage event each, in the tool's own transaction, into `usage_outbox`; the only route that records one is `POST /api/v1/surveys` (charged as `create_survey`); nothing else records one.
 - **Teams belong to the platform.** Catalog `team_id` is an opaque platform team id, verified at the platform on write; there is no local teams table.
 - **Platform webhooks** (`org.deleted`, `member.removed`, `team.deleted`) are signature-verified, fail closed, and apply idempotently.

@@ -87,8 +87,8 @@ function PageDialog({
     resolver: zodResolver(pageSchema),
     values: editing
       ? {
-          application_id: editing.application_id ?? undefined,
-          team_id: editing.team_id ?? "",
+          application_id: editing.applicationId ?? undefined,
+          team_id: editing.teamId ?? "",
           name: editing.name,
           path: editing.path ?? "",
           description: editing.description ?? "",
@@ -372,19 +372,19 @@ export function PagesPage() {
                   <TableCell><CopyableId value={pg.id} /></TableCell>
                   <TableCell className="font-medium">{pg.name}</TableCell>
                   <TableCell className="hidden sm:table-cell text-sm">
-                    {pg.team_id ? teamName(pg.team_id) : "—"}
+                    {pg.teamId ? teamName(pg.teamId) : "—"}
                   </TableCell>
                   <TableCell className="hidden sm:table-cell text-sm font-mono text-muted-foreground">
                     {pg.path ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm">
-                    {pg.application_id ? applicationName(pg.application_id) : "—"}
+                    {pg.applicationId ? applicationName(pg.applicationId) : "—"}
                   </TableCell>
                   <TableCell className="hidden lg:table-cell max-w-[200px] truncate text-muted-foreground text-sm">
                     {pg.description ?? "—"}
                   </TableCell>
                   <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                    {new Date(pg.created_at).toLocaleDateString()}
+                    {new Date(pg.createdAt).toLocaleDateString()}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">

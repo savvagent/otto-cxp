@@ -7,6 +7,7 @@
 //! naming it, never a fallback.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -33,6 +34,33 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub enforce_quotas: bool,
     pub log_format: LogFormat,
+    /// `FLY_APP_NAME`, which Fly sets on every machine: its presence alone
+    /// makes this process a deployment ([`Self::is_deployment`]).
+    pub fly_app_name: Option<String>,
+    /// The web console's sign-in, or `None` while `CXP_CONSOLE_CLIENT_ID` is
+    /// unset: then `/auth/login` answers `503 console_login_disabled` and the
+    /// session cookie is no credential anywhere.
+    pub console: Option<ConsoleConfig>,
+    /// `CXP_CONSOLE_DIR`: the built web console, served under `/console/`
+    /// with an `index.html` fallback for browser navigations there. Without
+    /// an `index.html`, `/console/` is the JSON `404` like any unknown path.
+    /// The image's Dockerfile `ENV` sets it (`/srv/console`); a deployment's
+    /// own environment would win over that.
+    pub console_dir: PathBuf,
+}
+
+/// The web console's sign-in settings.
+#[derive(Clone)]
+pub struct ConsoleConfig {
+    /// `CXP_CONSOLE_CLIENT_ID`: the first-party public client registered at
+    /// the platform with the redirect URI `{public_url}/auth/callback`. Not a
+    /// secret.
+    pub client_id: String,
+    /// `CXP_ENCRYPTION_KEY`: base64 of 32 bytes. Never used directly: two
+    /// HKDF-SHA256 subkeys seal the session tokens at rest and the in-flight
+    /// sign-in cookie (`cxp_http::console::ConsoleKeys`). Required with a
+    /// client id.
+    pub encryption_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +85,16 @@ impl std::fmt::Debug for Config {
             .field("allowed_origins", &self.allowed_origins)
             .field("enforce_quotas", &self.enforce_quotas)
             .field("log_format", &self.log_format)
+            .field("fly_app_name", &self.fly_app_name)
+            .field(
+                "console_client_id",
+                &self.console.as_ref().map(|c| c.client_id.as_str()),
+            )
+            .field(
+                "encryption_key",
+                &self.console.as_ref().map(|_| "<redacted>"),
+            )
+            .field("console_dir", &self.console_dir)
             // The database URL carries a password.
             .finish_non_exhaustive()
     }
@@ -79,6 +117,7 @@ impl Config {
             }
             None => format!("{public_url}/mcp"),
         };
+        let console = console_config(&vars, &public_url)?;
         Ok(Self {
             // `fly postgres attach` sets DATABASE_URL; CXP_DATABASE_URL wins
             // so a shell with another service's DATABASE_URL cannot point this
@@ -125,6 +164,14 @@ impl Config {
                 "json" => Ok(LogFormat::Json),
                 _ => Err(anyhow!("text or json")),
             })?,
+            fly_app_name: vars.optional("FLY_APP_NAME"),
+            console,
+            // Relative to the working directory: right for a `cargo run` from
+            // the repository root. The image sets /srv/console.
+            console_dir: vars
+                .optional("CXP_CONSOLE_DIR")
+                .unwrap_or_else(|| "apps/web/dist".into())
+                .into(),
         })
     }
 
@@ -135,6 +182,31 @@ impl Config {
             "{}/settings/billing",
             self.platform_url.trim_end_matches('/')
         )
+    }
+
+    /// Whether this is a deployment rather than a developer's machine. It is
+    /// one when any of these holds:
+    ///
+    /// - the public URL's host is not loopback (`localhost`, `127.0.0.0/8`,
+    ///   `::1`);
+    /// - the token audience (`CXP_RESOURCE_URI`) is not loopback: it is set
+    ///   independently of the public URL, and `CXP_ALLOWED_HOSTS` can admit
+    ///   the real host, so a loopback public URL alone does not mean real
+    ///   tokens cannot arrive;
+    /// - `FLY_APP_NAME` is set (Fly sets it on every machine).
+    ///
+    /// Only a process with all three pointing at a developer's machine is
+    /// not a deployment. A URL that does not parse counts as a deployment.
+    /// A deployment refuses to serve on a database role that is, or can
+    /// become, superuser-equivalent (`boot::check_db_role`).
+    ///
+    /// Derived rather than a setting of its own so it cannot be switched off
+    /// by a missing or mistyped key.
+    pub fn is_deployment(&self) -> bool {
+        let off_loopback = |v: &str| url::Url::parse(v).map_or(true, |u| !is_loopback(&u));
+        off_loopback(&self.public_url)
+            || off_loopback(&self.resource_uri)
+            || self.fly_app_name.is_some()
     }
 
     /// The `Host` headers `/mcp` accepts: the public URL's host (with its
@@ -180,8 +252,53 @@ impl Config {
             allowed_origins: vec![],
             enforce_quotas: false,
             log_format: LogFormat::Text,
+            fly_app_name: None,
+            console: None,
+            console_dir: "apps/web/dist".into(),
         }
     }
+}
+
+/// The console's sign-in, read only when `CXP_CONSOLE_CLIENT_ID` is set, so a
+/// deployment that has not registered the client (or set the key) boots with
+/// it off and everything else unchanged. A key that is set is checked either
+/// way: a typo should not wait until the day the console is switched on.
+fn console_config<F: Fn(&str) -> Option<String>>(
+    vars: &Vars<'_, F>,
+    public_url: &str,
+) -> Result<Option<ConsoleConfig>> {
+    let key = vars.optional("CXP_ENCRYPTION_KEY");
+    if let Some(key) = &key {
+        cxp_http::console::ConsoleKeys::derive(key).map_err(|_| {
+            anyhow!(
+                "CXP_ENCRYPTION_KEY must be base64 of exactly 32 bytes \
+                 (generate one with `openssl rand -base64 32`)"
+            )
+        })?;
+    }
+    let Some(client_id) = vars.optional("CXP_CONSOLE_CLIENT_ID") else {
+        return Ok(None);
+    };
+    let encryption_key = key.ok_or_else(|| {
+        anyhow!(
+            "CXP_ENCRYPTION_KEY is required when CXP_CONSOLE_CLIENT_ID is set: it seals the \
+             console's sessions"
+        )
+    })?;
+    // The session cookie is `__Host-` and `Secure` everywhere but a loopback
+    // development server; a plain-http public URL anywhere else would send it
+    // in the clear.
+    let parsed = url::Url::parse(public_url)?;
+    if parsed.scheme() != "https" && !is_loopback(&parsed) {
+        return Err(anyhow!(
+            "the console sign-in (CXP_CONSOLE_CLIENT_ID) needs an https CXP_PUBLIC_URL \
+             (plain http only for a loopback host), got {public_url:?}"
+        ));
+    }
+    Ok(Some(ConsoleConfig {
+        client_id,
+        encryption_key,
+    }))
 }
 
 struct Vars<'a, F: Fn(&str) -> Option<String>>(&'a F);
@@ -440,6 +557,63 @@ mod tests {
     }
 
     #[test]
+    fn only_loopback_urls_without_fly_are_not_a_deployment() {
+        for local in [
+            "http://localhost:8080",
+            "http://LOCALHOST:8080",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", local)])).unwrap();
+            assert_eq!(c.resource_uri, format!("{local}/mcp"));
+            assert!(!c.is_deployment(), "{local}");
+        }
+        for deployed in [
+            "https://otto-cxp.savvagent.com",
+            "https://otto-cxp.fly.dev",
+            "http://10.0.0.5:8080",
+            "http://0.0.0.0:8080",
+            "http://localhost.example.com",
+        ] {
+            let c = load(&env(&[("CXP_PUBLIC_URL", deployed)])).unwrap();
+            assert!(c.is_deployment(), "{deployed}");
+        }
+        assert!(Config::for_test().is_deployment());
+
+        // A loopback public URL does not hide a real audience: tokens for
+        // it can still arrive through CXP_ALLOWED_HOSTS.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("CXP_RESOURCE_URI", "https://otto-cxp.savvagent.com/mcp"),
+            ("CXP_ALLOWED_HOSTS", "otto-cxp.savvagent.com"),
+        ]))
+        .unwrap();
+        assert!(c.is_deployment());
+
+        // On Fly, whatever the URLs say.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("FLY_APP_NAME", "otto-cxp"),
+        ]))
+        .unwrap();
+        assert_eq!(c.fly_app_name.as_deref(), Some("otto-cxp"));
+        assert!(c.is_deployment());
+        // Blank is unset, like every other variable.
+        let c = load(&env(&[
+            ("CXP_PUBLIC_URL", "http://localhost:8080"),
+            ("FLY_APP_NAME", "  "),
+        ]))
+        .unwrap();
+        assert!(!c.is_deployment());
+
+        // Unparseable counts as a deployment (load refuses one, so set it).
+        let mut c = load(&env(&[("CXP_PUBLIC_URL", "http://localhost:8080")])).unwrap();
+        c.resource_uri = "not a url".into();
+        assert!(c.is_deployment());
+    }
+
+    #[test]
     fn a_bad_public_url_is_refused() {
         for bad in [
             "otto-cxp.savvagent.com",
@@ -552,6 +726,68 @@ mod tests {
         assert!(error(&vars).contains("CXP_DATABASE_URL (or DATABASE_URL)"));
     }
 
+    const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+
+    #[test]
+    fn the_console_is_off_until_its_client_id_is_set_and_needs_the_key_then() {
+        let c = load(&env(&[])).unwrap();
+        assert!(c.console.is_none());
+        assert_eq!(c.console_dir, std::path::Path::new("apps/web/dist"));
+        // A key alone does not turn it on.
+        let c = load(&env(&[("CXP_ENCRYPTION_KEY", KEY)])).unwrap();
+        assert!(c.console.is_none());
+
+        let c = load(&env(&[
+            ("CXP_CONSOLE_CLIENT_ID", " cxp-console "),
+            ("CXP_ENCRYPTION_KEY", KEY),
+            ("CXP_CONSOLE_DIR", "/srv/console"),
+        ]))
+        .unwrap();
+        let console = c.console.unwrap();
+        assert_eq!(console.client_id, "cxp-console");
+        assert_eq!(console.encryption_key, KEY);
+        assert_eq!(c.console_dir, std::path::Path::new("/srv/console"));
+
+        let msg = error(&env(&[("CXP_CONSOLE_CLIENT_ID", "cxp-console")]));
+        assert!(msg.contains("CXP_ENCRYPTION_KEY is required"), "{msg}");
+    }
+
+    #[test]
+    fn a_bad_encryption_key_is_refused_whether_or_not_the_console_is_on() {
+        for bad in ["not base64!", "c2hvcnQ=", &format!("{KEY}{KEY}")] {
+            for extra in [vec![], vec![("CXP_CONSOLE_CLIENT_ID", "cxp-console")]] {
+                let mut vars = vec![("CXP_ENCRYPTION_KEY", bad)];
+                vars.extend(extra);
+                let msg = error(&env(&vars));
+                assert!(
+                    msg.contains("CXP_ENCRYPTION_KEY must be base64"),
+                    "{bad}: {msg}"
+                );
+                assert!(!msg.contains(bad), "the key is echoed: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_console_needs_https_off_loopback() {
+        let with = |public: &str| {
+            env(&[
+                ("CXP_PUBLIC_URL", public),
+                ("CXP_CONSOLE_CLIENT_ID", "cxp-console"),
+                ("CXP_ENCRYPTION_KEY", KEY),
+            ])
+        };
+        let msg = error(&with("http://cxp.example.com"));
+        assert!(msg.contains("needs an https CXP_PUBLIC_URL"), "{msg}");
+        for ok in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "https://cxp.example.com",
+        ] {
+            assert!(load(&with(ok)).unwrap().console.is_some(), "{ok}");
+        }
+    }
+
     #[test]
     fn booleans_are_strict() {
         assert!(bool_value("TRUE").unwrap());
@@ -561,13 +797,18 @@ mod tests {
 
     #[test]
     fn debug_prints_no_secret() {
-        let c = load(&env(&[(
-            "DATABASE_URL",
-            "postgres://cxp:hunter2@db.internal/otto_cxp",
-        )]))
+        let c = load(&env(&[
+            (
+                "DATABASE_URL",
+                "postgres://cxp:hunter2@db.internal/otto_cxp",
+            ),
+            ("CXP_CONSOLE_CLIENT_ID", "cxp-console"),
+            ("CXP_ENCRYPTION_KEY", KEY),
+        ]))
         .unwrap();
         let s = format!("{c:?}");
-        for secret in ["otto_rs_abc", "otto_whsec_abc", "hunter2"] {
+        assert!(s.contains("cxp-console"), "{s}");
+        for secret in ["otto_rs_abc", "otto_whsec_abc", "hunter2", KEY] {
             assert!(!s.contains(secret), "{secret} leaked: {s}");
         }
         assert!(s.contains("otto-cxp.savvagent.com"), "{s}");

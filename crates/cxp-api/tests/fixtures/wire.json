@@ -1,0 +1,408 @@
+{
+  "application": {
+    "createdAt": "2026-10-12T12:30:00Z",
+    "description": "The web app",
+    "experienceId": "00000000-0000-0000-0000-00000000000a",
+    "id": "00000000-0000-0000-0000-00000000000b",
+    "metadata": {},
+    "name": "Web",
+    "platform": "web",
+    "teamId": "00000000-0000-0000-0000-000000000014",
+    "updatedAt": "2026-10-13T12:30:00Z"
+  },
+  "applicationList": {
+    "data": [
+      {
+        "createdAt": "2026-10-12T12:30:00Z",
+        "description": "The web app",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "id": "00000000-0000-0000-0000-00000000000b",
+        "metadata": {},
+        "name": "Web",
+        "platform": "web",
+        "teamId": "00000000-0000-0000-0000-000000000014",
+        "updatedAt": "2026-10-13T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "component": {
+    "componentType": "button",
+    "createdAt": "2026-10-16T12:30:00Z",
+    "description": "Submits payment",
+    "id": "00000000-0000-0000-0000-00000000000d",
+    "metadata": {},
+    "name": "Pay button",
+    "pageId": "00000000-0000-0000-0000-00000000000c",
+    "teamId": "00000000-0000-0000-0000-000000000014",
+    "updatedAt": "2026-10-17T12:30:00Z"
+  },
+  "componentList": {
+    "data": [
+      {
+        "componentType": "button",
+        "createdAt": "2026-10-16T12:30:00Z",
+        "description": "Submits payment",
+        "id": "00000000-0000-0000-0000-00000000000d",
+        "metadata": {},
+        "name": "Pay button",
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "teamId": "00000000-0000-0000-0000-000000000014",
+        "updatedAt": "2026-10-17T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "customer": {
+    "applicationId": "00000000-0000-0000-0000-00000000000b",
+    "company": "Analytical Engines",
+    "componentId": "00000000-0000-0000-0000-00000000000d",
+    "createdAt": "2026-10-01T12:30:00Z",
+    "email": "ada@example.com",
+    "experienceId": "00000000-0000-0000-0000-00000000000a",
+    "id": "00000000-0000-0000-0000-000000000001",
+    "metadata": {
+      "plan": "pro"
+    },
+    "name": "Ada Lovelace",
+    "pageId": "00000000-0000-0000-0000-00000000000c",
+    "phone": "+15550100",
+    "tags": [
+      "vip"
+    ],
+    "updatedAt": "2026-10-02T12:30:00Z"
+  },
+  "customer360": {
+    "customer": {
+      "applicationId": "00000000-0000-0000-0000-00000000000b",
+      "company": "Analytical Engines",
+      "componentId": "00000000-0000-0000-0000-00000000000d",
+      "createdAt": "2026-10-01T12:30:00Z",
+      "email": "ada@example.com",
+      "experienceId": "00000000-0000-0000-0000-00000000000a",
+      "id": "00000000-0000-0000-0000-000000000001",
+      "metadata": {
+        "plan": "pro"
+      },
+      "name": "Ada Lovelace",
+      "pageId": "00000000-0000-0000-0000-00000000000c",
+      "phone": "+15550100",
+      "tags": [
+        "vip"
+      ],
+      "updatedAt": "2026-10-02T12:30:00Z"
+    },
+    "recentFeedback": [
+      {
+        "body": "Loved it",
+        "createdAt": "2026-10-05T12:30:00Z",
+        "feedbackType": "nps",
+        "id": "00000000-0000-0000-0000-000000000003",
+        "rating": 9,
+        "subject": "Great"
+      }
+    ],
+    "recentInteractions": [
+      {
+        "createdAt": "2026-10-09T12:30:00Z",
+        "customerId": "00000000-0000-0000-0000-000000000001",
+        "id": "00000000-0000-0000-0000-000000000006",
+        "interactionType": "page_view",
+        "metadata": {
+          "path": "/pricing"
+        }
+      }
+    ],
+    "recentTickets": [
+      {
+        "assignedTo": "grace",
+        "channel": "email",
+        "createdAt": "2026-10-03T12:30:00Z",
+        "id": "00000000-0000-0000-0000-000000000002",
+        "priority": "high",
+        "resolvedAt": "2026-10-04T12:30:00Z",
+        "status": "in_progress",
+        "subject": "Cannot log in"
+      }
+    ]
+  },
+  "customerList": {
+    "data": [
+      {
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "company": "Analytical Engines",
+        "componentId": "00000000-0000-0000-0000-00000000000d",
+        "createdAt": "2026-10-01T12:30:00Z",
+        "email": "ada@example.com",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "id": "00000000-0000-0000-0000-000000000001",
+        "metadata": {
+          "plan": "pro"
+        },
+        "name": "Ada Lovelace",
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "phone": "+15550100",
+        "tags": [
+          "vip"
+        ],
+        "updatedAt": "2026-10-02T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "customerMinimal": {
+    "applicationId": null,
+    "company": null,
+    "componentId": null,
+    "createdAt": "2026-10-01T12:30:00Z",
+    "email": "min@example.com",
+    "experienceId": null,
+    "id": "00000000-0000-0000-0000-00000000001e",
+    "metadata": {},
+    "name": null,
+    "pageId": null,
+    "phone": null,
+    "tags": [],
+    "updatedAt": "2026-10-01T12:30:00Z"
+  },
+  "dashboardMetrics": {
+    "open_tickets": 1,
+    "total_customers": 1,
+    "total_experiences": 1,
+    "total_feedback": 3,
+    "total_surveys": 1,
+    "total_tickets": 2
+  },
+  "experience": {
+    "createdAt": "2026-10-10T12:30:00Z",
+    "description": "The shop",
+    "id": "00000000-0000-0000-0000-00000000000a",
+    "metadata": {},
+    "name": "Storefront",
+    "teamId": "00000000-0000-0000-0000-000000000014",
+    "updatedAt": "2026-10-11T12:30:00Z"
+  },
+  "experienceList": {
+    "data": [
+      {
+        "createdAt": "2026-10-10T12:30:00Z",
+        "description": "The shop",
+        "id": "00000000-0000-0000-0000-00000000000a",
+        "metadata": {},
+        "name": "Storefront",
+        "teamId": "00000000-0000-0000-0000-000000000014",
+        "updatedAt": "2026-10-11T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "feedback": {
+    "applicationId": "00000000-0000-0000-0000-00000000000b",
+    "body": "Loved it",
+    "componentId": "00000000-0000-0000-0000-00000000000d",
+    "createdAt": "2026-10-05T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-000000000001",
+    "experienceId": "00000000-0000-0000-0000-00000000000a",
+    "feedbackType": "nps",
+    "id": "00000000-0000-0000-0000-000000000003",
+    "metadata": {},
+    "pageId": "00000000-0000-0000-0000-00000000000c",
+    "rating": 9,
+    "subject": "Great"
+  },
+  "feedbackList": {
+    "data": [
+      {
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "body": "Loved it",
+        "componentId": "00000000-0000-0000-0000-00000000000d",
+        "createdAt": "2026-10-05T12:30:00Z",
+        "customerId": "00000000-0000-0000-0000-000000000001",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "feedbackType": "nps",
+        "id": "00000000-0000-0000-0000-000000000003",
+        "metadata": {},
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "rating": 9,
+        "subject": "Great"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "interaction": {
+    "createdAt": "2026-10-09T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-000000000001",
+    "id": "00000000-0000-0000-0000-000000000006",
+    "interactionType": "page_view",
+    "metadata": {
+      "path": "/pricing"
+    }
+  },
+  "page": {
+    "applicationId": "00000000-0000-0000-0000-00000000000b",
+    "createdAt": "2026-10-14T12:30:00Z",
+    "description": "Pay here",
+    "id": "00000000-0000-0000-0000-00000000000c",
+    "metadata": {},
+    "name": "Checkout",
+    "path": "/checkout",
+    "teamId": "00000000-0000-0000-0000-000000000014",
+    "updatedAt": "2026-10-15T12:30:00Z"
+  },
+  "pageList": {
+    "data": [
+      {
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "createdAt": "2026-10-14T12:30:00Z",
+        "description": "Pay here",
+        "id": "00000000-0000-0000-0000-00000000000c",
+        "metadata": {},
+        "name": "Checkout",
+        "path": "/checkout",
+        "teamId": "00000000-0000-0000-0000-000000000014",
+        "updatedAt": "2026-10-15T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "survey": {
+    "active": true,
+    "applicationId": "00000000-0000-0000-0000-00000000000b",
+    "componentId": "00000000-0000-0000-0000-00000000000d",
+    "createdAt": "2026-10-06T12:30:00Z",
+    "description": "How are we doing?",
+    "experienceId": "00000000-0000-0000-0000-00000000000a",
+    "id": "00000000-0000-0000-0000-000000000004",
+    "pageId": "00000000-0000-0000-0000-00000000000c",
+    "questions": [
+      {
+        "id": "q1",
+        "text": "Score us",
+        "type": "rating"
+      }
+    ],
+    "title": "Quarterly NPS",
+    "updatedAt": "2026-10-07T12:30:00Z"
+  },
+  "surveyList": {
+    "data": [
+      {
+        "active": true,
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "componentId": "00000000-0000-0000-0000-00000000000d",
+        "createdAt": "2026-10-06T12:30:00Z",
+        "description": "How are we doing?",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "id": "00000000-0000-0000-0000-000000000004",
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "questions": [
+          {
+            "id": "q1",
+            "text": "Score us",
+            "type": "rating"
+          }
+        ],
+        "title": "Quarterly NPS",
+        "updatedAt": "2026-10-07T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "surveyResponse": {
+    "answers": {
+      "q1": 9
+    },
+    "completedAt": "2026-10-08T12:30:00Z",
+    "createdAt": "2026-10-08T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-000000000001",
+    "id": "00000000-0000-0000-0000-000000000005",
+    "surveyId": "00000000-0000-0000-0000-000000000004"
+  },
+  "team": {
+    "id": "00000000-0000-0000-0000-000000000014",
+    "name": "Growth",
+    "slug": "growth"
+  },
+  "ticket": {
+    "applicationId": "00000000-0000-0000-0000-00000000000b",
+    "assignedTo": "grace",
+    "channel": "email",
+    "componentId": "00000000-0000-0000-0000-00000000000d",
+    "createdAt": "2026-10-03T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-000000000001",
+    "description": "The login button does nothing",
+    "experienceId": "00000000-0000-0000-0000-00000000000a",
+    "id": "00000000-0000-0000-0000-000000000002",
+    "metadata": {},
+    "pageId": "00000000-0000-0000-0000-00000000000c",
+    "priority": "high",
+    "resolvedAt": "2026-10-04T12:30:00Z",
+    "status": "in_progress",
+    "subject": "Cannot log in",
+    "tags": [
+      "login"
+    ],
+    "updatedAt": "2026-10-04T12:30:00Z"
+  },
+  "ticketList": {
+    "data": [
+      {
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "assignedTo": "grace",
+        "channel": "email",
+        "componentId": "00000000-0000-0000-0000-00000000000d",
+        "createdAt": "2026-10-03T12:30:00Z",
+        "customerId": "00000000-0000-0000-0000-000000000001",
+        "description": "The login button does nothing",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "id": "00000000-0000-0000-0000-000000000002",
+        "metadata": {},
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "priority": "high",
+        "resolvedAt": "2026-10-04T12:30:00Z",
+        "status": "in_progress",
+        "subject": "Cannot log in",
+        "tags": [
+          "login"
+        ],
+        "updatedAt": "2026-10-04T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1
+  },
+  "ticketOpen": {
+    "applicationId": null,
+    "assignedTo": null,
+    "channel": null,
+    "componentId": null,
+    "createdAt": "2026-10-03T12:30:00Z",
+    "customerId": "00000000-0000-0000-0000-00000000001e",
+    "description": null,
+    "experienceId": null,
+    "id": "00000000-0000-0000-0000-00000000001f",
+    "metadata": {},
+    "pageId": null,
+    "priority": "medium",
+    "resolvedAt": null,
+    "status": "open",
+    "subject": "Open",
+    "tags": [],
+    "updatedAt": "2026-10-03T12:30:00Z"
+  }
+}

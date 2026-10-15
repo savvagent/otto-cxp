@@ -12,7 +12,7 @@
  */
 
 import { useState } from "react";
-import { useParams, Link } from "react-router";
+import { useParams, Link, useNavigate } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -36,7 +36,13 @@ import {
   useUpdateCustomer,
 } from "@/hooks/use-customers";
 import { customersApi } from "@/lib/api";
-import type { Customer, Customer360, Ticket, Feedback, Interaction } from "@/lib/types";
+import type {
+  Customer,
+  Customer360,
+  TicketSummary,
+  FeedbackSummary,
+  Interaction,
+} from "@/lib/types";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -349,7 +355,7 @@ function ProfileCard({
 
           <div className="flex items-center gap-2 text-muted-foreground">
             <Calendar className="h-4 w-4 shrink-0" aria-hidden="true" />
-            <span>Customer since {formatDate(customer.created_at)}</span>
+            <span>Customer since {formatDate(customer.createdAt)}</span>
           </div>
         </dl>
 
@@ -371,7 +377,7 @@ function ProfileCard({
 // Tickets tab
 // ---------------------------------------------------------------------------
 
-function TicketsTab({ tickets }: { tickets: Ticket[] }) {
+function TicketsTab({ tickets }: { tickets: TicketSummary[] }) {
   if (tickets.length === 0) {
     return (
       <EmptyState
@@ -410,7 +416,7 @@ function TicketsTab({ tickets }: { tickets: Ticket[] }) {
                 {ticket.channel ?? "—"}
               </TableCell>
               <TableCell className="hidden sm:table-cell text-muted-foreground text-sm">
-                {formatDate(ticket.created_at)}
+                {formatDate(ticket.createdAt)}
               </TableCell>
             </TableRow>
           ))}
@@ -424,7 +430,7 @@ function TicketsTab({ tickets }: { tickets: Ticket[] }) {
 // Feedback tab
 // ---------------------------------------------------------------------------
 
-function FeedbackTab({ feedback }: { feedback: Feedback[] }) {
+function FeedbackTab({ feedback }: { feedback: FeedbackSummary[] }) {
   if (feedback.length === 0) {
     return (
       <EmptyState
@@ -451,7 +457,7 @@ function FeedbackTab({ feedback }: { feedback: Feedback[] }) {
             <TableRow key={item.id}>
               <TableCell>
                 <Badge variant="outline" className="capitalize text-xs">
-                  {item.feedback_type.replace(/_/g, " ")}
+                  {item.feedbackType.replace(/_/g, " ")}
                 </Badge>
               </TableCell>
               <TableCell className="max-w-[220px]">
@@ -477,7 +483,7 @@ function FeedbackTab({ feedback }: { feedback: Feedback[] }) {
                 )}
               </TableCell>
               <TableCell className="hidden md:table-cell text-muted-foreground text-sm">
-                {formatDate(item.created_at)}
+                {formatDate(item.createdAt)}
               </TableCell>
             </TableRow>
           ))}
@@ -516,11 +522,11 @@ function InteractionsTab({ interactions }: { interactions: Interaction[] }) {
             <TableRow key={interaction.id}>
               <TableCell>
                 <Badge variant="outline" className="capitalize text-xs">
-                  {interaction.interaction_type.replace(/_/g, " ")}
+                  {interaction.interactionType.replace(/_/g, " ")}
                 </Badge>
               </TableCell>
               <TableCell className="hidden sm:table-cell text-muted-foreground text-sm">
-                {formatDateTime(interaction.created_at)}
+                {formatDateTime(interaction.createdAt)}
               </TableCell>
             </TableRow>
           ))}
@@ -536,6 +542,7 @@ function InteractionsTab({ interactions }: { interactions: Interaction[] }) {
 
 export function CustomerDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [editOpen, setEditOpen] = useState(false);
 
   const {
@@ -591,15 +598,15 @@ export function CustomerDetailPage() {
           title="Customer not found"
           description="This customer may have been deleted or the link is invalid."
           action="View all customers"
-          onAction={() => window.location.assign("/customers")}
+          onAction={() => navigate("/customers")}
         />
       </div>
     );
   }
 
-  const tickets = data360?.recent_tickets ?? [];
-  const feedback = data360?.recent_feedback ?? [];
-  const interactions = data360?.recent_interactions ?? [];
+  const tickets = data360?.recentTickets ?? [];
+  const feedback = data360?.recentFeedback ?? [];
+  const interactions = data360?.recentInteractions ?? [];
 
   return (
     <div className="flex flex-col gap-6">

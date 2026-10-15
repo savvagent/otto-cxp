@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 cxp-core.workspace = true
+cxp-http.workspace = true
 otto-tenant.workspace = true
 otto-resource.workspace = true
 serde.workspace = true
@@ -21,3 +22,5 @@ tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true, features = ["util"] }
 sqlx.workspace = true
 chrono.workspace = true
+url.workspace = true
+futures.workspace = true
