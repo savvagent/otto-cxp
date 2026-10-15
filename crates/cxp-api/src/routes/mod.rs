@@ -17,7 +17,7 @@
 //! (`total_customers`, ...) beside the camelCase ones (#35). Errors are
 //! `{"error", "code"}`; the auth layer's `401`/`403` use the RFC 6750 names
 //! `error` and `error_description`. The web console's types follow this, and
-//! the `wire_fixture` test below pins the shapes it reads.
+//! the `wire_fixture` tests below pin the shapes it reads.
 
 pub mod catalog;
 pub mod customers;
@@ -408,10 +408,11 @@ mod wire_fixture {
     }
 }
 
-/// Request structs take camelCase keys and, as aliases, the snake_case
-/// spellings `/api/v1` accepted before #24, so older callers keep working.
 #[cfg(test)]
 mod casing {
+    //! Request structs, bodies and query strings alike, take camelCase keys
+    //! and, as aliases, the snake_case spellings `/api/v1` accepted before
+    //! #24, so older callers keep working.
     use axum::extract::Query;
     use serde::de::DeserializeOwned;
     use serde_json::json;

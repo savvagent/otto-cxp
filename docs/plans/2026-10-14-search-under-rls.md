@@ -1,5 +1,7 @@
 # Search under RLS — plan
 
+> The `X-Total-*` headers described here were replaced by the search envelope's `totalCapped` (#24).
+
 Spec: `docs/specs/2026-10-14-search-under-rls-design.md`. Issue #17. Rob chose option (c) (a
 capped count, bounded reads) on 2026-10-14; this plan is the rework that follows it.
 

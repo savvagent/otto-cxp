@@ -10,18 +10,23 @@ use crate::{ApiResult, AppState};
 
 /// The headline counts: the camelCase keys of the convention, plus the
 /// snake_case keys this route answered with before #24.
+///
+/// Built only through `From<DashboardMetrics>`, so the two halves always carry
+/// the same counts. The two key sets must never share a name (flattening
+/// would write it twice); `LegacyMetrics` is frozen until #35 removes it.
 #[derive(Debug, Serialize)]
 pub struct Metrics {
     #[serde(flatten)]
-    pub current: DashboardMetrics,
+    current: DashboardMetrics,
     #[serde(flatten)]
-    pub legacy: LegacyMetrics,
+    legacy: LegacyMetrics,
 }
 
 /// Deprecated: the pre-#24 snake_case keys, the same values as `current`.
 /// Kept so consumers that read `total_customers` keep working; removal is
 /// tracked in #35.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LegacyMetrics {
     pub total_customers: i64,
     pub total_tickets: i64,

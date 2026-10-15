@@ -2,9 +2,9 @@
 //! catalog, each entity optionally owned by a platform team.
 //!
 //! **The team field.** Bodies take `teamId` (the convention) and `team_id` as
-//! an alias (sending both is a `400`). On
-//! create, absent or `null` means no team. On update, absent keeps the team,
-//! an explicit `null` clears it, and an id sets it. Any id is verified at the platform
+//! an alias (sending both is a `400 invalid_argument`). On create, absent or
+//! `null` means no team. On update, absent keeps the team, an explicit `null`
+//! clears it, and an id sets it. Any id is verified at the platform
 //! (`cxp_core::catalog::verify_team`) before the transaction opens: a team the
 //! platform does not know in the caller's org is `400 unknown_team`, and a
 //! platform that cannot answer is `503`.

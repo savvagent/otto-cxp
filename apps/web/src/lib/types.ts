@@ -170,7 +170,7 @@ export interface MyTeam {
 
 /**
  * `GET /dashboard/metrics`. The server also sends deprecated snake_case twins of
- * these keys, which the console does not read.
+ * these keys, which the console does not read (their removal is #35).
  */
 export interface DashboardMetrics {
   totalCustomers: number;
@@ -188,7 +188,12 @@ export interface PaginatedResponse<T> {
   offset: number;
 }
 
-/** A search response: the list envelope plus whether `total` is capped. */
+/**
+ * A search response: the list envelope plus whether `total` is capped. With
+ * `totalCapped: false`, `total` and `data` are exact; with `true`, `total` is a
+ * lower bound (matches are counted up to 1000) and `data` is the requested page
+ * of the best-ranked matches found.
+ */
 export interface CappedPaginatedResponse<T> extends PaginatedResponse<T> {
   totalCapped: boolean;
 }

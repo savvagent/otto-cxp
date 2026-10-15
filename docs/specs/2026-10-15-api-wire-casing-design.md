@@ -209,7 +209,9 @@ honours `rename_all` and `alias` (no `flatten` is involved).
 
 None: no config key, secret, scope, migration, or role change. The deploy is `ci-auto`; the
 console ships in the same image, so server and console change together (no window where a new
-console talks to an old server, except a browser holding an old console bundle: an old console's
+console talks to an old server while production runs one machine, as it does today; a rolling
+deploy across several machines would let a new console reach an old replica, which ignores the
+camelCase keys, except a browser holding an old console bundle: an old console's
 snake_case writes still work via the aliases; an old console's search palette would see an object
 instead of an array until it reloads, and its dashboard keeps working via the legacy keys).
 
