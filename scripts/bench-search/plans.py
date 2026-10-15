@@ -6,10 +6,13 @@
 # force_generic_plan under EXPLAIN (ANALYZE, FORMAT JSON), and prints the
 # execution time and either "per-candidate" or what read a whole org:
 #
-# - a hashed subplan that reads customers, customer_search_grams,
+# - an executed hashed subplan that reads customers, customer_search_grams,
 #   knowledge_articles or knowledge_search_terms, or
-# - inside the customer statement's `matches`, a hash or merge join, or a
-#   read of customers by anything but an index scan.
+# - inside the customer statement's `matches`, an executed hash or merge
+#   join, or an executed read of customers by anything but an index scan.
+#
+# Only executed nodes count (EXPLAIN ANALYZE's `Actual Loops`); the plan
+# shape test, crates/cxp-core/tests/search_plans.rs, flags planned ones too.
 #
 # Exits 1 if any query fails the check.
 #

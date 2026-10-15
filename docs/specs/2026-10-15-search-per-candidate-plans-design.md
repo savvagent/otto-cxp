@@ -173,10 +173,11 @@ asserts:
   subplan's own subtree whose `Relation Name` is the table (a `CTE Scan` has none, so the
   expected hashed `NOT IN (SELECT ... FROM sub_all)` / `fts_hits` subplans over CTEs pass).
 
-On the current statements the hashed-subplan check fails on the article title `EXISTS` (the only
-probe the planner hashed in the prototype runs, even with index scans off); the `sub_hits`,
-`title_hits` and `fts_hits` fences are defence in depth that this check would catch if a planner
-change ever hashed them. The PR records which assertions failed before the fences.
+On the unfenced statements, with the test's own seed, the hashed-subplan check failed on
+`sub_hits`' probe (a hashed subplan seq-scanning `customer_search_grams`) and, with only the
+article fences removed, on a `knowledge_search_terms` probe; the mid-size benchmark data hashed
+the article title `EXISTS` instead. Which probe the planner hashes depends on the statistics, which
+is why every probe is fenced. The PR records the failures.
 
 `plans.py` applies the same two rules to `EXPLAIN (ANALYZE, FORMAT JSON)` of forced generic plans
 against a seeded benchmark database, with no planner knobs, and prints per query the execution
