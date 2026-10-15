@@ -69,11 +69,22 @@ function QuestionsList({ questions }: { questions: unknown }) {
   );
 }
 
+/**
+ * The responses heading's count. The console fetches the first page only, so
+ * when fewer responses are shown than exist it says how many of the total.
+ */
+export function responsesCount(shown: number, total: number): string {
+  return shown < total ? `${shown} of ${total}` : String(total);
+}
+
 export function SurveyDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { data: survey, isLoading: surveyLoading } = useSurvey(id);
-  const { data: responsesData, isLoading: responsesLoading } =
-    useSurveyResponses(id);
+  const {
+    data: responsesData,
+    isLoading: responsesLoading,
+    isError: responsesError,
+  } = useSurveyResponses(id);
   const updateSurvey = useUpdateSurvey();
 
   const [editing, setEditing] = useState(false);
@@ -137,7 +148,8 @@ export function SurveyDetailPage() {
     setEditing(false);
   }
 
-  const responses = responsesData ?? [];
+  const responses = responsesData?.data ?? [];
+  const total = responsesData?.total ?? 0;
 
   return (
     <div className="space-y-6">
@@ -295,9 +307,19 @@ export function SurveyDetailPage() {
 
       {/* Responses */}
       <div className="space-y-3">
-        <h3 className="text-lg font-semibold">Responses</h3>
+        <h3 className="text-lg font-semibold">
+          Responses
+          {responsesData
+            ? ` (${responsesCount(responses.length, total)})`
+            : ""}
+        </h3>
         {responsesLoading ? (
           <LoadingTable />
+        ) : responsesError ? (
+          <EmptyState
+            title="Failed to load responses"
+            description="Check your connection and try again."
+          />
         ) : responses.length === 0 ? (
           <EmptyState
             icon={ClipboardList}
@@ -315,7 +337,7 @@ export function SurveyDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {responses.map((response: import("@/lib/types").SurveyResponse) => {
+                {responses.map((response) => {
                   const answersStr = JSON.stringify(response.answers);
                   const truncated =
                     answersStr.length > 80

@@ -9,7 +9,8 @@ export const surveyKeys = {
     [...surveyKeys.lists(), params] as const,
   details: () => [...surveyKeys.all, "detail"] as const,
   detail: (id: string) => [...surveyKeys.details(), id] as const,
-  responses: (id: string) => [...surveyKeys.detail(id), "responses"] as const,
+  responses: (id: string, params: Record<string, unknown> = {}) =>
+    [...surveyKeys.detail(id), "responses", params] as const,
 };
 
 export function useSurveys(params?: {
@@ -34,10 +35,13 @@ export function useSurvey(id: string | undefined) {
   });
 }
 
-export function useSurveyResponses(id: string | undefined) {
+export function useSurveyResponses(
+  id: string | undefined,
+  params?: { limit?: number; offset?: number },
+) {
   return useQuery({
-    queryKey: surveyKeys.responses(id!),
-    queryFn: () => surveysApi.getResponses(id!),
+    queryKey: surveyKeys.responses(id!, params ?? {}),
+    queryFn: () => surveysApi.getResponses(id!, params),
     enabled: !!id,
   });
 }

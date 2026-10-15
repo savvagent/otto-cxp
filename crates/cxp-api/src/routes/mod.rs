@@ -11,9 +11,8 @@
 //! (`metadata`, `questions`, `answers`) passes through untouched.
 //!
 //! Lists answer [`Paginated`] `{data, total, limit, offset}`; search answers
-//! [`CappedPaginated`], which adds `totalCapped`. Two exceptions remain, each
-//! tracked: `GET /surveys/{id}/responses` is a plain array (#36), and
-//! `GET /dashboard/metrics` also sends its deprecated snake_case keys
+//! [`CappedPaginated`], which adds `totalCapped`. One exception remains,
+//! tracked: `GET /dashboard/metrics` also sends its deprecated snake_case keys
 //! (`total_customers`, ...) beside the camelCase ones (#35). Errors are
 //! `{"error", "code"}`; the auth layer's `401`/`403` use the RFC 6750 names
 //! `error` and `error_description`. The web console's types follow this, and
@@ -385,6 +384,7 @@ mod wire_fixture {
             "ticketList": Paginated::new((vec![ticket()], 1), page),
             "feedbackList": Paginated::new((vec![feedback()], 1), page),
             "surveyList": Paginated::new((vec![survey()], 1), page),
+            "surveyResponseList": Paginated::new((vec![survey_response()], 1), page),
             "experienceList": Paginated::new((vec![experience()], 1), page),
             "applicationList": Paginated::new((vec![application()], 1), page),
             "pageList": Paginated::new((vec![self::page()], 1), page),
