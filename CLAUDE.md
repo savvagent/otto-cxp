@@ -123,7 +123,9 @@ write indexed, so there is no backlog and searches only read (#34). A search pas
 `docs/deploy/fly.md` ("Search index storage"). Making a new column searchable means a new
 migration that changes the gram function, the sync trigger, and its `WHEN` clause together, and
 rebuilds the affected rows; extend the equivalence corpora in `crates/cxp-core/tests` with it.
-`totalCapped: false` promises results identical to a full scan.
+`totalCapped: false` promises results identical to a full scan. Per-candidate probes keep their
+fences (`LIMIT 1` in the customer lateral, `OFFSET 0` in each correlated `EXISTS`, #41), checked
+by `crates/cxp-core/tests/search_plans.rs` and `scripts/bench-search/plans.py`.
 
 ## Configuration
 
