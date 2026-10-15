@@ -520,15 +520,35 @@ where
         tracing::warn!("{why}: allowed only because this is not a deployment");
     }
 
+    // The shared tenant role is no longer used: a leftover membership is
+    // harmless, but it is a privilege this service should not hold.
+    if deployment {
+        match cxp_core::db_role::holds_shared_tenant_role(&db).await {
+            Ok(true) => tracing::warn!(
+                "database role {} is still a member of {}, the tenant role the otto services \
+                 share; this release no longer uses it: REVOKE {} FROM {} once it is verified \
+                 (docs/deploy/fly.md, runbook T5)",
+                sql_identifier(&role.current_user),
+                cxp_core::db_role::SHARED_TENANT_ROLE,
+                cxp_core::db_role::SHARED_TENANT_ROLE,
+                sql_identifier(&role.current_user),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e.log_detail(),
+                "could not read whether the database role still belongs to otto_app"),
+        }
+    }
+
     // Prove tenant isolation before serving. The same migrations isolate
     // perfectly under one database role and not at all under another, and
     // only the running database can say which this is.
-    let isolation = db
+    let report = db
         .verify_tenant_isolation()
         .await
-        .context("refusing to serve: tenant isolation is not enforced by this database")?
-        .summary();
+        .context("refusing to serve: tenant isolation is not enforced by this database")?;
+    let isolation = report.summary();
     tracing::info!("{isolation}");
+    check_tenant_role(&report, &role.current_user)?;
 
     let platform = platform_client(&config)?;
     let check = check_platform(&platform, &config).await;
@@ -659,6 +679,35 @@ fn flush_result(
 /// than sweep platform events.
 const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 
+/// Whether tenant transactions really run as otto-cxp's own tenant role. otto-tenant issues
+/// `SET LOCAL ROLE cxp_app` only when the role exists and the login holds it, and otherwise
+/// runs tenant transactions as the login itself, which `verify_tenant_isolation` accepts for any
+/// role that is neither superuser nor BYPASSRLS. That login also holds the background grants
+/// (the tombstone), and would serve every request with them, silently. So boot refuses unless
+/// the report says the role was assumed and is the effective role, on every machine: unlike the
+/// privilege checks (which only warn locally, where Postgres hands out a superuser), a local
+/// superuser passes this one (0007 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
+/// a local exception would only ever admit the silent fallback this exists to stop.
+pub fn check_tenant_role(
+    report: &otto_tenant::isolation::IsolationReport,
+    login: &str,
+) -> Result<()> {
+    if report.tenant_role_assumed && report.effective_role == cxp_core::TENANT_ROLE {
+        return Ok(());
+    }
+    let role = cxp_core::TENANT_ROLE;
+    let why = format!(
+        "tenant transactions run as {:?}, not otto-cxp's own tenant role {role} (it does not \
+         exist, or {} cannot assume it): as a superuser, CREATE ROLE {role} NOLOGIN; GRANT \
+         {role} TO {}; then migrate (docs/deploy/fly.md, runbook T1)",
+        report.effective_role,
+        sql_identifier(login),
+        sql_identifier(login),
+    );
+    tracing::error!("{why}: refusing to serve");
+    Err(anyhow!("refusing to serve: {why}"))
+}
+
 /// `name` as a quoted SQL identifier, ready to paste into a statement:
 /// always double-quoted, with every embedded double quote doubled, so a name
 /// Postgres would fold (`Cxp`), misparse (`cxp-runtime`), or read as a
@@ -709,6 +758,36 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use otto_resource::{ClientConfig, IntrospectionResponse};
+
+    fn report(effective: &str, assumed: bool) -> otto_tenant::isolation::IsolationReport {
+        otto_tenant::isolation::IsolationReport {
+            tenant_role: cxp_core::TENANT_ROLE.into(),
+            effective_role: effective.into(),
+            tenant_role_assumed: assumed,
+            role_is_superuser: false,
+            role_bypasses_rls: false,
+            tables: vec![],
+        }
+    }
+
+    #[test]
+    fn boot_refuses_tenant_transactions_that_did_not_assume_cxp_app() {
+        assert!(check_tenant_role(&report("cxp_app", true), "cxp_server").is_ok());
+        // cxp_app missing, or the login not a member: otto-tenant skipped SET LOCAL ROLE.
+        let err = check_tenant_role(&report("cxp_server", false), "cxp_server")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"tenant transactions run as "cxp_server""#),
+            "{err}"
+        );
+        assert!(err.contains(r#"GRANT cxp_app TO "cxp_server""#), "{err}");
+        // Assumed, but landing somewhere else, is refused too.
+        assert!(check_tenant_role(&report("otto_app", true), "cxp_server").is_err());
+        // Not assumed but the effective role happens to be named cxp_app (a login called
+        // cxp_app): refused, since nothing dropped privileges.
+        assert!(check_tenant_role(&report("cxp_app", false), "cxp_app").is_err());
+    }
 
     /// A platform whose introspection endpoint answers `status` (with an
     /// inactive-token body when 200), or one that cannot be reached.
