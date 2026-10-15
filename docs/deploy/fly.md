@@ -200,7 +200,7 @@ functions to `search_path = pg_catalog, public, pg_temp` with every call schema-
 Every boot, deployment or not, also refuses to serve unless tenant transactions assumed
 `cxp_app` (`refusing to serve: tenant transactions run as "<effective>", not otto-cxp's own
 tenant role cxp_app (it does not exist, or "<login>" cannot assume it): as a superuser, CREATE
-ROLE cxp_app NOLOGIN; GRANT cxp_app TO "<login>"; then migrate (docs/deploy/fly.md, runbook
+ROLE cxp_app NOLOGIN; GRANT cxp_app TO "<login>" WITH INHERIT TRUE; then migrate (docs/deploy/fly.md, runbook
 T1)`), and a deployment warns while the login is still a member of `otto_app` (`database role
 "cxp_server" is still a member of otto_app, the tenant role the otto services share; this
 release no longer uses it: REVOKE otto_app FROM "cxp_server" once it is verified (docs/deploy/fly.md,
@@ -1257,9 +1257,10 @@ fly certs add otto-cxp.savvagent.com -a otto-cxp
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL to a superuser,
 #    which a deployment refuses: run "Database role" below before step 5 (on a fresh
 #    setup its step R5 imports the secret with --stage, and R6 and R7 follow the first deploy),
-#    then the split runbook's S1 to S4 and S6's staged secret and this runbook's T1 (`cxp_app`, before the first release command runs 0007) (with nothing deployed yet,
+#    then the split runbook's S1 to S4 and S6's staged secret (with nothing deployed yet,
 #    S1's secret restarts nothing, and S4's checks of tables and console_session_org wait
-#    until after the first deploy, as does its restart).
+#    until after the first deploy, as does its restart). Then the tenant-role runbook's T1
+#    (cxp_app), before the first release command runs migration 0007.
 #    The first deploy's release command then migrates as cxp_owner.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 

@@ -1108,7 +1108,8 @@ async fn ship_once_ships_deletes_and_handles_duplicates_and_rejections(pool: PgP
 }
 
 /// The shipper runs unpinned across every org through `maintenance`; as
-/// `otto_app`, RLS applies to it, so this proves its policies admit it.
+/// the tenant role (`cxp_app`), RLS applies to it, so this proves its
+/// policies admit it.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn ship_once_drains_every_org_as_the_tenant_role(pool: PgPool) {
     let db = db(pool.clone());
