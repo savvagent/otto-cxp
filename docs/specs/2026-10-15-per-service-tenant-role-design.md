@@ -1,6 +1,6 @@
 # Give otto-cxp its own tenant role instead of the shared `otto_app` — design
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Issue:** #28
 **Plan:** `docs/plans/2026-10-15-per-service-tenant-role.md`
 **Stacked on:** PR #46 (#27, the migration-owner split); retargeted to `main` after it merges.
@@ -308,7 +308,9 @@ All human-only (Rob), per CLAUDE.md "Database role change". The runbook goes in
     version 6; `cxp_server` owns nothing and is a member of `otto_app` and `cxp_runtime`; no role
     named `cxp_app` exists; `PUBLIC` has no `CONNECT` on any service database.
   - **T1.** As postgres: `CREATE ROLE cxp_app NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB
-    NOCREATEROLE NOREPLICATION; GRANT cxp_app TO cxp_server;`. The running #27 release is
+    NOCREATEROLE NOREPLICATION; GRANT cxp_app TO cxp_server;`. The plain `GRANT` (INHERIT from
+    `cxp_server`'s own `INHERIT` attribute, the default, and SET) works on Postgres 15 and 16
+    alike; Postgres 16's `WITH INHERIT TRUE, SET TRUE` is not assumed. T2 proves both. The running #27 release is
     unaffected (it does not use `cxp_app`; its hourly role re-check finds nothing on a role that
     owns and holds nothing). No restart.
   - **T2 (read-only).** `cxp_app`: NOLOGIN, no attribute boot refuses, a member of nothing, owns
@@ -329,7 +331,8 @@ All human-only (Rob), per CLAUDE.md "Database role change". The runbook goes in
 - **Later (not this PR):** a migration revoking `otto_app`'s grants in `otto_cxp`, once no release
   that uses it can be rolled back to.
 
-No new secret, config key, or scope; no recurring cost.
+The PR body lists T0 to T5, marking T0 to T2 as before merge (CLAUDE.md "Database role
+change"). No new secret, config key, or scope; no recurring cost.
 
 ## Error handling & edge cases
 
@@ -350,7 +353,13 @@ No new secret, config key, or scope; no recurring cost.
   LOCAL ROLE` fails and every tenant transaction errors (fails closed); the hourly runtime-grant
   re-check logs `error`. A restart refuses with the fix.
 - **Local superuser:** creates `cxp_app` in 0007 and may `SET ROLE` to anything; `check_tenant_role`
-  passes (assumed). A local non-superuser runtime without `cxp_app`: warns.
+  passes (assumed). A local non-superuser runtime that cannot assume `cxp_app`: warns.
+- **A local non-superuser, non-CREATEROLE owner migrating a cluster with no `cxp_app`:** 0007
+  fails (where 0001 only logged a NOTICE for `otto_app`), naming the fix. `.env.example`'s local
+  split recipe creates `cxp_app` first.
+- **T4's parity query returns rows in production** (production's `otto_app` grants could differ
+  from a fresh migration's): stop before T5, keep `cxp_server` in `otto_app`, and report the
+  difference; the release still serves, as `cxp_app`.
 - **Concurrent test databases creating `cxp_app`:** tolerated in 0007; CI pre-creates it anyway.
 
 ## Testing approach
