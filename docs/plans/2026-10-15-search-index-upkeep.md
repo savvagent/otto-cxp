@@ -119,7 +119,9 @@ limit. Task 4 is docs. Each task leaves the workspace green.
     ACCESS EXCLUSIVE MODE` and keep it open; in the org's `db.begin(org)` transaction call
     `search_customers("anything", Page::default())`; assert the error's `code()` is
     `query_too_broad`, `retriable()`, and its `to_string()` does not contain "statement" or
-    "cancel"; then roll back the lock. (The search's `SET LOCAL statement_timeout = '2s'` bounds
+    "cancel"; assert the call took at least 1.9 s (so it really waited out the timeout rather
+    than failing some other way); then roll back the lock. Take the lock on its own
+    connection (`pool.begin()`), in an open transaction, before the search starts. (The search's `SET LOCAL statement_timeout = '2s'` bounds
     the lock wait; the lock is on a table only the search statement reads, so `begin_live`'s
     own statements are unaffected — if `db.begin` itself blocks, take the lock after
     `db.begin`.)

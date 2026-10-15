@@ -152,7 +152,10 @@ search (#24); lowering `NEWEST_READ`.
   disjuncts>) END`. CASE evaluates its branches in order and the uncorrelated subqueries are
   init-plans run only on first use, so the `LIMIT 20001` count of the org's customers runs only
   when the result is not already capped by its match count (a `sub_new` that found 1,001 matches
-  makes `matches` exceed the cap). The articles statement has no such count and is unchanged.
+  makes `matches` exceed the cap). The `OR` chain already short-circuits in practice; CASE
+  guarantees it rather than speeding anything up. A placeholder threshold outside [0, 1] set
+  before pg_trgm loads would be read raw by `fp` while pg_trgm rejects it on load; no surface can
+  set one. The articles statement has no such count and is unchanged.
 
 ### Timeout error (`error.rs`, `search.rs`)
 
