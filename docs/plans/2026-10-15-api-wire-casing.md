@@ -53,7 +53,9 @@ console's `lib/types.ts`, `lib/api/*.ts` and their callers switch to camelCase.
 
 Request side first (pure additive, unit-testable without a DB), then the two response changes
 and the fixture (which the console tests load), then the console against the new fixture, then
-docs. Each task leaves every gate green.
+docs. Each task leaves the cargo gates green; the one exception is the web `types.test.ts`
+dashboard-key check, red between Task 2 (fixture regenerated) and Task 3 (console types); only
+the PR head's gates count.
 
 ---
 
@@ -581,6 +583,7 @@ Refs #24"
     already present) and `customerSearch: wire.customerSearch satisfies CappedPaginatedResponse<Customer>`;
   - the existing test that checks only the dashboard keeps snake_case keys (it excludes
     `dashboardMetrics` from the camelCase sweep) stays, still excluding `dashboardMetrics`;
+    retitle it "only the dashboard's legacy keys are snake_case";
   - wherever the file asserts `sameKeys(wire.dashboardMetrics, keys.dashboardMetrics)`, replace it
     with a test that the fixture holds exactly the camelCase keys plus their legacy snake_case
     twins with equal values:
@@ -688,12 +691,21 @@ export function withCatalogFilters(prev: URLSearchParams, values: CatalogFilterV
       `apps/web/src/components/shared/catalog-filter-bar.test.ts` round-tripping both helpers
       (snake URL params in, camelCase values out; values back to the same URL params; a cleared
       value deletes its param; unrelated params survive).
+    - **The hooks' own parameter types** in `hooks/use-{tickets,customers,feedback,surveys,applications,pages,components,experiences}.ts`
+      re-declare snake_case shapes and pass them as variables to `*Api.list/create/update`; the
+      weak-type check passes because they share `limit`/`offset`/`name`/`status`. Rename every
+      snake_case key in those inline types to camelCase by hand.
+    - On `pages/tickets/index.tsx`, `handleCatalogChange` also deletes `page` inside the callback;
+      keep it: `const next = withCatalogFilters(prev, values); next.delete("page"); return next;`.
     - `pages/tickets/ticket-detail.tsx`: `updateField(field: "status" | "priority" |
       "assigned_to", …)` sends `{ [field]: value }`; change the union member to `"assignedTo"`
       and its call site (around line 307).
   - `grep -rnE "\b(experience|application|page|component|customer|team)_id\b|feedback_type|component_type|assigned_to|total_(customers|tickets|feedback|surveys|experiences)|open_tickets" apps/web/src --include='*.ts' --include='*.tsx'`
     afterwards may show only: zod form-field names and their form wiring, the `URL_PARAM` table,
-    and `types.test.ts`'s legacy-key test. Anything else on the API wire is a miss.
+    the console's own browser URL parameter names (`searchParams.get("…")` / `setFilter("…")` /
+    `next.set("…")` keys in `pages/catalog/*.tsx` and `pages/feedback/index.tsx`, which keep their
+    names so links work), and `types.test.ts`'s legacy-key test. Anything else on the API wire is
+    a miss.
 
 - [ ] **Step 4: Run to verify it passes.**
   Run from the worktree root: `pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test`.
@@ -716,7 +728,7 @@ Refs #24"
 **Files:**
 - Modify: `crates/cxp-api/src/routes/mod.rs` (module doc)
 - Modify: `crates/cxp-api/src/routes/surveys.rs` (`responses` doc)
-- Modify: `crates/cxp-api/src/routes/dashboard.rs` (follow-up number)
+- Check: `crates/cxp-api/src/routes/dashboard.rs` (`LegacyMetrics` cites #35)
 - Modify: `docs/specs/2026-10-14-otto-resource-server-design.md` (REST section ~line 355-367; "Out of scope" ~line 418-419)
 
 **Interfaces:** none.
