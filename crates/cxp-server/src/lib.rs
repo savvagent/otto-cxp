@@ -596,10 +596,14 @@ mod tests {
         // HEAD chooses between the same two answers; a query string does
         // not change the path.
         for (method, path) in [("HEAD", "/"), ("GET", "/?from=agent")] {
-            let (status, h, _) = send_raw(app(), request(method, path, &[("accept", "*/*")])).await;
+            let (status, h, body) =
+                send_raw(app(), request(method, path, &[("accept", "*/*")])).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
             assert_eq!(h["content-type"], "application/json", "{method} {path}");
             assert_eq!(h["vary"], "Accept, Authorization", "{method} {path}");
+            if method == "GET" {
+                assert_eq!(body, expected, "{method} {path}");
+            }
         }
     }
 

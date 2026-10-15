@@ -62,7 +62,7 @@ Out: `Vary` on any other route or 404; `Cache-Control` on the 404; changes to `w
 
 ## Architecture
 
-`fallback` (`crates/cxp-server/src/lib.rs:379`) serves the page for page-eligible
+`fallback` (`crates/cxp-server/src/lib.rs`) serves the page for page-eligible
 `GET`/`HEAD /`, and otherwise delegates to `console_or_not_found`. For path `/` that always
 ends in `not_found("/")`, because `/` is never under `/console`. The change: when the path is
 `/` and the method is `GET` or `HEAD`, the fallback returns `not_found("/")` with
