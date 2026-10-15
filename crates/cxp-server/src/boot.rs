@@ -558,23 +558,12 @@ fn flush_result(
 /// than sweep platform events.
 const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 
-/// `name` as an SQL identifier, ready to paste into a statement: as is when
-/// it is a plain lower-case identifier, otherwise double-quoted with every
-/// embedded double quote doubled. Postgres folds unquoted names to lower
-/// case, so a role named `Cxp` or `cxp-runtime` needs the quotes.
+/// `name` as a quoted SQL identifier, ready to paste into a statement:
+/// always double-quoted, with every embedded double quote doubled, so a name
+/// Postgres would fold (`Cxp`), misparse (`cxp-runtime`), or read as a
+/// keyword (`user`) pastes as written.
 fn sql_identifier(name: &str) -> String {
-    let plain = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if plain {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// A task that should have run until shutdown ended: log it at `error` and
@@ -913,17 +902,16 @@ mod tests {
         assert_eq!(migration_url(&local).unwrap(), owner_url);
     }
 
-    /// The suggested `GRANT` pastes as is: a name Postgres would fold or
-    /// misparse is quoted, embedded quotes doubled.
+    /// The suggested `GRANT` pastes as is: the name is always quoted, so a
+    /// keyword, a mixed-case or punctuated name all survive, embedded quotes
+    /// doubled.
     #[test]
-    fn a_role_name_is_quoted_only_when_it_needs_it() {
-        assert_eq!(sql_identifier("cxp_server"), "cxp_server");
-        assert_eq!(sql_identifier("_r2"), "_r2");
+    fn a_role_name_is_always_quoted() {
+        assert_eq!(sql_identifier("cxp_server"), r#""cxp_server""#);
+        assert_eq!(sql_identifier("user"), r#""user""#);
         assert_eq!(sql_identifier("Cxp"), r#""Cxp""#);
         assert_eq!(sql_identifier("cxp-runtime"), r#""cxp-runtime""#);
-        assert_eq!(sql_identifier("2cxp"), r#""2cxp""#);
         assert_eq!(sql_identifier(r#"a"b"#), r#""a""b""#);
-        assert_eq!(sql_identifier(""), r#""""#);
     }
 
     #[test]
