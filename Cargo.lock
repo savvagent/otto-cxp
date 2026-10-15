@@ -390,6 +390,7 @@ name = "cxp-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "otto-resource",
  "otto-tenant",
@@ -413,6 +414,8 @@ dependencies = [
  "base64",
  "chrono",
  "cxp-core",
+ "futures",
+ "hkdf",
  "http",
  "otto-resource",
  "otto-tenant",

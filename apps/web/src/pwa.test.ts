@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { SERVER_ONLY_PATHS } from "./pwa";
+import { APP_SHELL, CONSOLE_PATHS, SERVER_ONLY_PATHS } from "./pwa";
 
-const serverOnly = (path: string) => SERVER_ONLY_PATHS.some((re) => re.test(path));
+const matches = (res: RegExp[], path: string) => res.some((re) => re.test(path));
+/** Whether Workbox would answer a navigation to `path` with the app shell. */
+const shellFor = (path: string) =>
+  matches(CONSOLE_PATHS, path) && !matches(SERVER_ONLY_PATHS, path);
 
-// Workbox tests the denylist against `pathname + search`.
+// Workbox tests both lists against `pathname + search`.
 const SERVER_PATHS = [
-  "/auth/login?next=%2Ftickets",
+  "/auth/login?next=%2Fconsole%2Ftickets",
   "/auth/callback?code=x&state=y",
   "/auth/session",
   "/auth",
@@ -14,18 +17,37 @@ const SERVER_PATHS = [
   "/.well-known/oauth-protected-resource",
   "/platform/webhooks",
 ];
-const CONSOLE_PATHS = ["/", "/dashboard", "/tickets/1", "/authors", "/apis", "/catalog/pages"];
+// The server's, not the console's: `/` is the connector install page.
+const NOT_CONSOLE = ["/", "/dashboard", "/tickets/1", "/consoles", "/nope"];
+const CONSOLE_ROUTES = [
+  "/console",
+  "/console/",
+  "/console/dashboard",
+  "/console/tickets/1",
+  "/console/catalog/pages?tab=x",
+];
 
-describe("the service worker leaves the server's paths alone", () => {
+describe("the service worker answers only the console's routes from cache", () => {
+  it("the app shell is the console's index", () => {
+    expect(APP_SHELL).toBe("/console/index.html");
+  });
+
   it("denies the app-shell fallback to every server path", () => {
     for (const path of SERVER_PATHS) {
-      expect(serverOnly(path), path).toBe(true);
+      expect(matches(SERVER_ONLY_PATHS, path), path).toBe(true);
+      expect(shellFor(path), path).toBe(false);
     }
   });
 
-  it("still serves the app shell for the console's own routes", () => {
-    for (const path of CONSOLE_PATHS) {
-      expect(serverOnly(path), path).toBe(false);
+  it("leaves every path outside /console/ to the network", () => {
+    for (const path of NOT_CONSOLE) {
+      expect(shellFor(path), path).toBe(false);
+    }
+  });
+
+  it("serves the app shell for the console's own routes", () => {
+    for (const path of CONSOLE_ROUTES) {
+      expect(shellFor(path), path).toBe(true);
     }
   });
 });

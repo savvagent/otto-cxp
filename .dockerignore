@@ -7,6 +7,8 @@ apps
 apps/web/node_modules
 apps/web/dist
 apps/web/tsconfig.tsbuildinfo
+# Local Vite env files can hold secrets; the image never needs them.
+apps/web/.env*
 packages
 !packages/react/package.json
 sdk

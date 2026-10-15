@@ -4,6 +4,8 @@ import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { MobileNav } from "./mobile-nav";
 import { SignIn } from "@/components/auth/sign-in";
+import { RotateCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSession } from "@/hooks/use-session";
 
@@ -12,15 +14,31 @@ export function RootLayout() {
   const session = useSession();
   if (session.isPending) {
     return (
-      <div className="flex min-h-screen items-center justify-center p-4">
+      <div
+        className="flex min-h-screen items-center justify-center p-4"
+        aria-busy="true"
+        aria-label="Checking your sign-in"
+      >
         <Skeleton className="h-32 w-full max-w-sm rounded-lg" />
       </div>
     );
   }
   if (session.isError) {
     return (
-      <div className="flex min-h-screen items-center justify-center p-4 text-sm text-muted-foreground">
-        Could not reach otto-cxp. Reload to try again.
+      <div
+        className="flex min-h-screen flex-col items-center justify-center gap-3 p-4 text-sm text-muted-foreground"
+        aria-busy={session.isFetching}
+      >
+        <p role="alert">Could not reach otto-cxp to check your sign-in.</p>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={session.isFetching}
+          onClick={() => void session.refetch()}
+        >
+          <RotateCw className="h-4 w-4" />
+          Try again
+        </Button>
       </div>
     );
   }

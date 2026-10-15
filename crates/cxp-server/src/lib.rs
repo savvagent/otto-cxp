@@ -8,9 +8,10 @@
 //!   /api/v1/…                         cxp-api   bearer tokens, or the console's session cookie
 //!   /auth/…                           cxp-http  the console's sign-in through the platform
 //!   /platform/webhooks                cxp-api   the platform's signed lifecycle events
-//!   GET/HEAD, anything else           the built console (CXP_CONSOLE_DIR): a file, or
-//!                                     index.html for a browser navigation
-//!   everything else                   JSON 404
+//!   GET/HEAD /console/…               the built console (CXP_CONSOLE_DIR): a file, or
+//!                                     index.html for a browser navigation; /console
+//!                                     redirects to /console/
+//!   everything else, / included       JSON 404
 //! ```
 //!
 //! Every request body, on every surface, is capped at
@@ -39,7 +40,7 @@ use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use axum::{middleware, Router};
 use cxp_core::usage::Meter;
-use cxp_http::console::{Console, ConsoleSettings};
+use cxp_http::console::{Console, ConsoleKeys, ConsoleSettings};
 use http::{header, HeaderValue, Method, StatusCode};
 use otto_resource::{ClientConfig, PlatformClient};
 use otto_tenant::Db;
@@ -111,6 +112,7 @@ pub fn router(
     }
     let api = cxp_api::router(state);
     let assets = ConsoleAssets::find(&config.console_dir);
+    let hsts = config.public_url.starts_with("https://");
     Ok(health::router(db, platform_check)
         // Open, and not part of either surface: every `401` points at it.
         .merge(cxp_http::protected_resource_router(
@@ -123,6 +125,14 @@ pub fn router(
         .merge(cxp_http::console::router(console))
         .fallback(move |req: Request| console_or_not_found(assets.clone(), req))
         .layer(RequestBodyLimitLayer::new(cxp_api::MAX_BODY_BYTES))
+        .layer(middleware::map_response(move |mut res: Response| async move {
+            if hsts {
+                res.headers_mut()
+                    .entry(header::STRICT_TRANSPORT_SECURITY)
+                    .or_insert(HeaderValue::from_static(HSTS));
+            }
+            res
+        }))
         // Outside the limit: its own 413 is plain text, rewritten here to the
         // `{error, code}` shape every other error has.
         .layer(middleware::map_response(json_payload_too_large))
@@ -142,20 +152,34 @@ fn console(db: Db, platform: Arc<PlatformClient>, config: &Config) -> Result<Opt
         tracing::info!("console sign-in is off (CXP_CONSOLE_CLIENT_ID is unset)");
         return Ok(None);
     };
-    let cipher = otto_tenant::crypto::Cipher::from_base64_key(&c.encryption_key)
-        .map_err(|_| anyhow!("CXP_ENCRYPTION_KEY must be base64 of exactly 32 bytes"))?;
+    let keys = ConsoleKeys::derive(&c.encryption_key).map_err(|e| anyhow!(e))?;
     Ok(Some(Console::new(
         db,
         platform,
         ConsoleSettings {
             client_id: c.client_id.clone(),
-            cipher,
+            keys,
             public_url: config.public_url.clone(),
             platform_url: config.platform_url.clone(),
             resource_uri: config.resource_uri.clone(),
         },
     )))
 }
+
+/// Where the built console is served: `/console/`, never `/`.
+const CONSOLE_PREFIX: &str = "/console";
+
+/// The console's `Content-Security-Policy`. Scripts, connections, and frames
+/// are this origin's only. `style-src` allows inline styles because the
+/// console's toast and dialog libraries inject `<style>` elements at runtime;
+/// no inline script is allowed.
+const CONSOLE_CSP: &str = "default-src 'self'; script-src 'self'; connect-src 'self'; \
+                           style-src 'self' 'unsafe-inline'; object-src 'none'; \
+                           base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// `Strict-Transport-Security` on every response when the public URL is
+/// `https`: the session cookie must never travel over plain http.
+const HSTS: &str = "max-age=31536000";
 
 /// The built console: its files, and `index.html` for client-side routes.
 #[derive(Clone)]
@@ -171,33 +195,15 @@ impl ConsoleAssets {
         let index = dir.join("index.html");
         if !index.is_file() {
             tracing::warn!(dir = %dir.display(),
-                "no built console at CXP_CONSOLE_DIR (no index.html); unknown paths answer 404");
+                "no built console at CXP_CONSOLE_DIR (no index.html); /console answers 404");
             return None;
         }
         Some(Self {
-            files: ServeDir::new(dir),
+            // A directory is never listed or redirected to: only files.
+            files: ServeDir::new(dir).append_index_html_on_directories(false),
             index: ServeFile::new(index),
         })
     }
-}
-
-/// Path prefixes that are never the console: an unknown path under one is
-/// the JSON `404`, whatever the request accepts.
-const RESERVED: &[&str] = &[
-    "/api",
-    "/mcp",
-    "/auth",
-    "/.well-known",
-    "/platform",
-    "/healthz",
-    "/readyz",
-];
-
-fn is_reserved(path: &str) -> bool {
-    RESERVED.iter().any(|p| {
-        path.strip_prefix(p)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    })
 }
 
 /// Whether the request is a browser navigation: it accepts HTML.
@@ -209,42 +215,87 @@ fn wants_html(req: &Request) -> bool {
         .any(|v| v.contains("text/html"))
 }
 
-/// Everything no route serves: a file of the built console for a `GET` or
-/// `HEAD` outside the reserved prefixes, `index.html` for a browser
-/// navigation the console routes itself, and otherwise the JSON `404`, so an
-/// agent or script that guessed a path still gets a machine-readable answer.
+/// Whether a path under the console names a dotfile or a dot segment,
+/// plainly or percent-encoded. Never served, whatever is on disk.
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let seg = seg.to_ascii_lowercase();
+        seg.starts_with('.') || seg.starts_with("%2e")
+    })
+}
+
+/// Everything no route serves. Under `/console/`, a `GET` or `HEAD` is a file
+/// of the built console, or `index.html` for a browser navigation the console
+/// routes itself; `/console` redirects to `/console/`. Everything else,
+/// including `/`, is the JSON `404`, so an agent or script that guessed a
+/// path still gets a machine-readable answer.
 async fn console_or_not_found(assets: Option<ConsoleAssets>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let Some(assets) = assets else {
         return not_found(&path);
     };
-    if !matches!(*req.method(), Method::GET | Method::HEAD) || is_reserved(&path) {
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return not_found(&path);
+    }
+    if path == CONSOLE_PREFIX {
+        let to = match req.uri().query() {
+            Some(q) => format!("{CONSOLE_PREFIX}/?{q}"),
+            None => format!("{CONSOLE_PREFIX}/"),
+        };
+        return axum::response::Redirect::permanent(&to).into_response();
+    }
+    let Some(rest) = path
+        .strip_prefix(CONSOLE_PREFIX)
+        .filter(|r| r.starts_with('/'))
+    else {
+        return not_found(&path);
+    };
+    if has_dot_segment(rest) {
         return not_found(&path);
     }
     let html = wants_html(&req);
-    let (parts, _) = req.into_parts();
-    let file = assets
+    let (mut parts, _) = req.into_parts();
+    let Ok(uri) = rest.parse::<http::Uri>() else {
+        return not_found(&path);
+    };
+    parts.uri = uri;
+    let file = match assets
         .files
         .oneshot(Request::from_parts(parts.clone(), Body::empty()))
         .await
-        .map(|res| res.map(Body::new));
-    let mut res = match file {
-        Ok(res) if res.status() != StatusCode::NOT_FOUND => res,
-        _ if html => match assets
+    {
+        Ok(res) => res.map(Body::new),
+        Err(e) => match e {},
+    };
+    let status = file.status();
+    let mut res = if status.is_success() || status == StatusCode::NOT_MODIFIED {
+        file
+    } else if status.is_server_error() {
+        tracing::error!(%status, path = %path, "could not serve a console file");
+        return internal_error();
+    } else if html && status == StatusCode::NOT_FOUND {
+        match assets
             .index
             .oneshot(Request::from_parts(parts, Body::empty()))
             .await
         {
+            Ok(res) if res.status().is_server_error() => {
+                tracing::error!(path = %path, "could not serve the console's index.html");
+                return internal_error();
+            }
             Ok(res) => res.map(Body::new),
             Err(e) => match e {},
-        },
-        _ => return not_found(&path),
+        }
+    } else {
+        // A miss that is not a navigation, or anything ServeDir would answer
+        // with a redirect or another non-JSON shape.
+        return not_found(&path);
     };
     let headers = res.headers_mut();
     // Hashed build output never changes under its name; everything else
     // (index.html, the service worker, the manifest) must be revalidated, or
     // a deploy is invisible until a cache expires.
-    let cache = if path.starts_with("/assets/") {
+    let cache = if rest.starts_with("/assets/") {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -258,7 +309,11 @@ async fn console_or_not_found(assets: Option<ConsoleAssets>, req: Request) -> Re
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors 'none'"),
+        HeaderValue::from_static(CONSOLE_CSP),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
     );
     res
 }
@@ -297,6 +352,18 @@ fn not_found(path: &str) -> Response {
                  /.well-known/oauth-protected-resource). The REST API is under /api/v1."
             ),
             "code": "not_found",
+        })),
+    )
+        .into_response()
+}
+
+/// The `{error, code}` shape for a failure of the server's own.
+fn internal_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({
+            "error": cxp_core::error::INTERNAL_MESSAGE,
+            "code": "internal",
         })),
     )
         .into_response()
@@ -521,37 +588,78 @@ mod tests {
     const NAVIGATION: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 
     #[tokio::test]
-    async fn the_built_console_is_served_with_an_index_fallback_for_navigations() {
+    async fn the_built_console_is_served_under_console_with_an_index_fallback() {
         let dir = console_dir();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/config"), "x").unwrap();
         let mut config = Config::for_test();
         config.console_dir = dir.clone();
         let app = app_from(config, PlatformCheck::Accepted);
 
-        // A client-side route, navigated to: the console.
-        for path in ["/", "/tickets", "/customers/123"] {
+        // A client-side route, navigated to: the console, with its headers.
+        for path in [
+            "/console/",
+            "/console/tickets",
+            "/console/customers/123?tab=x",
+        ] {
             let (status, headers, body) = get_with(app.clone(), path, Some(NAVIGATION)).await;
             assert_eq!(status, StatusCode::OK, "{path}");
             assert!(body.contains("<title>CXP</title>"), "{path}: {body}");
             assert_eq!(headers["cache-control"], "no-cache", "{path}");
             assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+            assert_eq!(headers["content-security-policy"], CONSOLE_CSP, "{path}");
+            assert_eq!(headers["strict-transport-security"], HSTS, "{path}");
         }
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "connect-src 'self'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(CONSOLE_CSP.contains(directive), "{directive}");
+        }
+        assert!(!CONSOLE_CSP.contains("script-src 'self' 'unsafe"));
+        // /console itself: to /console/, the query kept.
+        let (status, headers, _) = get_with(app.clone(), "/console", Some(NAVIGATION)).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(headers["location"], "/console/");
+        let (_, headers, _) = get_with(app.clone(), "/console?login_error=failed", None).await;
+        assert_eq!(headers["location"], "/console/?login_error=failed");
         // Its files, to anyone.
-        let (status, headers, body) = get_with(app.clone(), "/assets/app-abc123.js", None).await;
+        let (status, headers, body) =
+            get_with(app.clone(), "/console/assets/app-abc123.js", None).await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "console.log(1)"));
         assert!(headers["cache-control"]
             .to_str()
             .unwrap()
             .contains("immutable"));
-        let (status, headers, _) = get_with(app.clone(), "/sw.js", None).await;
+        let (status, headers, _) = get_with(app.clone(), "/console/sw.js", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["cache-control"], "no-cache");
 
-        // Not a navigation, or under a reserved prefix: the JSON 404, never
-        // the console's HTML.
+        // Outside /console/, not a navigation, a dotfile, a directory, or
+        // under another prefix: the JSON 404, never the console's HTML.
         for (path, accept) in [
+            ("/", Some(NAVIGATION)),
+            ("/", None),
+            ("/tickets", Some(NAVIGATION)),
+            ("/index.html", Some(NAVIGATION)),
+            ("/assets/app-abc123.js", None),
+            ("/consoles/x", Some(NAVIGATION)),
             ("/nope", None),
             ("/nope", Some("application/json")),
-            ("/assets/missing.js", None),
+            ("/console/nope", None),
+            ("/console/assets/missing.js", None),
+            ("/console/.env", None),
+            ("/console/.env", Some(NAVIGATION)),
+            ("/console/.git/config", None),
+            ("/console/%2eenv", None),
+            ("/console/assets", None),
+            ("/console/assets/", None),
             ("/auth/nope", Some(NAVIGATION)),
             ("/.well-known/nope", Some(NAVIGATION)),
             ("/platform/nope", Some(NAVIGATION)),
@@ -568,6 +676,7 @@ mod tests {
                 "{path}"
             );
             assert!(body.contains("not_found"), "{path}: {body}");
+            assert!(!body.contains("SECRET"), "{path}");
         }
         // /api answers for itself: authentication first, in JSON.
         let (status, _, body) = get_with(app.clone(), "/api/v1/nope", Some(NAVIGATION)).await;
@@ -577,7 +686,7 @@ mod tests {
         let res = app
             .clone()
             .oneshot(
-                Request::post("/tickets")
+                Request::post("/console/tickets")
                     .header("accept", NAVIGATION)
                     .body(Body::empty())
                     .unwrap(),
@@ -588,14 +697,39 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn without_a_built_console_console_paths_are_json_404s() {
+        let mut config = Config::for_test();
+        config.console_dir =
+            std::env::temp_dir().join(format!("cxp-none-{}", uuid::Uuid::new_v4()));
+        let app = app_from(config, PlatformCheck::Accepted);
+        for path in ["/console", "/console/", "/console/tickets"] {
+            let (status, _, body) = get_with(app.clone(), path, Some(NAVIGATION)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert!(body.contains("not_found"), "{path}");
+        }
+    }
+
     #[test]
-    fn reserved_prefixes_match_whole_segments() {
-        for p in ["/api", "/api/v1/x", "/auth/login", "/.well-known/x", "/mcp"] {
-            assert!(is_reserved(p), "{p}");
+    fn dot_segments_are_found_plain_and_encoded() {
+        for p in ["/.env", "/a/.git/x", "/%2Eenv", "/x/%2e%2e/y", "/.."] {
+            assert!(has_dot_segment(p), "{p}");
         }
-        for p in ["/", "/apis", "/authors", "/tickets", "/mcpx"] {
-            assert!(!is_reserved(p), "{p}");
+        for p in ["/", "/assets/app.js", "/a.b/c", "/sw.js"] {
+            assert!(!has_dot_segment(p), "{p}");
         }
+    }
+
+    #[tokio::test]
+    async fn hsts_is_sent_only_for_an_https_public_url() {
+        let (_, headers, _) = get_with(app(), "/healthz", None).await;
+        assert_eq!(headers["strict-transport-security"], HSTS);
+        let mut config = Config::for_test();
+        config.public_url = "http://localhost:8080".into();
+        config.resource_uri = "http://localhost:8080/mcp".into();
+        let (_, headers, _) =
+            get_with(app_from(config, PlatformCheck::Accepted), "/healthz", None).await;
+        assert!(headers.get("strict-transport-security").is_none());
     }
 
     /// Merging with no console configured deploys safely: sign-in says it is

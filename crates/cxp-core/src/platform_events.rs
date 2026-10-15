@@ -163,12 +163,17 @@ pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
     let mut swept = 0;
     let mut failure = None;
     for step in [
-        Sweep::Events,
-        Sweep::Tombstones,
-        Sweep::RejectedUsage,
+        Sweep::InTx(TxSweep::Events),
+        Sweep::InTx(TxSweep::Tombstones),
+        Sweep::InTx(TxSweep::RejectedUsage),
         Sweep::ConsoleSessions,
     ] {
-        match sweep_one(db, step, keep_days).await {
+        let result = match step {
+            Sweep::InTx(one) => sweep_in_tx(db, one, keep_days).await,
+            // Its own bounded batches, each a maintenance transaction.
+            Sweep::ConsoleSessions => crate::console_sessions::sweep_expired(db).await,
+        };
+        match result {
             Ok(n) => swept += n,
             Err(e) => {
                 tracing::warn!(?step, error = %e.log_detail(), "a retention sweep step failed");
@@ -184,21 +189,22 @@ pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
 
 #[derive(Debug, Clone, Copy)]
 enum Sweep {
-    Events,
-    Tombstones,
-    RejectedUsage,
+    InTx(TxSweep),
     ConsoleSessions,
 }
 
-async fn sweep_one(db: &Db, step: Sweep, keep_days: i32) -> Result<u64> {
-    // Its own bounded batches, each a maintenance transaction.
-    if let Sweep::ConsoleSessions = step {
-        return crate::console_sessions::sweep_expired(db).await;
-    }
+/// A sweep step that is one maintenance transaction.
+#[derive(Debug, Clone, Copy)]
+enum TxSweep {
+    Events,
+    Tombstones,
+    RejectedUsage,
+}
+
+async fn sweep_in_tx(db: &Db, step: TxSweep, keep_days: i32) -> Result<u64> {
     let mut tx = crate::maintenance::begin(db).await?;
     let n = match step {
-        Sweep::ConsoleSessions => 0,
-        Sweep::Events => sqlx::query(
+        TxSweep::Events => sqlx::query(
             "DELETE FROM platform_events WHERE received_at < now() - make_interval(days => $1)",
         )
         .bind(keep_days)
@@ -208,13 +214,13 @@ async fn sweep_one(db: &Db, step: Sweep, keep_days: i32) -> Result<u64> {
         // otto_app may not DELETE tombstones; this database function deletes
         // only expired ones (twice REMOVED_MEMBER_TTL_SECS, fixed in the
         // migration).
-        Sweep::Tombstones => {
+        TxSweep::Tombstones => {
             let n: i64 = sqlx::query_scalar("SELECT expire_removed_members()")
                 .fetch_one(&mut *tx)
                 .await?;
             n as u64
         }
-        Sweep::RejectedUsage => sqlx::query(
+        TxSweep::RejectedUsage => sqlx::query(
             "DELETE FROM usage_outbox_rejected \
              WHERE rejected_at < now() - make_interval(days => $1)",
         )

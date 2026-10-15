@@ -40,8 +40,6 @@ kill_timeout = 30
   # platform and CXP_ENCRYPTION_KEY is set (docs/deploy/fly.md, "Web console sign-in"); then
   # set the printed client id here.
   # CXP_CONSOLE_CLIENT_ID = ""
-  # The built console the image ships (the Dockerfile's default, stated here too).
-  CXP_CONSOLE_DIR = "/srv/console"
   CXP_LOG_FORMAT = "json"
   RUST_LOG = "info,cxp_server=info,cxp_mcp=info,cxp_api=info"
 

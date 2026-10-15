@@ -11,7 +11,7 @@ Gates (run in the worktree, against its own Postgres):
 
 - [ ] 1. Schema. Add `console_sessions` to `BOOKKEEPING_TABLES` and `seed` in
   `crates/cxp-core/tests/db.rs`, and the lookup/sweep tests; see them fail.
-  Write `crates/cxp-core/migrations/0004_console_sessions.sql`; see them pass.
+  Write `crates/cxp-core/migrations/0003_console_sessions.sql`; see them pass.
 - [ ] 2. `crates/cxp-core/src/console_sessions.rs` (+ `lib.rs`, `Cargo.toml`
   deps `sha2`): tests first in `crates/cxp-core/tests/console_sessions.rs`
   (create/load/rotate/delete/sweep, create refused for a deleted org).
@@ -20,7 +20,7 @@ Gates (run in the worktree, against its own Postgres):
   to `PURGED_TABLES`, delete in `member_removed`, add the sweep step.
 - [ ] 4. `cxp_core::auth::authenticate_token` (split from `authenticate`,
   behaviour unchanged).
-- [ ] 5. `crates/cxp-http/src/console.rs` (cookies, flow, `safe_next`, PKCE,
+- [ ] 5. `crates/cxp-http/src/console/` (cookies, flow, `safe_next`, PKCE,
   token client, `Console`, `/auth/*` router) with unit tests first; the
   `Authenticator::with_console` opt-in, `Source`, and the origin check in
   `require_bearer` (unit tests for the origin matrix).
@@ -43,3 +43,30 @@ Gates (run in the worktree, against its own Postgres):
   `.env.example`, `fly.toml`, CLAUDE.md config table and architecture line.
 - [ ] 12. All gates green; commit `feat(console): sign the web console in with
   the otto platform` with `Fixes #14`.
+
+## Review round (PR #30)
+
+- [ ] 13. Refresh without holding anything: migration columns
+  `refresh_lease_until` and `generation`; `claim_refresh`, `store_refreshed`
+  (compare-and-swap), `release_lease`, `delete_generation`, `take` in
+  `cxp_core::console_sessions` with tests; the in-process single flight and
+  bounded lease polling in `cxp_http::console`; tests with an app pool of five
+  (eight concurrent requests, one refresh), a waited-out lease, and an
+  `org.deleted` webhook during a slow refresh.
+- [ ] 14. Logout and re-sign-in: delete and commit, then revoke with nothing
+  held; a callback ends the browser's previous session.
+- [ ] 15. Migration renamed to `0003`; the lookup policy `TO` the migrating role;
+  the non-superuser owner test in `tests/db.rs` (roles dropped whatever the
+  test does).
+- [ ] 16. The console under `/console/` (Vite base, router basename, PWA scope,
+  `safe_next`, the binary's fallback, `/` left to #29), CSP, HSTS, dotfiles,
+  file-server redirects and `5xx` as JSON.
+- [ ] 17. HKDF subkeys (`ConsoleKeys`), the `cxp_core::sealed` helper, the
+  session bound to its user, short-lived tokens clamped, no `expect` in cookie
+  building, the dead sweep arm removed.
+- [ ] 18. Web client: no navigation from `apiFetch`, no retry on `401`/`403`,
+  sign-out errors toasted, zod session, a11y, the service-worker test under
+  `tsc`.
+- [ ] 19. Docs: CLAUDE.md (Dockerfile gate paths, Auth invariant, security
+  focus, Build & Run, the lookup policy), `docs/deploy/fly.md`, this plan and
+  the spec; `CXP_CONSOLE_DIR` set only in the Dockerfile.

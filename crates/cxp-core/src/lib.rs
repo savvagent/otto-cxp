@@ -31,6 +31,7 @@ pub mod migrate;
 pub mod paging;
 pub mod platform_events;
 pub mod scopes;
+pub mod sealed;
 pub mod segments;
 pub mod tickets;
 pub mod usage;

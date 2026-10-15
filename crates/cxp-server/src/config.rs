@@ -38,9 +38,11 @@ pub struct Config {
     /// unset: then `/auth/login` answers `503 console_login_disabled` and the
     /// session cookie is no credential anywhere.
     pub console: Option<ConsoleConfig>,
-    /// `CXP_CONSOLE_DIR`: the built web console, served with an `index.html`
-    /// fallback for browser navigations. Without an `index.html` there, every
-    /// unknown path is the JSON `404`.
+    /// `CXP_CONSOLE_DIR`: the built web console, served under `/console/`
+    /// with an `index.html` fallback for browser navigations there. Without
+    /// an `index.html`, `/console/` is the JSON `404` like any unknown path.
+    /// The image's Dockerfile `ENV` sets it (`/srv/console`); a deployment's
+    /// own environment would win over that.
     pub console_dir: PathBuf,
 }
 
@@ -51,8 +53,10 @@ pub struct ConsoleConfig {
     /// the platform with the redirect URI `{public_url}/auth/callback`. Not a
     /// secret.
     pub client_id: String,
-    /// `CXP_ENCRYPTION_KEY`: base64 of 32 bytes; seals the session tokens at
-    /// rest and the in-flight sign-in cookie. Required with a client id.
+    /// `CXP_ENCRYPTION_KEY`: base64 of 32 bytes. Never used directly: two
+    /// HKDF-SHA256 subkeys seal the session tokens at rest and the in-flight
+    /// sign-in cookie (`cxp_http::console::ConsoleKeys`). Required with a
+    /// client id.
     pub encryption_key: String,
 }
 
@@ -234,7 +238,7 @@ fn console_config<F: Fn(&str) -> Option<String>>(
 ) -> Result<Option<ConsoleConfig>> {
     let key = vars.optional("CXP_ENCRYPTION_KEY");
     if let Some(key) = &key {
-        otto_tenant::crypto::Cipher::from_base64_key(key).map_err(|_| {
+        cxp_http::console::ConsoleKeys::derive(key).map_err(|_| {
             anyhow!(
                 "CXP_ENCRYPTION_KEY must be base64 of exactly 32 bytes \
                  (generate one with `openssl rand -base64 32`)"

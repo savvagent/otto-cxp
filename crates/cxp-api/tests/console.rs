@@ -2,11 +2,13 @@
 //! platform (introspection, `/oauth/token`, `/oauth/revoke`): the PKCE
 //! sign-in, the session cookie as a credential on `/api/v1` (reads, and
 //! writes only from this origin), a bearer deciding over a cookie, dead
-//! sessions, the single-flight refresh, sign-out, and the console switched
+//! sessions, the single-flight refresh (in a pool of five, without blocking
+//! a lifecycle webhook), sign-out, signing in again, and the console switched
 //! off.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -16,11 +18,12 @@ use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
 use cxp_core::usage::Meter;
-use cxp_http::console::{pkce_challenge, Console, ConsoleSettings};
+use cxp_http::console::{pkce_challenge, Console, ConsoleKeys, ConsoleSettings};
 use otto_resource::{ClientConfig, IntrospectionResponse, PlatformClient, Role, TokenKind};
 use otto_tenant::crypto::Cipher;
 use otto_tenant::Db;
 use serde_json::{json, Value};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -58,6 +61,10 @@ struct Platform {
     issue_inactive: bool,
     /// What the token endpoint was last sent, minus the secrets.
     last_form: HashMap<String, String>,
+    /// How long /oauth/token takes to answer a refresh.
+    refresh_delay: Duration,
+    /// Refresh requests received, answered or not yet.
+    refresh_requests: usize,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -111,10 +118,18 @@ fn invalid_grant() -> (StatusCode, Json<Value>) {
 }
 
 async fn token(
-    State(p): State<Shared>,
+    State(shared): State<Shared>,
     Form(f): Form<HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
-    let mut p = p.lock().unwrap();
+    if f.get("grant_type").map(String::as_str) == Some("refresh_token") {
+        let delay = {
+            let mut p = shared.lock().unwrap();
+            p.refresh_requests += 1;
+            p.refresh_delay
+        };
+        tokio::time::sleep(delay).await;
+    }
+    let mut p = shared.lock().unwrap();
     if p.token_down {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     }
@@ -209,7 +224,7 @@ async fn harness_with(pool: PgPool, console: bool) -> Harness {
             platform,
             ConsoleSettings {
                 client_id: CLIENT_ID.into(),
-                cipher: Cipher::from_base64_key(KEY).unwrap(),
+                keys: ConsoleKeys::derive(KEY).unwrap(),
                 public_url: PUBLIC_URL.into(),
                 platform_url: base,
                 resource_uri: RESOURCE.into(),
@@ -306,11 +321,17 @@ impl Harness {
     /// fresh member of a fresh org. Returns (org, user, session cookie).
     async fn sign_in(&self) -> (Uuid, Uuid, String) {
         let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
-        let cookie = self.sign_in_as(org, user, "/tickets").await;
+        let cookie = self.sign_in_as(org, user, "/console/tickets").await;
         (org, user, cookie)
     }
 
     async fn sign_in_as(&self, org: Uuid, user: Uuid, next: &str) -> String {
+        self.sign_in_with(org, user, next, None).await
+    }
+
+    /// [`Self::sign_in_as`] from a browser that may already hold a session
+    /// cookie.
+    async fn sign_in_with(&self, org: Uuid, user: Uuid, next: &str, prior: Option<&str>) -> String {
         let login = self
             .call("GET", &format!("/auth/login?next={next}"), &[], None)
             .await;
@@ -330,7 +351,13 @@ impl Harness {
             .call(
                 "GET",
                 &format!("/auth/callback?code={code}&state={}", authorize["state"]),
-                &[("cookie", &format!("{OAUTH}={oauth}"))],
+                &[(
+                    "cookie",
+                    &match prior {
+                        Some(c) => format!("{OAUTH}={oauth}; {SESSION}={c}"),
+                        None => format!("{OAUTH}={oauth}"),
+                    },
+                )],
                 None,
             )
             .await;
@@ -358,7 +385,12 @@ async fn the_console_signs_in_through_the_platform(pool: PgPool) {
     let h = harness(pool).await;
 
     let login = h
-        .call("GET", "/auth/login?next=/customers&org=acme", &[], None)
+        .call(
+            "GET",
+            "/auth/login?next=/console/customers&org=acme",
+            &[],
+            None,
+        )
         .await;
     assert_eq!(login.status, StatusCode::SEE_OTHER);
     assert_eq!(login.headers["cache-control"], "no-store");
@@ -390,7 +422,7 @@ async fn the_console_signs_in_through_the_platform(pool: PgPool) {
     assert!(!to.contains("verifier"));
 
     let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
-    let cookie = h.sign_in_as(org, user, "/customers").await;
+    let cookie = h.sign_in_as(org, user, "/console/customers").await;
     let form = h.stub.lock().unwrap().last_form.clone();
     assert_eq!(form["grant_type"], "authorization_code");
 
@@ -403,6 +435,13 @@ async fn the_console_signs_in_through_the_platform(pool: PgPool) {
             .unwrap();
     assert_eq!((stored.0, stored.1), (org, user));
     assert!(!stored.2.windows(7).any(|w| w == b"otto_at"));
+    // Sealed with the session-token subkey, never the configured key itself
+    // or the oauth cookie's subkey.
+    let keys = ConsoleKeys::derive(KEY).unwrap();
+    let opened = cxp_core::sealed::open(&keys.session_tokens, &stored.2).unwrap();
+    assert!(opened.starts_with(b"otto_at_"));
+    assert!(cxp_core::sealed::open(&Cipher::from_base64_key(KEY).unwrap(), &stored.2).is_err());
+    assert!(cxp_core::sealed::open(&keys.oauth_flow, &stored.2).is_err());
 
     // The cookie reads /api/v1, and the session endpoint knows who it is.
     let r = h
@@ -461,7 +500,7 @@ async fn the_session_cookie_is_host_only_http_only_and_lax(pool: PgPool) {
         )
         .await;
     // No `next`: the console's home.
-    assert_eq!(back.location(), "/");
+    assert_eq!(back.location(), "/console/");
     let session = back.set_cookie(SESSION).unwrap();
     for attr in [
         "Path=/",
@@ -524,7 +563,11 @@ async fn a_failed_callback_reflects_nothing_and_stores_nothing(pool: PgPool) {
         let headers: Vec<(&str, &str)> = cookie.map(|c| ("cookie", c)).into_iter().collect();
         let r = h.call("GET", &uri, &headers, None).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{uri}");
-        assert_eq!(r.location(), format!("/?login_error={expected}"), "{uri}");
+        assert_eq!(
+            r.location(),
+            format!("/console/?login_error={expected}"),
+            "{uri}"
+        );
         assert!(r.set_cookie(SESSION).is_none(), "{uri}");
     }
     assert_eq!(h.sessions().await, 0);
@@ -538,7 +581,7 @@ async fn a_failed_callback_reflects_nothing_and_stores_nothing(pool: PgPool) {
             None,
         )
         .await;
-    assert_eq!(back.location(), "/");
+    assert_eq!(back.location(), "/console/");
     assert_eq!(h.sessions().await, 1);
 }
 
@@ -729,36 +772,210 @@ async fn a_dead_session_is_401(pool: PgPool) {
     }
 }
 
+/// The app's pool as production sizes it (`CXP_DB_MAX_CONNECTIONS`): five.
+async fn pool_of_five(opts: PgPoolOptions, connect: PgConnectOptions) -> PgPool {
+    opts.max_connections(5)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(connect)
+        .await
+        .unwrap()
+}
+
 /// The platform rotates the refresh token on every use and revokes the
 /// family on a replay, so concurrent requests behind an expiring token must
-/// refresh it exactly once, and all succeed.
+/// refresh it exactly once, and all succeed. More requests than the pool has
+/// connections, while the platform takes its time: none may hold a
+/// connection while it waits on the refresh.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn an_expiring_token_is_refreshed_once_however_many_requests_need_it(pool: PgPool) {
-    let h = harness(pool).await;
+async fn an_expiring_token_is_refreshed_once_however_many_requests_need_it(
+    opts: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let pool = pool_of_five(opts, connect).await;
+    let h = harness(pool.clone()).await;
     let (_, _, cookie) = h.sign_in().await;
     sqlx::query("UPDATE console_sessions SET access_expires_at = now()")
         .execute(&h.pool)
         .await
         .unwrap();
+    h.stub.lock().unwrap().refresh_delay = Duration::from_millis(500);
 
     let cookie = with_cookie(&cookie);
     let headers = [("cookie", cookie.as_str())];
-    let calls = (0..6).map(|_| h.call("GET", "/api/v1/customers", &headers, None));
+    let calls = (0..8).map(|_| h.call("GET", "/api/v1/customers", &headers, None));
     for r in futures::future::join_all(calls).await {
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     }
-    let (refreshes, grant) = {
+    let (refreshes, requests, grant) = {
         let p = h.stub.lock().unwrap();
-        (p.refreshes, p.last_form["grant_type"].clone())
+        (
+            p.refreshes,
+            p.refresh_requests,
+            p.last_form["grant_type"].clone(),
+        )
     };
-    assert_eq!((refreshes, grant.as_str()), (1, "refresh_token"));
-    let fresh: bool = sqlx::query_scalar(
-        "SELECT access_expires_at > now() + interval '30 minutes' FROM console_sessions",
+    assert_eq!(
+        (refreshes, requests, grant.as_str()),
+        (1, 1, "refresh_token")
+    );
+    let (fresh, generation, leased): (bool, i64, bool) = sqlx::query_as(
+        "SELECT access_expires_at > now() + interval '30 minutes', generation, \
+                refresh_lease_until IS NOT NULL \
+         FROM console_sessions",
     )
     .fetch_one(&h.pool)
     .await
     .unwrap();
-    assert!(fresh);
+    assert_eq!((fresh, generation, leased), (true, 1, false));
+    drop(h);
+    pool.close().await;
+}
+
+/// Another replica holds the refresh lease: this one waits for its result
+/// rather than spending the same refresh token.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_leased_refresh_is_waited_for_not_repeated(pool: PgPool) {
+    let h = harness(pool).await;
+    let (_, _, cookie) = h.sign_in().await;
+    let cookie = with_cookie(&cookie);
+    // Another replica claimed the refresh a moment ago...
+    sqlx::query(
+        "UPDATE console_sessions SET access_expires_at = now(), \
+         refresh_lease_until = now() + interval '15 seconds'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let headers = [("cookie", cookie.as_str())];
+    let request = h.call("GET", "/api/v1/customers", &headers, None);
+    // ...and stores its fresh pair half a second later.
+    let other_replica = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sqlx::query(
+            "UPDATE console_sessions SET access_expires_at = now() + interval '1 hour', \
+             refresh_lease_until = NULL, generation = generation + 1",
+        )
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    };
+    let (r, ()) = tokio::join!(request, other_replica);
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(h.stub.lock().unwrap().refresh_requests, 0);
+}
+
+/// A refresh holds no connection or lock while the platform answers, so an
+/// `org.deleted` purge of the same org goes through at once; the refresh
+/// then finds its session gone, stores nothing, and revokes the pair it was
+/// issued.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_slow_refresh_does_not_block_an_org_deleted_webhook(
+    opts: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let pool = pool_of_five(opts, connect).await;
+    let h = harness(pool.clone()).await;
+    let (org, _, cookie) = h.sign_in().await;
+    let cookie = with_cookie(&cookie);
+    sqlx::query("UPDATE console_sessions SET access_expires_at = now()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let slow = Duration::from_secs(4);
+    h.stub.lock().unwrap().refresh_delay = slow;
+
+    let headers = [("cookie", cookie.as_str())];
+    let request = h.call("GET", "/api/v1/customers", &headers, None);
+    let webhook = async {
+        // Once the refresh is waiting on the platform...
+        while h.stub.lock().unwrap().refresh_requests == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let body = otto_resource::webhook::body(
+            Uuid::new_v4(),
+            "org.deleted",
+            Utc::now(),
+            &json!({"org_id": org}),
+        );
+        let sig = otto_resource::webhook::sign("otto_whsec_test", Utc::now().timestamp(), &body);
+        let started = Instant::now();
+        let r = h
+            .send(
+                Request::post("/platform/webhooks")
+                    .header("content-type", "application/json")
+                    .header(otto_resource::webhook::SIGNATURE_HEADER, sig)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+        (r, started.elapsed())
+    };
+    let (r, (hook, took)) = tokio::join!(request, webhook);
+    assert_eq!(hook.status, StatusCode::OK, "{}", hook.body);
+    assert!(
+        took < slow / 2,
+        "org.deleted waited {took:?} on a refresh's platform call"
+    );
+    // The purge won: the request is refused, and the session stays gone.
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert_eq!(h.sessions().await, 0);
+    let (refreshes, revoked) = {
+        let p = h.stub.lock().unwrap();
+        (p.refreshes, p.revoked.len())
+    };
+    assert_eq!(refreshes, 1);
+    assert_eq!(revoked, 1, "the orphaned pair was not revoked");
+    drop(h);
+    pool.close().await;
+}
+
+/// A session is its signed-in user's: a token the platform says is someone
+/// else's is refused, and the session dropped.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_session_whose_token_is_another_users_is_refused(pool: PgPool) {
+    let h = harness(pool).await;
+    let (_, _, cookie) = h.sign_in().await;
+    sqlx::query("UPDATE console_sessions SET user_id = gen_random_uuid()")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let r = h
+        .call(
+            "GET",
+            "/api/v1/customers",
+            &[("cookie", &with_cookie(&cookie))],
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.sessions().await, 0);
+}
+
+/// Signing in again from a browser that already holds a session replaces it:
+/// the old session is deleted and its refresh token revoked.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn signing_in_again_ends_the_previous_session(pool: PgPool) {
+    let h = harness(pool).await;
+    let (org, user, first) = h.sign_in().await;
+    let second = h.sign_in_with(org, user, "/console/", Some(&first)).await;
+    assert_ne!(first, second);
+    assert_eq!(h.sessions().await, 1);
+    assert_eq!(h.stub.lock().unwrap().revoked.len(), 1);
+    let get = |c: String| {
+        let h = &h;
+        async move {
+            h.call(
+                "GET",
+                "/api/v1/customers",
+                &[("cookie", &with_cookie(&c))],
+                None,
+            )
+            .await
+            .status
+        }
+    };
+    assert_eq!(get(first).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(get(second).await, StatusCode::OK);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]

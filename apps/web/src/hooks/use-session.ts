@@ -1,9 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchSession } from "@/lib/session";
+import { fetchSession, sessionKeys } from "@/lib/session";
 
-export const sessionKeys = {
-  all: ["session"] as const,
-};
+export { sessionKeys };
 
 /** Whether this browser is signed in to the console, and as whom. */
 export function useSession() {

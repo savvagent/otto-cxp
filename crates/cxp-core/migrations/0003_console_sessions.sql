@@ -4,7 +4,8 @@
 --
 -- The browser holds a random 32-byte cookie that is never stored; `id_hash` is
 -- its SHA-256, so a database dump cannot be replayed as a cookie. The tokens
--- are sealed with CXP_ENCRYPTION_KEY (AES-256-GCM, stored as nonce ||
+-- are sealed with a subkey derived from CXP_ENCRYPTION_KEY (HKDF-SHA256,
+-- label "cxp.console.session-tokens.v1"; AES-256-GCM, stored as nonce ||
 -- ciphertext), so a dump alone yields no credential either.
 --
 -- `org_id` and `user_id` are the platform's opaque ids, taken from the
@@ -13,6 +14,13 @@
 -- working; past it the row is dead weight, and the hourly sweep deletes it.
 -- Nothing references this table and it references nothing, so it has no
 -- foreign keys.
+--
+-- A refresh never holds a connection or a lock across the platform call. It
+-- claims `refresh_lease_until` in one short transaction (so another replica
+-- waits for it rather than spending the same, rotating refresh token), calls
+-- the platform with nothing held, and stores the new pair in a second short
+-- transaction only if `generation` is still the one it claimed (a
+-- compare-and-swap: a sign-out or a purge in between wins).
 --
 -- Additive only: a previous release ignores the table and the function.
 
@@ -24,7 +32,11 @@ CREATE TABLE console_sessions (
   refresh_token_enc bytea       NOT NULL,
   access_expires_at timestamptz NOT NULL,
   created_at        timestamptz NOT NULL DEFAULT now(),
-  expires_at        timestamptz NOT NULL
+  expires_at        timestamptz NOT NULL,
+  -- Until when one replica holds the right to refresh this session's tokens.
+  refresh_lease_until timestamptz,
+  -- Bumped on every rotation: the compare-and-swap a refresh stores against.
+  generation        bigint      NOT NULL DEFAULT 0
 );
 
 -- "This user's sessions in this org" (member.removed) and "this org's
@@ -54,13 +66,21 @@ CREATE POLICY console_sessions_tenant_isolation ON console_sessions
 -- The function is SECURITY DEFINER, so it runs as its owner (the migrating
 -- role). While that role is a superuser it bypasses RLS; once it is not (#16),
 -- FORCE ROW LEVEL SECURITY binds it too, and this SELECT-only policy is what
--- admits the lookup: unpinned, and only while app.console_session_lookup is
--- 'on', which the function's own SET clause sets for the duration of the call
--- and nothing else sets. A request path that forgot to pin still sees nothing.
-CREATE POLICY console_sessions_lookup ON console_sessions
-  FOR SELECT
-  USING (current_org() IS NULL
-         AND current_setting('app.console_session_lookup', true) = 'on');
+-- admits the lookup: for the function's owner only (the role running this
+-- migration, named below), unpinned, and only while app.console_session_lookup
+-- is 'on', which the function's own SET clause sets for the duration of the
+-- call. Any other role, otto_app included, gains nothing by setting it
+-- itself, and a request path that forgot to pin still sees nothing. If the
+-- function's ownership ever moves (REASSIGN OWNED), move the policy with it:
+-- ALTER POLICY console_sessions_lookup ON console_sessions TO <new owner>.
+DO $$
+BEGIN
+  EXECUTE format(
+    'CREATE POLICY console_sessions_lookup ON console_sessions FOR SELECT TO %I '
+    'USING (current_org() IS NULL '
+    'AND current_setting(''app.console_session_lookup'', true) = ''on'')',
+    current_user);
+END $$;
 
 CREATE FUNCTION console_session_org(session_hash bytea) RETURNS uuid
   LANGUAGE sql STABLE SECURITY DEFINER

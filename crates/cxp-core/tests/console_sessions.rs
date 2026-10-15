@@ -1,13 +1,13 @@
 //! The console's sign-in sessions against a real Postgres: tokens sealed at
 //! rest and opened only with the key, the cookie-to-org lookup, the pinned
-//! read, rotation under the row lock, deletion, the `member.removed` cleanup,
+//! read, the refresh lease and compare-and-swap store, deletion, the `member.removed` cleanup,
 //! and the expiry sweep in bounded batches under the maintenance marker.
 
 mod common;
 
 use chrono::{Duration, Utc};
 use common::{db, org, otto_app_db, user};
-use cxp_core::console_sessions::{self, NewSession};
+use cxp_core::console_sessions::{self, Claim, NewSession, Refreshed};
 use cxp_core::platform_events::{self, Outcome};
 use cxp_core::Error;
 use otto_tenant::crypto::Cipher;
@@ -163,51 +163,169 @@ async fn no_session_is_created_for_a_deleted_org_or_a_removed_member(pool: PgPoo
     }
 }
 
+/// The refresh protocol's database half: a lease claimed in one short
+/// transaction, a compare-and-swap store in another, and nothing held in
+/// between.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn a_locked_session_rotates_and_deletes(pool: PgPool) {
+async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
     let db = db(pool);
     let o = org();
     let hash = new_session(&db, o, user(), Duration::days(1)).await;
+    let lease = Duration::seconds(15);
 
-    let (mut tx, s) = console_sessions::lock(&db, o, &hash)
+    // A fresh token needs no refresh: nothing is claimed.
+    let now = Utc::now();
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, now, lease)
+            .await
+            .unwrap(),
+        Claim::Fresh(_)
+    ));
+
+    // About to expire: the first claim wins, a second sees the live lease.
+    let soon = now + Duration::minutes(60);
+    let Claim::Claimed(s) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
         .await
         .unwrap()
-        .unwrap();
+    else {
+        panic!("not claimed");
+    };
     assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
-    let later = Utc::now() + Duration::days(30);
-    console_sessions::rotate(
-        &mut tx,
+    assert_eq!(s.generation, 0);
+    assert!(s.refresh_lease_until.is_some());
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+            .await
+            .unwrap(),
+        Claim::Leased
+    ));
+    // Once the lease lapses (its holder died), another may take it.
+    let later = soon + Duration::seconds(16);
+    let Claim::Claimed(again) = console_sessions::claim_refresh(&db, o, &hash, later, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("a lapsed lease was not taken over");
+    };
+    assert_eq!(again.generation, 0);
+
+    // The store wins once, at the claimed generation, and ends the lease.
+    let expires = Utc::now() + Duration::days(30);
+    let pair = |access, refresh| Refreshed {
+        access_token: access,
+        refresh_token: refresh,
+        access_expires_at: Utc::now() + Duration::minutes(60),
+        expires_at: expires,
+    };
+    assert!(console_sessions::store_refreshed(
+        &db,
         &cipher(),
+        o,
         &hash,
-        "otto_at_next",
-        "otto_rt_next",
-        Utc::now() + Duration::minutes(60),
-        later,
+        0,
+        &pair("otto_at_next", "otto_rt_next")
     )
     .await
-    .unwrap();
-    tx.commit().await.unwrap();
-
+    .unwrap());
+    assert!(
+        !console_sessions::store_refreshed(
+            &db,
+            &cipher(),
+            o,
+            &hash,
+            0,
+            &pair("otto_at_stale", "otto_rt_stale")
+        )
+        .await
+        .unwrap(),
+        "a second store at a spent generation"
+    );
     let s = console_sessions::load(&db, o, &hash)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(s.access_token(&cipher()).unwrap(), "otto_at_next");
     assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_next");
-    assert!((s.expires_at - later).num_seconds().abs() < 2);
+    assert_eq!((s.generation, s.refresh_lease_until), (1, None));
+    assert!((s.expires_at - expires).num_seconds().abs() < 2);
 
-    let (mut tx, _) = console_sessions::lock(&db, o, &hash)
+    // A released lease frees the session at once; at a stale generation it
+    // changes nothing.
+    let soon = Utc::now() + Duration::minutes(60);
+    let Claim::Claimed(s) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
         .await
         .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    console_sessions::release_lease(&db, o, &hash, s.generation + 1)
+        .await
         .unwrap();
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+            .await
+            .unwrap(),
+        Claim::Leased
+    ));
+    console_sessions::release_lease(&db, o, &hash, s.generation)
+        .await
+        .unwrap();
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+            .await
+            .unwrap(),
+        Claim::Claimed(_)
+    ));
+
+    // A refused refresh deletes only the generation it refused.
     assert_eq!(
-        console_sessions::delete_locked(&mut tx, &hash)
+        console_sessions::delete_generation(&db, o, &hash, 0)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        console_sessions::delete_generation(&db, o, &hash, 1)
             .await
             .unwrap(),
         1
     );
-    tx.commit().await.unwrap();
-    assert!(console_sessions::lock(&db, o, &hash)
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+            .await
+            .unwrap(),
+        Claim::Gone
+    ));
+    // A store after the session went (a sign-out raced the platform call)
+    // resurrects nothing.
+    assert!(!console_sessions::store_refreshed(
+        &db,
+        &cipher(),
+        o,
+        &hash,
+        1,
+        &pair("otto_at_late", "otto_rt_late")
+    )
+    .await
+    .unwrap());
+    assert!(console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Sign-out deletes and hands back what the row held, once.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_session_is_taken_once(pool: PgPool) {
+    let db = db(pool);
+    let o = org();
+    let hash = new_session(&db, o, user(), Duration::days(1)).await;
+    let taken = console_sessions::take(&db, o, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
+    assert!(console_sessions::take(&db, o, &hash)
         .await
         .unwrap()
         .is_none());

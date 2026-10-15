@@ -1,16 +1,10 @@
-import { signIn } from "./session";
+import { ApiError } from "./api-error";
+import { queryClient } from "./query-client";
+import { markSignedOut } from "./session";
+
+export { ApiError };
 
 const BASE_URL = "/api/v1";
-
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
 
 export async function apiFetch<T>(
   path: string,
@@ -32,8 +26,11 @@ export async function apiFetch<T>(
 
   if (response.status === 401) {
     // Signed out, or the session ended (expired, signed out elsewhere, or
-    // access revoked): sign in again and come back here.
-    signIn();
+    // access revoked). Never navigate from here: `/auth/session` can still
+    // say signed in while `/api` refuses (a local revocation), and a redirect
+    // through a silent platform sign-in would loop. The console shows its
+    // sign-in screen instead, and the person decides.
+    markSignedOut(queryClient);
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));

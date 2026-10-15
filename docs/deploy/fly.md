@@ -59,7 +59,7 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
 | `DATABASE_URL` | Postgres URL for `otto_cxp` | `fly postgres attach` |
 | `CXP_INTROSPECTION_SECRET` | `otto_rs_...`, authenticates every call to the platform | `resource rotate-secret` |
 | `CXP_PLATFORM_WEBHOOK_SECRET` | `otto_whsec_...`, verifies platform webhooks | `resource set-webhook` |
-| `CXP_ENCRYPTION_KEY` | 32 bytes, base64; seals the web console's session tokens at rest and its in-flight sign-in cookie. Required only once `CXP_CONSOLE_CLIENT_ID` is set | `openssl rand -base64 32` |
+| `CXP_ENCRYPTION_KEY` | 32 bytes, base64. Never used directly: two HKDF-SHA256 subkeys seal the web console's session tokens at rest and its in-flight sign-in cookie. Required only once `CXP_CONSOLE_CLIENT_ID` is set; rotating it signs every console user out | `openssl rand -base64 32` |
 
 Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set -a otto-cxp
 --stage NAME=...` before the release that reads it, plus a row here and in `.env.example`.
@@ -123,11 +123,14 @@ call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name); 
 
 ## Web console sign-in
 
-The console (`apps/web`, built into the image and served at `/`) signs people in with an OAuth
-authorization-code + PKCE flow against the platform, then keeps its own session cookie
+The console (`apps/web`, built into the image at `/srv/console`, the Dockerfile's
+`CXP_CONSOLE_DIR`, and served under `/console/`; `/` is not the console's) signs people in with
+an OAuth authorization-code + PKCE flow against the platform, then keeps its own session cookie
 (`__Host-cxp_session`) over a platform token pair held server-side in `console_sessions`
-(tokens sealed with `CXP_ENCRYPTION_KEY`; the cookie is stored only as its SHA-256). Design:
-`docs/specs/2026-10-14-console-sign-in-design.md`.
+(tokens sealed with a subkey derived from `CXP_ENCRYPTION_KEY`, labels
+`cxp.console.session-tokens.v1` and, for the sign-in cookie, `cxp.console.oauth-flow.v1`; the
+cookie is stored only as its SHA-256). Design: `docs/specs/2026-10-14-console-sign-in-design.md`.
+Turning it on in production is tracked in #31.
 
 It is **off until `CXP_CONSOLE_CLIENT_ID` is set**: the server boots and serves everything else,
 `/auth/login` answers `503 console_login_disabled`, and the console shows that sign-in is not
@@ -152,13 +155,16 @@ fly secrets set -a otto-cxp --stage CXP_ENCRYPTION_KEY="$(openssl rand -base64 3
 ```
 
 The redirect URI is registered **exactly**: a deployment that moves to another hostname registers
-a new client. Then open `https://otto-cxp.savvagent.com/`, sign in, and check that the dashboard
-loads; `GET /auth/session` answers `{"signedIn": true, ...}` from that browser.
+a new client. Then open `https://otto-cxp.savvagent.com/console/`, sign in, and check that the
+dashboard loads; `GET /auth/session` answers `{"signedIn": true, ...}` from that browser.
 
 **Rotating `CXP_ENCRYPTION_KEY` signs every console user out** (sessions that no longer open are
 deleted on their next use). The platform rotates a refresh token on every use and revokes the
-whole sign-in if a spent one is replayed, so the service refreshes under the session's row lock
-and each refresh happens once, across machines. Sessions are deleted on sign-out, by the
+whole sign-in if a spent one is replayed, so each refresh happens once, across machines: a
+machine coalesces its own requests in memory, claims a short lease on the session row (15 s),
+calls the platform holding no database connection or lock, and stores the new pair only if the
+row is unchanged (a compare-and-swap); another machine that finds the lease waits for the
+result. A sign-out or `org.deleted` during that call wins, and the new pair is revoked. Sessions are deleted on sign-out, by the
 `org.deleted` and `member.removed` webhooks, and by the hourly sweep once expired (30 days
 without a refresh).
 
@@ -187,7 +193,8 @@ credential`), not as a failing `/readyz`.
 
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records. `curl -s -H 'accept: text/html'
-https://otto-cxp.savvagent.com/` returns the console's `index.html`, and
+https://otto-cxp.savvagent.com/console/` returns the console's `index.html` (`/` is a JSON
+`404` until #29 serves it), and
 `curl -s https://otto-cxp.savvagent.com/auth/session` answers `loginEnabled` true once
 `CXP_CONSOLE_CLIENT_ID` is set (false before).
 

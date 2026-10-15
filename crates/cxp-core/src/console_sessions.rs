@@ -4,14 +4,32 @@
 //! The console signs people in with an OAuth authorization-code + PKCE flow
 //! against the otto platform (`cxp_http::console`). What that leaves here is a
 //! [`Session`]: the org and user the platform vouched for, and the access and
-//! refresh tokens it issued, sealed with `CXP_ENCRYPTION_KEY`. The browser
-//! holds only a random cookie; the database holds only that cookie's SHA-256
-//! ([`hash_cookie`]), so neither a dump nor a log line can be replayed as a
-//! sign-in.
+//! refresh tokens it issued, sealed ([`crate::sealed`]) with the console's
+//! session-token key. The browser holds only a random cookie; the database
+//! holds only that cookie's SHA-256 ([`hash_cookie`]), so neither a dump nor a
+//! log line can be replayed as a sign-in.
 //!
 //! This module is SQL only: it knows nothing of HTTP or of the platform's
-//! token endpoint. The refresh protocol lives in `cxp_http::console`, which
-//! uses [`lock`] to make it single-flight.
+//! token endpoint.
+//!
+//! # Refreshing without holding anything
+//!
+//! The platform rotates the refresh token on every use, so two refreshes of
+//! one session must never race. A refresh is three steps, and no connection,
+//! row lock, or lifecycle lock is held across the platform call between them:
+//!
+//! 1. [`claim_refresh`], one short transaction: take the session's refresh
+//!    lease (`refresh_lease_until`) and read its sealed refresh token, or learn
+//!    that the session is gone, already fresh, or leased by someone else.
+//! 2. The caller asks the platform, holding nothing.
+//! 3. [`store_refreshed`], a second short transaction: store the new pair only
+//!    if the session's `generation` is still the one claimed (a
+//!    compare-and-swap), which also ends the lease. A sign-out or a purge in
+//!    between wins: the row is gone, and nothing is resurrected.
+//!
+//! Within one process the caller also coalesces refreshes in memory, so
+//! parallel requests wait without a connection; the lease is what keeps two
+//! replicas apart.
 //!
 //! # Tenancy
 //!
@@ -19,7 +37,7 @@
 //! no org, and the cookie is how the org is learned, so [`org_of`] asks the
 //! database function `console_session_org`, which answers with the org of the
 //! one unexpired session whose hash it is given and never a token (see
-//! migration 0004). Everything else runs pinned to that org through
+//! migration 0003). Everything else runs pinned to that org through
 //! [`crate::platform_events::begin_live`], and names the org in its predicate
 //! as well; the expiry sweep runs under [`crate::maintenance`].
 
@@ -31,6 +49,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 use crate::platform_events::begin_live;
+use crate::sealed;
 
 /// A session whose access token expires within this long is refreshed before
 /// it is used, so the token is still good for the request that triggered it.
@@ -39,11 +58,19 @@ pub const REFRESH_SKEW_SECS: i64 = 60;
 /// The most expired sessions one sweep transaction deletes.
 pub const SWEEP_BATCH: i64 = 1000;
 
-/// The AES-GCM nonce length: a sealed column is `nonce || ciphertext`.
-const NONCE_BYTES: usize = 12;
+macro_rules! cols {
+    () => {
+        "id_hash, org_id, user_id, access_token_enc, refresh_token_enc, \
+         access_expires_at, created_at, expires_at, refresh_lease_until, generation"
+    };
+}
 
-const COLS: &str = "id_hash, org_id, user_id, access_token_enc, refresh_token_enc, \
-                    access_expires_at, created_at, expires_at";
+/// The unexpired session `$2` in org `$1`.
+const FIND: &str = concat!(
+    "SELECT ",
+    cols!(),
+    " FROM console_sessions WHERE org_id = $1 AND id_hash = $2 AND expires_at > now()"
+);
 
 /// The database key for a cookie value.
 pub fn hash_cookie(cookie: &str) -> [u8; 32] {
@@ -62,6 +89,10 @@ pub struct Session {
     pub access_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// Until when a refresh holds this session's lease, if one does.
+    pub refresh_lease_until: Option<DateTime<Utc>>,
+    /// Bumped on every rotation.
+    pub generation: i64,
 }
 
 // Not derived: the sealed tokens stay out of log lines.
@@ -72,6 +103,7 @@ impl std::fmt::Debug for Session {
             .field("user_id", &self.user_id)
             .field("access_expires_at", &self.access_expires_at)
             .field("expires_at", &self.expires_at)
+            .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
 }
@@ -92,21 +124,11 @@ impl Session {
 }
 
 fn seal(cipher: &Cipher, plain: &str) -> Result<Vec<u8>> {
-    let sealed = cipher.seal(plain.as_bytes())?;
-    let mut out = sealed.nonce;
-    out.extend_from_slice(&sealed.ciphertext);
-    Ok(out)
+    sealed::seal(cipher, plain.as_bytes())
 }
 
 fn open(cipher: &Cipher, stored: &[u8]) -> Result<String> {
-    if stored.len() <= NONCE_BYTES {
-        return Err(
-            otto_tenant::Error::Crypto("a sealed session token is truncated".into()).into(),
-        );
-    }
-    let (nonce, ciphertext) = stored.split_at(NONCE_BYTES);
-    let plain = cipher.open(ciphertext, nonce)?;
-    String::from_utf8(plain).map_err(|_| {
+    String::from_utf8(sealed::open(cipher, stored)?).map_err(|_| {
         otto_tenant::Error::Crypto("a sealed session token is not UTF-8".into()).into()
     })
 }
@@ -159,85 +181,184 @@ pub async fn org_of(db: &Db, id_hash: &[u8; 32]) -> Result<Option<OrgId>> {
     Ok(org.map(OrgId::from))
 }
 
-const FIND: &str = "SELECT {COLS} FROM console_sessions \
-                    WHERE org_id = $1 AND id_hash = $2 AND expires_at > now()";
+async fn find(tx: &mut Tx<'_>, id_hash: &[u8; 32]) -> Result<Option<Session>> {
+    let org = tx.org();
+    Ok(sqlx::query_as(FIND)
+        .bind(org)
+        .bind(&id_hash[..])
+        .fetch_optional(tx.conn())
+        .await?)
+}
 
 /// The unexpired session `id_hash` in `org`, read pinned to it.
 pub async fn load(db: &Db, org: OrgId, id_hash: &[u8; 32]) -> Result<Option<Session>> {
     let mut tx = begin_live(db, org, None).await?;
-    let session = sqlx::query_as(&FIND.replace("{COLS}", COLS))
-        .bind(org)
-        .bind(&id_hash[..])
-        .fetch_optional(tx.conn())
-        .await?;
+    let session = find(&mut tx, id_hash).await?;
     tx.commit().await?;
     Ok(session)
 }
 
-/// Lock one session's row for the length of the returned transaction: the
-/// single-flight guard for a token refresh. A concurrent caller blocks here
-/// until the holder commits, then reads the rotated tokens. `None` means the
-/// session is gone (signed out, swept, or its member removed).
-pub async fn lock(
+/// What [`claim_refresh`] found.
+#[derive(Debug)]
+pub enum Claim {
+    /// This caller holds the lease until it stores a new pair, gives the lease
+    /// back, or the lease lapses. Refresh with the session's refresh token,
+    /// then [`store_refreshed`] against its `generation`.
+    Claimed(Session),
+    /// The access token is good: someone else refreshed it.
+    Fresh(Session),
+    /// Another refresh holds a live lease: wait, then look again.
+    Leased,
+    /// Signed out, swept, purged, or expired.
+    Gone,
+}
+
+/// Take the refresh lease on session `id_hash` for `lease`, if its token
+/// still needs a refresh at `now` and no live lease is held. One short
+/// transaction; nothing is held when it returns.
+pub async fn claim_refresh(
     db: &Db,
     org: OrgId,
     id_hash: &[u8; 32],
-) -> Result<Option<(Tx<'static>, Session)>> {
+    now: DateTime<Utc>,
+    lease: chrono::Duration,
+) -> Result<Claim> {
     let mut tx = begin_live(db, org, None).await?;
-    let session: Option<Session> =
-        sqlx::query_as(&format!("{} FOR UPDATE", FIND.replace("{COLS}", COLS)))
-            .bind(org)
-            .bind(&id_hash[..])
-            .fetch_optional(tx.conn())
-            .await?;
-    Ok(session.map(|s| (tx, s)))
+    let claimed: Option<Session> = sqlx::query_as(concat!(
+        "UPDATE console_sessions SET refresh_lease_until = $3 + $4 \
+         WHERE org_id = $1 AND id_hash = $2 AND expires_at > now() \
+           AND access_expires_at <= $3 + $5 \
+           AND (refresh_lease_until IS NULL OR refresh_lease_until <= $3) \
+         RETURNING ",
+        cols!()
+    ))
+    .bind(org)
+    .bind(&id_hash[..])
+    .bind(now)
+    .bind(lease)
+    .bind(chrono::Duration::seconds(REFRESH_SKEW_SECS))
+    .fetch_optional(tx.conn())
+    .await?;
+    let claim = match claimed {
+        Some(s) => Claim::Claimed(s),
+        None => match find(&mut tx, id_hash).await? {
+            None => Claim::Gone,
+            Some(s) if !s.needs_refresh(now) => Claim::Fresh(s),
+            Some(_) => Claim::Leased,
+        },
+    };
+    tx.commit().await?;
+    Ok(claim)
 }
 
-/// Store a rotated token pair on a session held by [`lock`].
-pub async fn rotate(
-    tx: &mut Tx<'_>,
+/// A refreshed token pair for a claimed session.
+pub struct Refreshed<'a> {
+    pub access_token: &'a str,
+    pub refresh_token: &'a str,
+    pub access_expires_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Store a refreshed pair on session `id_hash`, if it is still at
+/// `generation` (the claim's): bumps the generation and ends the lease.
+/// `false` means the session was deleted or rotated by someone else since the
+/// claim, and nothing was written.
+pub async fn store_refreshed(
+    db: &Db,
     cipher: &Cipher,
+    org: OrgId,
     id_hash: &[u8; 32],
-    access_token: &str,
-    refresh_token: &str,
-    access_expires_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-) -> Result<()> {
-    let org = tx.org();
-    sqlx::query(
+    generation: i64,
+    new: &Refreshed<'_>,
+) -> Result<bool> {
+    let access = seal(cipher, new.access_token)?;
+    let refresh = seal(cipher, new.refresh_token)?;
+    let mut tx = begin_live(db, org, None).await?;
+    let n = sqlx::query(
         "UPDATE console_sessions \
-         SET access_token_enc = $3, refresh_token_enc = $4, access_expires_at = $5, \
-             expires_at = $6 \
-         WHERE org_id = $1 AND id_hash = $2",
+         SET access_token_enc = $4, refresh_token_enc = $5, access_expires_at = $6, \
+             expires_at = $7, generation = generation + 1, refresh_lease_until = NULL \
+         WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
     )
     .bind(org)
     .bind(&id_hash[..])
-    .bind(seal(cipher, access_token)?)
-    .bind(seal(cipher, refresh_token)?)
-    .bind(access_expires_at)
-    .bind(expires_at)
+    .bind(generation)
+    .bind(access)
+    .bind(refresh)
+    .bind(new.access_expires_at)
+    .bind(new.expires_at)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n == 1)
+}
+
+/// Give back a lease taken at `generation` without rotating (the platform
+/// could not be reached), so the next request may try again at once.
+pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], generation: i64) -> Result<()> {
+    let mut tx = begin_live(db, org, None).await?;
+    sqlx::query(
+        "UPDATE console_sessions SET refresh_lease_until = NULL \
+         WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
+    )
+    .bind(org)
+    .bind(&id_hash[..])
+    .bind(generation)
     .execute(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// Delete a session inside a transaction that holds it.
-pub async fn delete_locked(tx: &mut Tx<'_>, id_hash: &[u8; 32]) -> Result<u64> {
-    let org = tx.org();
-    Ok(
-        sqlx::query("DELETE FROM console_sessions WHERE org_id = $1 AND id_hash = $2")
-            .bind(org)
-            .bind(&id_hash[..])
-            .execute(tx.conn())
-            .await?
-            .rows_affected(),
+/// Delete session `id_hash` if it is still at `generation`: the platform
+/// refused the refresh token that generation holds.
+pub async fn delete_generation(
+    db: &Db,
+    org: OrgId,
+    id_hash: &[u8; 32],
+    generation: i64,
+) -> Result<u64> {
+    let mut tx = begin_live(db, org, None).await?;
+    let n = sqlx::query(
+        "DELETE FROM console_sessions WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
     )
+    .bind(org)
+    .bind(&id_hash[..])
+    .bind(generation)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Delete one session and return what it held (sign-out: the caller revokes
+/// its refresh token afterwards, with nothing held). Idempotent: `None` if
+/// there was no such session.
+pub async fn take(db: &Db, org: OrgId, id_hash: &[u8; 32]) -> Result<Option<Session>> {
+    let mut tx = begin_live(db, org, None).await?;
+    let session = sqlx::query_as(concat!(
+        "DELETE FROM console_sessions WHERE org_id = $1 AND id_hash = $2 RETURNING ",
+        cols!()
+    ))
+    .bind(org)
+    .bind(&id_hash[..])
+    .fetch_optional(tx.conn())
+    .await?;
+    tx.commit().await?;
+    Ok(session)
 }
 
 /// Delete one session. Idempotent.
 pub async fn delete(db: &Db, org: OrgId, id_hash: &[u8; 32]) -> Result<u64> {
     let mut tx = begin_live(db, org, None).await?;
-    let n = delete_locked(&mut tx, id_hash).await?;
+    let n = sqlx::query("DELETE FROM console_sessions WHERE org_id = $1 AND id_hash = $2")
+        .bind(org)
+        .bind(&id_hash[..])
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
     tx.commit().await?;
     Ok(n)
 }
