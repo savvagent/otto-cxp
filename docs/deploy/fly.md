@@ -631,8 +631,9 @@ curl -s https://otto-cxp.savvagent.com/auth/session
   ```bash
   curl -s -i -X POST https://otto-cxp.savvagent.com/api/v1/customers \
     -H 'cookie: __Host-cxp_session=<value>' -H 'origin: https://example.com' \
-    -H 'content-type: application/json' -d '{"email":"cross-site@example.com"}'
-  # -> 403, "error": "cross_site_request"; nothing is created
+    -H 'content-type: application/json' -d '{}'
+  # -> 403, "error": "cross_site_request". The empty body is invalid, so even a broken origin
+  #    check writes nothing (it would answer a 4xx validation error instead).
   ```
 
 - Sign out in the console. `GET /auth/session` from that browser answers `"signedIn": false`, and

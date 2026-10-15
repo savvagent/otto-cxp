@@ -137,6 +137,9 @@ pub async fn begin_live(db: &Db, org: OrgId, user: Option<UserId>) -> Result<Tx<
 
 /// Database-side bounds on a transaction's waits: `lock_timeout` and
 /// `statement_timeout`, both transaction-local.
+/// Both are sent in whole milliseconds, and PostgreSQL reads `0` as "no
+/// limit", so a bound under 1 ms would turn itself off; each must be at
+/// least 1 ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     /// The longest any one lock wait may last (`lock_timeout`).

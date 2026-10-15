@@ -500,6 +500,20 @@ async fn claimed_session(db: &Db, o: OrgId) -> ([u8; 32], Lease) {
 /// on its lock forever fails rather than hangs.
 const NO_LONGER_THAN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Whether `result` failed because a database-side bound cut a wait off:
+/// `55P03` (`lock_timeout`) or `57014` (`statement_timeout`), and not for
+/// some unrelated reason.
+fn timed_out<T: std::fmt::Debug>(result: &Result<T, Error>) -> bool {
+    let db = match result {
+        Err(Error::Database(e)) | Err(Error::Tenant(otto_tenant::Error::Db(e))) => e,
+        _ => return false,
+    };
+    matches!(
+        db.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("55P03" | "57014")
+    )
+}
+
 /// The store runs inside the lease holder's `STORE_ALLOWANCE`; a row lock
 /// held elsewhere must make it fail in time, not wait it out, and the failed
 /// transaction changes nothing and leaves the pool usable.
@@ -531,7 +545,7 @@ async fn a_store_behind_a_held_row_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the store waited out the row lock");
-    assert!(stored.is_err(), "{stored:?}");
+    assert!(timed_out(&stored), "{stored:?}");
     holder.rollback().await.unwrap();
 
     let s = console_sessions::load(&db, o, &hash)
@@ -565,7 +579,7 @@ async fn a_release_behind_a_held_row_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the release waited out the row lock");
-    assert!(released.is_err(), "{released:?}");
+    assert!(timed_out(&released), "{released:?}");
     holder.rollback().await.unwrap();
 
     let s = console_sessions::load(&db, o, &hash)
@@ -600,7 +614,7 @@ async fn a_store_behind_the_lifecycle_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the store waited out the lifecycle lock");
-    assert!(stored.is_err(), "{stored:?}");
+    assert!(timed_out(&stored), "{stored:?}");
     holder.rollback().await.unwrap();
 
     assert!(

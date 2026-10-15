@@ -96,6 +96,12 @@ pub const STORE_TIMEOUTS: Timeouts = Timeouts {
 /// to wait on nothing.
 pub const STORE_STATEMENTS: u32 = 4;
 
+// A bound under 1 ms is sent as `0`, which PostgreSQL reads as no limit.
+const _: () = assert!(
+    STORE_TIMEOUTS.lock.as_millis() >= 1 && STORE_TIMEOUTS.statement.as_millis() >= 1,
+    "a store timeout under 1 ms would disable the bound"
+);
+
 /// The most expired sessions one sweep transaction deletes.
 pub const SWEEP_BATCH: i64 = 1000;
 
