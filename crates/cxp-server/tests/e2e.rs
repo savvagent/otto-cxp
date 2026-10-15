@@ -2324,9 +2324,14 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     let (boot, ()) = tokio::join!(server, client);
     let boot = boot.expect("a clean stop");
 
+    // Not privileged, and the per-test databases beside its own (PUBLIC's
+    // default CONNECT, not another service's) do not count.
     assert!(
-        boot.database_role
-            .contains("holds no superuser-equivalent privilege"),
+        boot.database_role.contains(
+            "holds no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, \
+             CREATEDB, REPLICATION, or a cross-service predefined role), directly or through \
+             membership, and can connect to no other service's database"
+        ),
         "{}",
         boot.database_role
     );

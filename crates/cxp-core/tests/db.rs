@@ -920,12 +920,14 @@ async fn a_tampered_known_migration_still_refuses_to_boot(pool: PgPool) {
     );
 }
 
-/// Roles a test created, dropped when it ends, failed or not: roles are
-/// cluster-wide and outlive the test database. The drop runs on its own
-/// thread and runtime (`Drop` cannot await), as the test pool's superuser.
+/// Roles and databases a test created, dropped when it ends, failed or not:
+/// both are cluster-wide and outlive the test database. The drop runs on its
+/// own thread and runtime (`Drop` cannot await), as the test pool's
+/// superuser, databases first (a role that owns one cannot be dropped).
 struct TestRoles {
     options: sqlx::postgres::PgConnectOptions,
     names: Vec<String>,
+    databases: Vec<String>,
 }
 
 impl TestRoles {
@@ -933,7 +935,19 @@ impl TestRoles {
         Self {
             options: pool.connect_options().as_ref().clone(),
             names: Vec::new(),
+            databases: Vec::new(),
         }
+    }
+
+    /// `CREATE DATABASE name`, registered for the drop. Returns its name.
+    async fn database(&mut self, pool: &PgPool, prefix: &str) -> String {
+        let name = format!("{prefix}_{}", Uuid::new_v4().simple());
+        self.databases.push(name.clone());
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        name
     }
 
     /// `CREATE ROLE name LOGIN PASSWORD ... <attributes>`, registered for
@@ -973,6 +987,7 @@ impl Drop for TestRoles {
     fn drop(&mut self) {
         let options = self.options.clone();
         let names = std::mem::take(&mut self.names);
+        let databases = std::mem::take(&mut self.databases);
         let dropped = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -981,6 +996,11 @@ impl Drop for TestRoles {
             rt.block_on(async move {
                 use sqlx::Connection;
                 let mut conn = sqlx::PgConnection::connect_with(&options).await?;
+                for database in &databases {
+                    sqlx::query(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+                        .execute(&mut conn)
+                        .await?;
+                }
                 for name in names.iter().rev() {
                     for stmt in [
                         format!(
@@ -1015,7 +1035,7 @@ fn found(role: &cxp_core::db_role::DbRole) -> Vec<(&str, &str, &[cxp_core::db_ro
 /// The boot check's view of a login role (#16): a plain role (even a member
 /// of `otto_app`) is not privileged; SUPERUSER, BYPASSRLS, CREATEROLE,
 /// REPLICATION, membership in a role with any of them (one `SET ROLE`
-/// away), and membership in a server-access predefined role are, and are
+/// away), and membership in a cross-service predefined role are, and are
 /// named.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_database_role_check_sees_every_superuser_equivalent(pool: PgPool) {
@@ -1114,12 +1134,12 @@ async fn the_database_role_check_sees_every_superuser_equivalent(pool: PgPool) {
         [(
             exec.as_str(),
             "pg_execute_server_program",
-            &[ServerRole][..]
+            &[PredefinedRole][..]
         )]
     );
     assert_eq!(
         found(read_all_r),
-        [(read_all.as_str(), "pg_read_all_data", &[ServerRole][..])]
+        [(read_all.as_str(), "pg_read_all_data", &[PredefinedRole][..])]
     );
     assert!(
         read_all_r
@@ -1175,4 +1195,211 @@ async fn the_database_role_check_sees_a_superuser_session_behind_set_role(pool: 
         "{}",
         role.summary()
     );
+}
+
+/// The rest of what a deployment refuses (#16, round 2): CREATEDB, the
+/// predefined roles that reach other sessions (`pg_signal_backend`,
+/// `pg_monitor`, `pg_read_all_stats`, `pg_create_subscription`, and
+/// `pg_maintain` where the server has it), and a Postgres 16 membership that
+/// grants `SET` without `INHERIT`, still one `SET ROLE` from BYPASSRLS.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_the_cross_service_roles_and_set_only_membership(
+    pool: PgPool,
+) {
+    use cxp_core::db_role::{inspect, Privilege::*};
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    let (createdb, createdb_db) = roles
+        .login(&pool, "cxp_t_createdb", "NOSUPERUSER CREATEDB")
+        .await;
+    let role = inspect(&createdb_db).await.unwrap();
+    createdb_db.pool().close().await;
+    assert_eq!(
+        found(&role),
+        [(createdb.as_str(), createdb.as_str(), &[CreateDb][..])]
+    );
+    assert!(role.summary().contains("is CREATEDB"), "{}", role.summary());
+
+    // Looked up by name: whichever this server has (pg_maintain is 17+).
+    let present: Vec<String> = sqlx::query_scalar(
+        "SELECT rolname::text FROM pg_roles WHERE rolname = ANY($1) ORDER BY rolname",
+    )
+    .bind(
+        [
+            "pg_signal_backend",
+            "pg_monitor",
+            "pg_read_all_stats",
+            "pg_create_subscription",
+            "pg_maintain",
+        ]
+        .map(String::from)
+        .to_vec(),
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for required in [
+        "pg_signal_backend",
+        "pg_monitor",
+        "pg_read_all_stats",
+        "pg_create_subscription",
+    ] {
+        assert!(present.iter().any(|r| r == required), "{required} missing");
+    }
+    for predefined in &present {
+        let (login, as_role) = roles.login(&pool, "cxp_t_predefined", base).await;
+        sqlx::query(&format!("GRANT {predefined} TO {login}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let role = inspect(&as_role).await.unwrap();
+        as_role.pool().close().await;
+        // pg_monitor brings pg_read_all_stats (and more) with it: the
+        // granted role is among those named.
+        assert!(
+            found(&role)
+                .iter()
+                .any(|&(u, n, p)| u == login && n == predefined && p == [PredefinedRole]),
+            "{predefined}: {}",
+            role.summary()
+        );
+    }
+
+    // GRANT ... WITH INHERIT FALSE, SET TRUE (Postgres 16): none of the
+    // group's privileges apply until SET ROLE, which the member may do.
+    let bypass_group = roles
+        .nologin(&pool, "cxp_t_bypass_group", "NOSUPERUSER BYPASSRLS")
+        .await;
+    let (set_only, set_only_db) = roles.login(&pool, "cxp_t_set_only", base).await;
+    sqlx::query(&format!(
+        "GRANT {bypass_group} TO {set_only} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (inherits, set_ok): (bool, bool) = sqlx::query_as(
+        "SELECT pg_has_role($1::text::name, $2::text::name, 'USAGE'), \
+                pg_has_role($1::text::name, $2::text::name, 'SET')",
+    )
+    .bind(&set_only)
+    .bind(&bypass_group)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((inherits, set_ok), (false, true), "the grant is SET-only");
+    let role = inspect(&set_only_db).await.unwrap();
+    set_only_db.pool().close().await;
+    assert_eq!(
+        found(&role),
+        [(set_only.as_str(), bypass_group.as_str(), &[BypassRls][..])]
+    );
+
+    // A database owner is implicitly a member of pg_database_owner, which
+    // is not refused: the e2e least-privilege test owns its database and
+    // boots; here, the predefined role itself is not flagged.
+    let flagged: bool = sqlx::query_scalar(
+        "SELECT rolname = ANY($1) FROM pg_roles WHERE rolname = 'pg_database_owner'",
+    )
+    .bind(
+        cxp_core::db_role::PREDEFINED_ROLES
+            .map(String::from)
+            .to_vec(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!flagged);
+}
+
+/// Cross-database `CONNECT` and the shared-instance signal (#16, round 2),
+/// with uniquely named databases standing in for the other services'
+/// (`inspect_with`), so the shared test cluster never looks like `otto-db`
+/// to the tests running beside this one.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_other_databases_and_a_shared_instance(pool: PgPool) {
+    use cxp_core::db_role::{inspect, inspect_with, DatabaseAccess};
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let service = roles.database(&pool, "cxp_t_svc").await;
+    let other = roles.database(&pool, "cxp_t_other").await;
+    let services = [service.as_str()];
+    let (login, as_role) = roles.login(&pool, "cxp_t_reach", base).await;
+    let group = roles.nologin(&pool, "cxp_t_group", base).await;
+    let owner = roles.nologin(&pool, "cxp_t_owner", base).await;
+    sqlx::query(&format!("GRANT {group} TO {login}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let access = |database: &str, through: &str| DatabaseAccess {
+        user: login.clone(),
+        database: database.into(),
+        through: through.into(),
+    };
+
+    // The real list finds no other service here, so nothing is shared, and
+    // PUBLIC's default CONNECT on the per-test databases is not counted.
+    let role = inspect(&as_role).await.unwrap();
+    assert!(!role.shares_the_instance(), "{}", role.summary());
+    assert!(!role.is_refused_in_a_deployment(), "{}", role.summary());
+
+    // Another service's database counts through PUBLIC; any other database
+    // does not.
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert_eq!(role.shared_with, std::slice::from_ref(&service));
+    assert_eq!(role.other_databases, [access(&service, "PUBLIC")]);
+    assert!(role.is_refused_in_a_deployment());
+    assert!(!role.is_privileged());
+
+    // Revoked from PUBLIC (R3): out of reach, still a shared instance.
+    sqlx::query(&format!("REVOKE CONNECT ON DATABASE {service} FROM PUBLIC"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert!(role.other_databases.is_empty(), "{}", role.summary());
+    assert!(role.shares_the_instance());
+    assert!(!role.is_refused_in_a_deployment());
+
+    // A grant to a role it belongs to (a later grant to otto_app) counts on
+    // any database, and on another service's after the revoke too.
+    for stmt in [
+        format!("GRANT CONNECT ON DATABASE {other} TO {group}"),
+        format!("GRANT CONNECT ON DATABASE {service} TO {group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    let mut expected = vec![access(&other, &group), access(&service, &group)];
+    expected.sort_by(|a, b| a.database.cmp(&b.database));
+    assert_eq!(role.other_databases, expected);
+    for stmt in [
+        format!("REVOKE CONNECT ON DATABASE {other} FROM {group}"),
+        format!("REVOKE CONNECT ON DATABASE {service} FROM {group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(inspect_with(&as_role, &services)
+        .await
+        .unwrap()
+        .other_databases
+        .is_empty());
+
+    // Membership in a database's owning role counts.
+    for stmt in [
+        format!("ALTER DATABASE {other} OWNER TO {owner}"),
+        format!("GRANT {owner} TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect_with(&as_role, &services).await.unwrap();
+    assert_eq!(role.other_databases, [access(&other, &owner)]);
+    assert!(
+        role.summary().contains(&format!(
+            "can connect to database {other:?} (through {owner:?})"
+        )),
+        "{}",
+        role.summary()
+    );
+    as_role.pool().close().await;
 }

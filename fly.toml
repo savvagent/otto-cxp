@@ -8,7 +8,8 @@
 # otto-platform, otto-factory, and otto-flags (shared for cost; split before
 # real customers). otto-cxp connects as `cxp_server`, which owns only
 # `otto_cxp` and holds no superuser-equivalent privilege; boot refuses a
-# privileged role here (FLY_APP_NAME is set on every Fly machine). Isolation
+# privileged role, or one that can connect to another service's database, here
+# (FLY_APP_NAME is set on every Fly machine). Isolation
 # rests on `SET LOCAL ROLE otto_app` under row-level security; cxp-server
 # proves that at boot.
 #

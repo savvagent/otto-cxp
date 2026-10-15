@@ -10,13 +10,20 @@ Postgres (`DATABASE_URL=postgres://cxp:cxp@localhost:<port>/otto_cxp`).
     superuser pool) and `the_database_role_check_sees_a_superuser_session_behind_set_role`.
   - Add `crates/cxp-core/src/db_role.rs` (`DbRole`, `PrivilegedRole`, `inspect`, `summary`, unit
     test of the summary) and `pub mod db_role;` in `lib.rs`.
+  - Round 2: CREATEDB and the remaining cross-service predefined roles
+    (`PREDEFINED_ROLES`, looked up by name), cross-database `CONNECT`, and the shared-instance
+    signal (`OTHER_SERVICE_DATABASES`, `inspect_with` for tests). Failing tests first:
+    `the_database_role_check_sees_the_cross_service_roles_and_set_only_membership` (incl. a
+    Postgres 16 `WITH INHERIT FALSE, SET TRUE` grant) and
+    `the_database_role_check_sees_other_databases_and_a_shared_instance`.
   - `cargo test -p cxp-core --test db the_database_role`
 
 - [ ] **2. Refuse a privileged role in a deployment (`cxp-server`).**
   - Failing tests first: `config.rs` `only_loopback_urls_without_fly_are_not_a_deployment`;
     `boot.rs` `a_deployment_refuses_a_privileged_database_role`.
   - `Config::is_deployment`; `boot::check_db_role`, called in `run_with` after connecting and
-    before migrations; `Boot::database_role`.
+    before migrations, which also treats a shared instance as a deployment and refuses
+    another service's database within reach; `Boot::database_role`.
   - `cargo test -p cxp-server --lib`
 
 - [ ] **3. Prove the whole service as a least-privilege owner (`tests/e2e.rs`).**

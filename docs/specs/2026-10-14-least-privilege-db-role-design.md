@@ -39,10 +39,18 @@ Acceptance criteria (verbatim from #16):
   with `SET ROLE` (`?options=-c role=...`, `ALTER ROLE ... SET role`): `RESET ROLE` returns to
   the superuser. The check reads `session_user` too.
 - **Superuser-equivalent is more than SUPERUSER and BYPASSRLS.** CREATEROLE (before Postgres 16
-  it grants itself any non-superuser role, BYPASSRLS ones included), REPLICATION, and the
-  predefined roles `pg_execute_server_program`, `pg_read_server_files`,
-  `pg_write_server_files`, `pg_read_all_data`, `pg_write_all_data` all reach past RLS or past
-  `otto_cxp`.
+  it grants itself any non-superuser role, BYPASSRLS ones included), CREATEDB (new databases on
+  a shared instance), REPLICATION, and the predefined roles `pg_execute_server_program`,
+  `pg_read_server_files`, `pg_write_server_files`, `pg_read_all_data`, `pg_write_all_data`,
+  `pg_signal_backend`, `pg_read_all_stats`, `pg_monitor`, `pg_create_subscription`, and
+  `pg_maintain` (17+) all reach past RLS, past `otto_cxp`, or into other services' sessions.
+  `pg_database_owner` is not one: every database owner is implicitly its member, and it holds
+  nothing beyond that database. Membership counts however it was granted: a Postgres 16
+  `GRANT ... WITH INHERIT FALSE, SET TRUE` passes no privilege on, but still allows `SET ROLE`,
+  so the check uses `pg_has_role(..., 'MEMBER')`.
+- **Superuser-equivalence is not the only way out of `otto_cxp`.** A grant of `CONNECT` on
+  another service's database (to `otto_app`, say, which every service's role belongs to) or
+  membership in a role that owns one opens that database to a role with no privilege at all.
 
 ## Assumptions
 
@@ -71,7 +79,8 @@ runbook in `docs/deploy/fly.md`; `fly.toml`, `.env.example`, and `CLAUDE.md` wor
 
 Out: running the runbook (Rob); least-privilege roles for the other otto services; refusing a
 deployment whose role cannot assume `otto_app` (isolation then still holds through FORCE, and
-`verify_tenant_isolation` reports it); revoking `CONNECT` on `postgres` and `repmgr`.
+`verify_tenant_isolation` reports it); revoking `CONNECT` on `postgres`; re-checking the role
+after boot (noted on #27).
 
 ## Architecture
 
@@ -89,34 +98,82 @@ and the existing e2e boot tests (`http://127.0.0.1:<port>` for both URLs) are lo
 working with the test cluster's superuser. The cost: running locally behind a tunnel needs a
 non-superuser local role, which `.env.example` shows how to make.
 
+**The shared-instance rule.** URLs describe the process, not the database: a developer running
+locally against `otto-db` through `fly proxy` has loopback URLs and production's data. So
+`boot::check_db_role` also treats the process as a deployment when the instance hosts any of
+`db_role::OTHER_SERVICE_DATABASES` (`otto_platform`, `otto_factory`, `otto_flags`) besides the
+current database (`DbRole::shares_the_instance`, read from `pg_database`, which every role may
+read). Why those three names and not a broader rule ("more than one non-template database",
+"databases owned by other roles"):
+
+- The test cluster and a developer's Postgres host many databases: `otto_cxp` beside every
+  per-test database `#[sqlx::test]` creates (and keeps when a test fails). Any count- or
+  owner-based rule would turn every test run into a "deployment" and refuse the superuser the
+  e2e boot test runs as. `otto_cxp` itself is therefore not in the list either.
+- The names are exactly the databases `otto-db` hosts beside `otto_cxp` today (the Topology
+  section of `docs/deploy/fly.md`), so the signal is precise on production and never fires on a
+  per-service local container. A developer who puts every otto service on one local Postgres is
+  treated as a deployment and needs the local least-privilege role `.env.example` shows, which
+  is the point: that instance holds other services' data.
+- A new otto service on `otto-db` must be added to the list (the runbook's new-service note
+  says so). Missing it weakens only this signal, not the CONNECT check below.
+
+Tests stand in uniquely named databases through `db_role::inspect_with(db, names)`, so creating
+them never makes the shared test cluster look like `otto-db` to the tests running beside.
+
 ### The check
 
 - `cxp_core::db_role::inspect(&Db) -> DbRole` (new, `crates/cxp-core/src/db_role.rs`; SQL stays in
-  cxp-core): `session_user` and `current_user`, and for each (once when they are equal) every
-  role with `rolsuper`, `rolbypassrls`, `rolcreaterole`, or `rolreplication`, or named in
-  `db_role::SERVER_ROLES`, that `pg_has_role(user, oid, 'MEMBER')`, the user itself first, at
-  most 8 per user (a superuser is a member of every role, so for one only itself is kept).
-  Each entry records which user holds it. `DbRole::summary()` is the log line, naming the
-  session user when it differs.
+  cxp-core): `session_user` and `current_user`, and for each (once when they are equal):
+  - every role with `rolsuper`, `rolbypassrls`, `rolcreaterole`, `rolcreatedb`, or
+    `rolreplication`, or named in `db_role::PREDEFINED_ROLES` (matched by name, so a role a
+    server version lacks is simply absent), that `pg_has_role(user, oid, 'MEMBER')`, the user
+    itself first, at most 8 (a superuser is a member of every role, so for one only itself is
+    kept);
+  - unless the user is a superuser (already refused, and able to open every database), every
+    other database it may `CONNECT` to (`has_database_privilege`), skipping templates,
+    databases that disallow connections, the current database, `postgres`, and `repmgr`,
+    explained by the first ACL entry (`aclexplode` of `datacl`, or `acldefault` when it is
+    NULL) granting `CONNECT` to a role the user holds the privileges of
+    (`pg_has_role(..., 'USAGE')`, which includes the owner's entry), else `PUBLIC`. It counts
+    when the grant is not `PUBLIC`'s, or the database is one of `OTHER_SERVICE_DATABASES`; at
+    most 8. `PUBLIC`'s default `CONNECT` elsewhere is not counted: every database created
+    without a revoke has it, every per-test database included, and it opens only what
+    `PUBLIC` holds there.
+
+  Then the `OTHER_SERVICE_DATABASES` present on the instance. Each entry records which user
+  holds it. `DbRole::summary()` is the log line, naming the session user when it differs, each
+  reachable database with the grantee it is reached through, and the services sharing the
+  instance.
 - `boot::check_db_role(&DbRole, &Config)` (`crates/cxp-server/src/boot.rs`), called right after
-  connecting and before migrations, so a refused role runs nothing:
-  - not privileged: `info`, `database role "cxp_server" holds no superuser-equivalent privilege
-    (...), directly or through membership`;
-  - privileged in a deployment: `error`, and `run` returns `refusing to serve: database role
-    "otto_cxp" is SUPERUSER; ...` (the process exits non-zero, the Fly health check fails);
-  - privileged and not a deployment: `warn`, `... allowed only because this is not a deployment
-    (loopback CXP_PUBLIC_URL and CXP_RESOURCE_URI, no FLY_APP_NAME)`.
+  connecting and before migrations, so a refused role runs nothing. A session is refused when
+  it is privileged or reaches another database (`DbRole::is_refused_in_a_deployment`); the
+  process is a deployment when `Config::is_deployment()` or `DbRole::shares_the_instance()`:
+  - not refused: `info`, `database role "cxp_server" holds no superuser-equivalent privilege
+    (...), directly or through membership, and can connect to no other service's database`
+    (plus `; the instance also hosts ...` on `otto-db`);
+  - refused in a deployment: `error`, and `run` returns `refusing to serve: database role
+    "otto_cxp" is SUPERUSER; ...` or `... can connect to database "otto_platform" (through
+    "otto_app")` (the process exits non-zero, the Fly health check fails);
+  - refused and not a deployment: `warn`, `... allowed only because this is not a deployment
+    (loopback CXP_PUBLIC_URL and CXP_RESOURCE_URI, no FLY_APP_NAME, and no other otto service's
+    database on the instance)`.
 - `Boot` gains `database_role: String` (the summary), as it carries `isolation`.
 
 ### The production role
 
-`cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION, in no
-predefined role; member
+`cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION,
+CONNECTION LIMIT 15 (two machines' pools of 5, a third during a rolling deploy, and a psql
+session), in no predefined role; member
 of `otto_app` with INHERIT and SET (otto-tenant decides whether to `SET LOCAL ROLE` with
 `pg_has_role(..., 'USAGE')`, which needs INHERIT); owner of `otto_cxp` and, via `REASSIGN OWNED`,
 of every object in it; default privileges for it re-granted to `otto_app`. `CONNECT` on the four
-service databases revoked from `PUBLIC` and granted back to `cxp_server` on `otto_cxp` only. The
-runbook is `docs/deploy/fly.md` "Database role", R0 to R7.
+service databases and `repmgr` revoked from `PUBLIC` (each non-superuser role that uses one
+granted it explicitly first, `repmgr` included) and granted back to `cxp_server` on `otto_cxp`
+only. The runbook is `docs/deploy/fly.md` "Database role", R0 to R7; R2 runs under a 5-second
+`lock_timeout`, R5 pipes the secret from `read -rs` through `printf` into `fly secrets import`,
+and R7 is a guarded `DO` block that refuses a role this setup depends on, a database owner, a
+role with a live session, or one that still owns relations in `otto_cxp`.
 
 Ordering: R1 to R4 (create, transfer ownership, revoke, verify) cannot affect the running
 release, which is a superuser. R5 sets `DATABASE_URL` without `--stage`, restarting the running
@@ -128,7 +185,8 @@ code change. R6 is the merge. R7 makes the attach role NOLOGIN.
 - Tenant isolation: tightened. The connecting role is now proven bound by RLS in a deployment,
   as long as it does not alter its own tables (see Risks).
 - No SQL outside cxp-core: the catalog query lives in `cxp_core::db_role`.
-- Small shared DB: the query is bounded (`LIMIT 8`).
+- Small shared DB: each catalog query is bounded (`LIMIT 8` per user; the shared-instance query
+  matches at most three names), and they run once, at boot.
 - Migrations: none added.
 - `CLAUDE.md`'s isolation invariant now says production's role is `cxp_server` once the runbook
   has run, and that until then a release with the check will not boot there.
@@ -151,6 +209,10 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
 - `otto_app` membership is not a privilege (it holds none of the attributes); the test asserts
   a role holding only that passes.
 - A superuser login that `SET ROLE`s on connect: the session user is named as privileged.
+- A Postgres version without `pg_maintain` or `pg_create_subscription`: the name matches no row.
+- A grant to a role the user belongs to without INHERIT: `has_database_privilege` (which honors
+  inheritance, as login does) decides whether the database is reachable at all; the grantee
+  shown is one whose privileges the user holds.
 - A REASSIGN guard failure aborts its transaction; nothing changes.
 
 ## Testing approach
@@ -158,12 +220,19 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
 - `cxp-core` `tests/db.rs`, logging in as real roles (dropped by a guard even when the test
   fails): `inspect` under a plain role, a BYPASSRLS role, a member of a BYPASSRLS role, a
   CREATEROLE role, a REPLICATION role, members of `pg_execute_server_program` and
-  `pg_read_all_data`, and the superuser test pool; and a superuser session that `SET ROLE`s to a
-  plain role on connect.
+  `pg_read_all_data`, and the superuser test pool; a superuser session that `SET ROLE`s to a
+  plain role on connect; a CREATEDB role, a member of each of `pg_signal_backend`,
+  `pg_monitor`, `pg_read_all_stats`, `pg_create_subscription` (and `pg_maintain` where the
+  server has it), and a `WITH INHERIT FALSE, SET TRUE` member of a BYPASSRLS role; and, with
+  stand-in service databases through `inspect_with`, `CONNECT` through `PUBLIC` on a service
+  database (refused) but not on another (ignored), the R3 revoke, a grant to a group the role
+  belongs to, membership in a database's owner, and the shared-instance signal.
 - `cxp-server` `config.rs` unit test: loopback URLs without `FLY_APP_NAME` are not deployments;
   a non-loopback public URL or resource URI, or `FLY_APP_NAME`, is.
 - `cxp-server` `boot.rs` unit test: a deployment refuses every privilege, held by the session or
-  the current user, directly or through membership; a non-deployment only warns.
+  the current user, directly or through membership, and another service's database within
+  reach; a non-deployment only warns; a shared instance is a deployment whatever the URLs say,
+  where a clean role still serves.
 - `cxp-server` `tests/e2e.rs`:
   - `the_service_runs_whole_as_a_least_privilege_database_owner`: on an empty test database, a
     fresh LOGIN role set up as the runbook does (owner, `otto_app` member, `CONNECT` revoked from
@@ -175,9 +244,14 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
     makes it fail.
   - `a_deployment_refuses_a_superuser_database_role`: boot refuses before migrating.
   - The existing boot test now also expects the loopback warning.
-- The runbook SQL was dry-run against a local Postgres 16 with a simulated superuser attach role,
-  including the guard refusing an `old_role` that owns other databases or does not own
-  `public.customers`.
+- The runbook SQL was dry-run against a local Postgres 16 with a simulated superuser attach role
+  and stand-in `otto_platform`, `otto_factory`, `otto_flags`, and `repmgr` databases (and a
+  non-superuser `repmgr` role), including the R2 guard refusing an `old_role` that owns other
+  databases or does not own `public.customers`, R2 timing out on a held lock and changing
+  nothing, and R7's guard refusing a wrong role, a database owner, a role with a live session,
+  and one that still owns relations. The binary was booted against that instance with loopback
+  URLs: refused as the attach role, refused as `cxp_server` with `CONNECT` granted to
+  `otto_app`, served as `cxp_server` once the grant was revoked.
 
 ## Risks & open questions
 
@@ -189,9 +263,15 @@ R7 (attach role NOLOGIN). No new config key, no new secret name (`DATABASE_URL` 
 - The other services' attach roles stay superusers; a compromise of one of them still reaches
   `otto_cxp`. Their own issues.
 - **RLS binds `cxp_server` only while it leaves its own tables alone.** As their owner it can
-  `NO FORCE` or `DISABLE ROW LEVEL SECURITY` and `DROP POLICY`, so code execution as
-  `cxp_server` could turn RLS off on `otto_cxp`'s tables (not reach other databases). Fix:
-  separate the migration owner from the runtime role, #27.
+  `NO FORCE` or `DISABLE ROW LEVEL SECURITY`, `DROP POLICY`, and `TRUNCATE` (which ignores RLS
+  altogether), so code execution as `cxp_server` could turn RLS off on, or empty,
+  `otto_cxp`'s tables (not reach other databases). Fix: separate the migration owner from the
+  runtime role, #27.
+- **The check runs once, at boot.** A grant made later is caught at the next restart, not
+  before; re-checking periodically is noted on #27.
+- **`PUBLIC` `CONNECT` on a database not in `OTHER_SERVICE_DATABASES` is not refused.** On
+  `otto-db` the runbook revokes it from every service database; a new service must revoke its
+  own and join the list.
 - **`otto_app` is shared by every otto service.** A database-level grant to it (above all
   `CONNECT`) would open that database to every service's login role. Rule, in
   `docs/deploy/fly.md`: no service grants `otto_app` any database-level privilege. Fix: a

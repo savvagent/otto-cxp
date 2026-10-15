@@ -459,13 +459,14 @@ commands live in `docs/deploy/fly.md` (S12).
   index) before an org grows large.
 - Database role (#16): cxp-server connects as the migrating role and assumes `otto_app` per
   tenant transaction; background maintenance and the tombstone write run as the connecting
-  role. A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, or `FLY_APP_NAME`
-  set) refuses to boot unless both the session user and the current user hold no
-  superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, REPLICATION, or a
-  server-file, server-program, or all-data predefined role), directly or through membership
+  role. A deployment (non-loopback `CXP_PUBLIC_URL` or `CXP_RESOURCE_URI`, `FLY_APP_NAME`
+  set, or an instance that also hosts another otto service's database) refuses to boot unless
+  both the session user and the current user hold no superuser-equivalent privilege
+  (SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined
+  role), directly or through membership, and can `CONNECT` to no other service's database
   (`cxp_core::db_role`, `boot::check_db_role`). Production's role is `cxp_server`, owner of
   `otto_cxp` only, set up by the runbook in `docs/deploy/fly.md` ("Database role"). Residual:
-  as the tables' owner, `cxp_server` can `NO FORCE` RLS or drop policies on its own tables, so
-  RLS binds it only while it leaves them alone; splitting the migration owner from the runtime
+  as the tables' owner, `cxp_server` can `NO FORCE` RLS, drop policies, or `TRUNCATE` (which
+  ignores RLS) on its own tables, so RLS binds it only while it leaves them alone; splitting the migration owner from the runtime
   role is #27. `otto_app` is shared by every otto service; no service may grant it `CONNECT` or
   another database-level privilege, and #28 gives each service its own.
