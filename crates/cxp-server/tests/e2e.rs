@@ -2540,6 +2540,18 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         "{}",
         boot.isolation
     );
+    // No leftover membership of the shared role, so no warning about it.
+    let member: bool = sqlx::query_scalar("SELECT pg_has_role($1, 'otto_app', 'MEMBER')")
+        .bind(&role)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!member);
+    assert!(
+        !logs.text().contains("is still a member of otto_app"),
+        "{}",
+        logs.text()
+    );
     // The shipper drained the outbox as the role, through the maintenance
     // policy.
     let received = mock.lock().unwrap().received.clone();
@@ -2982,6 +2994,122 @@ async fn a_local_run_warns_about_a_runtime_role_without_the_tombstone_grant(pool
     assert!(
         text.contains("INSERT on deleted_orgs")
             && text.contains("allowed only because this is not a deployment"),
+        "{text}"
+    );
+}
+
+/// The shape before runbook T1 (the runtime role is in the shared `otto_app`,
+/// not `cxp_app`): the owner migrates, then `run_with` as the runtime login;
+/// the boot error, with the login replaced by `<runtime>`. Nothing listens.
+async fn boot_without_cxp_app(pool: &PgPool, local: bool) -> String {
+    let roles = split_with(pool, &["otto_app", "cxp_runtime"]).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.runtime_url, None);
+    if local {
+        config.public_url = "http://localhost:8080".into();
+        config.resource_uri = "http://localhost:8080/mcp".into();
+        config.fly_app_name = None;
+        assert!(!config.is_deployment());
+    }
+    config.run_migrations = false;
+    config.bind = addr;
+    config.platform_url = base;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    assert!(
+        err.contains(&format!(r#"GRANT cxp_app TO "{}""#, roles.runtime)),
+        "{err}"
+    );
+    err.replace(&roles.runtime, "<runtime>")
+}
+
+/// A deployment refuses a runtime role that cannot assume `cxp_app`.
+#[sqlx::test(migrations = false)]
+async fn a_deployment_refuses_a_runtime_role_that_cannot_assume_cxp_app(pool: PgPool) {
+    let _guard = discard_logs();
+    let err = boot_without_cxp_app(&pool, false).await;
+    assert!(err.contains("refusing to serve"), "{err}");
+    assert!(err.contains("cxp_app"), "{err}");
+}
+
+/// Locally too: the runtime-grant check only warns there, and otto-tenant
+/// would run tenant transactions as the login itself, so boot refuses.
+#[sqlx::test(migrations = false)]
+async fn a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally(pool: PgPool) {
+    let _guard = discard_logs();
+    let err = boot_without_cxp_app(&pool, true).await;
+    assert!(
+        err.contains(r#"tenant transactions run as "<runtime>""#),
+        "{err}"
+    );
+}
+
+/// Between the deploy and runbook T5: the runtime role holds both `cxp_app`
+/// and the shared `otto_app`. It serves as `cxp_app` and warns about the
+/// leftover membership.
+#[sqlx::test(migrations = false)]
+async fn the_rollout_shape_serves_and_warns_about_otto_app(pool: PgPool) {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    let roles = split_with(&pool, &["otto_app", cxp_core::TENANT_ROLE, "cxp_runtime"]).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.runtime_url, None);
+    config.run_migrations = false;
+    config.bind = addr;
+    config.platform_url = base;
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run(config, listener, async move {
+        let _ = stopped.await;
+    });
+    let client = async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(res) = reqwest::get(format!("http://{addr}/readyz")).await {
+                if res.status().as_u16() == 200 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rollout shape did not become ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        stop.send(()).unwrap();
+    };
+    let (boot, ()) = tokio::join!(server, client);
+    boot.expect("the rollout shape boots and stops cleanly");
+    let text = logs.text();
+    assert!(text.contains("is still a member of otto_app"), "{text}");
+    assert!(
+        text.contains(r#"tenant isolation enforced as role "cxp_app""#),
         "{text}"
     );
 }
