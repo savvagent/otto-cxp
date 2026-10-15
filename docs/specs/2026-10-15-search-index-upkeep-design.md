@@ -55,8 +55,10 @@ The issue's three comments are in scope (PR #33 re-reviews, all Minor or defence
   the statement says. The only false rows are those that existed when 0004 ran; production had
   none then (0 customers, 0 articles) and has none now. Removing the backlog path therefore
   needs no migration and no backfill. A row loaded with triggers disabled (a superuser restore
-  with `session_replication_role = replica` or `--disable-triggers`) would be the only way back
-  to a false row; such a restore is a human operation and the runbook says to rebuild (below).
+  with `session_replication_role = replica` or `--disable-triggers`, or a data-only `COPY`) can
+  lack index rows; it usually reads `search_indexed = true` (the default since 0004), so the
+  runbook detects such rows by their missing index rows, not by the flag, and rebuilds them in
+  two steps (final review, #34).
 - **Comments 1 (backlog timeout, batch retry) and 3 (stalled backlog) are moot** once the
   backlog path is gone: there is no batch left to time out or stall.
 
@@ -106,7 +108,8 @@ re-reviews, and give Rob a threshold and a query to know when the index's storag
 - `fp` reads the threshold with `current_setting(..., true)` and a 0.3 fallback; the 20,001-row
   count runs only when the match count has not already capped the result.
 - Article content over `MAX_CONTENT_CHARS` is `invalid_argument` on create and update.
-- Both random-corpus tests assert at least 80% of the queries they run are uncapped.
+- Both random-corpus tests assert at least 95% of the queries they run are uncapped (measured:
+  100%; the corpora are fixed-seed).
 - `docs/deploy/fly.md` holds the threshold, the watch query, the production baseline, and the
   LEAKPROOF re-evaluation trigger with its boot-check design; CLAUDE.md's "Search index (#17)"
   matches the code.
@@ -245,8 +248,8 @@ path changes.
   `search_indexed = false` read back true and have grams) and
   `a_search_past_its_timeout_is_query_too_broad` (a superuser holds `ACCESS EXCLUSIVE` on
   `customer_search_grams`; the search fails after 2 s with `query_too_broad`, retriable, no
-  database text). The random corpus test counts uncapped queries and asserts >= 80%.
-- `tests/support.rs`: the article corpus test asserts >= 80% uncapped;
+  database text). The random corpus test counts uncapped queries and asserts >= 95%.
+- `tests/support.rs`: the article corpus test asserts >= 95% uncapped;
   `article_content_is_length_limited` (create and update, at and past the limit); an article
   timeout test as for customers (lock `knowledge_search_terms`).
 - `tests/search_backlog.rs`: the least-privilege test no longer calls `index_backlog`. After 0004
@@ -267,5 +270,5 @@ path changes.
   cross-org reads (maintenance) on every boot for a case that needs a human anyway. Not added.
 - **Removing the `fz_all` filter** makes a non-positive threshold read all customers, as it did
   for indexed ones; bounded by `FUZZY_CHECKED` as before.
-- **The 80% bound** is calibrated on the fixed-seed corpora; it is deterministic, so it cannot
+- **The 95% bound** is calibrated on the fixed-seed corpora; it is deterministic, so it cannot
   flake, but a future change to the corpora must re-check it.

@@ -19,7 +19,7 @@
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
 //! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]): only a failure that can pass |
-//! | `query_too_broad` | 503, with `Retry-After`: a search ran past its time limit; narrow the query or retry |
+//! | `query_too_broad` | 503, with `Retry-After`: a search ran past its time limit; narrow the query or retry (a client that retries every 503 by itself repeats the broad query, so back off before retrying it unchanged) |
 //! | `internal` | 500, never with `Retry-After` (including a platform failure a retry cannot fix, such as this service's credential being refused) |
 
 use axum::response::{IntoResponse, Response};

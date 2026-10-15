@@ -132,7 +132,7 @@ error.rs            Error enum (NotFound { kind: &'static str }, Invalid(String)
                     Internal(String), Tenant(..), Database(sqlx::Error)) with `code() -> &'static str` and
                     `retriable() -> bool` (the codes MCP and REST put on the wire: not_found,
                     invalid_argument, conflict, unknown_team, access_revoked, quota_exceeded,
-                    unavailable, internal); Display never includes database text; a
+                    unavailable, query_too_broad (#34), internal); Display never includes database text; a
                     database error reads the same through Tenant(Db(..)) as through Database;
                     pub(crate) map_fk(e, &[(constraint, kind)]) maps a composite-FK violation
                     to NotFound { kind }
@@ -348,7 +348,7 @@ with `#[tool_router(router = …)]` per file, combined in `tools/mod.rs`; `tools
 `caller(&parts)` → scope check → `tx(&caller)` (begin_live) → (`charge` if billable) → domain call
 → commit → `Json(out)`. Errors: `ErrorData` with `data: {code, retriable}`; codes include
 `unauthenticated`, `insufficient_scope`, `not_found`, `invalid_argument`, `access_revoked`,
-`quota_exceeded`, `unavailable`, `internal` (no database text). Resources (3) and prompts (4)
+`quota_exceeded`, `unavailable`, `query_too_broad` (#34), `internal` (no database text). Resources (3) and prompts (4)
 ported; resources need read scope; `metrics://dashboard` calls `DashboardExt` (S8). `lib.rs` exposes `Config { public_url, resource_uri,
 platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Result<Router, NoAllowedHosts>`
 that mounts `/mcp` behind `cxp_http::require_bearer` (the open metadata route is `cxp_http`'s, mounted by cxp-server), refusing an empty

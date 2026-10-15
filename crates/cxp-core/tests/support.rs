@@ -1107,7 +1107,8 @@ async fn random_article_corpora_search_like_the_scan(pool: PgPool) {
         }
     }
     // Measured when this bound was set (#34): 250 of 250 uncapped.
-    assert!(uncapped * 5 >= run * 4, "{uncapped} of {run} uncapped");
+    // The corpus is fixed-seed, so the bound cannot flake: at least 95%.
+    assert!(uncapped * 20 >= run * 19, "{uncapped} of {run} uncapped");
 }
 
 /// An article search past its `statement_timeout` is `query_too_broad`, as

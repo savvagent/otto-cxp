@@ -3,9 +3,8 @@
 //! The branch point is machine-readable: `data.code` is stable
 //! (`insufficient_scope`, `not_found`, `invalid_argument`, `conflict`,
 //! `unknown_team`, `access_revoked`, `quota_exceeded`, `unavailable`,
-//! `query_too_broad`,
-//! `internal`, and `unauthenticated` for a surface mounted without its
-//! middleware) and `data.retriable` says whether repeating the call unchanged
+//! `query_too_broad`, `internal`, and `unauthenticated` for a surface mounted
+//! without its middleware) and `data.retriable` says whether repeating the call unchanged
 //! could succeed.
 //!
 //! `cxp_core::Error`'s `Display` never carries database or platform text, so

@@ -120,10 +120,10 @@ composite `(org_id, id)` foreign keys.
 (migration 0004), which triggers keep in step with every write; `search_mark_indexed` marks every
 write indexed, so there is no backlog and searches only read (#34). A search past its 2 s
 `statement_timeout` is `query_too_broad` (retriable). Storage threshold and watch query:
-`docs/deploy/fly.md` ("Search index storage"). Making a new
-column searchable means a new migration that changes the gram function, the sync trigger, and its
-`WHEN` clause together, and rebuilds the affected rows; extend the equivalence corpora in
-`crates/cxp-core/tests` with it. `totalCapped: false` promises results identical to a full scan.
+`docs/deploy/fly.md` ("Search index storage"). Making a new column searchable means a new
+migration that changes the gram function, the sync trigger, and its `WHEN` clause together, and
+rebuilds the affected rows; extend the equivalence corpora in `crates/cxp-core/tests` with it.
+`totalCapped: false` promises results identical to a full scan.
 
 ## Configuration
 

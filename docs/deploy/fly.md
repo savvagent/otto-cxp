@@ -524,8 +524,8 @@ anything elsewhere.
 Customer and knowledge-base search keep their own index tables, `customer_search_grams` and
 `knowledge_search_terms` (migration 0004, design in
 `docs/specs/2026-10-14-search-under-rls-design.md`). They cost about 7 kB per customer and 25 kB
-per published article when bulk-loaded, and 25 to 30% more when grown a row at a time. That is
-30 to 60 times the size of the rows they index. `otto-db` has a single **1 GB** volume
+per published article when bulk-loaded, and 25 to 30% more when grown a row at a time.
+`otto-db` has a single **1 GB** volume
 (`fly volumes list -a otto-db`), shared with `otto_platform`, `otto_factory`, and `otto_flags`.
 
 ### When to act
@@ -541,9 +541,10 @@ What to do, in order of preference:
 
 1. **Move otto-cxp to a dedicated Postgres instance.** This adds recurring cost, so it is Rob's
    decision. This doc already says to split before real customers arrive.
-2. **Slim the index** with the LEAKPROOF route (below), which lets a later migration replace the
-   trigram and lexeme rows with GIN. That drops most of `knowledge_search_terms` and about a
-   quarter of `customer_search_grams`.
+2. **Slim the index** with the LEAKPROOF route (below), which lets a later migration serve fuzzy
+   name search from a GIN index and drop the trigram rows: about a quarter of
+   `customer_search_grams`. Dropping the article lexeme and title rows as well would need `@@`
+   and `ILIKE` leakproof too, which this route does not cover.
 
 Growing the volume is a stopgap, not a fix. It also adds recurring cost (Rob).
 
@@ -577,13 +578,17 @@ FROM pg_stat_user_tables
 WHERE relname IN ('customer_search_grams', 'knowledge_search_terms');
 SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size
 FROM pg_database WHERE NOT datistemplate ORDER BY pg_database_size(datname) DESC;
-SELECT count(*) FILTER (WHERE NOT search_indexed) AS customers_unindexed FROM customers;
-SELECT count(*) FILTER (WHERE NOT search_indexed) AS articles_unindexed FROM knowledge_articles;
+SELECT count(*) AS customers_missing_from_index FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g
+                  WHERE g.org_id = c.org_id AND g.customer_id = c.id);
+SELECT count(*) AS articles_missing_from_index FROM knowledge_articles a
+WHERE a.published AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t
+                                  WHERE t.org_id = a.org_id AND t.article_id = a.id);
 ROLLBACK;
 ```
 
 The baseline on 2026-10-15: 0 customers and 0 articles in every org, the index tables 56 kB in
-all, `otto_cxp` 9.5 MB, and 0 unindexed rows. `n_live_tup` is an estimate; the sizes are exact.
+all, `otto_cxp` 9.5 MB, and 0 rows missing from the index (0 with `search_indexed = false`). `n_live_tup` is an estimate; the sizes are exact.
 
 ### No backlog
 
@@ -594,16 +599,31 @@ Since #34, search no longer reads or indexes such rows: a row with `search_index
 invisible to search. The column and its two partial indexes stay only because migrations are
 additive.
 
-The one way back to a `false` row is loading data with triggers disabled, such as a restore with
-`--disable-triggers` or `session_replication_role = replica`. After such a restore, the last two
-lines of the watch query show the count. If either is nonzero, rebuild. This is a human-only
-production write (Rob), run as the superuser in `otto_cxp`, and the triggers write the index
-rows:
+The way to lose index rows is loading data with triggers disabled: a restore with
+`--disable-triggers` or `session_replication_role = replica`, or a data-only `COPY` of the base
+tables without the index tables. Such rows usually still read `search_indexed = true` (the
+column's default, or the dumped value), so the flag does not show them; the last two statements
+of the watch query find them by their missing index rows. If either count is nonzero, rebuild.
+This is a human-only production write (Rob), run as the superuser in `otto_cxp`. Step 1 marks
+the rows unindexed with triggers off (the `BEFORE` trigger would otherwise force the flag back
+to `true`); step 2, with triggers on, sets it again, which fires the sync triggers (their `WHEN`
+includes `NOT OLD.search_indexed`) to write the index rows:
 
 ```sql
+BEGIN;
+SET LOCAL session_replication_role = replica;
+UPDATE customers c SET search_indexed = false
+WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g
+                  WHERE g.org_id = c.org_id AND g.customer_id = c.id);
+UPDATE knowledge_articles a SET search_indexed = false
+WHERE a.published AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t
+                                  WHERE t.org_id = a.org_id AND t.article_id = a.id);
+COMMIT;
 UPDATE customers SET search_indexed = true WHERE NOT search_indexed;
 UPDATE knowledge_articles SET search_indexed = true WHERE NOT search_indexed;
 ```
+
+Then re-run the watch query; both counts read 0.
 
 ### Search timeouts
 
