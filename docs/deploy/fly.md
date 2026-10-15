@@ -609,12 +609,36 @@ fly secrets set -a otto-cxp --stage CXP_ENCRYPTION_KEY="$(openssl rand -base64 3
 # 3. Set the client id in fly.toml [env] (it is not a secret: a public client has nothing else
 #    to authenticate with, and PKCE binds each code to the browser that asked for it):
 #      CXP_CONSOLE_CLIENT_ID = "<client_id from step 1>"
-#    and merge that commit; the deploy turns sign-in on.
+#    and merge that commit (a PR referencing #31); the deploy turns sign-in on. Step 2 must be
+#    staged before this deploys, or the boot refuses, naming CXP_ENCRYPTION_KEY.
 ```
 
 The redirect URI is registered **exactly**: a deployment that moves to another hostname registers
-a new client. Then open `https://otto-cxp.savvagent.com/console/`, sign in, and check that the
-dashboard loads; `GET /auth/session` answers `{"signedIn": true, ...}` from that browser.
+a new client.
+
+4. Verify live, after the deploy:
+
+```bash
+# Sign-in is on: "loginEnabled": true ("signedIn": false without a cookie).
+curl -s https://otto-cxp.savvagent.com/auth/session
+```
+
+- Open `https://otto-cxp.savvagent.com/console/`, sign in at the platform, and check that the
+  customers list loads; `GET /auth/session` from that browser answers `"signedIn": true`.
+- A cross-site write is refused. Copy the `__Host-cxp_session` cookie from the browser's dev
+  tools, then:
+
+  ```bash
+  curl -s -i -X POST https://otto-cxp.savvagent.com/api/v1/customers \
+    -H 'cookie: __Host-cxp_session=<value>' -H 'origin: https://example.com' \
+    -H 'content-type: application/json' -d '{"email":"cross-site@example.com"}'
+  # -> 403, "error": "cross_site_request"; nothing is created
+  ```
+
+- Sign out in the console. `GET /auth/session` from that browser answers `"signedIn": false`, and
+  the copied cookie no longer works (`curl -s -o /dev/null -w '%{http_code}' -H 'cookie:
+  __Host-cxp_session=<value>' https://otto-cxp.savvagent.com/api/v1/customers` prints `401`):
+  the row is deleted and its refresh token revoked at the platform.
 
 **Rotating `CXP_ENCRYPTION_KEY` signs every console user out** (sessions that no longer open are
 deleted on their next use). The platform rotates a refresh token on every use and revokes the
@@ -622,7 +646,8 @@ whole sign-in if a spent one is replayed, so each refresh happens once, across m
 machine coalesces its own requests in memory, claims a short lease on the session row (45 s,
 on the database's clock), calls the platform holding no database connection or lock only if the
 call and the store still fit in the lease, and stores the new pair only if the row still holds
-that lease (a compare-and-swap); another machine that finds the lease waits for the
+that lease (a compare-and-swap, its waits cut off in the database: 2 s for a lock, 3 s per
+statement); another machine that finds the lease waits for the
 result. A sign-out or `org.deleted` during that call wins, and the new pair is revoked. Sessions are deleted on sign-out, by the
 `org.deleted` and `member.removed` webhooks, and by the hourly sweep once expired (30 days
 without a refresh).
@@ -654,8 +679,8 @@ credential`), not as a failing `/readyz`.
 
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records. `curl -s -H 'accept: text/html'
-https://otto-cxp.savvagent.com/console/` returns the console's `index.html` (`/` is a JSON
-`404` until #29 serves it), and
+https://otto-cxp.savvagent.com/console/` returns the console's `index.html` (`/` serves
+browsers the connector install page, #29), and
 `curl -s https://otto-cxp.savvagent.com/auth/session` answers `loginEnabled` true once
 `CXP_CONSOLE_CLIENT_ID` is set (false before).
 
