@@ -1,6 +1,6 @@
 # `Vary: Accept, Authorization` on the JSON 404 at `/`
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#37)
 **Ticket:** #32
 
 ## Brief
