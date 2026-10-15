@@ -1,7 +1,7 @@
 # Search index upkeep Implementation Plan
 
 > Execute task-by-task (fresh implementer per task, review between tasks). Steps use checkbox
-> (`- [ ]`) syntax for tracking.
+> (`- [x]`) syntax for tracking.
 
 **Goal:** Retire the lazy search backlog, give a search timeout its own error code, tighten the
 search statements, cap article content, and document when the index's storage needs action.
@@ -67,7 +67,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 
 **Files:** `crates/cxp-core/src/error.rs`, `crates/cxp-api/src/error.rs`, `crates/cxp-mcp/src/error.rs`
 
-- [ ] **Step 1: failing tests.**
+- [x] **Step 1: failing tests.**
   - `crates/cxp-core/src/error.rs` `mod tests`: add `(Error::QueryTooBroad, "query_too_broad")`
     to `every_variant_has_its_wire_code`; add `Error::QueryTooBroad` to the `yes` list of
     `retriable_marks_what_an_agent_may_simply_retry`; add a test
@@ -81,9 +81,9 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   - `crates/cxp-mcp/src/error.rs` tests: add `Error::QueryTooBroad` to the table that asserts
     `data.code == e.code()` (around line 140), expecting rpc `INVALID_PARAMS` and
     `retriable: true` if that table checks them.
-- [ ] **Step 2:** `cargo test -p cxp-core --lib error && cargo test -p cxp-api --lib error &&
+- [x] **Step 2:** `cargo test -p cxp-core --lib error && cargo test -p cxp-api --lib error &&
   cargo test -p cxp-mcp --lib error` — fails to compile (no variant).
-- [ ] **Step 3: implement.** In `cxp_core::Error`, after `Unavailable`:
+- [x] **Step 3: implement.** In `cxp_core::Error`, after `Unavailable`:
   ```rust
   /// A search ran past its `statement_timeout` (SQLSTATE 57014): too broad
   /// for this org, or the first search on a cold cache. A narrower query or
@@ -100,8 +100,8 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   comment (retriable, so 503 and `Retry-After`); add the row
   `| \`query_too_broad\` | 503, with \`Retry-After\`: a search ran past its time limit; narrow
   the query or retry |` to the module doc table. `cxp-mcp` `from_core` needs no code change.
-- [ ] **Step 4:** re-run the Step 2 commands — pass. Then the full gates (test, clippy, fmt).
-- [ ] **Step 5: commit** `feat(core): give a search timeout its own error code` — body: a
+- [x] **Step 4:** re-run the Step 2 commands — pass. Then the full gates (test, clippy, fmt).
+- [x] **Step 5: commit** `feat(core): give a search timeout its own error code` — body: a
   search past its statement_timeout read as `internal`; agents could not tell a broad query
   from a server fault. `Refs #34`.
 
@@ -113,7 +113,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 `crates/cxp-core/src/knowledge.rs`, `crates/cxp-core/tests/customers.rs`,
 `crates/cxp-core/tests/support.rs`, `crates/cxp-core/tests/search_backlog.rs`
 
-- [ ] **Step 1: failing tests** (`crates/cxp-core/tests/customers.rs` unless noted).
+- [x] **Step 1: failing tests** (`crates/cxp-core/tests/customers.rs` unless noted).
   - `a_search_past_its_timeout_is_query_too_broad`: create and COMMIT a customer in an org in its
     own transaction first (an uncommitted insert holds a lock on `customer_search_grams` and the
     `LOCK TABLE` below would wait forever); then in a separate
@@ -157,11 +157,11 @@ limit. Task 4 is docs. Each task leaves the workspace green.
     Update the file's module doc: the migrating role sees no rows, so rows predating 0004 stay
     unindexed until an ordinary write (this update, or the superuser rebuild in
     `docs/deploy/fly.md`) indexes them; production had none.
-- [ ] **Step 2:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p cxp-core
+- [x] **Step 2:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p cxp-core
   --test customers --test support --test search_backlog` — the timeout tests fail (code is
   `internal`); the search_backlog test fails because search still reads the backlog and finds
   "grace" before the update; the trigger test passes already (it documents existing behaviour).
-- [ ] **Step 3: implement `search.rs`.** Delete `BACKLOG_READ`, `Indexed` (and its impl),
+- [x] **Step 3: implement `search.rs`.** Delete `BACKLOG_READ`, `Indexed` (and its impl),
   `index_backlog`, the savepoint block. `prepare` becomes
   `pub(crate) async fn prepare(tx: &mut Tx<'_>) -> Result<()>` running only `SET LOCAL jit = off`
   and `SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'`; its doc says so and that a search
@@ -187,7 +187,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   triggers (`search_mark_indexed` sets `search_indexed` on every write, so no row can be
   written unindexed); the column and partial indexes remain only because migrations are
   additive (#34).
-- [ ] **Step 4: implement `customers.rs`.** In `SEARCH_CUSTOMERS_SQL`: delete the `backlog`
+- [x] **Step 4: implement `customers.rs`.** In `SEARCH_CUSTOMERS_SQL`: delete the `backlog`
   CTE; delete `UNION ALL SELECT customer_id FROM backlog WHERE customer_id NOT IN (SELECT
   customer_id FROM sub_all)` from `matches`; in `fz_all` delete `AND search_indexed`; replace
   `current_setting('pg_trgm.similarity_threshold')::float8 AS th` with
@@ -202,16 +202,16 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   In `search_customers`: `search::prepare(self).await?;` and `.map_err(search::on_timeout
   ("search_customers"))` on both the hits `fetch_one` and the rows `fetch_all` (replace their
   `?` on sqlx errors accordingly).
-- [ ] **Step 5: implement `knowledge.rs`.** In `SEARCH_ARTICLES_SQL`: delete the `backlog` CTE;
+- [x] **Step 5: implement `knowledge.rs`.** In `SEARCH_ARTICLES_SQL`: delete the `backlog` CTE;
   delete the third `UNION ALL` arm of `matches` (from `UNION ALL SELECT a.id, a.search_tsv @@
   tsq.q,` through `AND (a.search_tsv @@ tsq.q OR a.title ILIKE $3)`), keeping the closing `) AS u`;
   delete `OR (SELECT count(*) FROM backlog) > {BACKLOG_READ}` from `capped`; remove the format
   arg and import. Doc comment: remove the `backlog` bullet. In `search_articles`:
   `search::prepare(self)` and `on_timeout("search_articles")` on both statements.
-- [ ] **Step 6:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p
+- [x] **Step 6:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p
   cxp-core` — all pass, including the equivalence, threshold, cap, and corpus tests. Then the
   full gates (workspace test, clippy, fmt, migrations check).
-- [ ] **Step 7: commit** `feat(core): retire lazy search backlog indexing` — body: production had
+- [x] **Step 7: commit** `feat(core): retire lazy search backlog indexing` — body: production had
   no rows predating migration 0004 (SELECT-only check 2026-10-15) and its trigger marks every
   write indexed, so the per-search backlog batch and CTEs only cost time; a timeout now reads
   `query_too_broad`; the threshold falls back to pg_trgm's default instead of relying on CTE
@@ -223,13 +223,13 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 
 **Files:** `crates/cxp-core/src/knowledge.rs`, `crates/cxp-core/tests/support.rs`
 
-- [ ] **Step 1: failing test** in `support.rs`, next to `article_titles_are_length_limited` and in
+- [x] **Step 1: failing test** in `support.rs`, next to `article_titles_are_length_limited` and in
   its style: `article_content_is_length_limited` — create with content of `MAX_CONTENT_CHARS`
   `"é"` characters succeeds; create with one more fails `invalid_argument`; update of that
   article with `content: Some(one more)` fails `invalid_argument` and leaves content unchanged.
-- [ ] **Step 2:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p
+- [x] **Step 2:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p
   cxp-core --test support article_content` — fails to compile (no constant).
-- [ ] **Step 3: implement.** In `knowledge.rs` next to `MAX_TITLE_CHARS`:
+- [x] **Step 3: implement.** In `knowledge.rs` next to `MAX_TITLE_CHARS`:
   ```rust
   /// Longest article content, in characters (about 30 printed pages). Search
   /// indexes one row per distinct lexeme of an article (migration 0004), and
@@ -239,8 +239,8 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   and `checked_content` mirroring `checked_title` (message "an article's content must be at
   most {MAX_CONTENT_CHARS} characters"); call it in `create_article` and, when `Some`, in
   `update_article`. Update the `KnowledgeExt::create_article` doc to mention both limits.
-- [ ] **Step 4:** re-run Step 2's command — pass; then the full gates.
-- [ ] **Step 5: commit** `feat(core): limit knowledge article content length` — body: content
+- [x] **Step 4:** re-run Step 2's command — pass; then the full gates.
+- [x] **Step 5: commit** `feat(core): limit knowledge article content length` — body: content
   drives an article's index rows and tsvector cost; bound it before any route or tool exposes
   article writes. `Refs #34`.
 
@@ -250,7 +250,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 
 **Files:** `docs/deploy/fly.md`, `CLAUDE.md`
 
-- [ ] **Step 1: fly.md.** In the Infrastructure bullet, replace "Searches also index, a batch at a
+- [x] **Step 1: fly.md.** In the Infrastructure bullet, replace "Searches also index, a batch at a
   time, the rows written before migration 0004. Watching that size, and retiring the backlog path
   once production has none left, is #34." with a pointer to the new section. Add a section
   `## Search index storage (#34)` (after `## Database role` and its runbooks, before the next `##`)
@@ -286,16 +286,16 @@ limit. Task 4 is docs. Each task leaves the workspace green.
   Rebuild after a restore with triggers disabled (human, superuser, a write):
   `UPDATE customers SET search_indexed = true WHERE NOT search_indexed;` and the same for
   `knowledge_articles` (the triggers write the index rows).
-- [ ] **Step 2: CLAUDE.md** "### Search index (#17)": replace "Searches are `cxp:read` yet write:
+- [x] **Step 2: CLAUDE.md** "### Search index (#17)": replace "Searches are `cxp:read` yet write:
   each indexes a batch of its org's pre-0004 backlog (`cxp_core::search::index_backlog`)." with:
   every row is indexed by the tables' triggers (`search_mark_indexed` marks every write), so
   there is no backlog and searches only read; a search past its 2 s `statement_timeout` is
   `query_too_broad` (retriable); storage watch and threshold: `docs/deploy/fly.md` ("Search index
   storage"). Also update the `cxp-core` crate bullet's `search` description ("and the per-org
   backlog of rows written before migration 0004, indexed a batch per search") to drop the backlog.
-- [ ] **Step 3:** `cargo fmt --all -- --check` (unchanged code) and a read-through for broken
+- [x] **Step 3:** `cargo fmt --all -- --check` (unchanged code) and a read-through for broken
   links/anchors.
-- [ ] **Step 4: commit** `docs: document search index storage watch and retire backlog notes` —
+- [x] **Step 4: commit** `docs: document search index storage watch and retire backlog notes` —
   body: the size threshold and query for the 1 GB shared volume, and the LEAKPROOF
   re-evaluation trigger, for #34. `Refs #34`.
 
@@ -303,5 +303,5 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 
 **Model:** orchestrator
 
-- [ ] Set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes; commit
+- [x] Set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes; commit
   `docs: mark search index upkeep implemented` with `Refs #34`; re-run the merge gate.

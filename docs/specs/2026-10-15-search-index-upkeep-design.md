@@ -1,6 +1,6 @@
 # Search index upkeep — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#40)
 **Issue:** #34 "Watch and slim search index storage; retire lazy backlog indexing"
 **Plan:** `docs/plans/2026-10-15-search-index-upkeep.md`
 **Builds on:** `docs/specs/2026-10-14-search-under-rls-design.md` (#17, PR #33)
