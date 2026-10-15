@@ -536,7 +536,7 @@ impl Console {
             Err(TokenError::InvalidGrant) => {
                 tracing::info!(org = %org,
                     "the platform refused a console session's refresh token; dropping the session");
-                console_sessions::delete_generation(&i.db, org, &id_hash, lease.generation)
+                console_sessions::delete_generation(&i.db, org, &id_hash, lease)
                     .await
                     .map_err(|e| db_failure("drop a console session", e))?;
                 Err(AuthFailure::Inactive)

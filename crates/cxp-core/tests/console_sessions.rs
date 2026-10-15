@@ -254,22 +254,26 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
     console_sessions::release_lease(&db, o, &hash, claimed)
         .await
         .unwrap();
-    assert!(matches!(
-        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
-            .await
-            .unwrap(),
-        Claim::Claimed(..)
-    ));
+    let Claim::Claimed(_, current) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("a released lease was not claimable");
+    };
 
     // A refused refresh deletes only the generation it refused.
+    let older = Lease {
+        generation: 0,
+        until: current.until,
+    };
     assert_eq!(
-        console_sessions::delete_generation(&db, o, &hash, 0)
+        console_sessions::delete_generation(&db, o, &hash, older)
             .await
             .unwrap(),
         0
     );
     assert_eq!(
-        console_sessions::delete_generation(&db, o, &hash, 1)
+        console_sessions::delete_generation(&db, o, &hash, current)
             .await
             .unwrap(),
         1
@@ -426,6 +430,56 @@ async fn a_lapsed_but_unclaimed_lease_still_stores(pool: PgPool) {
     )
     .await
     .unwrap());
+}
+
+/// A holder whose lease lapsed and was claimed anew at the same generation
+/// cannot delete the session when the platform refuses its (stale) refresh
+/// token: the newer holder's claim stands, and only that holder's lease
+/// deletes it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_stale_holder_never_deletes_a_session_claimed_anew(pool: PgPool) {
+    let db = db(pool);
+    let o = org();
+    let hash = new_session(&db, o, user(), Duration::days(1)).await;
+    let soon = Utc::now() + Duration::minutes(60);
+    let Claim::Claimed(_, stale) =
+        console_sessions::claim_refresh(&db, o, &hash, soon, Duration::milliseconds(200))
+            .await
+            .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let Claim::Claimed(_, newer) =
+        console_sessions::claim_refresh(&db, o, &hash, soon, Duration::seconds(15))
+            .await
+            .unwrap()
+    else {
+        panic!("a lapsed lease was not taken over");
+    };
+    assert_eq!(newer.generation, stale.generation);
+
+    assert_eq!(
+        console_sessions::delete_generation(&db, o, &hash, stale)
+            .await
+            .unwrap(),
+        0,
+        "a stale holder deleted a session claimed anew"
+    );
+    assert!(console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        console_sessions::delete_generation(&db, o, &hash, newer)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// A fresh session on `db`, claimed for a refresh: its hash and the lease.

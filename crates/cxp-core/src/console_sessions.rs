@@ -385,21 +385,27 @@ pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], lease: Lease
     Ok(())
 }
 
-/// Delete session `id_hash` if it is still at `generation`: the platform
-/// refused the refresh token that generation holds.
+/// Delete session `id_hash` if it still holds `lease` (its generation and
+/// lease expiry, as [`store_refreshed`] and [`release_lease`] match them):
+/// the platform refused the refresh token that generation holds. A holder
+/// whose lease lapsed and was claimed anew at the same generation deletes
+/// nothing, so it never ends a session out from under the newer holder,
+/// whose own refresh decides the session's fate.
 pub async fn delete_generation(
     db: &Db,
     org: OrgId,
     id_hash: &[u8; 32],
-    generation: i64,
+    lease: Lease,
 ) -> Result<u64> {
     let mut tx = begin_live(db, org, None).await?;
     let n = sqlx::query(
-        "DELETE FROM console_sessions WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
+        "DELETE FROM console_sessions \
+         WHERE org_id = $1 AND id_hash = $2 AND generation = $3 AND refresh_lease_until = $4",
     )
     .bind(org)
     .bind(&id_hash[..])
-    .bind(generation)
+    .bind(lease.generation)
+    .bind(lease.until)
     .execute(tx.conn())
     .await?
     .rows_affected();
