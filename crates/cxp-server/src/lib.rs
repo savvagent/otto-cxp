@@ -91,12 +91,16 @@ pub fn router(
     config: &Config,
     platform_check: PlatformCheck,
 ) -> Result<Router> {
+    // One limiter for the whole process, so `/api` and `/mcp` together hold
+    // at most half the pool with searches (#42).
+    let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
     // cxp-mcp refuses an empty host list itself (rmcp reads one as "accept
     // any"); the only way to get one here is a public URL with no host.
     let mcp = cxp_mcp::router(
         db.clone(),
         platform.clone(),
         meter.clone(),
+        search.clone(),
         mcp_config(config),
     )
     .map_err(|e| anyhow!("{e}: CXP_PUBLIC_URL must have a host"))?;
@@ -105,6 +109,7 @@ pub fn router(
         db.clone(),
         platform,
         meter,
+        search,
         cxp_api::Config {
             public_url: config.public_url.clone(),
             webhook_secret: config.platform_webhook_secret.clone(),

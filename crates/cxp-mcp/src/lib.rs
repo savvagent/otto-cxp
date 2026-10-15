@@ -28,6 +28,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any_service;
 use axum::Router;
+use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use http::StatusCode;
 use otto_resource::PlatformClient;
@@ -78,6 +79,7 @@ pub fn router(
     db: Db,
     platform: Arc<PlatformClient>,
     meter: Arc<Meter>,
+    search: SearchLimiter,
     config: Config,
 ) -> Result<Router, NoAllowedHosts> {
     if config.allowed_hosts.iter().all(|h| h.trim().is_empty()) {
@@ -92,7 +94,7 @@ pub fn router(
     transport.allowed_hosts = config.allowed_hosts;
     transport.allowed_origins = config.allowed_origins;
 
-    let cxp = Cxp::new(db, platform, meter);
+    let cxp = Cxp::new(db, platform, meter, search);
     let service = StreamableHttpService::new(
         move || Ok(cxp.clone()),
         Arc::new(LocalSessionManager::default()),

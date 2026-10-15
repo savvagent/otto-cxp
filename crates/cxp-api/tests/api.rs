@@ -15,6 +15,7 @@ use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
+use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use otto_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role,
@@ -22,7 +23,8 @@ use otto_resource::{
 };
 use otto_tenant::Db;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -214,14 +216,21 @@ struct Harness {
     app: Router,
     stub: Shared,
     pool: PgPool,
+    search: SearchLimiter,
 }
 
 async fn harness_with(pool: PgPool, webhook_secret: &str) -> Harness {
-    harness_opts(pool, webhook_secret, false).await
+    harness_opts(pool, webhook_secret, false, SearchLimiter::for_pool(5)).await
 }
 
-/// [`harness_with`], with the meter enforcing quotas when `enforce` is set.
-async fn harness_opts(pool: PgPool, webhook_secret: &str, enforce: bool) -> Harness {
+/// [`harness_with`], with the meter enforcing quotas when `enforce` is set
+/// and the given search limiter.
+async fn harness_opts(
+    pool: PgPool,
+    webhook_secret: &str,
+    enforce: bool,
+    search: SearchLimiter,
+) -> Harness {
     let (base, stub) = start_platform().await;
     let platform =
         Arc::new(PlatformClient::new(ClientConfig::new(base, RESOURCE, "otto_rs_test")).unwrap());
@@ -234,6 +243,7 @@ async fn harness_opts(pool: PgPool, webhook_secret: &str, enforce: bool) -> Harn
         Db::from_pool(pool.clone()),
         platform,
         meter,
+        search.clone(),
         Config {
             public_url: PUBLIC_URL.into(),
             webhook_secret: webhook_secret.into(),
@@ -243,6 +253,7 @@ async fn harness_opts(pool: PgPool, webhook_secret: &str, enforce: bool) -> Harn
         app: router(state),
         stub,
         pool,
+        search,
     }
 }
 
@@ -1194,7 +1205,7 @@ async fn bodies_over_256_kib_are_413(pool: PgPool) {
 /// nothing created, nothing recorded. Free routes still work.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn an_org_over_its_allowance_cannot_create_a_survey_over_rest(pool: PgPool) {
-    let h = harness_opts(pool, SECRET, true).await;
+    let h = harness_opts(pool, SECRET, true, SearchLimiter::for_pool(5)).await;
     h.stub.lock().unwrap().blocked = true;
     let (org, _, t) = h.caller(RW);
 
@@ -1356,4 +1367,143 @@ async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
         .await;
     assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
     assert_eq!(r.body["code"], "not_found");
+}
+
+// ------------------------------------------------------------ search permits
+
+/// A pool sized as production's (5) with an acquire timeout well under the
+/// searches' 2 s statement_timeout.
+async fn pool_of_five(opts: PgPoolOptions, connect: PgConnectOptions) -> PgPool {
+    opts.max_connections(5)
+        .acquire_timeout(std::time::Duration::from_millis(500))
+        .connect_with(connect)
+        .await
+        .unwrap()
+}
+
+/// Fires `n` customer searches that block on a table lock until their
+/// statement_timeout, waits until `h.search` has no permit left and the app
+/// pool has `busy` connections checked out (or 1 s), then sends a ticket
+/// write for `customer` and returns its status, with the searches' statuses
+/// once they finish. The whole thing is bounded, so a search that stops
+/// honouring its statement_timeout fails the test instead of hanging it.
+async fn write_during_a_search_flood(
+    h: &Harness,
+    token: &str,
+    customer: &str,
+    n: usize,
+    busy: u32,
+) -> (StatusCode, Vec<StatusCode>) {
+    let searches = futures::future::join_all(
+        (0..n).map(|_| h.call("GET", "/api/v1/customers/search?q=grace", Some(token), None)),
+    );
+    let write = async {
+        for _ in 0..100 {
+            let held = h.pool.size() - h.pool.num_idle() as u32;
+            if h.search.available() == 0 && held >= busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        h.call(
+            "POST",
+            "/api/v1/tickets",
+            Some(token),
+            Some(json!({"customerId": customer, "subject": "flood"})),
+        )
+        .await
+        .status
+    };
+    let (searches, write) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(searches, write)
+    })
+    .await
+    .expect("a search outlived its statement_timeout");
+    (write, searches.into_iter().map(|r| r.status).collect())
+}
+
+/// Runs the flood against a harness over a pool of five with `limiter`,
+/// holding `customer_search_grams` locked from outside the app's pool.
+async fn flood(
+    opts: PgPoolOptions,
+    connect: PgConnectOptions,
+    limiter: SearchLimiter,
+    n: usize,
+    busy: u32,
+) -> (StatusCode, Vec<StatusCode>) {
+    let pool = pool_of_five(opts, connect.clone()).await;
+    let h = harness_opts(pool.clone(), SECRET, false, limiter).await;
+    let (_, _, t) = h.caller(RW);
+    let made = h
+        .call(
+            "POST",
+            "/api/v1/customers",
+            Some(&t),
+            Some(json!({"email": "grace@example.com", "name": "Grace"})),
+        )
+        .await;
+    assert_eq!(made.status, StatusCode::OK, "{}", made.body);
+    let customer = made.body["id"].as_str().unwrap().to_string();
+    // A connection outside the app's pool holds the lock.
+    let mut locker = sqlx::PgConnection::connect_with(&connect).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut locker).await.unwrap();
+    sqlx::query("LOCK TABLE customer_search_grams IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut locker)
+        .await
+        .unwrap();
+    let out = write_during_a_search_flood(&h, &t, &customer, n, busy).await;
+    sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
+    locker.close().await.unwrap();
+    drop(h);
+    pool.close().await;
+    out
+}
+
+/// #42: searches can hold at most half the pool, so a write during a flood
+/// of searches that each block for seconds still gets a connection. The
+/// lock makes every customer search wait until its 2 s statement_timeout.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_search_flood_cannot_starve_a_write(opts: PgPoolOptions, connect: PgConnectOptions) {
+    let (write, searches) = flood(opts, connect, SearchLimiter::for_pool(5), 8, 2).await;
+    assert_eq!(write, StatusCode::OK, "the write was starved: {searches:?}");
+    assert!(
+        searches.iter().all(
+            |s| *s == StatusCode::SERVICE_UNAVAILABLE || *s == StatusCode::UNPROCESSABLE_ENTITY
+        ),
+        "{searches:?}"
+    );
+    assert!(
+        searches.contains(&StatusCode::SERVICE_UNAVAILABLE),
+        "nothing was turned away: {searches:?}"
+    );
+}
+
+/// The control: with a limiter as large as the pool, the same flood does
+/// starve the write, so the test above can tell the difference.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn without_the_cap_a_search_flood_starves_a_write(
+    opts: PgPoolOptions,
+    connect: PgConnectOptions,
+) {
+    let (write, searches) = flood(opts, connect, SearchLimiter::new(5), 8, 5).await;
+    assert!(
+        !write.is_success(),
+        "the write got through without the cap: {write} {searches:?}"
+    );
+}
+
+/// A search that cannot get a permit answers 503 unavailable with
+/// Retry-After, and never reaches the database.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_search_without_a_permit_is_unavailable(pool: PgPool) {
+    let limiter = SearchLimiter::new(1);
+    let h = harness_opts(pool, SECRET, false, limiter.clone()).await;
+    let (_, _, t) = h.caller(RO);
+    let _held = limiter.acquire().await.unwrap();
+    let r = h
+        .call("GET", "/api/v1/customers/search?q=grace", Some(&t), None)
+        .await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.body["code"], "unavailable", "{}", r.body);
+    assert!(r.headers.contains_key("retry-after"));
 }

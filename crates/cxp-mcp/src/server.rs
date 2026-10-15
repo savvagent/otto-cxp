@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use cxp_core::auth::{MissingScope, Principal};
+use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
@@ -64,15 +65,23 @@ pub struct Cxp {
     db: Db,
     platform: Arc<PlatformClient>,
     meter: Arc<Meter>,
+    /// The process-wide search cap, shared with `/api` (#42).
+    search: SearchLimiter,
     tool_router: ToolRouter<Self>,
 }
 
 impl Cxp {
-    pub fn new(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>) -> Self {
+    pub fn new(
+        db: Db,
+        platform: Arc<PlatformClient>,
+        meter: Arc<Meter>,
+        search: SearchLimiter,
+    ) -> Self {
         Self {
             db,
             platform,
             meter,
+            search,
             tool_router: crate::tools::router(),
         }
     }
@@ -83,6 +92,12 @@ impl Cxp {
 
     pub fn meter(&self) -> &Meter {
         &self.meter
+    }
+
+    /// The search cap: a search tool takes its permit from it, after the
+    /// scope check and before [`Cxp::tx`], so waiting holds no connection.
+    pub(crate) fn search(&self) -> &SearchLimiter {
+        &self.search
     }
 
     /// The principal for the HTTP request this call arrived on.

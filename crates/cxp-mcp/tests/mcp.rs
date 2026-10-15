@@ -15,6 +15,7 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use chrono::Utc;
+use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use cxp_mcp::{router, Config};
 use http::{Request, StatusCode};
@@ -164,6 +165,15 @@ async fn harness(pool: PgPool) -> Harness {
 
 /// [`harness`], with the meter enforcing quotas when `enforce` is set.
 async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
+    harness_opts(pool, enforce, SearchLimiter::for_pool(5)).await
+}
+
+/// [`harness`], with the given search limiter.
+async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
+    harness_opts(pool, false, search).await
+}
+
+async fn harness_opts(pool: PgPool, enforce: bool, search: SearchLimiter) -> Harness {
     let (base, platform) = start_platform().await;
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
@@ -176,6 +186,7 @@ async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
         Db::from_pool(pool.clone()),
         client,
         meter,
+        search,
         Config {
             public_url: PUBLIC_URL.into(),
             allowed_hosts: vec![HOST.into()],
@@ -888,6 +899,7 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
             Db::from_pool(pool.clone()),
             client.clone(),
             meter,
+            SearchLimiter::for_pool(5),
             Config {
                 public_url: PUBLIC_URL.into(),
                 allowed_hosts: hosts.clone(),
@@ -895,5 +907,23 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
             },
         );
         assert_eq!(built.err(), Some(cxp_mcp::NoAllowedHosts), "{hosts:?}");
+    }
+}
+
+/// #42: a search tool that cannot get a permit fails as retriable
+/// `unavailable` rather than waiting on the pool.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_search_tool_without_a_permit_is_unavailable(pool: PgPool) {
+    let limiter = SearchLimiter::new(1);
+    let h = harness_search(pool, limiter.clone()).await;
+    let t = token(&h.platform, Uuid::new_v4(), READ);
+    let _held = limiter.acquire().await.unwrap();
+    for (tool, args) in [
+        ("search_customers", json!({"query": "grace"})),
+        ("search_knowledge_base", json!({"query": "reset"})),
+    ] {
+        let failed = h.tool(&t, tool, args).await.unwrap_err();
+        assert_eq!(code(&failed), "unavailable", "{tool}: {failed}");
+        assert_eq!(failed["data"]["retriable"], true, "{tool}: {failed}");
     }
 }
