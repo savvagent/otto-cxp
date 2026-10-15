@@ -32,6 +32,7 @@ pub mod boot;
 pub mod config;
 pub mod health;
 pub mod install_page;
+pub mod secret_env;
 
 use std::path::Path;
 use std::sync::Arc;

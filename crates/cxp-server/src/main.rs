@@ -8,14 +8,18 @@
 //! command (`release_command = "migrate"`, given to the image's entrypoint).
 
 use anyhow::{Context, Result};
+use cxp_server::secret_env;
 use cxp_server::{migrate, run, Config, LogFormat};
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Not `#[tokio::main]`: a serving process first sheds the migration owner's
+/// credential, by re-executing itself without it ([`secret_env`]), and that
+/// must happen while the process has one thread, before the runtime starts
+/// its workers.
+fn main() -> Result<()> {
     // Decided before anything else, so a mistyped release command never
     // falls through to serving.
     const USAGE: &str = "usage: cxp-server [migrate]";
@@ -27,9 +31,16 @@ async fn main() -> Result<()> {
     if let Some(extra) = std::env::args().nth(2) {
         anyhow::bail!("unexpected argument {extra:?}; {USAGE}");
     }
+    if !migrating {
+        // Does not return when it had something to remove.
+        secret_env::reexec_without_migration_secret()?;
+    }
     // Never overrides a variable already set, so a deployment's environment
     // always wins over a stray .env.
     let dotenv = dotenvy::dotenv();
+    // A local .env may still name it; a serving process forgets it, still
+    // single-threaded.
+    let forgot_dotenv_secret = !migrating && secret_env::forget_migration_secret();
     let config = Config::from_env().context(
         "configuration is incomplete. Copy .env.example to .env for local runs, or set the \
          variables named above in the deployment",
@@ -44,20 +55,31 @@ async fn main() -> Result<()> {
     if let Ok(path) = dotenv {
         tracing::debug!(path = %path.display(), "loaded .env");
     }
-
-    if migrating {
-        // An error exits non-zero, which aborts the deploy.
-        migrate(&config).await?;
-        return Ok(());
+    if !migrating && (secret_env::was_reexecuted() || forgot_dotenv_secret) {
+        tracing::info!(
+            "removed {} from the serving process's environment; only cxp-server migrate uses it",
+            secret_env::MIGRATION_SECRET
+        );
     }
 
-    let listener = TcpListener::bind(config.bind)
-        .await
-        .with_context(|| format!("could not bind {}", config.bind))?;
-    // An error here (a refused boot, or a background task that died while
-    // serving) exits non-zero, so the machine is restarted.
-    run(config, listener, shutdown_signal()).await?;
-    Ok(())
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the async runtime")?
+        .block_on(async move {
+            if migrating {
+                // An error exits non-zero, which aborts the deploy.
+                migrate(&config).await?;
+                return Ok(());
+            }
+            let listener = TcpListener::bind(config.bind)
+                .await
+                .with_context(|| format!("could not bind {}", config.bind))?;
+            // An error here (a refused boot, or a background task that died
+            // while serving) exits non-zero, so the machine is restarted.
+            run(config, listener, shutdown_signal()).await?;
+            Ok(())
+        })
 }
 
 fn init_tracing(format: LogFormat) {

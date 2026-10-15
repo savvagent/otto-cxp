@@ -109,9 +109,29 @@ owning runtime role (the sweep, the shipper, the tombstone, `/readyz`, a future 
 could switch tenant isolation off for every org. `cxp_server` owns nothing and holds no
 `TRUNCATE` or `TRIGGER`, so it cannot. The owner never serves: its credential is used only by the
 release command. (A NOLOGIN owner that `cxp_server` could assume would not do: assuming a role is
-a `SET ROLE`, which any SQL the runtime login runs could repeat. Fly secrets are app-wide, so
-`CXP_MIGRATION_DATABASE_URL` is in the serving machines' environment too; SQL cannot read it,
-but code execution in the process could, and closing that needs a separate app.)
+a `SET ROLE`, which any SQL the runtime login runs could repeat; and a NOLOGIN owner assumed by
+a second login only moves the exposure to that login's credential.)
+
+**The owner's credential and the serving machines.** Fly secrets are app-wide, so
+`CXP_MIGRATION_DATABASE_URL` reaches every serving machine, not only the release command's. A
+serving `cxp-server` therefore sheds it before doing anything else: finding it in its
+environment, it re-executes itself with the same arguments and the environment minus that
+variable, before reading its configuration or starting a thread (`unsetenv` alone would leave the
+original environment block in memory and in `/proc/<pid>/environ`). It logs `removed
+CXP_MIGRATION_DATABASE_URL from the serving process's environment; only cxp-server migrate uses
+it`, never reads or logs the value, and refuses to start if the re-exec fails
+(`crates/cxp-server/tests/secret_env.rs` proves it on the built binary). So SQL run as
+`cxp_server` cannot reach the owner (it is a different login), and code execution or an
+environment dump in the serving process does not find its credential either.
+
+What remains: Fly's init (PID 1, root) still holds the app's secrets for the machine's life, so
+root on a serving machine (`fly ssh console`, or an exploit that escalates from the
+unprivileged `cxp` user to root) can read the owner's credential, and so can anyone with the
+app's Fly deploy token (`fly ssh`, or a machine they start). Closing that means the owner's
+credential living outside this app: a separate Fly app (say `otto-cxp-migrate`) holding only
+`CXP_MIGRATION_DATABASE_URL` and running `cxp-server migrate` as a one-off machine from the
+deploy job before `fly deploy`. That is a follow-up, not done here: it adds an app, its own
+deploy token, and ordering in CI.
 
 The `SECURITY DEFINER` functions run as their owner, `cxp_owner`: `console_session_org` (the
 console's cookie lookup, which `cxp_server` may call through `otto_app`'s `EXECUTE`) and
@@ -1150,7 +1170,8 @@ The logs must show, in order:
 - from the release command's machine: `database role "cxp_owner" holds no superuser-equivalent
   privilege (...) ... and can connect to no other service's database; it owns database
   "otto_cxp", ...`, then `applying migrations`, then `migrations applied`;
-- from each serving machine: `database role "cxp_server" holds no superuser-equivalent
+- from each serving machine: `removed CXP_MIGRATION_DATABASE_URL from the serving process's
+  environment; only cxp-server migrate uses it`, then `database role "cxp_server" holds no superuser-equivalent
   privilege (...) ... and can connect to no other service's database; it owns nothing in this
   database and can TRUNCATE or add a TRIGGER to no table; the instance also hosts ...`
 - `not migrating: migrations run as the database owner through cxp-server migrate`

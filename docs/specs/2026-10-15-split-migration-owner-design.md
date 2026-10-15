@@ -267,6 +267,17 @@ table, so no RLS or isolation-list change. No `SECURITY DEFINER` function is add
   `missing_runtime_grants`; non-empty refuses in a deployment (`the runtime role cannot write
   the org.deleted tombstone (INSERT on deleted_orgs): GRANT cxp_runtime TO <role>`), warns
   locally.
+- **The owner's credential never stays in a serving process** (`secret_env.rs`, `main.rs`). Fly
+  secrets are app-wide, so `CXP_MIGRATION_DATABASE_URL` is in every serving machine's
+  environment. `main` is no longer `#[tokio::main]`: when serving, its first act (after argument
+  parsing, while single-threaded) is to re-execute itself without the variable if present
+  (`std::os::unix::process::CommandExt::exec`, same executable and arguments, environment minus
+  the variable plus the marker `CXP_MIGRATION_SECRET_REMOVED=1`), because `unsetenv` leaves the
+  original block in memory and `/proc/<pid>/environ`. A failed exec refuses to serve. A value a
+  local `.env` supplies afterwards is removed with `remove_var` before the runtime starts.
+  `run_with` also drops `Config::migration_database_url`. The re-executed process logs that the
+  variable was removed; nothing logs its value. `migrate` keeps and uses it. Tested on the built
+  binary (`tests/secret_env.rs`, reading `/proc/<pid>/environ`).
 - **Re-check** (`boot::recheck_db_role(db, config, alarm)`), called by `sweep_loop` after each
   sweep pass (hourly; the first pass runs at boot, right after the boot check, and is harmless):
   re-runs `inspect` and `role_verdict`. `Refused` → `tracing::error!` with the summary
@@ -409,9 +420,13 @@ revoked), after which the new binary serves as `cxp_server`.
 
 ## Risks & open questions
 
-- **The owner credential is in every machine's environment** (Fly secrets are app-wide). SQL run
-  as `cxp_server` cannot read it; remote code execution in the process could. Closing that needs
-  a separate app or machine-scoped secrets; out of scope, recorded in fly.md.
+- **The owner credential reaches every machine** (Fly secrets are app-wide). The serving process
+  re-executes itself without it, so SQL as `cxp_server`, code execution as the unprivileged
+  `cxp` user inside the serving process, and environment dumps of it do not find it. Root on a
+  serving machine (Fly's init holds the secrets), and anyone holding the app's deploy token, still
+  can. The stronger arrangement, a separate Fly app holding only the owner credential and running
+  `cxp-server migrate` from the deploy job, is a recorded follow-up (another app, token, and CI
+  ordering).
 - **No schema-version check before serving.** If the release command were skipped, a newer binary
   would serve against an older schema and fail per query. Fly aborts the deploy when the release
   command fails, so new machines do not start; a follow-up could read `_sqlx_migrations` (it would
