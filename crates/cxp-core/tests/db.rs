@@ -799,6 +799,160 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
     );
 }
 
+/// #26's runbook moves the tables and functions from the role that created
+/// them to `cxp_server` with `REASSIGN OWNED`, then clears the old role out
+/// with `DROP OWNED BY` and `DROP ROLE`. `DROP OWNED BY` also drops every
+/// policy whose only target is the dropped role; `console_sessions_lookup`
+/// names no role (it admits the function's owner, read from `pg_proc` at
+/// query time), so it must come through those steps unchanged and keep
+/// admitting the lookup under the new owner. A control policy aimed at the
+/// old role alone is dropped by the same steps, so the test would see a
+/// lookup policy written `TO` that role vanish. Both owners are
+/// `NOSUPERUSER NOBYPASSRLS`, so the policy, not a bypass, is what admits
+/// the lookup. The roles are cluster-wide, so they are dropped whatever the
+/// test does.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_console_lookup_policy_survives_drop_owned_by_its_previous_owner(pool: PgPool) {
+    let suffix = Uuid::new_v4().simple();
+    let old = format!("cxp_test_old_owner_{suffix}");
+    let new = format!("cxp_test_new_owner_{suffix}");
+    let me: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for role in [&old, &new] {
+        sqlx::query(&format!(
+            "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Run in a task so a failed assertion still reaches the cleanup below.
+    let outcome = tokio::spawn(lookup_survives_drop_owned(
+        pool.clone(),
+        old.clone(),
+        new.clone(),
+    ))
+    .await;
+
+    // `old` is normally gone already; `new` owns what it took over.
+    let cleanup = [
+        format!(
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{old}') THEN \
+                 EXECUTE 'REASSIGN OWNED BY {old} TO {me}'; EXECUTE 'DROP OWNED BY {old}'; \
+                 END IF; END $$"
+        ),
+        format!("REASSIGN OWNED BY {new} TO {me}"),
+        format!("DROP OWNED BY {new}"),
+        format!("DROP ROLE IF EXISTS {old}"),
+        format!("DROP ROLE {new}"),
+    ];
+    for sql in cleanup {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn lookup_survives_drop_owned(pool: PgPool, old: String, new: String) {
+    let admin = db(pool.clone());
+    let a = org();
+    let hash: Vec<u8> = (0..32).collect();
+    let mut tx = admin.begin(a).await.unwrap();
+    sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now() + interval '1 day')",
+    )
+    .bind(&hash)
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let policy = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Vec<String>, String)>(
+                "SELECT roles::text[], qual FROM pg_policies \
+                 WHERE tablename = 'console_sessions' AND policyname = $1",
+            )
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = policy("console_sessions_lookup")
+        .await
+        .expect("the lookup policy exists");
+
+    // The state before the runbook: `old` owns the table and the function,
+    // and a policy targets `old` alone.
+    for sql in [
+        format!("ALTER TABLE console_sessions OWNER TO {old}"),
+        format!("ALTER FUNCTION console_session_org(bytea) OWNER TO {old}"),
+        format!(
+            "CREATE POLICY cxp_test_named ON console_sessions FOR SELECT TO {old} USING (false)"
+        ),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    assert!(policy("cxp_test_named").await.is_some());
+
+    // The runbook's steps.
+    for sql in [
+        format!("REASSIGN OWNED BY {old} TO {new}"),
+        format!("DROP OWNED BY {old}"),
+        format!("DROP ROLE {old}"),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+
+    assert!(
+        policy("cxp_test_named").await.is_none(),
+        "DROP OWNED BY kept a policy aimed only at the dropped role"
+    );
+    assert_eq!(
+        policy("console_sessions_lookup").await,
+        Some(before),
+        "the lookup policy was dropped or changed"
+    );
+    let owners: (String, String) = sqlx::query_as(
+        "SELECT (SELECT tableowner::text FROM pg_tables WHERE tablename = 'console_sessions'), \
+                pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, (new.clone(), new.clone()));
+
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(
+        lookup(hash).await,
+        Some(a.as_uuid()),
+        "the lookup, under the new owner"
+    );
+    assert_eq!(lookup(vec![9u8; 32]).await, None);
+}
+
 /// Foreign-key checks bypass row-level security, so only the composite
 /// `(org_id, x_id)` keys stop a row in one org pointing at another org's row.
 /// Each attempt writes a row for org B (passing RLS) that names org A's id.
