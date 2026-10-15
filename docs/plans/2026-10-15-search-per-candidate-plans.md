@@ -90,7 +90,7 @@ part of either statement, and do not edit `tests/customers.rs` or `tests/support
 
 **Model:** sonnet — the SQL edits and the test are fully specified below.
 
-- [ ] **Step 1: Add the accessors (no behavior change)**
+- [x] **Step 1: Add the accessors (no behavior change)**
 
 In `crates/cxp-core/src/customers.rs`, directly after the `SEARCH_CUSTOMERS_SQL` static:
 
@@ -114,7 +114,7 @@ pub fn search_articles_sql() -> &'static str {
 }
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `crates/cxp-core/tests/search_plans.rs`:
 
@@ -379,7 +379,7 @@ If `OrgId` has no `as_uuid()`, use whatever accessor `otto_tenant::ids::OrgId` p
 `sqlx::raw_sql` is unavailable in the pinned sqlx, report NEEDS_CONTEXT rather than switching to a
 macro.
 
-- [ ] **Step 3: Run the tests and see them fail**
+- [x] **Step 3: Run the tests and see them fail**
 
 Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test -p cxp-core --test search_plans --locked`
 Expected: both tests FAIL — `customer_matches_probe_each_candidate` with "matches joins its
@@ -390,7 +390,7 @@ either test passes on the unfenced statements, first raise the seed (e.g. 2,000 
 1,000 articles per org) and rerun; if it still passes, stop and report DONE_WITH_CONCERNS with
 the plan output: the test would not guard anything.
 
-- [ ] **Step 4: Add the fences**
+- [x] **Step 4: Add the fences**
 
 In `SEARCH_CUSTOMERS_SQL` (`customers.rs`), two edits, nothing else:
 
@@ -452,7 +452,7 @@ knowledge.rs:
 /// `tests/search_plans.rs` checks the plans.
 ```
 
-- [ ] **Step 5: Run the tests and see them pass**
+- [x] **Step 5: Run the tests and see them pass**
 
 Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test -p cxp-core --test search_plans --locked`
 Expected: 2 passed, 0 failed, 0 ignored.
@@ -461,7 +461,7 @@ Run the equivalence and random-corpus suites, unchanged:
 `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test -p cxp-core --test customers --test support --locked`
 Expected: all pass, none ignored.
 
-- [ ] **Step 6: Full gates**
+- [x] **Step 6: Full gates**
 
 Run:
 - `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test --workspace --locked`
@@ -470,7 +470,7 @@ Run:
 - `git diff --name-status --diff-filter=MDR origin/main...HEAD -- 'crates/*/migrations/*'`
 Expected: all green; report pass counts per test binary.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/cxp-core/src/customers.rs crates/cxp-core/src/knowledge.rs crates/cxp-core/tests/search_plans.rs
@@ -504,13 +504,13 @@ these scripts at a Fly database.
 
 **Model:** sonnet — a small script with the rules spelled out.
 
-- [ ] **Step 1: Regenerate the pgbench scripts**
+- [x] **Step 1: Regenerate the pgbench scripts**
 
 Run: `python3 scripts/bench-search/gen.py . scripts/bench-search`
 Expected: `after-customers.sql` gains `LIMIT 1) AS m` and one `OFFSET 0))`; `after-articles.sql`
 gains four `OFFSET 0`.
 
-- [ ] **Step 2: Write `plans.py`**
+- [x] **Step 2: Write `plans.py`**
 
 Create `scripts/bench-search/plans.py`:
 
@@ -631,7 +631,7 @@ sys.exit(1 if failed else 0)
 Note the substitution order: `50::bigint` before `0::bigint` (the latter is a suffix of the
 former), and `:pat` before `:q` is irrelevant (no overlap) but keep the listed order.
 
-- [ ] **Step 3: Run it on the fenced statements, then on the unfenced ones**
+- [x] **Step 3: Run it on the fenced statements, then on the unfenced ones**
 
 Run: `python3 scripts/bench-search/plans.py postgres://cxp:cxp@localhost:15466/bench`
 Expected: exit 0, every line `per-candidate`.
@@ -652,7 +652,7 @@ statements: exit 1, with `matches uses a Hash Join` and/or `matches reads custom
 Heap Scan` for most customer queries and `hashed SubPlan N reads knowledge_articles` for `brou`.
 Record both outputs for the PR.
 
-- [ ] **Step 4: Update the `run.sh` header**
+- [x] **Step 4: Update the `run.sh` header**
 
 In `scripts/bench-search/run.sh`, after the paragraph about `CONTAINER=` and before
 `# LOCAL POSTGRES ONLY.`, add:
@@ -665,13 +665,13 @@ In `scripts/bench-search/run.sh`, after the paragraph about `CONTAINER=` and bef
 #
 ```
 
-- [ ] **Step 5: Benchmark evidence**
+- [x] **Step 5: Benchmark evidence**
 
 Run: `scripts/bench-search/run.sh postgres://cxp:cxp@localhost:15466/bench 20`
 (record the `after-*` lines; the `before-*` lines are the pre-#17 scans and may be skipped by
 interrupting after the `after-articles` lines if they take long). Record the output for the PR.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/bench-search/seed.sql scripts/bench-search/plans.py scripts/bench-search/after-customers.sql scripts/bench-search/after-articles.sql scripts/bench-search/run.sh
@@ -695,7 +695,7 @@ Refs #41"
 
 **Model:** haiku — one sentence.
 
-- [ ] **Step 1: Add one sentence** at the end of the "### Search index (#17)" paragraph:
+- [x] **Step 1: Add one sentence** at the end of the "### Search index (#17)" paragraph:
 
 ```
 Per-candidate probes keep their fences (`LIMIT 1` in the customer lateral, `OFFSET 0` in each
@@ -703,7 +703,7 @@ correlated `EXISTS`, #41), checked by `crates/cxp-core/tests/search_plans.rs` an
 `scripts/bench-search/plans.py`.
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add CLAUDE.md

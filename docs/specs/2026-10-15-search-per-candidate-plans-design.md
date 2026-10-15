@@ -1,6 +1,6 @@
 # Search per-candidate plans — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#44)
 **Issue:** #41 "Keep search per-candidate in mid-size orgs (generic plans flatten into whole-org scans)"
 **Plan:** `docs/plans/2026-10-15-search-per-candidate-plans.md`
 **Builds on:** `docs/specs/2026-10-14-search-under-rls-design.md` (#17),
