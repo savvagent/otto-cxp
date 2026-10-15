@@ -288,8 +288,11 @@ async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
     // (a `fly proxy` run) is a deployment here too: it needs the owner's own
     // credential.
     if config.migration_database_url.is_none() && role.shares_the_instance() {
-        tracing::error!("{}: {MIGRATION_URL_REQUIRED}", role.summary());
-        return Err(anyhow!("{MIGRATION_URL_REQUIRED}"));
+        let summary = role.summary();
+        tracing::error!("{summary}: {MIGRATION_URL_REQUIRED}");
+        return Err(anyhow!(
+            "refusing to migrate: {summary}; {MIGRATION_URL_REQUIRED}"
+        ));
     }
     check_migration_role(&role, config)?;
     tracing::info!("applying migrations");
@@ -409,7 +412,7 @@ where
         let why = format!(
             "the runtime role cannot write the org.deleted tombstone ({}): GRANT cxp_runtime TO {}",
             missing.join(", "),
-            role.current_user
+            sql_identifier(&role.current_user)
         );
         if deployment {
             tracing::error!("{why}: refusing to serve");
@@ -480,7 +483,7 @@ where
             shipper_done = true;
             Some(ended("the usage shipper", r.map(|r| r.map_err(anyhow::Error::from))))
         }
-        r = &mut sweeper => Some(ended("the platform-event sweeper", r.map(Ok))),
+        r = &mut sweeper => Some(ended(SWEEPER, r.map(Ok))),
     };
 
     // Drain: stop accepting, let in-flight requests finish, within bounds.
@@ -550,6 +553,29 @@ fn flush_result(
         // Logged by the shipper itself.
         Ok(Err(e)) => Err(format!("the final usage flush failed: {e}")),
         Err(e) => Err(format!("the usage shipper did not stop cleanly: {e}")),
+    }
+}
+
+/// What the log and the exit error call [`sweep_loop`], which does more
+/// than sweep platform events.
+const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
+
+/// `name` as an SQL identifier, ready to paste into a statement: as is when
+/// it is a plain lower-case identifier, otherwise double-quoted with every
+/// embedded double quote doubled. Postgres folds unquoted names to lower
+/// case, so a role named `Cxp` or `cxp-runtime` needs the quotes.
+fn sql_identifier(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
 
@@ -887,6 +913,28 @@ mod tests {
         assert_eq!(migration_url(&local).unwrap(), local.database_url);
         local.migration_database_url = Some(owner_url.into());
         assert_eq!(migration_url(&local).unwrap(), owner_url);
+    }
+
+    /// The suggested `GRANT` pastes as is: a name Postgres would fold or
+    /// misparse is quoted, embedded quotes doubled.
+    #[test]
+    fn a_role_name_is_quoted_only_when_it_needs_it() {
+        assert_eq!(sql_identifier("cxp_server"), "cxp_server");
+        assert_eq!(sql_identifier("_r2"), "_r2");
+        assert_eq!(sql_identifier("Cxp"), r#""Cxp""#);
+        assert_eq!(sql_identifier("cxp-runtime"), r#""cxp-runtime""#);
+        assert_eq!(sql_identifier("2cxp"), r#""2cxp""#);
+        assert_eq!(sql_identifier(r#"a"b"#), r#""a""b""#);
+        assert_eq!(sql_identifier(""), r#""""#);
+    }
+
+    #[test]
+    fn a_background_task_that_ends_is_named_in_the_exit_error() {
+        let err = ended(SWEEPER, Ok(Ok(()))).to_string();
+        assert_eq!(
+            err,
+            "the sweeper (retention and database-role re-check) ended while serving: it returned"
+        );
     }
 
     #[test]

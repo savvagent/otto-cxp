@@ -18,11 +18,15 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // Decided before anything else, so a mistyped release command never
     // falls through to serving.
+    const USAGE: &str = "usage: cxp-server [migrate]";
     let migrating = match std::env::args().nth(1).as_deref() {
         None => false,
         Some("migrate") => true,
-        Some(other) => anyhow::bail!("unknown argument {other:?}; usage: cxp-server [migrate]"),
+        Some(other) => anyhow::bail!("unknown argument {other:?}; {USAGE}"),
     };
+    if let Some(extra) = std::env::args().nth(2) {
+        anyhow::bail!("unexpected argument {extra:?}; {USAGE}");
+    }
     // Never overrides a variable already set, so a deployment's environment
     // always wins over a stray .env.
     let dotenv = dotenvy::dotenv();
