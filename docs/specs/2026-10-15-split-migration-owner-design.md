@@ -69,6 +69,18 @@ is not the owner.
   LEVEL SECURITY binds that owner too, and `console_sessions_lookup` admits whichever role owns
   `console_session_org` at query time (it reads `pg_proc`), so the lookup follows the ownership
   transfer with no policy change. `removed_members` has no RLS; its owner may delete from it.
+- **An ownership transfer takes `cxp_server`'s `CONNECT` with it.** The #16 runbook revoked
+  `CONNECT` on `otto_cxp` from `PUBLIC` and granted it to `cxp_server` while `cxp_server` owned the
+  database, so the entry is `cxp_server=c/cxp_server`. `REASSIGN OWNED` / `ALTER DATABASE … OWNER
+  TO` rewrite every ACL entry naming the old owner, as grantee or grantor, to the new owner: after
+  the transfer `cxp_server` could open no new connection. The runbook re-grants it in the same
+  transaction, and its proof checks it.
+- **Fly passes `release_command` to the image's `ENTRYPOINT`.** The Dockerfile's
+  `ENTRYPOINT ["/usr/local/bin/cxp-server"]` has no `CMD`; Fly runs the release command as the
+  machine's command, which Docker semantics append to the entrypoint. So the setting is
+  `release_command = "migrate"` (the process runs `cxp-server migrate`); `"cxp-server migrate"`
+  would run `cxp-server cxp-server migrate`. The gate run includes the built image run with that
+  argument against the local database.
 - **The running release cannot restart as a non-owner with migrations on.** Verified on Postgres
   16: sqlx's `CREATE TABLE IF NOT EXISTS _sqlx_migrations` fails with `permission denied for
   schema public` for a role without `CREATE` there, even when the table exists. So the runbook
@@ -146,7 +158,8 @@ tolerates `insufficient_privilege` on a fresh setup.
 
 ### Why a release command (and not a NOLOGIN owner the deploy assumes)
 
-Recommendation: **`[deploy] release_command = "cxp-server migrate"` with its own secret,
+Recommendation: **`[deploy] release_command = "migrate"` (the entrypoint makes it
+`cxp-server migrate`) with its own secret,
 `CXP_MIGRATION_DATABASE_URL`**, connecting as the LOGIN role `cxp_owner`.
 
 - *NOLOGIN owner assumed by the deploy:* the runtime login would have to be a member of the owner
@@ -183,7 +196,8 @@ pub struct TablePrivilege { pub user: String, pub table: String, pub privileges:
 - Owned: `pg_database` (current database), `pg_namespace` (excluding `pg_catalog`,
   `information_schema`, `pg_toast*`, `pg_temp*`), `pg_class` (relations in those schemas, `relkind`
   mapped to table / view / sequence / index / ...), `pg_proc`, `pg_type` (excluding array and
-  relation row types), each `WHERE pg_has_role(user, owner, 'MEMBER')`. Membership counts as for
+  relation row types), `pg_extension` (an extension's owner may drop it, with every object in
+  it), each `WHERE pg_has_role(user, owner, 'MEMBER')`. Membership counts as for
   privileges: a member can `SET ROLE` to the owner. Schema `public` owned by `pg_database_owner`
   is reported for the database owner (its implicit member).
 - Table privileges: relations (`relkind IN ('r','p','v','m','f')`) in those schemas, not owned via
@@ -262,7 +276,11 @@ table, so no RLS or isolation-list change. No `SECURITY DEFINER` function is add
 - **`/readyz`** (`health.rs`): a `RoleAlarm` (`Arc<RwLock<Option<String>>>`, cheap clone) joins
   the platform check in the health state. While set, `/readyz` answers 503
   `{"status":"unready","reason":"database role refused"}` and logs `warn` per probe (the reason
-  never carries the summary: no catalog text in a response). `router()`'s last parameter
+  never carries the summary: no catalog text in a response). Consequence, chosen deliberately
+  (fail closed, as boot does): `/readyz` is the app's only Fly health check, so with one machine a
+  raised alarm takes the service out of rotation until the role is fixed. Recovery is the fix
+  itself (revoke the grant or attribute; the next hourly pass clears the alarm) or, to clear it at
+  once, a machine restart, which re-runs the boot check. fly.md says so. `router()`'s last parameter
   becomes `impl Into<health::Readiness>`, with `From<PlatformCheck>` so existing callers compile
   unchanged; boot builds a `Readiness` holding the alarm it shares with the sweeper.
 
@@ -303,11 +321,17 @@ All human-only (Rob), **before merge**, per CLAUDE.md "Database role change" and
 
 1. The runbook in `docs/deploy/fly.md` ("Runbook: split the migration owner from the runtime
    role", steps S0–S7): look (read-only); turn migrations off on the running release
-   (`CXP_RUN_MIGRATIONS=false` as a secret, which also protects a later rollback to a pre-#27
-   image); create `cxp_owner` and `cxp_runtime`; set `CXP_MIGRATION_DATABASE_URL`; transfer
-   ownership from `cxp_server` to `cxp_owner`, grant `cxp_runtime`, fix default privileges,
-   revoke the parameter grant from `cxp_server`; prove both roles read-only; then merge (or hand
-   deploy if `FLY_DEPLOY` is not enabled) and verify the release-command and boot log lines.
+   (`CXP_RUN_MIGRATIONS=false` as a secret, kept permanently: it also stops a rollback to a
+   pre-#27 image, whose `fly.toml` lacks the setting, from migrating as a non-owner); check
+   Postgres is 15+ (schema `public` follows the database owner); create `cxp_owner` and
+   `cxp_runtime`; set `CXP_MIGRATION_DATABASE_URL`; in one transaction transfer ownership from
+   `cxp_server` to `cxp_owner`, re-grant `CONNECT` on `otto_cxp` to `cxp_server`, grant `INSERT`
+   on `deleted_orgs` to `cxp_runtime` by hand (idempotent with 0005, so the old release's
+   tombstone keeps working before 0005 runs), add `ALTER DEFAULT PRIVILEGES FOR ROLE cxp_owner`
+   entries and remove `cxp_server`'s, and revoke the parameter grant from `cxp_server`; prove
+   both roles read-only and restart the old release to prove it boots as a non-owner; then merge
+   (or hand deploy if `FLY_DEPLOY` is not enabled) and verify the release-command and boot log
+   lines.
 2. New secret `CXP_MIGRATION_DATABASE_URL`: in the secrets table and `.env.example`.
 3. New non-secret config (agent, in this PR): `CXP_RUN_MIGRATIONS = "false"` in `fly.toml`
    `[env]` and `[deploy] release_command`; `config.rs` and `.env.example` document
@@ -331,6 +355,8 @@ All human-only (Rob), **before merge**, per CLAUDE.md "Database role change" and
   database itself anyway.
 - **Re-check after the alarm was raised and the grant is revoked again:** clears, `info` once.
 - **Machine suspended:** the sweep, and so the re-check, runs again on resume (within the hour).
+- **A raised alarm is an outage** on a one-machine app (see `/readyz` above); a stray
+  `GRANT TRUNCATE` to the runtime role is enough. Intended: such a role is what boot refuses.
 - **Superuser locally:** owns everything; skipped like the other per-user reads; allowed with the
   existing warning.
 - **Test cluster:** the per-test databases' `PUBLIC` defaults do not change the owner reads (they
@@ -340,8 +366,12 @@ All human-only (Rob), **before merge**, per CLAUDE.md "Database role change" and
 
 Gates: `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test --workspace --locked`
 (this worktree's own container), clippy, fmt, the migrations-append-only diff, `podman build -t
-otto-cxp:check-issue27 .` (Dockerfile, crates, fly.toml unaffected by the image but crates
-are). No pnpm paths change.
+otto-cxp:check-issue27 .` (crates change). No pnpm paths change. Beyond the gates, two manual
+proofs recorded in the PR: the built image run as Fly will run it (`podman run --rm --network
+host -e … otto-cxp:check-issue27 migrate` against a scratch database, as a non-privileged owner,
+in a deployment configuration), and the runbook's SQL (S1, S4, S5) run in order against a local
+database put in production's #16 state (`cxp_server` owning everything, `PUBLIC` `CONNECT`
+revoked), after which the new binary serves as `cxp_server`.
 
 - `crates/cxp-core/tests/db.rs` (`RoleGuard` helpers already create and drop roles):
   `the_database_role_check_sees_what_a_role_owns_and_can_truncate` — a plain member of `otto_app`
