@@ -71,10 +71,11 @@ Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set 
 
 otto-cxp connects to `otto-db` as `cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB,
 NOCREATEROLE, NOREPLICATION, CONNECTION LIMIT 15, a member of `otto_app` (so tenant
-transactions can `SET LOCAL ROLE otto_app`), and the owner of database `otto_cxp` and every
-object in it. Owning the database
-lets it run otto-cxp's migrations (`pg_trgm` is a trusted extension a database owner may
-create). FORCE ROW LEVEL SECURITY binds it as the tables' owner, so its background work reaches
+transactions can `SET LOCAL ROLE otto_app`), granted `SET` on the parameter
+`app.console_session_lookup`, and the owner of database `otto_cxp` and every object in it.
+Owning the database lets it run otto-cxp's migrations (`pg_trgm` is a trusted extension a
+database owner may create; the parameter grant lets it define migration 0003's
+`console_session_org`, whose `SET` clause names that parameter). FORCE ROW LEVEL SECURITY binds it as the tables' owner, so its background work reaches
 other orgs' rows only through the maintenance policies, but only while it leaves its own tables
 alone: an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, `DISABLE ROW LEVEL
 SECURITY`, or `DROP POLICY`, and `TRUNCATE` ignores RLS altogether, so code running as
@@ -182,6 +183,12 @@ CREATE ROLE cxp_server LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOR
 \password cxp_server
 -- INHERIT and SET, the defaults: otto-tenant needs both to SET LOCAL ROLE otto_app.
 GRANT otto_app TO cxp_server;
+-- Migration 0003's console_session_org sets this custom parameter in its SET clause, which only
+-- a superuser or a role granted SET on it may define (Postgres 15+). Without the grant, a
+-- migration run as cxp_server (a fresh setup, or a release reaching 0003 after R5) fails with
+-- `permission denied to set parameter "app.console_session_lookup"`. Calling the function needs
+-- nothing: a non-superuser may set any custom parameter at run time.
+GRANT SET ON PARAMETER app.console_session_lookup TO cxp_server;
 ```
 
 **R2. Give it `otto_cxp`.** Still as postgres, in `otto_cxp` (`REASSIGN OWNED` acts on the
@@ -234,7 +241,9 @@ ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
   GRANT USAGE, SELECT ON SEQUENCES TO otto_app;
 COMMIT;
 
--- Everything in otto_cxp is cxp_server's now. Must be 0 rows.
+-- Everything in otto_cxp is cxp_server's now, the console's sign-in objects (0003) included:
+-- table console_sessions and the SECURITY DEFINER function console_session_org, which runs as
+-- its owner. Must be 0 rows.
 SELECT 'relation' AS kind, c.relname::text AS name, pg_get_userbyid(c.relowner) AS owner
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relowner <> 'cxp_server'::regrole
@@ -257,7 +266,15 @@ UNION ALL
 SELECT 'schema', n.nspname::text, pg_get_userbyid(n.nspowner)
 FROM pg_namespace n WHERE n.nspname = 'public'
   AND n.nspowner NOT IN ('cxp_server'::regrole, 'pg_database_owner'::regrole);
+
+-- cxp_server: the web console's session lookup runs as this owner (0 rows on a fresh setup,
+-- before the first deploy has migrated).
+SELECT pg_get_userbyid(proowner) AS console_session_org_owner FROM pg_proc
+WHERE oid = to_regprocedure('public.console_session_org(bytea)');
 ```
+
+The `console_sessions_lookup` policy needs no `ALTER POLICY`: it names no role, and admits
+whichever role owns `console_session_org` at query time, so `REASSIGN OWNED` above moved it too.
 
 **R3. Close the other databases.** A role that connects to `otto_platform`, `otto_factory`,
 `otto_flags`, or `repmgr` only through `PUBLIC` loses access at the revoke, so first find every
@@ -380,6 +397,10 @@ SELECT pg_has_role(current_user, 'otto_app', 'USAGE') AS assumes_otto_app,
        has_schema_privilege('public', 'CREATE') AS can_migrate;
 -- 0: row-level security binds it with no org pinned
 SELECT count(*) FROM customers;
+-- 0, then NULL with no error: the sessions are bound too, and the console's lookup runs as
+-- cxp_server (skip both on a fresh setup, before the first deploy has migrated)
+SELECT count(*) FROM console_sessions;
+SELECT console_session_org(decode(repeat('00', 32), 'hex'));
 -- t for otto_cxp and postgres; f for the other services' databases and repmgr
 SELECT datname, has_database_privilege(current_user, oid, 'CONNECT') AS may_connect
 FROM pg_database WHERE NOT datistemplate ORDER BY datname;

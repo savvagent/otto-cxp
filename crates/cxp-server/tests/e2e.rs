@@ -2083,8 +2083,9 @@ fn database_url_as(pool: &PgPool, user: Option<(&str, &str)>) -> String {
 
 /// What docs/deploy/fly.md sets up on `otto-db`, on this test's (empty)
 /// database: a login role that is not a superuser, not BYPASSRLS, cannot
-/// create roles or databases, is a member of `otto_app`, and owns the
-/// database, which only it may connect to. Returns its connection URL.
+/// create roles or databases, is a member of `otto_app`, may set the
+/// console lookup's parameter, and owns the database, which only it may
+/// connect to. Returns its connection URL.
 async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
     let database = pool.connect_options().get_database().unwrap().to_string();
     let password = Uuid::new_v4().simple().to_string();
@@ -2099,6 +2100,10 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
             .to_string(),
         format!("GRANT otto_app TO {role}"),
+        // 0003's console_session_org sets this custom parameter in its SET
+        // clause, which only a superuser, or a role granted SET on it, may
+        // define (Postgres 15+). The runbook's R1 grants the same.
+        format!("GRANT SET ON PARAMETER app.console_session_lookup TO {role}"),
         format!("ALTER DATABASE \"{database}\" OWNER TO {role}"),
         format!("REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"),
         format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
@@ -2400,9 +2405,60 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
         1
     );
 
+    // The console's cookie lookup, the one unpinned read a request makes:
+    // console_session_org runs as its owner, the role, which FORCE binds,
+    // and console_sessions_lookup admits it because it owns the function.
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, role);
+    let cookie = "e2e-least-privilege-cookie";
+    cxp_core::console_sessions::create(
+        &Db::from_pool(pool.clone()),
+        &otto_tenant::crypto::Cipher::from_base64_key(
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        )
+        .unwrap(),
+        &cxp_core::console_sessions::NewSession {
+            id_hash: cxp_core::console_sessions::hash_cookie(cookie),
+            org_id: a.into(),
+            user_id: Uuid::new_v4().into(),
+            access_token: "otto_at_e2e",
+            refresh_token: "otto_rt_e2e",
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            expires_at: Utc::now() + chrono::Duration::days(1),
+        },
+    )
+    .await
+    .unwrap();
+    let org_of = |cookie: &'static str| {
+        let as_role = as_role.clone();
+        async move {
+            cxp_core::console_sessions::org_of(
+                &as_role,
+                &cxp_core::console_sessions::hash_cookie(cookie),
+            )
+            .await
+            .unwrap()
+            .map(|o| o.as_uuid())
+        }
+    };
+    assert_eq!(org_of(cookie).await, Some(a), "the lookup as the owner");
+    assert_eq!(org_of("no-such-cookie").await, None);
+
     // Row-level security binds the role itself: unpinned and unmarked, the
     // owner sees none of A's rows, and cannot reach the bookkeeping either.
-    for table in ["customers", "feedback", "platform_events", "usage_outbox"] {
+    for table in [
+        "customers",
+        "feedback",
+        "platform_events",
+        "usage_outbox",
+        "console_sessions",
+    ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(as_role.pool())
             .await
