@@ -371,6 +371,7 @@ dependencies = [
  "chrono",
  "cxp-core",
  "cxp-http",
+ "futures",
  "http",
  "otto-resource",
  "otto-tenant",
@@ -380,6 +381,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -388,12 +390,14 @@ name = "cxp-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chrono",
  "otto-resource",
  "otto-tenant",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
@@ -407,13 +411,25 @@ name = "cxp-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
+ "chrono",
  "cxp-core",
+ "futures",
+ "hkdf",
  "http",
  "otto-resource",
  "otto-tenant",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tokio",
  "tower",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -446,6 +462,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "cxp-api",
  "cxp-core",
@@ -457,6 +474,7 @@ dependencies = [
  "otto-tenant",
  "reqwest",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tower",
@@ -873,6 +891,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1271,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "mio"
@@ -2512,12 +2546,20 @@ checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
  "http-body-util",
+ "http-range-header",
+ "httpdate",
  "iri-string",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2622,6 +2664,12 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"

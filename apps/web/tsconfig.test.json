@@ -1,0 +1,11 @@
+{
+  // The tests outside `src/` (they read the build output with Node's APIs),
+  // type-checked by `pnpm build` alongside the app.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo"
+  },
+  "include": ["test"]
+}

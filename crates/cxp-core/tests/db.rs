@@ -33,7 +33,12 @@ const DOMAIN_TABLES: [&str; 15] = [
 ];
 
 /// Bookkeeping tables carrying a `<table>_tenant_isolation` policy.
-const BOOKKEEPING_TABLES: [&str; 3] = ["platform_events", "usage_outbox", "usage_outbox_rejected"];
+const BOOKKEEPING_TABLES: [&str; 4] = [
+    "platform_events",
+    "usage_outbox",
+    "usage_outbox_rejected",
+    "console_sessions",
+];
 
 /// Ids of one row in every tenant table, all in one org.
 struct Seeded {
@@ -112,6 +117,11 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
             .to_string(),
         "INSERT INTO usage_outbox_rejected (event_id, org_id, tool, billable, occurred_at, reason) \
          VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(), 'test')"
+            .to_string(),
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), $1, gen_random_uuid(), '\\x00', \
+         '\\x00', now(), now() + interval '1 day')"
             .to_string(),
     ];
     let mut tx = db.begin(org).await.unwrap();
@@ -437,6 +447,309 @@ async fn the_usage_outbox_is_drained_across_orgs_only_under_the_marker(pool: PgP
         assert_eq!(deleted, 2, "the marked shipper deletes from {table}");
         tx.rollback().await.unwrap();
     }
+}
+
+/// A console session is the one row a request reads before it knows the org:
+/// the cookie is how the org is learned. An unpinned transaction (a request
+/// path that forgot to pin) still sees, changes, and deletes nothing; the
+/// org comes only from `console_session_org`, which answers with the org of
+/// the one unexpired row whose hash it is given, and never a token.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_console_session_is_found_before_its_org_only_through_the_lookup_function(pool: PgPool) {
+    let admin = db(pool.clone());
+    let (a, b) = (org(), org());
+    seed(&admin, a).await;
+    seed(&admin, b).await;
+    let live: Vec<u8> = (0..32).collect();
+    let expired: Vec<u8> = (100..132).collect();
+    for (hash, expires) in [(&live, "now() + interval '1 day'"), (&expired, "now()")] {
+        let mut tx = admin.begin(a).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+             refresh_token_enc, access_expires_at, expires_at) \
+             VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), {expires})"
+        ))
+        .bind(hash)
+        .bind(a)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Unpinned, without the function: nothing, whatever the statement.
+    let mut tx = as_app_unpinned(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "console_sessions is readable unpinned");
+    for sql in [
+        "UPDATE console_sessions SET expires_at = now()",
+        "DELETE FROM console_sessions",
+    ] {
+        let changed = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "unpinned: {sql}");
+    }
+    let err = sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now())",
+    )
+    .bind(vec![7u8; 32])
+    .bind(a)
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "unpinned INSERT");
+    tx.rollback().await.unwrap();
+
+    // The marked sweep may delete across orgs, but cannot write one.
+    let mut tx = as_app_maintenance(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 4, "the marked sweep reads across orgs");
+    let err = sqlx::query("UPDATE console_sessions SET org_id = $1")
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "the marked sweep moved a session");
+    tx.rollback().await.unwrap();
+
+    // The function, called as otto_app with no org pinned.
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            // The setting it reads under ends with the call.
+            let after: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('app.console_session_lookup', true)")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_ne!(after.as_deref(), Some("on"), "the lookup setting leaked");
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "the table is readable after the call");
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(lookup(live.clone()).await, Some(a.as_uuid()));
+
+    // Setting the lookup's marker by hand admits otto_app to nothing: the
+    // lookup policy admits only the function's owner.
+    let mut tx = as_app_unpinned(&pool).await;
+    sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "otto_app read sessions by setting the lookup marker");
+    tx.rollback().await.unwrap();
+    // It names no role: who it admits is read from the function's owner at
+    // query time, so moving that ownership needs no ALTER POLICY.
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(roles)::text FROM pg_policies \
+         WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["public".to_string()]);
+    assert_eq!(lookup(expired).await, None, "an expired session");
+    assert_eq!(lookup(vec![9u8; 32]).await, None, "an unknown hash");
+
+    // Its shape: SECURITY DEFINER with a pinned search_path, executable by
+    // otto_app and not by PUBLIC.
+    let (definer, config): (bool, Vec<String>) = sqlx::query_as(
+        "SELECT prosecdef, coalesce(proconfig, '{}') FROM pg_proc \
+         WHERE proname = 'console_session_org'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(definer);
+    assert!(
+        config.iter().any(|c| c.starts_with("search_path=")),
+        "{config:?}"
+    );
+    let grants: (bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE'), \
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) acl \
+                        WHERE p.proname = 'console_session_org' AND acl.grantee = 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, (true, false), "(otto_app may, PUBLIC may not)");
+}
+
+/// Today the migrating role is a superuser, so `console_session_org` bypasses
+/// RLS and the lookup policy is never what admits it. Once it is not (#16),
+/// the policy is the only thing that does, and #26's runbook moves ownership
+/// of the table and the function to a new least-privilege role. Here a fresh
+/// `NOSUPERUSER NOBYPASSRLS` role takes both over with `ALTER ... OWNER TO`
+/// alone (what `REASSIGN OWNED` does, which a per-test database cannot run
+/// against the cluster superuser that migrated it), and no `ALTER POLICY`:
+/// the lookup works; the new owner's plain `SELECT` sees nothing; a non-owner
+/// that sets the lookup's marker by hand sees nothing; and with the policy
+/// gone the lookup finds nothing, so the policy, not the ownership, is what
+/// admits it. The role is cluster-wide, so it is dropped whatever the test
+/// does.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_console_lookup_follows_its_function_to_a_non_superuser_owner(pool: PgPool) {
+    let owner = format!("cxp_test_owner_{}", Uuid::new_v4().simple());
+    let me: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Run in a task so a failed assertion still reaches the cleanup below.
+    let outcome = tokio::spawn(lookup_as_non_superuser_owner(pool.clone(), owner.clone())).await;
+
+    for sql in [
+        format!("REASSIGN OWNED BY {owner} TO {me}"),
+        format!("DROP OWNED BY {owner}"),
+        format!("DROP ROLE {owner}"),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
+    let admin = db(pool.clone());
+    let a = org();
+    let hash: Vec<u8> = (0..32).collect();
+    let mut tx = admin.begin(a).await.unwrap();
+    sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now() + interval '1 day')",
+    )
+    .bind(&hash)
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let policy = || async {
+        let (roles, qual): (Vec<String>, String) = sqlx::query_as(
+            "SELECT roles::text[], qual FROM pg_policies \
+             WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (roles, qual)
+    };
+    let before = policy().await;
+    // Ownership only: no ALTER POLICY.
+    for sql in [
+        format!("ALTER TABLE console_sessions OWNER TO {owner}"),
+        format!("ALTER FUNCTION console_session_org(bytea) OWNER TO {owner}"),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.unwrap();
+    }
+    assert_eq!(policy().await, before, "the policy was changed");
+    let (superuser, bypass): (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(&owner)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((superuser, bypass), (false, false));
+    let owners: (String, String) = sqlx::query_as(
+        "SELECT (SELECT tableowner::text FROM pg_tables WHERE tablename = 'console_sessions'), \
+                pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, (owner.clone(), owner.clone()));
+
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(
+        lookup(hash.clone()).await,
+        Some(a.as_uuid()),
+        "the lookup, run as a non-superuser owner"
+    );
+    assert_eq!(lookup(vec![9u8; 32]).await, None);
+
+    // Plain SELECTs, unpinned: the new owner without the marker, and
+    // otto_app (not the owner) with the marker set by hand. Neither sees a
+    // row.
+    for (role, marker) in [(owner.as_str(), false), ("otto_app", true)] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {role}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if marker {
+            sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{role} (marker set: {marker}) read sessions unpinned");
+        tx.rollback().await.unwrap();
+    }
+
+    // Without the policy, the lookup finds nothing: the policy, not the
+    // ownership, is what admits it.
+    sqlx::query("DROP POLICY console_sessions_lookup ON console_sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup(hash).await,
+        None,
+        "the lookup worked without its policy"
+    );
 }
 
 /// Foreign-key checks bypass row-level security, so only the composite

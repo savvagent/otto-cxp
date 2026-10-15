@@ -289,6 +289,53 @@ async fn a_cookie_alone_is_not_a_credential_on_mcp(pool: PgPool) {
     assert_eq!(headers["www-authenticate"], h0["www-authenticate"]);
 }
 
+/// The converse of `/api`, where the web console's session cookie is a
+/// credential: a *live* session (stored, its token one the platform honours)
+/// presented as the console's cookie, under every name it is ever sent with,
+/// still gets exactly the no-credential `401` on `/mcp`.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_live_console_session_cookie_is_not_a_credential_on_mcp(pool: PgPool) {
+    use cxp_core::console_sessions::{self, NewSession};
+    let h = harness(pool).await;
+    let org = Uuid::new_v4();
+    let access = token(&h.platform, org, WRITE);
+    let cookie = "A".repeat(43);
+    console_sessions::create(
+        &Db::from_pool(h.pool.clone()),
+        &otto_tenant::crypto::Cipher::from_base64_key(
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        )
+        .unwrap(),
+        &NewSession {
+            id_hash: console_sessions::hash_cookie(&cookie),
+            org_id: org.into(),
+            user_id: Uuid::new_v4().into(),
+            access_token: &access,
+            refresh_token: "otto_rt_x",
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            expires_at: Utc::now() + chrono::Duration::days(1),
+        },
+    )
+    .await
+    .unwrap();
+
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (s0, h0, v0) = h.send(Harness::post(None, body.clone())).await;
+    let mut req = Harness::post(None, body);
+    req.headers_mut().insert(
+        "cookie",
+        format!("__Host-cxp_session={cookie}; cxp_session={cookie}")
+            .parse()
+            .unwrap(),
+    );
+    req.headers_mut()
+        .insert("origin", PUBLIC_URL.parse().unwrap());
+    let (status, headers, v) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!((status, &v), (s0, &v0));
+    assert_eq!(headers["www-authenticate"], h0["www-authenticate"]);
+}
+
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn inactive_and_wrong_audience_tokens_are_401(pool: PgPool) {
     let h = harness(pool).await;
