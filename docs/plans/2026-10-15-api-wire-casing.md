@@ -75,7 +75,7 @@ the PR head's gates count.
 
 **Model:** sonnet — mechanical serde attributes plus tests.
 
-- [ ] **Step 1: Write the failing tests.** Append to `crates/cxp-api/src/routes/mod.rs`:
+- [x] **Step 1: Write the failing tests.** Append to `crates/cxp-api/src/routes/mod.rs`:
 
 ```rust
 /// Request structs take camelCase keys and, as aliases, the snake_case
@@ -229,12 +229,12 @@ mod casing {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails.**
+- [x] **Step 2: Run to verify it fails.**
   Run: `cargo test -p cxp-api --locked --lib casing`
   Expected: FAIL (camelCase keys are ignored, so `assert_eq!(…, Some(A))` fails on the camel
   iteration; `both_spellings_of_one_field_are_refused` fails because `customerId` is unknown).
 
-- [ ] **Step 3: Implement.** On every request struct listed under **Files**, add
+- [x] **Step 3: Implement.** On every request struct listed under **Files**, add
   `#[serde(rename_all = "camelCase")]` after `#[derive(Debug, Deserialize)]` (including structs
   whose fields are all single words: `customers::{CreateBody, UpdateBody, SearchParams}`,
   `surveys::{CreateBody, UpdateBody}`, `mod::PageParams`). On every field whose Rust name contains
@@ -273,14 +273,14 @@ pub struct ListParams {
   `the_team_field_tells_absent_from_null_and_accepts_both_spellings` stays as it is (its
   assertions already cover both spellings). Run `cargo fmt --all` before the format gate.
 
-- [ ] **Step 4: Run to verify it passes.**
+- [x] **Step 4: Run to verify it passes.**
   Run: `cargo test -p cxp-api --locked --lib` — Expected: all pass, including the six `casing::*`
   tests and `catalog::tests::*`.
   Then: `DATABASE_URL=postgres://cxp:cxp@localhost:15461/otto_cxp cargo test -p cxp-api --locked`
   (the integration suite still sends snake_case and must stay green: alias coverage),
   `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add crates/cxp-api/src/routes
@@ -308,7 +308,7 @@ Refs #24"
 
 **Model:** sonnet — contained serde/handler change with a spec-given shape.
 
-- [ ] **Step 1: Write the failing integration assertions.** In `crates/cxp-api/tests/api.rs`, replace the search block (currently asserting `found.body.as_array()` and the `x-total-*` headers) with:
+- [x] **Step 1: Write the failing integration assertions.** In `crates/cxp-api/tests/api.rs`, replace the search block (currently asserting `found.body.as_array()` and the `x-total-*` headers) with:
 
 ```rust
     let found = h
@@ -418,11 +418,11 @@ Refs #24"
   `teamId` / `team_id`); if it only uses one spelling, leave it, since Task 1's unit tests cover
   both spellings of every catalog body.
 
-- [ ] **Step 2: Run to verify it fails.**
+- [x] **Step 2: Run to verify it fails.**
   Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15461/otto_cxp cargo test -p cxp-api --locked --test api`
   Expected: FAIL at the search envelope assertion (`found.body["data"]` is `null` on an array).
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
 
   In `routes/mod.rs`, add `#[serde(rename_all = "camelCase")]` to `Paginated`, and below it:
 
@@ -538,7 +538,7 @@ impl From<DashboardMetrics> for Metrics {
   and add
   `"customerSearch": super::CappedPaginated::new(cxp_core::search::SearchPage { items: vec![customer()], total: 1, total_capped: false }, page),`.
 
-- [ ] **Step 4: Regenerate the fixture and run.**
+- [x] **Step 4: Regenerate the fixture and run.**
   Run: `UPDATE_WIRE_FIXTURES=1 cargo test -p cxp-api --locked --lib wire_fixture` (expected to
   panic "fixture regenerated"), then `cargo test -p cxp-api --locked --lib` (all pass), then
   `DATABASE_URL=postgres://cxp:cxp@localhost:15461/otto_cxp cargo test -p cxp-api -p cxp-server --locked`
@@ -546,7 +546,7 @@ impl From<DashboardMetrics> for Metrics {
   crates/cxp-api/tests/fixtures/wire.json`: only `dashboardMetrics` gains six camelCase keys and
   `customerSearch` is added.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add crates/cxp-api crates/cxp-server/tests/e2e.rs
@@ -574,7 +574,7 @@ Refs #24"
 
 **Model:** sonnet — many mechanical edits guided by `tsc`.
 
-- [ ] **Step 1: Write the failing test.** In `apps/web/src/lib/types.test.ts`:
+- [x] **Step 1: Write the failing test.** In `apps/web/src/lib/types.test.ts`:
   - import `CappedPaginatedResponse` from `./types`;
   - change the `dashboardMetrics` key list to
     `{ totalCustomers: true, totalTickets: true, openTickets: true, totalFeedback: true, totalSurveys: true, totalExperiences: true } satisfies Record<keyof DashboardMetrics, true>`;
@@ -609,12 +609,12 @@ Refs #24"
     key (`experienceId`, `teamId`, …). If `customersApi.search` is tested, it now returns the
     envelope.
 
-- [ ] **Step 2: Run to verify it fails.**
+- [x] **Step 2: Run to verify it fails.**
   Run: `pnpm install --frozen-lockfile && pnpm --filter ./apps/web build` (from the worktree root; if the filter
   syntax is not accepted, `cd apps/web && pnpm build`). Expected: FAIL in `tsc`
   (`CappedPaginatedResponse` not exported; `DashboardMetrics` keys mismatch).
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `types.ts`: rewrite the header comment to: responses, request bodies and query parameters
     are all camelCase (the one `/api/v1` convention, `crates/cxp-api/src/routes/mod.rs`); enum
     values stay as the server stores them. `DashboardMetrics` becomes
@@ -707,11 +707,11 @@ export function withCatalogFilters(prev: URLSearchParams, values: CatalogFilterV
     names so links work), and `types.test.ts`'s legacy-key test. Anything else on the API wire is
     a miss.
 
-- [ ] **Step 4: Run to verify it passes.**
+- [x] **Step 4: Run to verify it passes.**
   Run from the worktree root: `pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test`.
   Expected: all packages build; vitest passes in every package with counts reported (no skips).
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add apps/web
@@ -741,7 +741,7 @@ Refs #24"
   (a) remove `/dashboard/metrics`'s deprecated snake_case keys once no consumer reads them;
   (b) move `GET /api/v1/surveys/{id}/responses` into the `Paginated` envelope. Each body cites
   #24 and states the change and its acceptance criterion.
-- [ ] **Step 2: Module doc.** Replace the `routes/mod.rs` header with the convention: every JSON
+- [x] **Step 2: Module doc.** Replace the `routes/mod.rs` header with the convention: every JSON
   key in request bodies and responses and every query-parameter name is camelCase; multi-word
   request keys also accept their pre-#24 snake_case spelling as an alias (both at once is `400`);
   enum values and caller-owned JSON (`metadata`, `questions`, `answers`) are untouched; lists are
@@ -750,17 +750,17 @@ Refs #24"
   also sends deprecated snake_case keys (#35); errors are `{error, code}` and the auth
   layer's `401`/`403` use the RFC 6750 names `error`/`error_description`. Update the `responses`
   doc in `surveys.rs` to cite #36, and `LegacyMetrics`' doc to cite #35.
-- [ ] **Step 3: Design doc.** In the REST section replace "Request bodies are snake_case
+- [x] **Step 3: Design doc.** In the REST section replace "Request bodies are snake_case
   (`team_id`), and catalog bodies also accept `teamId` as a permanent alias; responses are
   camelCase. The casing mismatch is resolved by #15 (the console reads camelCase); the broader
   question of one convention for `/api/v1` is tracked in #24." with a statement of the convention
   (as in Step 2, condensed, citing #24), and in "Out of scope" replace "one casing convention for
   `/api/v1` is #24" with "`/api/v1` uses one camelCase convention (#24)". Also fix the sentence
   "Catalog create/update with a `teamId` …" only if it now contradicts.
-- [ ] **Step 4: Run** `cargo test -p cxp-api --locked --lib`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `cargo doc -p cxp-api --no-deps` (no broken intra-doc links).
+- [x] **Step 4: Run** `cargo test -p cxp-api --locked --lib`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `cargo doc -p cxp-api --no-deps` (no broken intra-doc links).
   Add one line under the title of `docs/specs/2026-10-14-search-under-rls-design.md`:
   `> The X-Total-* headers described here were replaced by the search envelope's totalCapped (#24).`
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 git add crates/cxp-api/src/routes docs/specs
@@ -774,5 +774,5 @@ Refs #24"
 
 ### Task 5: full gate run and record as shipped
 
-- [ ] After the PR exists and before merge (orchestrator): set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes, in a final `docs:` commit.
-- [ ] Run every gate in Global Constraints from the worktree, including `podman build -t otto-cxp:check .`, and record per-binary counts and `git rev-parse HEAD`.
+- [x] After the PR exists and before merge (orchestrator): set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes, in a final `docs:` commit.
+- [x] Run every gate in Global Constraints from the worktree, including `podman build -t otto-cxp:check .`, and record per-binary counts and `git rev-parse HEAD`.

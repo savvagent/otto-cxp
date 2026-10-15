@@ -1,6 +1,6 @@
 # One casing convention for the `/api/v1` wire format — design
 
-**Status:** IN PROGRESS
+**Status:** IMPLEMENTED (#39)
 **Issue:** #24
 
 ## Brief
