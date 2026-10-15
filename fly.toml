@@ -6,15 +6,21 @@
 #
 # Database: `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with
 # otto-platform, otto-factory, and otto-flags (shared for cost; split before
-# real customers). otto-cxp connects as `cxp_server`, which owns only
-# `otto_cxp` and holds no superuser-equivalent privilege; boot refuses a
-# privileged role, or one that can connect to another service's database, here
-# (FLY_APP_NAME is set on every Fly machine). Isolation
+# real customers). otto-cxp serves as `cxp_server`, which owns nothing and holds
+# no superuser-equivalent privilege; boot refuses a privileged role, one that
+# can connect to another service's database, or one that owns anything in
+# `otto_cxp`, may TRUNCATE or add a TRIGGER to a table, or may CREATE or create
+# TEMPORARY tables there, here (FLY_APP_NAME is set on every Fly
+# machine). Migrations run in the release command as `cxp_owner`, the owner
+# (#27; docs/deploy/fly.md, "Database role"). Isolation
 # rests on `SET LOCAL ROLE otto_app` under row-level security; cxp-server
 # proves that at boot.
 #
 # Secrets (`fly secrets set`, never here):
 #   DATABASE_URL                    as cxp_server (docs/deploy/fly.md, "Database role")
+#   CXP_MIGRATION_DATABASE_URL      as cxp_owner; read only by the release command
+#   CXP_RUN_MIGRATIONS              false, duplicating [env] below so a rollback to a
+#                                   release from before #27 does not migrate either
 #   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
 #   CXP_PLATFORM_WEBHOOK_SECRET     otto_whsec_... from `resource set-webhook`
 #   CXP_ENCRYPTION_KEY              32 bytes base64 (`openssl rand -base64 32`); seals the
@@ -28,6 +34,12 @@ kill_timeout = 30
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  # Migrations, as the owner (CXP_MIGRATION_DATABASE_URL), in a temporary machine
+  # of the new image before any machine is updated; a failure aborts the deploy.
+  # The image's ENTRYPOINT is cxp-server, so this runs `cxp-server migrate`.
+  release_command = "migrate"
+
 [env]
   CXP_BIND = "0.0.0.0:8080"
   CXP_PUBLIC_URL = "https://otto-cxp.savvagent.com"
@@ -39,6 +51,9 @@ kill_timeout = 30
   CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
   # Small: otto-db is a shared 512 MB instance.
   CXP_DB_MAX_CONNECTIONS = "5"
+  # The serving role owns nothing and cannot migrate; the release command does.
+  # A deployment refuses to serve with this on.
+  CXP_RUN_MIGRATIONS = "false"
   # The web console's sign-in is off until the first-party client is registered at the
   # platform and CXP_ENCRYPTION_KEY is set (docs/deploy/fly.md, "Web console sign-in"); then
   # set the printed client id here.
@@ -68,7 +83,9 @@ kill_timeout = 30
     method = "GET"
     interval = "15s"
     timeout = "5s"
-    # Migrations run at startup under an advisory lock.
+    # Boot connects, checks the database role, proves tenant isolation, and asks
+    # the platform before it serves; migrations ran in the release command.
+    # A database role the hourly re-check refuses fails this check too.
     grace_period = "30s"
 
 [[vm]]

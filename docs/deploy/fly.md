@@ -35,18 +35,21 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   trail by up to the idle period.
 - **Database** `otto_cxp` on `otto-db`, the unmanaged Fly Postgres shared with `otto_platform`,
   `otto_factory`, and `otto_flags`. Plain Postgres 16 is enough: pgvector is NOT needed (the
-  schema uses only the stock `pg_trgm`). otto-cxp connects as `cxp_server`, a dedicated role
-  that owns `otto_cxp` and nothing else: not a superuser, not BYPASSRLS, no CREATEDB or
-  CREATEROLE, a member of `otto_app`, and the only role besides superusers that may connect to
-  `otto_cxp` (see [Database role](#database-role)). Tenant transactions run as `otto_app`
-  under row-level security, which `cxp-server` proves at boot
+  schema uses only the stock `pg_trgm`). otto-cxp serves as `cxp_server`, a dedicated role
+  that owns nothing: not a superuser, not BYPASSRLS, no CREATEDB or CREATEROLE, a member of
+  `otto_app` and `cxp_runtime`, and with `cxp_owner` the only roles besides superusers that may
+  connect to `otto_cxp`. `cxp_owner` owns `otto_cxp` and everything in it, and logs in only from
+  the release command, to migrate (see [Database role](#database-role)). Tenant transactions run
+  as `otto_app` under row-level security, which `cxp-server` proves at boot
   (`tenant isolation enforced as role "otto_app"`) and refuses to start without; everything
-  else (migrations, the sweep and usage shipper, tombstones, `/readyz`) runs as `cxp_server`,
-  which FORCE ROW LEVEL SECURITY binds too, as long as it does not alter or truncate its own
-  tables. A deployment refuses to serve when the connecting role is, or can `SET ROLE` to, a
-  superuser-equivalent role, or can connect to another service's database
-  ([#16](https://github.com/savvagent/otto-cxp/issues/16)), so the role `fly postgres attach`
-  creates, a superuser on the whole instance, is refused.
+  else (the sweep and usage shipper, tombstones, `/readyz`) runs as `cxp_server`, which RLS binds
+  like any non-owner and which can neither alter, drop, nor truncate a table
+  ([#27](https://github.com/savvagent/otto-cxp/issues/27)). A deployment refuses to serve when
+  the connecting role is, or can `SET ROLE` to, a superuser-equivalent role, or can connect to
+  another service's database ([#16](https://github.com/savvagent/otto-cxp/issues/16)), or owns
+  anything in `otto_cxp` or may `TRUNCATE` or add a `TRIGGER` to a table (#27), so the role
+  `fly postgres attach` creates, a superuser on the whole instance, is refused, and so is the
+  owner.
   Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
   planner off index paths for `ILIKE`, `%`, and `@@`; since
   [#17](https://github.com/savvagent/otto-cxp/issues/17) they look candidates up in their own
@@ -57,14 +60,20 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   watches it, are in [Search index storage](#search-index-storage-34). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
-- **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
-  advisory lock. Never run the platform's migrations here.
+- **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`). They run in Fly's release
+  command (`[deploy] release_command = "migrate"`, so `cxp-server migrate` under the image's
+  entrypoint), as `cxp_owner` through `CXP_MIGRATION_DATABASE_URL`, in a temporary machine of the
+  new image before any machine is updated, under sqlx's advisory lock; a failure aborts the
+  deploy and leaves the old release serving. The serving machines run with
+  `CXP_RUN_MIGRATIONS=false` and never migrate. Never run the platform's migrations here.
 
 ## Secrets
 
 | Secret | What | Where from |
 |---|---|---|
-| `DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_server` | [Database role](#database-role) (replaces the one `fly postgres attach` set) |
+| `DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_server` (the runtime role, which owns nothing) | [Database role](#database-role) (replaces the one `fly postgres attach` set) |
+| `CXP_MIGRATION_DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_owner`. Read only by the release command (`cxp-server migrate`); a deployment's `migrate` refuses to run without it, and the serving process never reads it | [Split the migration owner](#runbook-split-the-migration-owner-from-the-runtime-role-human-only-rob), S6 (staged, so only a release that sheds it receives it) |
+| `CXP_RUN_MIGRATIONS` | `false`. Also in `fly.toml` `[env]`; kept as a secret (which wins over `[env]`) so a rollback to an image from before #27, whose `fly.toml` lacks it, does not try to migrate as the runtime role | Same runbook, S1 |
 | `CXP_INTROSPECTION_SECRET` | `otto_rs_...`, authenticates every call to the platform | `resource rotate-secret` |
 | `CXP_PLATFORM_WEBHOOK_SECRET` | `otto_whsec_...`, verifies platform webhooks | `resource set-webhook` |
 | `CXP_ENCRYPTION_KEY` | 32 bytes, base64. Never used directly: two HKDF-SHA256 subkeys seal the web console's session tokens at rest and its in-flight sign-in cookie. Required only once `CXP_CONSOLE_CLIENT_ID` is set; rotating it signs every console user out | `openssl rand -base64 32` |
@@ -74,21 +83,63 @@ Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set 
 
 ## Database role
 
-otto-cxp connects to `otto-db` as `cxp_server`: LOGIN, NOSUPERUSER, NOBYPASSRLS, NOCREATEDB,
-NOCREATEROLE, NOREPLICATION, CONNECTION LIMIT 15, a member of `otto_app` (so tenant
-transactions can `SET LOCAL ROLE otto_app`), granted `SET` on the parameter
-`app.console_session_lookup`, and the owner of database `otto_cxp` and every object in it.
-Owning the database lets it run otto-cxp's migrations (`pg_trgm` is a trusted extension a
-database owner may create; the parameter grant lets it define migration 0003's
-`console_session_org`, whose `SET` clause names that parameter). FORCE ROW LEVEL SECURITY binds it as the tables' owner, so its background work reaches
-other orgs' rows only through the maintenance policies, but only while it leaves its own tables
-alone: an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, `DISABLE ROW LEVEL
-SECURITY`, or `DROP POLICY`, and `TRUNCATE` ignores RLS altogether, so code running as
-`cxp_server` could switch RLS off on, or empty, `otto_cxp`'s tables (and nothing beyond them).
-Splitting the migration owner from the runtime role closes that:
-[#27](https://github.com/savvagent/otto-cxp/issues/27). `CONNECT` on `otto_cxp`,
-`otto_platform`, `otto_factory`, `otto_flags`, and `repmgr` is revoked from `PUBLIC`, so
-`cxp_server` can open no other service's database.
+Three roles, since #27 ([split runbook](#runbook-split-the-migration-owner-from-the-runtime-role-human-only-rob)):
+
+| Role | Login | Owns | Holds | Used by |
+|---|---|---|---|---|
+| `cxp_server` | yes | nothing | member of `otto_app` and `cxp_runtime`; `CONNECT` on `otto_cxp` | the serving machines (`DATABASE_URL`) |
+| `cxp_owner` | yes | database `otto_cxp` and every object in it | `SET` on the parameter `app.console_session_lookup` | the release command, `cxp-server migrate` (`CXP_MIGRATION_DATABASE_URL`) |
+| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0005) | the runtime's grants beyond `otto_app` |
+
+All three are NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION; `cxp_server`
+has CONNECTION LIMIT 15, `cxp_owner` 3. `cxp_server` is a member of `otto_app` so tenant
+transactions can `SET LOCAL ROLE otto_app`, and of `cxp_runtime` for the one thing it does as
+itself that `otto_app` may not: write the `org.deleted` tombstone. A migration cannot name a
+deployment's login, but it can name `cxp_runtime`; a later migration that gives background work
+a new privilege grants it there too. `cxp_owner` owns the database so it can migrate (`pg_trgm`
+is a trusted extension a database owner may create; the parameter grant lets it define
+migration 0003's `console_session_org`, whose `SET` clause names that parameter).
+
+Why the split: an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, `DISABLE ROW LEVEL
+SECURITY`, or `DROP POLICY`, and `TRUNCATE` ignores RLS altogether, so any SQL running as an
+owning runtime role (the sweep, the shipper, the tombstone, `/readyz`, a future injection bug)
+could switch tenant isolation off for every org. `cxp_server` owns nothing and holds no
+`TRUNCATE` or `TRIGGER`, so it cannot. The owner never serves: its credential is used only by the
+release command. (A NOLOGIN owner that `cxp_server` could assume would not do: assuming a role is
+a `SET ROLE`, which any SQL the runtime login runs could repeat; and a NOLOGIN owner assumed by
+a second login only moves the exposure to that login's credential.)
+
+**The owner's credential and the serving machines.** Fly secrets are app-wide, so
+`CXP_MIGRATION_DATABASE_URL` reaches every serving machine, not only the release command's. A
+serving `cxp-server` therefore sheds it before doing anything else: finding it in its
+environment, it re-executes itself with the same arguments and the environment minus that
+variable, before reading its configuration or starting a thread (`unsetenv` alone would leave the
+original environment block in memory and in `/proc/<pid>/environ`). It logs `removed
+CXP_MIGRATION_DATABASE_URL from the serving process's environment; only cxp-server migrate uses
+it`, never reads or logs the value, and refuses to start if the re-exec fails
+(`crates/cxp-server/tests/secret_env.rs` proves it on the built binary). So SQL run as
+`cxp_server` cannot reach the owner (it is a different login), and code execution or an
+environment dump in the serving process does not find its credential either.
+
+What remains: Fly's init (PID 1, root) still holds the app's secrets for the machine's life, so
+root on a serving machine (`fly ssh console`, or an exploit that escalates from the
+unprivileged `cxp` user to root) can read the owner's credential, and so can anyone with the
+app's Fly deploy token (`fly ssh`, or a machine they start). Closing that means the owner's
+credential living outside this app: a separate Fly app (say `otto-cxp-migrate`) holding only
+`CXP_MIGRATION_DATABASE_URL` and running `cxp-server migrate` as a one-off machine from the
+deploy job before `fly deploy`. That is a follow-up,
+[#45](https://github.com/savvagent/otto-cxp/issues/45), not done here: it adds an app, its own
+deploy token, and ordering in CI.
+
+The `SECURITY DEFINER` functions run as their owner, `cxp_owner`: `console_session_org` (the
+console's cookie lookup, which `cxp_server` may call through `otto_app`'s `EXECUTE`) and
+`expire_removed_members` (the sweep). FORCE ROW LEVEL SECURITY binds `cxp_owner` too, and the
+`console_sessions_lookup` policy admits whichever role owns `console_session_org` at query time,
+so the lookup followed the ownership transfer with nothing to change. The maintenance policies
+name no role, so they bind the non-owning `cxp_server` exactly as they bound the owner.
+
+`CONNECT` on `otto_cxp`, `otto_platform`, `otto_factory`, `otto_flags`, and `repmgr` is revoked
+from `PUBLIC`, so neither login can open another service's database.
 
 `otto_app` is shared by every otto service, which is one more reason the revoke matters: a role
 that could connect to `otto_platform` would hold whatever `otto_app` holds there. So, a rule for
@@ -121,13 +172,46 @@ current user, and refuses when either:
   `CONNECT` on a database that is not another service's (every database created without a
   revoke has it, such as each test database `cargo test` creates).
 
+A serving process (not `cxp-server migrate`, whose role is meant to own) also refuses when either
+user owns, or is a member of a role that owns, anything in `otto_cxp`: the database, a schema
+(`public` follows the database owner through `pg_database_owner`), a table, sequence, index or
+other relation, a function, a type, or an extension; or may `TRUNCATE` or add a `TRIGGER` to any
+table, view, or foreign table; or may `CREATE` in the database or one of its schemas, or create
+`TEMPORARY` tables there (a temporary table named like a tenant table would shadow it, with no
+RLS, for every later transaction on that pooled connection; `CREATE` on a schema would let it
+plant an overload a `SECURITY DEFINER` function resolves) — each through any role it inherits or
+can only `SET ROLE` to, `PUBLIC` included. And it refuses `CXP_RUN_MIGRATIONS=true` (the runtime
+role cannot migrate), and a runtime role that lacks what its own work needs: `INSERT` on
+`deleted_orgs` (the tombstone) and inheriting `otto_app` (the background tasks); the message
+names the fix (`GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "<role>"`,
+`GRANT otto_app TO "<role>" WITH INHERIT TRUE`). Migration 0006 also pins both `SECURITY DEFINER`
+functions to `search_path = pg_catalog, public, pg_temp` with every call schema-qualified.
+
 It logs, for example,
 `database role "otto_cxp" is SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION: refusing to serve`,
+`database role "cxp_owner" ...; it owns database "otto_cxp", schema "public", table ... (N objects in all)`
+for the owner given as `DATABASE_URL`,
 `database role "cxp_server" (session user "otto_cxp"): session user "otto_cxp" is SUPERUSER`
 for a superuser login whose connections `SET ROLE cxp_server`, or
 `database role "cxp_server" can connect to database "otto_platform" (through "otto_app")`.
 A developer's machine (loopback URLs, no `FLY_APP_NAME`, none of those databases on its
 Postgres) only warns, since a local Postgres hands out a superuser.
+
+**The check runs again every hour,** after the retention sweep, because a later `ALTER ROLE cxp_server BYPASSRLS`, `GRANT pg_read_all_data TO
+cxp_server`, or `GRANT TRUNCATE ... TO cxp_server` would otherwise go unnoticed until a restart.
+When the role is one a deployment would refuse, the machine logs at `error`
+`the database role changed after boot: <summary>; /readyz answers 503 until it is fixed`, and
+`/readyz` answers 503 `{"status":"unready","reason":"database role refused"}` (each probe logs a
+`warn` with that fixed reason). `/readyz` is the app's only health check, so with one machine
+**this takes the service out of rotation**, deliberately: it is the role boot refuses. The outage
+lasts until the next hourly pass after the fix or a restart. To recover, undo the change (revoke
+the grant or attribute); the next pass clears the alarm and logs `the database role re-check
+passes again`, or restart the machines (`fly apps restart otto-cxp`) to re-run the boot check at
+once. The re-check gives up after 30 seconds; a failed or timed-out re-check leaves the alarm as
+it was and logs `warn`, and from the third failure in a row `error` (`the role is not being
+watched`). The hourly pass also re-checks the runtime grants and logs `error` if one went
+missing (without the alarm: org.deleted would fail and be retried by the platform, nothing is
+exposed).
 
 ### Runbook: from the attach role to `cxp_server` (human-only, Rob)
 
@@ -519,6 +603,310 @@ otto_cxp`, `DROP OWNED BY <attach role>;` to clear its leftover grants and defau
 there, then `DROP ROLE <attach role>;`) is optional; `DROP ROLE` refuses while it still holds
 anything elsewhere.
 
+### Runbook: split the migration owner from the runtime role (human-only, Rob)
+
+[#27](https://github.com/savvagent/otto-cxp/issues/27). It starts from the state R1 to R7 left:
+`cxp_server` owns `otto_cxp` and everything in it and is the role the app connects as. It ends
+with `cxp_owner` owning everything, migrating in the release command, and `cxp_server` owning
+nothing. Every step is production DDL on the shared `otto-db`, or a production secret; the agent
+that wrote this ran the SQL only against a local container put in the same state. Do the steps in
+order. **S0 to S4, and S6's staging of the secret, must be done before the PR for #27 merges**:
+that release refuses to serve as a role that owns anything or may create temporary tables, and
+its release command needs `CXP_MIGRATION_DATABASE_URL`. Until S3, nothing changes for the running
+release but a restart; from S3 on it runs as a non-owner, which it can do because S1 turned its
+migrations off, and S4 proves it. Paste each SQL block whole; a failure inside `BEGIN ... COMMIT` rolls
+the block back.
+
+**S0. Look first (read-only).** In `fly postgres connect -a otto-db`:
+
+```sql
+\set ON_ERROR_STOP on
+-- 150000 or more: schema public follows the database owner (pg_database_owner).
+SHOW server_version_num;
+-- cxp_server owns otto_cxp; cxp_owner and cxp_runtime do not exist yet; otto_app does.
+SELECT datname, pg_get_userbyid(datdba) AS owner, datacl FROM pg_database WHERE datname = 'otto_cxp';
+SELECT rolname, rolcanlogin, rolsuper, rolbypassrls FROM pg_roles
+WHERE rolname IN ('cxp_server', 'cxp_owner', 'cxp_runtime', 'otto_app') ORDER BY 1;
+\c otto_cxp
+-- One row: cxp_server, owner of every table.
+SELECT tableowner, count(*) FROM pg_tables WHERE schemaname = 'public' GROUP BY 1;
+-- The parameter grant R1 made.
+SELECT parname, paracl FROM pg_parameter_acl;
+-- Schema public: {pg_database_owner=UC/pg_database_owner,=U/pg_database_owner} on a cluster
+-- initialised on 15+. A "=UC" (PUBLIC may CREATE, as on a cluster upgraded from 14 or earlier)
+-- is removed in S3.
+SELECT nspname, nspacl FROM pg_namespace WHERE nspname = 'public';
+```
+
+and the secret names (values are never shown): `fly secrets list -a otto-cxp`.
+
+**S1. Create the roles, and turn migrations off on the running release.** First the roles, in the
+`fly postgres connect -a otto-db` session. Generate `cxp_owner`'s password locally and keep it in
+your password manager (hex, so it needs no escaping in a URL): `openssl rand -hex 32`.
+
+```sql
+\set ON_ERROR_STOP on
+-- The migration owner. It logs in only from the release command: CONNECTION LIMIT covers its
+-- 2-connection pool and a psql session.
+CREATE ROLE cxp_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION
+  CONNECTION LIMIT 3;
+\password cxp_owner
+-- 0003's console_session_org names this parameter in its SET clause; a fresh database migrated
+-- by cxp_owner needs the grant (R1 gave it to cxp_server, which no longer migrates).
+GRANT SET ON PARAMETER app.console_session_lookup TO cxp_owner;
+-- The runtime's grants beyond otto_app (migration 0005 and later grant to this role).
+CREATE ROLE cxp_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT cxp_runtime TO cxp_server;
+```
+
+Then one secret, **not staged**: it restarts the running release, which is still the owner and
+boots as before, with migrations off from now on (`CXP_RUN_MIGRATIONS is off` in its log).
+`CXP_RUN_MIGRATIONS` stays a secret for good (a secret wins over `fly.toml`'s `[env]`): after #27
+merges `fly.toml` sets it too, but a rollback to an image from before #27 (whose `fly.toml` does
+not) needs it, or that release would try to migrate as a non-owner and fail to boot. The owner's
+credential is **not** set here: the running release cannot shed it, so it is staged in S6 and
+reaches only the release that does.
+
+```bash
+fly secrets set -a otto-cxp CXP_RUN_MIGRATIONS=false
+curl -s https://otto-cxp.savvagent.com/readyz      # ready
+```
+
+From here until #27 deploys, nothing runs migrations: merge no other PR that adds one before
+#27 (its release would ship without migrating).
+
+**S2. Prove `cxp_owner` before giving it anything (read-only).** `fly proxy 15499:5432 -a otto-db`
+in a second terminal, then log in to the `postgres` database (it cannot open `otto_cxp` until it
+owns it in S3: R3 revoked `PUBLIC`'s `CONNECT` there), with the password from S1:
+`psql "postgres://cxp_owner@localhost:15499/postgres"`
+
+```sql
+-- cxp_owner, cxp_owner: nothing switched roles on connect
+SELECT session_user, current_user;
+-- 0 rows: no privilege boot refuses, directly or through membership
+SELECT r.rolname FROM pg_roles r
+WHERE (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
+       OR r.rolname IN ('pg_execute_server_program', 'pg_read_server_files',
+                        'pg_write_server_files', 'pg_read_all_data', 'pg_write_all_data',
+                        'pg_signal_backend', 'pg_read_all_stats', 'pg_monitor',
+                        'pg_create_subscription', 'pg_maintain'))
+  AND pg_has_role(current_user, r.oid, 'MEMBER');
+-- t for postgres only (otto_cxp follows in S4)
+SELECT datname, has_database_privilege(current_user, oid, 'CONNECT') AS may_connect
+FROM pg_database WHERE NOT datistemplate ORDER BY datname;
+```
+
+**S3. Move ownership to `cxp_owner`.** As postgres, in `otto_cxp`. `REASSIGN OWNED` takes an
+exclusive lock on every table, so the block waits at most 5 seconds for each; on `canceling
+statement due to lock timeout` nothing changed: paste it again, or run it while the app is idle.
+
+```sql
+\c otto_cxp
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+DO $$
+BEGIN
+  IF current_database() <> 'otto_cxp' THEN
+    RAISE EXCEPTION 'run this connected to otto_cxp, not %', current_database();
+  END IF;
+  -- A fresh setup has no tables yet; otherwise cxp_server, which ran the migrations, owns them.
+  IF to_regclass('public.customers') IS NOT NULL
+     AND (SELECT relowner FROM pg_class WHERE oid = 'public.customers'::regclass)
+         <> 'cxp_server'::regrole THEN
+    RAISE EXCEPTION 'cxp_server does not own public.customers: S3 already ran, or R2 did not';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = 'cxp_server'::regrole AND datname <> 'otto_cxp')
+     OR EXISTS (SELECT 1 FROM pg_tablespace WHERE spcowner = 'cxp_server'::regrole) THEN
+    RAISE EXCEPTION 'cxp_server owns a database or tablespace besides otto_cxp, which REASSIGN OWNED would move too';
+  END IF;
+  IF NOT pg_has_role('cxp_server', 'cxp_runtime', 'MEMBER') THEN
+    RAISE EXCEPTION 'cxp_runtime is not granted to cxp_server: run S1 first';
+  END IF;
+END $$;
+REASSIGN OWNED BY cxp_server TO cxp_owner;
+ALTER DATABASE otto_cxp OWNER TO cxp_owner;
+-- The transfer rewrote cxp_server's own CONNECT grant (made while it owned the database) to the
+-- new owner; without this it could open no new connection.
+GRANT CONNECT ON DATABASE otto_cxp TO cxp_server;
+-- What the old release does as itself, now as a non-owner: the org.deleted tombstone. Migration
+-- 0005 grants the same; this covers the release still running until #27 deploys (and does
+-- nothing on a fresh setup, where 0005 will).
+DO $$
+BEGIN
+  IF to_regclass('public.deleted_orgs') IS NOT NULL THEN
+    GRANT INSERT ON public.deleted_orgs TO cxp_runtime;
+  END IF;
+END $$;
+-- Default privileges belong to a role and do not move: tables a later migration creates as
+-- cxp_owner get otto_app's grants; cxp_server creates nothing any more.
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_owner IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO otto_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_owner IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO otto_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
+  REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM otto_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
+  REVOKE USAGE, SELECT ON SEQUENCES FROM otto_app;
+-- Only a migrating role needs it.
+REVOKE SET ON PARAMETER app.console_session_lookup FROM cxp_server;
+-- No temporary tables: one named like a tenant table would shadow it (unqualified names resolve
+-- through pg_temp first) for every later transaction on that pooled connection, with no RLS.
+-- cxp_owner keeps TEMPORARY as the owner; nothing in otto-cxp uses temporary tables.
+REVOKE TEMPORARY ON DATABASE otto_cxp FROM PUBLIC;
+-- No-op on a cluster initialised on 15+; on one upgraded from earlier, PUBLIC could create in
+-- public and plant an overload a SECURITY DEFINER function would resolve.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+COMMIT;
+```
+
+The `console_sessions_lookup` policy needs nothing: it admits whichever role owns
+`console_session_org`, now `cxp_owner`, and the function runs as that owner.
+
+**S4. Prove both roles (read-only).** As postgres in `otto_cxp`:
+
+```sql
+-- 0 rows: cxp_server owns nothing, directly or through a role it can SET ROLE to.
+SELECT 'relation' AS kind, c.relname::text AS name FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+  AND pg_has_role('cxp_server', c.relowner, 'MEMBER')
+UNION ALL
+SELECT 'function', p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND pg_has_role('cxp_server', p.proowner, 'MEMBER')
+UNION ALL
+SELECT 'schema', n.nspname::text FROM pg_namespace n
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_t%'
+  AND pg_has_role('cxp_server', n.nspowner, 'MEMBER')
+UNION ALL
+SELECT 'database', d.datname::text FROM pg_database d
+WHERE pg_has_role('cxp_server', d.datdba, 'MEMBER')
+UNION ALL
+SELECT 'extension', e.extname::text FROM pg_extension e
+WHERE e.extname <> 'plpgsql' AND pg_has_role('cxp_server', e.extowner, 'MEMBER');
+-- 0 rows: no table it, or a role it can SET ROLE to, may TRUNCATE or add a trigger to.
+SELECT c.relname, r.rolname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN pg_roles r
+WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND pg_has_role('cxp_server', r.oid, 'MEMBER')
+  AND (has_table_privilege(r.oid, c.oid, 'TRUNCATE')
+       OR has_table_privilege(r.oid, c.oid, 'TRIGGER'));
+-- 0 rows: nowhere it, or a role it can SET ROLE to, may create a schema, an object, or a
+-- temporary table (PUBLIC counts).
+SELECT r.rolname, 'database' AS on_, has_database_privilege(r.oid, 'otto_cxp', 'CREATE') AS create_,
+       has_database_privilege(r.oid, 'otto_cxp', 'TEMPORARY') AS temporary_
+FROM pg_roles r WHERE pg_has_role('cxp_server', r.oid, 'MEMBER')
+  AND (has_database_privilege(r.oid, 'otto_cxp', 'CREATE')
+       OR has_database_privilege(r.oid, 'otto_cxp', 'TEMPORARY'))
+UNION ALL
+SELECT r.rolname, 'schema ' || n.nspname, true, false
+FROM pg_roles r CROSS JOIN pg_namespace n
+WHERE pg_has_role('cxp_server', r.oid, 'MEMBER')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_t%'
+  AND has_schema_privilege(r.oid, n.oid, 'CREATE');
+-- t, t, t, t, t: it connects, inherits otto_app, writes the tombstone, runs the console lookup,
+-- and runs the sweep's tombstone expiry.
+SELECT has_database_privilege('cxp_server', 'otto_cxp', 'CONNECT') AS connects,
+       pg_has_role('cxp_server', 'otto_app', 'USAGE') AS assumes_otto_app,
+       has_table_privilege('cxp_server', 'public.deleted_orgs', 'INSERT') AS tombstone,
+       has_function_privilege('cxp_server', 'public.console_session_org(bytea)', 'EXECUTE') AS lookup,
+       has_function_privilege('cxp_server', 'public.expire_removed_members()', 'EXECUTE') AS sweep;
+-- NULL, with no error: the console's cookie lookup as the runtime role, running as its new owner
+-- (it needs cxp_owner's SET grant from S1). Read-only.
+SET ROLE cxp_server;
+SELECT console_session_org(decode(repeat('00', 32), 'hex'));
+RESET ROLE;
+-- cxp_owner for each: it owns the database, the tables, and the console lookup.
+SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'otto_cxp';
+SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = 'public';
+SELECT pg_get_userbyid(proowner) FROM pg_proc
+WHERE oid = 'public.console_session_org(bytea)'::regprocedure;
+```
+
+Then, through the proxy, `psql "postgres://cxp_owner@localhost:15499/otto_cxp"` and repeat S2's
+queries (now `t` for `otto_cxp` and `postgres` only), plus `SELECT has_schema_privilege('public',
+'CREATE');` (`t`: it can migrate). And prove the running release boots as a non-owner:
+
+```bash
+fly apps restart otto-cxp
+curl -s https://otto-cxp.savvagent.com/readyz      # ready
+fly logs -a otto-cxp --no-tail                     # CXP_RUN_MIGRATIONS is off; tenant isolation enforced as role "otto_app"
+```
+
+**S5. Undo, only before S6.** S3 alone, back to `cxp_server` owning everything (as postgres; the
+`\c` matters: run from the `postgres` database, `REASSIGN OWNED` would move only the database and
+leave the tables with `cxp_owner`). The `TEMPORARY` and `CREATE` revokes stay: the old release
+needs neither. `CXP_RUN_MIGRATIONS=false` stays too; unset it (`fly secrets unset -a otto-cxp
+CXP_RUN_MIGRATIONS`) only if the old release should migrate at boot again.
+
+```sql
+\c otto_cxp
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+DO $$
+BEGIN
+  IF current_database() <> 'otto_cxp' THEN
+    RAISE EXCEPTION 'run this connected to otto_cxp, not %', current_database();
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = 'cxp_owner'::regrole AND datname <> 'otto_cxp') THEN
+    RAISE EXCEPTION 'cxp_owner owns another database, which REASSIGN OWNED would move too';
+  END IF;
+  -- Migration 0005 runs only in #27's release command: once it has, S6 happened, and the new
+  -- release refuses an owning runtime role.
+  IF EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version >= 5) THEN
+    RAISE EXCEPTION '#27 is deployed (migration 0005 applied): roll the code back first, never S3';
+  END IF;
+END $$;
+REASSIGN OWNED BY cxp_owner TO cxp_server;
+ALTER DATABASE otto_cxp OWNER TO cxp_server;
+GRANT CONNECT ON DATABASE otto_cxp TO cxp_server;
+GRANT SET ON PARAMETER app.console_session_lookup TO cxp_server;
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO otto_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO otto_app;
+COMMIT;
+```
+
+**S6. Stage the owner's credential, then merge the PR for #27.** Staged, so the running release
+(which cannot shed it) never receives it; it applies with the next deploy, to the release command
+and to the new release, which re-executes itself without it:
+
+```bash
+read -rs PW     # paste cxp_owner's password, then Enter; nothing is shown
+printf 'CXP_MIGRATION_DATABASE_URL=postgres://cxp_owner:%s@otto-db.flycast:5432/otto_cxp?sslmode=disable\n' \
+  "$PW" | fly secrets import -a otto-cxp --stage
+unset PW
+fly secrets list -a otto-cxp        # CXP_MIGRATION_DATABASE_URL listed as staged
+```
+
+(Same host, port, and query string as `DATABASE_URL`; R0 noted them. `read` and `printf` are shell
+builtins: the password reaches neither the history nor the process list.) Then merge; with
+`FLY_DEPLOY` enabled the merge deploys, otherwise `fly deploy -a otto-cxp --remote-only`. Fly
+first runs the release command, `cxp-server migrate`, in a temporary machine as `cxp_owner`; it
+applies 0005 and 0006 (0006 recreates `console_session_org`, whose `SET` clause needs the
+parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
+serving. Then see [Verify](#verify): the release command's log shows `database role "cxp_owner"
+holds no superuser-equivalent privilege ...`, `applying migrations`, `migrations applied`; each
+machine's shows `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment ...`,
+`database role "cxp_server" ... it owns nothing in this database, can TRUNCATE or add a TRIGGER
+to no table, and can create no schema, object, or temporary table in it ...`, `not migrating`,
+`tenant isolation enforced as role "otto_app"`.
+
+Rolling back after S6 means rolling back the code, and the release command is the catch: an image
+from before #27 does not know `migrate` and would start serving inside the release machine until
+Fly's release-command timeout (5 minutes by default) aborts the deploy. Revert the PR (the reverted `fly.toml` has no release command), or deploy the
+previous image with the previous commit's `fly.toml` (`git show <previous commit>:fly.toml >
+/tmp/fly.toml && fly deploy -a otto-cxp --image <previous image> -c /tmp/fly.toml`). Either way
+the `CXP_RUN_MIGRATIONS` secret keeps the old binary from migrating, and S4 proved it serves as
+a non-owner. Never undo S3 after S6: the new release refuses an owning runtime role.
+
+**S7. Nothing to retire.** `cxp_server` keeps its password and `DATABASE_URL`. `cxp_owner`'s
+password lives only in `CXP_MIGRATION_DATABASE_URL` and your password manager; rotate it with
+`\password cxp_owner` and the same `read -rs PW ... | fly secrets import -a otto-cxp` (unstaged
+is fine once #27 is deployed: the serving release sheds it on restart).
+
 ## Search index storage (#34)
 
 Customer and knowledge-base search keep their own index tables, `customer_search_grams` and
@@ -712,7 +1100,11 @@ fly certs add otto-cxp.savvagent.com -a otto-cxp
 
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL to a superuser,
 #    which a deployment refuses: run "Database role" below before step 5 (on a fresh
-#    setup its step R5 imports the secret with --stage, and R6 and R7 follow the first deploy).
+#    setup its step R5 imports the secret with --stage, and R6 and R7 follow the first deploy),
+#    then the split runbook's S1 to S4 and S6's staged secret (with nothing deployed yet,
+#    S1's secret restarts nothing, and S4's checks of tables and console_session_org wait
+#    until after the first deploy, as does its restart).
+#    The first deploy's release command then migrates as cxp_owner.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
 # 3. Register the resource server at the platform (run on the platform's machine).
@@ -847,9 +1239,15 @@ fly logs -a otto-cxp --no-tail
 
 The logs must show, in order:
 
-- `database role "cxp_server" holds no superuser-equivalent privilege (...) ... and can connect
-  to no other service's database; the instance also hosts ...`
-- `applying migrations`
+- from the release command's machine: `database role "cxp_owner" holds no superuser-equivalent
+  privilege (...) ... and can connect to no other service's database; it owns database
+  "otto_cxp", ...`, then `applying migrations`, then `migrations applied`;
+- from each serving machine: `removed CXP_MIGRATION_DATABASE_URL from the serving process's
+  environment; only cxp-server migrate uses it`, then `database role "cxp_server" holds no superuser-equivalent
+  privilege (...) ... and can connect to no other service's database; it owns nothing in this
+  database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or
+  temporary table in it; the instance also hosts ...`
+- `not migrating: migrations run as the database owner through cxp-server migrate`
 - `tenant isolation enforced as role "otto_app"`
 - `the otto platform accepted this service's credential`
 
@@ -905,8 +1303,11 @@ Migrations are append-only: a schema change is a new `crates/cxp-core/migrations
 never an edit, rename, or delete of an existing one. sqlx refuses to boot when an applied
 migration's checksum changed, and CI's `migrations-append-only` job rejects such a PR.
 `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema (a
-rollback of the image works), which means every migration must be additive. They run at boot;
-confirm with the `applying migrations` log line.
+rollback of the image works), which means every migration must be additive. They run in the
+release command as `cxp_owner` (see [Infrastructure](#infrastructure)); confirm with the
+`applying migrations` and `migrations applied` lines in the release command's log. A migration
+that gives the runtime a privilege beyond `otto_app`'s grants it to `cxp_runtime`, guarded by
+`IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_runtime')` as 0005 does.
 
 ## Local seeding (human-only against otto-db)
 

@@ -26,14 +26,53 @@
 //! `GRANT ... WITH INHERIT FALSE, SET TRUE` included), so membership counts
 //! too. `pg_database_owner` is not in the list: every database owner is
 //! implicitly a member of it, and it holds nothing beyond that database.
+//!
+//! Ownership is the other way around row-level security (#27). An owner
+//! may `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, drop a policy, or drop
+//! the table; the owner of a database or schema may drop what is in it; an
+//! extension's owner may drop it with every object it holds. `TRUNCATE`
+//! ignores RLS outright, and `TRIGGER` lets a role attach code that runs as
+//! whoever next writes the table. So the check also reads, per user, the
+//! objects in the current database owned by a role it is or can `SET ROLE`
+//! to ([`DbRole::owned`]), and the tables it may `TRUNCATE` or add a
+//! `TRIGGER` to without owning them ([`DbRole::table_privileges`]). The
+//! runtime role must have neither; the migration owner has the first by
+//! design. Schema `public` is owned by `pg_database_owner`, so the
+//! database's owner is reported as owning it.
+//!
+//! Creating objects is the last way around it ([`DbRole::create_privileges`]).
+//! `TEMPORARY` on the database lets a role create a temporary table named
+//! like a tenant table: `pg_temp` is searched before every other schema for
+//! relations, so unqualified statements later run on that pooled connection,
+//! tenant transactions included, would read and write a table with no RLS,
+//! and a temporary table lives as long as the connection, not the
+//! transaction. `CREATE` on a schema lets a role plant an exact-match
+//! overload of a function a `SECURITY DEFINER` function calls, which then
+//! runs as that function's owner (the CVE-2018-1058 pattern; migration 0006
+//! also schema-qualifies those calls and pins `pg_temp` last). `CREATE` on
+//! the database creates new schemas. So the check reads, per user and for
+//! every role it is a member of (inherited or not), `CREATE` and `TEMPORARY`
+//! on the current database and `CREATE` on each non-system schema, skipping
+//! a database or schema the user owns through membership (reported as owned
+//! already). `PUBLIC` holds `TEMPORARY` on every database by default; the
+//! runbook revokes it.
+//!
+//! Not every kind of object is listed as owned: operators, operator classes
+//! and families, collations, conversions, casts, text-search objects,
+//! foreign-data wrappers and servers, publications, and event triggers are
+//! not (event triggers need a superuser anyway). None of them gets around
+//! row-level security on its own; the kinds that do (relations, the database,
+//! schemas, extensions, functions, and types) are all listed.
 
 use otto_tenant::Db;
 
 use crate::Result;
 
-/// At most this many privileged roles, or reachable databases, are read per
-/// user: one is enough to refuse.
-const MAX_REPORTED: i64 = 8;
+/// At most this many privileged roles, reachable databases, owned objects,
+/// tables it may `TRUNCATE` or add a `TRIGGER` to, or places it may create
+/// in are read per user: one is enough to refuse. Public only so tests can follow it.
+#[doc(hidden)]
+pub const MAX_REPORTED: i64 = 8;
 
 /// The predefined roles whose members reach past this service: server files
 /// and programs, every table in every database they can open, other
@@ -66,6 +105,12 @@ pub const PREDEFINED_ROLES: [&str; 10] = [
 /// would make every test look shared.
 pub const OTHER_SERVICE_DATABASES: [&str; 3] = ["otto_platform", "otto_factory", "otto_flags"];
 
+/// The schemas whose objects count for ownership and table privileges:
+/// every one but the system catalogs, TOAST, and temporary schemas.
+const SCHEMAS: &str = "SELECT n.oid, n.nspname, n.nspowner FROM pg_catalog.pg_namespace n \
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+       AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'";
+
 /// Databases a connection may always open: Postgres's own maintenance
 /// database and Fly's `repmgr` (no service data in either).
 const ALWAYS_REACHABLE: [&str; 2] = ["postgres", "repmgr"];
@@ -92,7 +137,111 @@ pub struct DbRole {
     pub other_databases: Vec<DatabaseAccess>,
     /// The [`OTHER_SERVICE_DATABASES`] that exist on this instance.
     pub shared_with: Vec<String>,
+    /// Objects in the current database owned by a role either user is or
+    /// is a member of, at most `MAX_REPORTED` per user, by kind then
+    /// name. Not read for a superuser user, which owns everything in effect
+    /// and is refused already.
+    pub owned: Vec<OwnedObject>,
+    /// How many objects the users own in all (each user's count, summed),
+    /// of which [`DbRole::owned`] lists the first few.
+    pub owned_total: i64,
+    /// Tables, views, and foreign tables either user, or a role it can `SET
+    /// ROLE` to (inherited or not), may `TRUNCATE` or add a `TRIGGER` to
+    /// without owning them, at most `MAX_REPORTED` per
+    /// user. Not read for a superuser user.
+    pub table_privileges: Vec<TablePrivilege>,
+    /// The current database (`CREATE`, `TEMPORARY`) and schemas (`CREATE`)
+    /// either user, or a role it can `SET ROLE` to (inherited or not), may
+    /// create in without owning them, `PUBLIC`'s grants included: the
+    /// database first, then schemas by name, at most `MAX_REPORTED` per user.
+    /// Not read for a superuser user.
+    pub create_privileges: Vec<CreatePrivilege>,
 }
+
+/// A place one of the session's users may create objects or temporary
+/// tables in without owning it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePrivilege {
+    /// The `session_user` or `current_user` that holds the privileges.
+    pub user: String,
+    /// `"database"` or `"schema"`.
+    pub kind: &'static str,
+    /// The database's or schema's name.
+    pub name: String,
+    /// `"CREATE"`, `"TEMPORARY"` (a database only), or both, in that order.
+    pub privileges: Vec<&'static str>,
+}
+
+impl CreatePrivilege {
+    /// `database "x"` or `schema "public"`, as the summary names it.
+    pub fn object(&self) -> String {
+        format!("{} {:?}", self.kind, self.name)
+    }
+}
+
+/// One object in the current database that one of the session's users owns,
+/// directly or through membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedObject {
+    /// The `session_user` or `current_user` that is, or is a member of, the
+    /// owner.
+    pub user: String,
+    /// One of [`OWNED_KINDS`]: `"database"`, `"schema"`, `"table"`, ...
+    pub kind: &'static str,
+    /// The object's name: schema-qualified when not on the default search
+    /// path, with its argument types for a function.
+    pub name: String,
+    /// The owning role: `user` itself, or a role it can `SET ROLE` to
+    /// (`pg_database_owner` for schema `public`).
+    pub owner: String,
+}
+
+/// A relation one of the session's users may `TRUNCATE` or add a `TRIGGER`
+/// to without owning it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablePrivilege {
+    /// The `session_user` or `current_user` that holds the privileges.
+    pub user: String,
+    pub table: String,
+    /// `"TRUNCATE"`, `"TRIGGER"`, or both, in that order.
+    pub privileges: Vec<&'static str>,
+}
+
+/// The ownership clause of [`DbRole::summary`] for a role that can change
+/// or shadow nothing.
+pub const CLEAN_OWNERSHIP: &str = "it owns nothing in this database, can TRUNCATE or add a \
+    TRIGGER to no table, and can create no schema, object, or temporary table in it";
+
+/// The kinds of owned object reported, in the order they are listed.
+pub const OWNED_KINDS: [&str; 15] = [
+    "database",
+    "schema",
+    "extension",
+    "table",
+    "partitioned table",
+    "view",
+    "materialized view",
+    "foreign table",
+    "sequence",
+    "function",
+    "procedure",
+    "aggregate",
+    "type",
+    "composite type",
+    "index",
+];
+
+/// What the runtime role needs besides being a member of `otto_app`.
+///
+/// - `INSERT on deleted_orgs`: what it does as itself rather than as
+///   `otto_app`, on a table it no longer owns once the migration owner is
+///   split from it (#27): the `org.deleted` tombstone. Migration 0005 grants
+///   it to `cxp_runtime`.
+/// - `inheriting otto_app`: the maintenance sweep, the usage shipper, and the
+///   console lookup run as the connecting role and rely on the table
+///   privileges it holds through `otto_app`; a `NOINHERIT` login, or a grant
+///   `WITH INHERIT FALSE`, is a member that holds none of them.
+pub const RUNTIME_GRANTS: [&str; 2] = ["INSERT on deleted_orgs", "inheriting otto_app"];
 
 /// One privileged role, and which of the session's users holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +320,82 @@ impl DbRole {
         !self.shared_with.is_empty()
     }
 
+    /// Whether either user owns, or can `SET ROLE` to the owner of, an
+    /// object in the current database.
+    pub fn owns_objects(&self) -> bool {
+        !self.owned.is_empty()
+    }
+
+    /// Whether either user can change or shadow the schema, and so step
+    /// around row-level security, without a superuser-equivalent privilege:
+    /// by owning something here, by holding `TRUNCATE` or `TRIGGER` on a
+    /// table, or by holding `CREATE` on the database or a schema or
+    /// `TEMPORARY` on the database.
+    pub fn can_alter_tables(&self) -> bool {
+        self.owns_objects()
+            || !self.table_privileges.is_empty()
+            || !self.create_privileges.is_empty()
+    }
+
+    /// Whether either user is itself a superuser, whose ownership and table
+    /// privileges are not read.
+    fn has_superuser_user(&self) -> bool {
+        self.privileged
+            .iter()
+            .any(|p| p.name == p.user && p.privileges.contains(&Privilege::Superuser))
+    }
+
+    /// The ownership clause of [`DbRole::summary`], without its leading
+    /// `"; "`, or `None` for a superuser session (nothing was read, so
+    /// "owns nothing" would mislead).
+    fn ownership_clause(&self, who: impl Fn(&str) -> String) -> Option<String> {
+        if !self.can_alter_tables() {
+            return (!self.has_superuser_user()).then(|| CLEAN_OWNERSHIP.to_string());
+        }
+        let same = self.session_user == self.current_user;
+        let mut parts = Vec::new();
+        if self.owns_objects() {
+            let items: Vec<String> = self
+                .owned
+                .iter()
+                .map(|o| {
+                    let through = if o.owner == o.user {
+                        String::new()
+                    } else {
+                        format!(" (through {:?})", o.owner)
+                    };
+                    let verb = if same { "" } else { "owns " };
+                    format!("{}{verb}{} {:?}{through}", who(&o.user), o.kind, o.name)
+                })
+                .collect();
+            let subject = if same { "it owns " } else { "" };
+            parts.push(format!(
+                "{subject}{} ({} objects in all)",
+                items.join(", "),
+                self.owned_total
+            ));
+        } else {
+            parts.push("it owns nothing in this database".to_string());
+        }
+        parts.extend(self.table_privileges.iter().map(|t| {
+            format!(
+                "{}can {} table {:?}",
+                who(&t.user),
+                t.privileges.join(", "),
+                t.table
+            )
+        }));
+        parts.extend(self.create_privileges.iter().map(|c| {
+            format!(
+                "{}can {} in {}",
+                who(&c.user),
+                c.privileges.join(", "),
+                c.object()
+            )
+        }));
+        Some(parts.join("; "))
+    }
+
     /// One line for the boot log, naming each privilege and each other
     /// database found, which user holds it, and the services sharing the
     /// instance.
@@ -231,6 +456,10 @@ impl DbRole {
             let sep = if same { " " } else { ": " };
             format!("{subject}{sep}{}", found.join("; "))
         };
+        if let Some(clause) = self.ownership_clause(who) {
+            line.push_str("; ");
+            line.push_str(&clause);
+        }
         if self.shares_the_instance() {
             line.push_str(&format!(
                 "; the instance also hosts {}",
@@ -245,7 +474,8 @@ impl DbRole {
     }
 
     /// A `DbRole` from literals, for tests: `(user, role, privileges)`, with
-    /// no other database reachable and an unshared instance.
+    /// no other database reachable, nothing owned or truncatable, and an
+    /// unshared instance.
     #[doc(hidden)]
     pub fn for_test(
         session_user: &str,
@@ -265,6 +495,10 @@ impl DbRole {
                 .collect(),
             other_databases: Vec::new(),
             shared_with: Vec::new(),
+            owned: Vec::new(),
+            owned_total: 0,
+            table_privileges: Vec::new(),
+            create_privileges: Vec::new(),
         }
     }
 }
@@ -294,6 +528,10 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
     let always: Vec<String> = ALWAYS_REACHABLE.iter().map(|d| d.to_string()).collect();
     let mut privileged = Vec::new();
     let mut other_databases = Vec::new();
+    let mut owned = Vec::new();
+    let mut owned_total = 0;
+    let mut table_privileges = Vec::new();
+    let mut create_privileges = Vec::new();
     for user in users {
         let rows: Vec<(String, bool, bool, bool, bool, bool, bool)> = sqlx::query_as(
             "SELECT r.rolname::text, r.rolsuper, r.rolbypassrls, r.rolcreaterole, \
@@ -384,6 +622,171 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
             database,
             through,
         }));
+
+        // The objects here owned by a role the user is or can SET ROLE to,
+        // the first few by kind then name, and how many in all. Each kind is
+        // a way around RLS for its owner: the database and its schemas (drop
+        // or replace what is in them), extensions (dropped with every object
+        // in them), tables and the rest of pg_class (NO FORCE RLS, drop a
+        // policy, ALTER or drop the relation), and functions and types
+        // (replace the code and types the triggers, policies, and the
+        // console lookup run).
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(&format!(
+            "WITH schemas AS ({SCHEMAS}), \
+             objects AS ( \
+               SELECT 'database' AS kind, d.datname::text AS name, d.datdba AS owner \
+               FROM pg_catalog.pg_database d \
+               WHERE d.datname = pg_catalog.current_database() \
+               UNION ALL \
+               SELECT 'schema', s.nspname::text, s.nspowner FROM schemas s \
+               UNION ALL \
+               SELECT 'extension', e.extname::text, e.extowner \
+               FROM pg_catalog.pg_extension e \
+               UNION ALL \
+               SELECT CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' \
+                        WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
+                        WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' \
+                        WHEN 'c' THEN 'composite type' ELSE 'index' END, \
+                      c.oid::pg_catalog.regclass::text, c.relowner \
+               FROM pg_catalog.pg_class c JOIN schemas s ON s.oid = c.relnamespace \
+               WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c', 'i', 'I') \
+               UNION ALL \
+               SELECT CASE p.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate' \
+                        ELSE 'function' END, \
+                      p.oid::pg_catalog.regprocedure::text, p.proowner \
+               FROM pg_catalog.pg_proc p JOIN schemas s ON s.oid = p.pronamespace \
+               UNION ALL \
+               SELECT 'type', t.oid::pg_catalog.regtype::text, t.typowner \
+               FROM pg_catalog.pg_type t JOIN schemas s ON s.oid = t.typnamespace \
+               WHERE t.typrelid = 0 \
+                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e WHERE e.typarray = t.oid) \
+             ) \
+             SELECT o.kind, o.name, pg_catalog.pg_get_userbyid(o.owner)::text, \
+                    count(*) OVER () \
+             FROM objects o \
+             WHERE pg_catalog.pg_has_role($1::text::name, o.owner, 'MEMBER') \
+             ORDER BY pg_catalog.array_position($2::text[], o.kind), o.name \
+             LIMIT $3"
+        ))
+        .bind(&user)
+        .bind(&OWNED_KINDS[..])
+        .bind(MAX_REPORTED)
+        .fetch_all(&mut *conn)
+        .await?;
+        owned_total += rows.first().map_or(0, |r| r.3);
+        owned.extend(rows.into_iter().map(|(kind, name, owner, _)| {
+            let known = OWNED_KINDS.into_iter().find(|k| *k == kind);
+            // Unreachable: the query only produces OWNED_KINDS. Should the
+            // two drift, the object is still reported, as "object", rather
+            // than dropped from a list that decides whether to refuse.
+            debug_assert!(known.is_some(), "kind {kind:?} is not in OWNED_KINDS");
+            OwnedObject {
+                user: user.clone(),
+                kind: known.unwrap_or("object"),
+                name,
+                owner,
+            }
+        }));
+
+        // Relations it may TRUNCATE (which ignores RLS) or add a TRIGGER to
+        // (code that runs as whoever writes next) without owning them.
+        // has_table_privilege(user, ...) counts only what the user inherits;
+        // a NOINHERIT login, or a grant WITH INHERIT FALSE, SET TRUE, still
+        // reaches a role's privileges by SET ROLE, so each role the user is a
+        // member of (itself included) is asked in turn.
+        let rows: Vec<(String, bool, bool)> = sqlx::query_as(&format!(
+            "WITH schemas AS ({SCHEMAS}), \
+             roles AS ( \
+               SELECT r.oid FROM pg_catalog.pg_roles r \
+               WHERE pg_catalog.pg_has_role($1::text::name, r.oid, 'MEMBER') \
+             ), \
+             relations AS ( \
+               SELECT c.oid, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_table_privilege(r.oid, c.oid, 'TRUNCATE')) \
+                        AS can_truncate, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_table_privilege(r.oid, c.oid, 'TRIGGER')) \
+                        AS can_trigger \
+               FROM pg_catalog.pg_class c JOIN schemas s ON s.oid = c.relnamespace \
+               WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 AND NOT pg_catalog.pg_has_role($1::text::name, c.relowner, 'MEMBER') \
+             ) \
+             SELECT oid::pg_catalog.regclass::text, can_truncate, can_trigger \
+             FROM relations WHERE can_truncate OR can_trigger \
+             ORDER BY 1 \
+             LIMIT $2"
+        ))
+        .bind(&user)
+        .bind(MAX_REPORTED)
+        .fetch_all(&mut *conn)
+        .await?;
+        table_privileges.extend(rows.into_iter().map(|(table, truncate, trigger)| {
+            TablePrivilege {
+                user: user.clone(),
+                table,
+                privileges: [(truncate, "TRUNCATE"), (trigger, "TRIGGER")]
+                    .into_iter()
+                    .filter_map(|(has, p)| has.then_some(p))
+                    .collect(),
+            }
+        }));
+
+        // Where it may create without owning: CREATE and TEMPORARY on the
+        // current database (a temporary table shadows a tenant table through
+        // pg_temp), CREATE on a schema (an overload a SECURITY DEFINER
+        // function resolves). As for TRUNCATE, each role the user is a
+        // member of is asked, so a privilege one SET ROLE away counts;
+        // has_*_privilege includes PUBLIC's grants.
+        let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(&format!(
+            "WITH schemas AS ({SCHEMAS}), \
+             roles AS ( \
+               SELECT r.oid FROM pg_catalog.pg_roles r \
+               WHERE pg_catalog.pg_has_role($1::text::name, r.oid, 'MEMBER') \
+             ), \
+             places AS ( \
+               SELECT 0 AS ord, 'database' AS kind, d.datname::text AS name, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_database_privilege(r.oid, d.oid, 'CREATE')) \
+                        AS can_create, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_database_privilege(r.oid, d.oid, 'TEMPORARY')) \
+                        AS can_temp \
+               FROM pg_catalog.pg_database d \
+               WHERE d.datname = pg_catalog.current_database() \
+                 AND NOT pg_catalog.pg_has_role($1::text::name, d.datdba, 'MEMBER') \
+               UNION ALL \
+               SELECT 1, 'schema', s.nspname::text, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_schema_privilege(r.oid, s.oid, 'CREATE')), \
+                      false \
+               FROM schemas s \
+               WHERE NOT pg_catalog.pg_has_role($1::text::name, s.nspowner, 'MEMBER') \
+             ) \
+             SELECT kind, name, can_create, can_temp FROM places \
+             WHERE can_create OR can_temp \
+             ORDER BY ord, name \
+             LIMIT $2"
+        ))
+        .bind(&user)
+        .bind(MAX_REPORTED)
+        .fetch_all(&mut *conn)
+        .await?;
+        create_privileges.extend(rows.into_iter().map(|(kind, name, create, temp)| {
+            CreatePrivilege {
+                user: user.clone(),
+                kind: if kind == "database" {
+                    "database"
+                } else {
+                    "schema"
+                },
+                name,
+                privileges: [(create, "CREATE"), (temp, "TEMPORARY")]
+                    .into_iter()
+                    .filter_map(|(has, p)| has.then_some(p))
+                    .collect(),
+            }
+        }));
     }
     let shared_with: Vec<String> = sqlx::query_scalar(
         "SELECT datname::text FROM pg_catalog.pg_database \
@@ -399,7 +802,36 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
         privileged,
         other_databases,
         shared_with,
+        owned,
+        owned_total,
+        table_privileges,
+        create_privileges,
     })
+}
+
+/// The [`RUNTIME_GRANTS`] the connecting role lacks, in that order: `INSERT
+/// on deleted_orgs` when that table exists and `current_user` may not insert
+/// into it, and `inheriting otto_app` when that role exists and
+/// `current_user` does not hold its privileges (`pg_has_role(..., 'USAGE')`).
+/// Empty before migrations (no table yet) and for the table's owner where
+/// `otto_app` does not exist.
+pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>> {
+    // has_table_privilege and pg_has_role are strict: a NULL oid (no table,
+    // no role) gives NULL.
+    let (no_insert, no_inherit): (bool, bool) = sqlx::query_as(
+        "SELECT coalesce(NOT pg_catalog.has_table_privilege(current_user, \
+                pg_catalog.to_regclass('public.deleted_orgs'), 'INSERT'), false), \
+                coalesce(NOT pg_catalog.pg_has_role(current_user, \
+                (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'otto_app'), 'USAGE'), \
+                false)",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    Ok([no_insert, no_inherit]
+        .into_iter()
+        .zip(RUNTIME_GRANTS)
+        .filter_map(|(missing, grant)| missing.then_some(grant))
+        .collect())
 }
 
 #[cfg(test)]
@@ -416,7 +848,8 @@ mod tests {
             plain.summary(),
             "database role \"cxp_server\" holds no superuser-equivalent privilege (SUPERUSER, \
              BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined role), \
-             directly or through membership, and can connect to no other service's database"
+             directly or through membership, and can connect to no other service's database; \
+             it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it"
         );
         let sup = DbRole::for_test(
             "otto_cxp",
@@ -438,7 +871,7 @@ mod tests {
         );
         assert_eq!(
             member.summary(),
-            r#"database role "cxp_server" is CREATEROLE, CREATEDB; is a member of "pg_monitor" (cross-service predefined role)"#
+            r#"database role "cxp_server" is CREATEROLE, CREATEDB; is a member of "pg_monitor" (cross-service predefined role); it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it"#
         );
     }
 
@@ -464,7 +897,7 @@ mod tests {
         );
         assert_eq!(
             both.summary(),
-            r#"database role "cxp_server" (session user "login"): session user "login" is REPLICATION; current user "cxp_server" is a member of "bypass" (BYPASSRLS)"#
+            r#"database role "cxp_server" (session user "login"): session user "login" is REPLICATION; current user "cxp_server" is a member of "bypass" (BYPASSRLS); it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it"#
         );
         let clean = DbRole::for_test("login", "cxp_server", &[]);
         assert!(clean
@@ -494,7 +927,7 @@ mod tests {
         assert!(reach.shares_the_instance());
         assert_eq!(
             reach.summary(),
-            r#"database role "cxp_server" can connect to database "otto_platform" (through "otto_app"); can connect to database "otto_flags" (through PUBLIC); the instance also hosts "otto_flags", "otto_platform""#
+            r#"database role "cxp_server" can connect to database "otto_platform" (through "otto_app"); can connect to database "otto_flags" (through PUBLIC); it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it; the instance also hosts "otto_flags", "otto_platform""#
         );
 
         // Production after the runbook: clean, on a shared instance.
@@ -502,8 +935,131 @@ mod tests {
         clean.shared_with = vec!["otto_platform".into()];
         assert!(!clean.is_refused_in_a_deployment());
         assert!(clean.summary().ends_with(
-            r#"and can connect to no other service's database; the instance also hosts "otto_platform""#
+            r#"and can connect to no other service's database; it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it; the instance also hosts "otto_platform""#
         ));
+    }
+
+    fn object(user: &str, kind: &'static str, name: &str, owner: &str) -> OwnedObject {
+        OwnedObject {
+            user: user.into(),
+            kind,
+            name: name.into(),
+            owner: owner.into(),
+        }
+    }
+
+    #[test]
+    fn the_summary_names_what_the_role_owns_and_may_truncate() {
+        let clean = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        assert!(!clean.owns_objects());
+        assert!(!clean.can_alter_tables());
+        assert!(clean.summary().ends_with(
+            "; it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or temporary table in it"
+        ));
+
+        // The migration owner: owns the database, its schema, its tables.
+        let mut owner = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        owner.owned = vec![
+            object("cxp_server", "database", "otto_cxp", "cxp_server"),
+            object("cxp_server", "schema", "public", "pg_database_owner"),
+            object("cxp_server", "table", "customers", "cxp_server"),
+        ];
+        owner.owned_total = 42;
+        owner.shared_with = vec!["otto_platform".into()];
+        assert!(owner.owns_objects());
+        assert!(owner.can_alter_tables());
+        // Ownership is not, by itself, a superuser-equivalent privilege.
+        assert!(!owner.is_refused_in_a_deployment());
+        assert_eq!(
+            owner.summary(),
+            "database role \"cxp_server\" holds no superuser-equivalent privilege (SUPERUSER, \
+             BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or a cross-service predefined role), \
+             directly or through membership, and can connect to no other service's database; \
+             it owns database \"otto_cxp\", schema \"public\" (through \"pg_database_owner\"), \
+             table \"customers\" (42 objects in all); the instance also hosts \"otto_platform\""
+        );
+
+        let mut truncate = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        truncate.table_privileges = vec![
+            TablePrivilege {
+                user: "cxp_server".into(),
+                table: "customers".into(),
+                privileges: vec!["TRUNCATE"],
+            },
+            TablePrivilege {
+                user: "cxp_server".into(),
+                table: "feedback".into(),
+                privileges: vec!["TRUNCATE", "TRIGGER"],
+            },
+        ];
+        assert!(!truncate.owns_objects());
+        assert!(truncate.can_alter_tables());
+        assert!(truncate.summary().ends_with(
+            r#"; it owns nothing in this database; can TRUNCATE table "customers"; can TRUNCATE, TRIGGER table "feedback""#
+        ));
+    }
+
+    #[test]
+    fn the_summary_names_where_the_role_may_create() {
+        let mut create = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        create.create_privileges = vec![
+            CreatePrivilege {
+                user: "cxp_server".into(),
+                kind: "database",
+                name: "otto_cxp".into(),
+                privileges: vec!["CREATE", "TEMPORARY"],
+            },
+            CreatePrivilege {
+                user: "cxp_server".into(),
+                kind: "schema",
+                name: "public".into(),
+                privileges: vec!["CREATE"],
+            },
+        ];
+        assert!(!create.owns_objects());
+        assert!(create.can_alter_tables());
+        assert!(!create.is_refused_in_a_deployment());
+        assert!(create.summary().ends_with(
+            r#"; it owns nothing in this database; can CREATE, TEMPORARY in database "otto_cxp"; can CREATE in schema "public""#
+        ));
+
+        let mut temp = DbRole::for_test("login", "cxp_server", &[]);
+        temp.create_privileges = vec![CreatePrivilege {
+            user: "login".into(),
+            kind: "database",
+            name: "otto_cxp".into(),
+            privileges: vec!["TEMPORARY"],
+        }];
+        assert!(temp.can_alter_tables());
+        assert!(temp.summary().ends_with(
+            r#"; it owns nothing in this database; session user "login" can TEMPORARY in database "otto_cxp""#
+        ));
+    }
+
+    #[test]
+    fn the_ownership_clause_names_the_user_when_they_differ_and_skips_a_superuser() {
+        let mut both = DbRole::for_test("login", "cxp_server", &[]);
+        both.owned = vec![
+            object("login", "table", "tickets", "login"),
+            object("cxp_server", "table", "segments", "owners"),
+        ];
+        both.owned_total = 2;
+        both.table_privileges = vec![TablePrivilege {
+            user: "cxp_server".into(),
+            table: "customers".into(),
+            privileges: vec!["TRIGGER"],
+        }];
+        assert!(both.summary().ends_with(
+            r#"; session user "login" owns table "tickets", current user "cxp_server" owns table "segments" (through "owners") (2 objects in all); current user "cxp_server" can TRIGGER table "customers""#
+        ));
+
+        // A superuser's ownership is not read: no "owns nothing" claim.
+        let sup = DbRole::for_test(
+            "otto_cxp",
+            "cxp_server",
+            &[("otto_cxp", "otto_cxp", &[Superuser])],
+        );
+        assert!(!sup.summary().contains("owns"), "{}", sup.summary());
     }
 
     #[test]
