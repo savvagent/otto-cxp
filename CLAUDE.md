@@ -88,8 +88,9 @@ the transaction with `platform_events::begin_live` (it also refuses revoked orgs
 anywhere but the verified token. The one pre-org lookup is a console cookie's session:
 `console_sessions::org_of` calls the `SECURITY DEFINER` function `console_session_org`, which
 returns only the org of the one row whose hash it is given; the row is then read pinned. The
-`console_sessions_lookup` policy that admits it is `TO` the function's owner only (the migrating
-role, named at migration time); if that ownership moves, `ALTER POLICY … TO` the new owner.
+`console_sessions_lookup` policy that admits it names no role: it admits whichever role owns the
+function at query time (read from `pg_proc`), so it follows an `ALTER FUNCTION … OWNER TO` or
+`REASSIGN OWNED` with nothing else to change.
 
 ### PostgreSQL enum handling
 The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_channel`, `feedback_type`,

@@ -161,9 +161,10 @@ dashboard loads; `GET /auth/session` answers `{"signedIn": true, ...}` from that
 **Rotating `CXP_ENCRYPTION_KEY` signs every console user out** (sessions that no longer open are
 deleted on their next use). The platform rotates a refresh token on every use and revokes the
 whole sign-in if a spent one is replayed, so each refresh happens once, across machines: a
-machine coalesces its own requests in memory, claims a short lease on the session row (15 s),
-calls the platform holding no database connection or lock, and stores the new pair only if the
-row is unchanged (a compare-and-swap); another machine that finds the lease waits for the
+machine coalesces its own requests in memory, claims a short lease on the session row (45 s,
+on the database's clock), calls the platform holding no database connection or lock only if the
+call and the store still fit in the lease, and stores the new pair only if the row still holds
+that lease (a compare-and-swap); another machine that finds the lease waits for the
 result. A sign-out or `org.deleted` during that call wins, and the new pair is revoked. Sessions are deleted on sign-out, by the
 `org.deleted` and `member.removed` webhooks, and by the hourly sweep once expired (30 days
 without a refresh).

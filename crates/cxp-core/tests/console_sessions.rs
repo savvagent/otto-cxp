@@ -184,46 +184,39 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
 
     // About to expire: the first claim wins, a second sees the live lease.
     let soon = now + Duration::minutes(60);
-    let Claim::Claimed(s) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+    let Claim::Claimed(s, claimed) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
         .await
         .unwrap()
     else {
         panic!("not claimed");
     };
     assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
-    assert_eq!(s.generation, 0);
-    assert!(s.refresh_lease_until.is_some());
+    assert_eq!(claimed.generation, 0);
+    assert_eq!(s.refresh_lease_until, Some(claimed.until));
     assert!(matches!(
         console_sessions::claim_refresh(&db, o, &hash, soon, lease)
             .await
             .unwrap(),
         Claim::Leased
     ));
-    // Once the lease lapses (its holder died), another may take it.
-    let later = soon + Duration::seconds(16);
-    let Claim::Claimed(again) = console_sessions::claim_refresh(&db, o, &hash, later, lease)
-        .await
-        .unwrap()
-    else {
-        panic!("a lapsed lease was not taken over");
-    };
-    assert_eq!(again.generation, 0);
+    // The caller's clock does not decide when a lease lapses: a caller whose
+    // clock runs a minute ahead still sees it live.
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon + Duration::minutes(1), lease)
+            .await
+            .unwrap(),
+        Claim::Leased
+    ));
 
-    // The store wins once, at the claimed generation, and ends the lease.
+    // The store wins once, at the claimed lease, and ends the lease.
     let expires = Utc::now() + Duration::days(30);
-    let pair = |access, refresh| Refreshed {
-        access_token: access,
-        refresh_token: refresh,
-        access_expires_at: Utc::now() + Duration::minutes(60),
-        expires_at: expires,
-    };
     assert!(console_sessions::store_refreshed(
         &db,
         &cipher(),
         o,
         &hash,
-        0,
-        &pair("otto_at_next", "otto_rt_next")
+        claimed,
+        &pair("otto_at_next", "otto_rt_next", expires)
     )
     .await
     .unwrap());
@@ -233,12 +226,12 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
             &cipher(),
             o,
             &hash,
-            0,
-            &pair("otto_at_stale", "otto_rt_stale")
+            claimed,
+            &pair("otto_at_stale", "otto_rt_stale", expires)
         )
         .await
         .unwrap(),
-        "a second store at a spent generation"
+        "a second store at a spent lease"
     );
     let s = console_sessions::load(&db, o, &hash)
         .await
@@ -249,32 +242,22 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
     assert_eq!((s.generation, s.refresh_lease_until), (1, None));
     assert!((s.expires_at - expires).num_seconds().abs() < 2);
 
-    // A released lease frees the session at once; at a stale generation it
-    // changes nothing.
+    // A released lease frees the session at once.
     let soon = Utc::now() + Duration::minutes(60);
-    let Claim::Claimed(s) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
+    let Claim::Claimed(_, claimed) = console_sessions::claim_refresh(&db, o, &hash, soon, lease)
         .await
         .unwrap()
     else {
         panic!("not claimed");
     };
-    console_sessions::release_lease(&db, o, &hash, s.generation + 1)
+    console_sessions::release_lease(&db, o, &hash, claimed)
         .await
         .unwrap();
     assert!(matches!(
         console_sessions::claim_refresh(&db, o, &hash, soon, lease)
             .await
             .unwrap(),
-        Claim::Leased
-    ));
-    console_sessions::release_lease(&db, o, &hash, s.generation)
-        .await
-        .unwrap();
-    assert!(matches!(
-        console_sessions::claim_refresh(&db, o, &hash, soon, lease)
-            .await
-            .unwrap(),
-        Claim::Claimed(_)
+        Claim::Claimed(..)
     ));
 
     // A refused refresh deletes only the generation it refused.
@@ -303,8 +286,8 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
         &cipher(),
         o,
         &hash,
-        1,
-        &pair("otto_at_late", "otto_rt_late")
+        claimed,
+        &pair("otto_at_late", "otto_rt_late", expires)
     )
     .await
     .unwrap());
@@ -312,6 +295,136 @@ async fn a_refresh_is_leased_then_stored_as_a_compare_and_swap(pool: PgPool) {
         .await
         .unwrap()
         .is_none());
+}
+
+fn pair<'a>(access: &'a str, refresh: &'a str, expires: chrono::DateTime<Utc>) -> Refreshed<'a> {
+    Refreshed {
+        access_token: access,
+        refresh_token: refresh,
+        access_expires_at: Utc::now() + Duration::minutes(60),
+        expires_at: expires,
+    }
+}
+
+/// A holder that died (or stalled) mid-refresh: once its lease lapses on the
+/// database's clock, another caller takes the session over. The stale holder,
+/// when it comes back, can neither release the newer claim nor store over it;
+/// only the newer holder's store lands.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_lapsed_lease_is_taken_over_and_its_stale_holder_changes_nothing(pool: PgPool) {
+    let db = db(pool);
+    let o = org();
+    let hash = new_session(&db, o, user(), Duration::days(1)).await;
+    let soon = Utc::now() + Duration::minutes(60);
+    let short = Duration::milliseconds(200);
+
+    let Claim::Claimed(_, stale) = console_sessions::claim_refresh(&db, o, &hash, soon, short)
+        .await
+        .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, short)
+            .await
+            .unwrap(),
+        Claim::Leased
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Lapsed: taken over, at the same generation, under a new lease.
+    let Claim::Claimed(s, newer) =
+        console_sessions::claim_refresh(&db, o, &hash, soon, Duration::seconds(15))
+            .await
+            .unwrap()
+    else {
+        panic!("a lapsed lease was not taken over");
+    };
+    assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
+    assert_eq!(newer.generation, stale.generation);
+    assert!(newer.until > stale.until);
+
+    // The stale holder's release frees nothing: the newer claim stands.
+    console_sessions::release_lease(&db, o, &hash, stale)
+        .await
+        .unwrap();
+    assert!(matches!(
+        console_sessions::claim_refresh(&db, o, &hash, soon, Duration::seconds(15))
+            .await
+            .unwrap(),
+        Claim::Leased
+    ));
+    // Nor does its store land, though the generation still matches.
+    let expires = Utc::now() + Duration::days(30);
+    assert!(!console_sessions::store_refreshed(
+        &db,
+        &cipher(),
+        o,
+        &hash,
+        stale,
+        &pair("otto_at_stale", "otto_rt_stale", expires)
+    )
+    .await
+    .unwrap());
+    let s = console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_refresh");
+    assert_eq!(
+        (s.generation, s.refresh_lease_until),
+        (0, Some(newer.until))
+    );
+
+    // The newer holder's store does.
+    assert!(console_sessions::store_refreshed(
+        &db,
+        &cipher(),
+        o,
+        &hash,
+        newer,
+        &pair("otto_at_next", "otto_rt_next", expires)
+    )
+    .await
+    .unwrap());
+    let s = console_sessions::load(&db, o, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.refresh_token(&cipher()).unwrap(), "otto_rt_next");
+    assert_eq!((s.generation, s.refresh_lease_until), (1, None));
+}
+
+/// A lease that lapsed with no one claiming it since still matches: a slow
+/// holder's store keeps the pair the platform issued instead of losing it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_lapsed_but_unclaimed_lease_still_stores(pool: PgPool) {
+    let db = db(pool);
+    let o = org();
+    let hash = new_session(&db, o, user(), Duration::days(1)).await;
+    let soon = Utc::now() + Duration::minutes(60);
+    let Claim::Claimed(_, lease) =
+        console_sessions::claim_refresh(&db, o, &hash, soon, Duration::milliseconds(100))
+            .await
+            .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(console_sessions::store_refreshed(
+        &db,
+        &cipher(),
+        o,
+        &hash,
+        lease,
+        &pair(
+            "otto_at_next",
+            "otto_rt_next",
+            Utc::now() + Duration::days(30)
+        )
+    )
+    .await
+    .unwrap());
 }
 
 /// Sign-out deletes and hands back what the row held, once.

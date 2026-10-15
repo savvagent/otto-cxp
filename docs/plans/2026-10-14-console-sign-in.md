@@ -55,8 +55,8 @@ Gates (run in the worktree, against its own Postgres):
   `org.deleted` webhook during a slow refresh.
 - [ ] 14. Logout and re-sign-in: delete and commit, then revoke with nothing
   held; a callback ends the browser's previous session.
-- [ ] 15. Migration renamed to `0003`; the lookup policy `TO` the migrating role;
-  the non-superuser owner test in `tests/db.rs` (roles dropped whatever the
+- [ ] 15. Migration renamed to `0003`; the lookup policy admits the function's
+  current owner (read from `pg_proc`, no role list); the non-superuser owner test in `tests/db.rs` (roles dropped whatever the
   test does).
 - [ ] 16. The console under `/console/` (Vite base, router basename, PWA scope,
   `safe_next`, the binary's fallback, `/` left to #29), CSP, HSTS, dotfiles,
@@ -70,3 +70,17 @@ Gates (run in the worktree, against its own Postgres):
 - [ ] 19. Docs: CLAUDE.md (Dockerfile gate paths, Auth invariant, security
   focus, Build & Run, the lookup policy), `docs/deploy/fly.md`, this plan and
   the spec; `CXP_CONSOLE_DIR` set only in the Dockerfile.
+
+## Review round 2 (PR #30)
+
+- [ ] 20. The lookup policy follows the function's owner (`pg_proc`), the
+  function created first; the non-superuser test moves ownership with
+  `ALTER ... OWNER TO` alone; the `ALTER POLICY` notes removed.
+- [ ] 21. The lease on the database's clock, 45 s; store and release match the
+  claimed lease; no platform call unless the call and the store fit in what is
+  left; tests for a lapsed lease taken over and a stale holder changing
+  nothing.
+- [ ] 22. The single-flight entry freed by a drop guard, with a panic test.
+- [ ] 23. Suggestions: an unsaved pair revoked on a store error, encoded
+  slashes refused, `nosniff` on every response, `SKIP LOCKED` in the sweep,
+  the grant and module-doc comments.

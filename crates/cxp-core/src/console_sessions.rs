@@ -23,9 +23,25 @@
 //!    that the session is gone, already fresh, or leased by someone else.
 //! 2. The caller asks the platform, holding nothing.
 //! 3. [`store_refreshed`], a second short transaction: store the new pair only
-//!    if the session's `generation` is still the one claimed (a
-//!    compare-and-swap), which also ends the lease. A sign-out or a purge in
-//!    between wins: the row is gone, and nothing is resurrected.
+//!    if the session still holds exactly the lease claimed (its `generation`
+//!    and its `refresh_lease_until`, a compare-and-swap), which also ends the
+//!    lease. A sign-out or a purge in between wins: the row is gone, and
+//!    nothing is resurrected. So does a newer claim by someone who found the
+//!    lease lapsed: a stale holder can neither store over it nor release it
+//!    ([`release_lease`] matches the same pair).
+//!
+//! The lease is set and compared on the database's clock
+//! (`clock_timestamp()`, read when the claiming `UPDATE` runs, so time spent
+//! waiting for a connection is not charged to it), never the caller's, so
+//! replicas whose clocks disagree still agree on when a lease lapses. The
+//! caller's clock decides only whether a token needs a refresh at all. How
+//! long the lease must be, and how the caller keeps a refresh inside it, is
+//! the caller's arithmetic (`cxp_http::console`).
+//!
+//! If the database fails after the platform has rotated the pair, the new
+//! pair is lost and the stored refresh token is spent: the next claim
+//! presents it, the platform refuses it (`invalid_grant`), and the person is
+//! signed out and must sign in again. Nothing is leaked or reused by it.
 //!
 //! Within one process the caller also coalesces refreshes in memory, so
 //! parallel requests wait without a connection; the lease is what keeps two
@@ -198,13 +214,22 @@ pub async fn load(db: &Db, org: OrgId, id_hash: &[u8; 32]) -> Result<Option<Sess
     Ok(session)
 }
 
+/// A claimed refresh lease: the session's generation and the lease's expiry,
+/// on the database's clock, exactly as stored. [`store_refreshed`] and
+/// [`release_lease`] act only while the row still holds both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    pub generation: i64,
+    pub until: DateTime<Utc>,
+}
+
 /// What [`claim_refresh`] found.
 #[derive(Debug)]
 pub enum Claim {
-    /// This caller holds the lease until it stores a new pair, gives the lease
+    /// This caller holds `Lease` until it stores a new pair, gives the lease
     /// back, or the lease lapses. Refresh with the session's refresh token,
-    /// then [`store_refreshed`] against its `generation`.
-    Claimed(Session),
+    /// then [`store_refreshed`] against the lease.
+    Claimed(Session, Lease),
     /// The access token is good: someone else refreshed it.
     Fresh(Session),
     /// Another refresh holds a live lease: wait, then look again.
@@ -214,8 +239,10 @@ pub enum Claim {
 }
 
 /// Take the refresh lease on session `id_hash` for `lease`, if its token
-/// still needs a refresh at `now` and no live lease is held. One short
-/// transaction; nothing is held when it returns.
+/// still needs a refresh at `now` (the caller's clock) and no live lease is
+/// held. The lease runs from the database's `clock_timestamp()` when the
+/// claiming `UPDATE` runs, and lapses on that clock. One short transaction;
+/// nothing is held when it returns.
 pub async fn claim_refresh(
     db: &Db,
     org: OrgId,
@@ -225,10 +252,10 @@ pub async fn claim_refresh(
 ) -> Result<Claim> {
     let mut tx = begin_live(db, org, None).await?;
     let claimed: Option<Session> = sqlx::query_as(concat!(
-        "UPDATE console_sessions SET refresh_lease_until = $3 + $4 \
+        "UPDATE console_sessions SET refresh_lease_until = clock_timestamp() + $4 \
          WHERE org_id = $1 AND id_hash = $2 AND expires_at > now() \
            AND access_expires_at <= $3 + $5 \
-           AND (refresh_lease_until IS NULL OR refresh_lease_until <= $3) \
+           AND (refresh_lease_until IS NULL OR refresh_lease_until <= clock_timestamp()) \
          RETURNING ",
         cols!()
     ))
@@ -240,7 +267,18 @@ pub async fn claim_refresh(
     .fetch_optional(tx.conn())
     .await?;
     let claim = match claimed {
-        Some(s) => Claim::Claimed(s),
+        Some(s) => match s.refresh_lease_until {
+            Some(until) => {
+                let lease = Lease {
+                    generation: s.generation,
+                    until,
+                };
+                Claim::Claimed(s, lease)
+            }
+            // The UPDATE just set it, so RETURNING never sees it NULL; were
+            // it to, waiting is the safe answer.
+            None => Claim::Leased,
+        },
         None => match find(&mut tx, id_hash).await? {
             None => Claim::Gone,
             Some(s) if !s.needs_refresh(now) => Claim::Fresh(s),
@@ -259,16 +297,20 @@ pub struct Refreshed<'a> {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Store a refreshed pair on session `id_hash`, if it is still at
-/// `generation` (the claim's): bumps the generation and ends the lease.
-/// `false` means the session was deleted or rotated by someone else since the
-/// claim, and nothing was written.
+/// Store a refreshed pair on session `id_hash`, if it still holds `lease`
+/// (the claim's generation and lease expiry): bumps the generation and ends
+/// the lease. `false` means the session was deleted, rotated, or claimed
+/// anew by someone else since, and nothing was written.
+///
+/// A lease that lapsed with no one claiming it since still matches, and the
+/// store succeeds: the pair the platform just issued is kept rather than
+/// lost.
 pub async fn store_refreshed(
     db: &Db,
     cipher: &Cipher,
     org: OrgId,
     id_hash: &[u8; 32],
-    generation: i64,
+    lease: Lease,
     new: &Refreshed<'_>,
 ) -> Result<bool> {
     let access = seal(cipher, new.access_token)?;
@@ -276,13 +318,14 @@ pub async fn store_refreshed(
     let mut tx = begin_live(db, org, None).await?;
     let n = sqlx::query(
         "UPDATE console_sessions \
-         SET access_token_enc = $4, refresh_token_enc = $5, access_expires_at = $6, \
-             expires_at = $7, generation = generation + 1, refresh_lease_until = NULL \
-         WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
+         SET access_token_enc = $5, refresh_token_enc = $6, access_expires_at = $7, \
+             expires_at = $8, generation = generation + 1, refresh_lease_until = NULL \
+         WHERE org_id = $1 AND id_hash = $2 AND generation = $3 AND refresh_lease_until = $4",
     )
     .bind(org)
     .bind(&id_hash[..])
-    .bind(generation)
+    .bind(lease.generation)
+    .bind(lease.until)
     .bind(access)
     .bind(refresh)
     .bind(new.access_expires_at)
@@ -294,17 +337,19 @@ pub async fn store_refreshed(
     Ok(n == 1)
 }
 
-/// Give back a lease taken at `generation` without rotating (the platform
-/// could not be reached), so the next request may try again at once.
-pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], generation: i64) -> Result<()> {
+/// Give back `lease` without rotating (the platform could not be reached),
+/// so the next request may try again at once. A no-op once anyone else has
+/// claimed or rotated the session: a stale holder never frees a newer claim.
+pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], lease: Lease) -> Result<()> {
     let mut tx = begin_live(db, org, None).await?;
     sqlx::query(
         "UPDATE console_sessions SET refresh_lease_until = NULL \
-         WHERE org_id = $1 AND id_hash = $2 AND generation = $3",
+         WHERE org_id = $1 AND id_hash = $2 AND generation = $3 AND refresh_lease_until = $4",
     )
     .bind(org)
     .bind(&id_hash[..])
-    .bind(generation)
+    .bind(lease.generation)
+    .bind(lease.until)
     .execute(tx.conn())
     .await?;
     tx.commit().await?;
@@ -386,7 +431,8 @@ pub async fn sweep_expired(db: &Db) -> Result<u64> {
         let mut tx = crate::maintenance::begin(db).await?;
         let n = sqlx::query(
             "DELETE FROM console_sessions WHERE id_hash IN ( \
-               SELECT id_hash FROM console_sessions WHERE expires_at <= now() LIMIT $1)",
+               SELECT id_hash FROM console_sessions WHERE expires_at <= now() \
+               LIMIT $1 FOR UPDATE SKIP LOCKED)",
         )
         .bind(SWEEP_BATCH)
         .execute(&mut *tx)

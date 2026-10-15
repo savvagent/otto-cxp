@@ -552,7 +552,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
     assert_eq!(lookup(live.clone()).await, Some(a.as_uuid()));
 
     // Setting the lookup's marker by hand admits otto_app to nothing: the
-    // lookup policy is the function owner's alone.
+    // lookup policy admits only the function's owner.
     let mut tx = as_app_unpinned(&pool).await;
     sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
         .execute(&mut *tx)
@@ -564,6 +564,8 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
         .unwrap();
     assert_eq!(n, 0, "otto_app read sessions by setting the lookup marker");
     tx.rollback().await.unwrap();
+    // It names no role: who it admits is read from the function's owner at
+    // query time, so moving that ownership needs no ALTER POLICY.
     let roles: Vec<String> = sqlx::query_scalar(
         "SELECT unnest(roles)::text FROM pg_policies \
          WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
@@ -571,15 +573,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
     .fetch_all(&pool)
     .await
     .unwrap();
-    let me: String = sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        roles,
-        vec![me],
-        "the lookup policy is for the migrating role only"
-    );
+    assert_eq!(roles, vec!["public".to_string()]);
     assert_eq!(lookup(expired).await, None, "an expired session");
     assert_eq!(lookup(vec![9u8; 32]).await, None, "an unknown hash");
 
@@ -610,14 +604,18 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
 
 /// Today the migrating role is a superuser, so `console_session_org` bypasses
 /// RLS and the lookup policy is never what admits it. Once it is not (#16),
-/// the policy is the only thing that does. Here a `NOSUPERUSER NOBYPASSRLS`
-/// role owns the table and the function, and the policy names it, as the
-/// migration would have had that role run it: the lookup works, the owner's
-/// own plain `SELECT` sees nothing, and without the policy the lookup finds
-/// nothing either. The role is cluster-wide, so it is dropped whatever the
-/// test does.
+/// the policy is the only thing that does, and #26's runbook moves ownership
+/// of the table and the function to a new least-privilege role. Here a fresh
+/// `NOSUPERUSER NOBYPASSRLS` role takes both over with `ALTER ... OWNER TO`
+/// alone (what `REASSIGN OWNED` does, which a per-test database cannot run
+/// against the cluster superuser that migrated it), and no `ALTER POLICY`:
+/// the lookup works; the new owner's plain `SELECT` sees nothing; a non-owner
+/// that sets the lookup's marker by hand sees nothing; and with the policy
+/// gone the lookup finds nothing, so the policy, not the ownership, is what
+/// admits it. The role is cluster-wide, so it is dropped whatever the test
+/// does.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn the_console_lookup_works_for_a_non_superuser_owner_through_its_policy(pool: PgPool) {
+async fn the_console_lookup_follows_its_function_to_a_non_superuser_owner(pool: PgPool) {
     let owner = format!("cxp_test_owner_{}", Uuid::new_v4().simple());
     let me: String = sqlx::query_scalar("SELECT current_user::text")
         .fetch_one(&pool)
@@ -634,7 +632,6 @@ async fn the_console_lookup_works_for_a_non_superuser_owner_through_its_policy(p
     let outcome = tokio::spawn(lookup_as_non_superuser_owner(pool.clone(), owner.clone())).await;
 
     for sql in [
-        format!("ALTER POLICY console_sessions_lookup ON console_sessions TO {me}"),
         format!("REASSIGN OWNED BY {owner} TO {me}"),
         format!("DROP OWNED BY {owner}"),
         format!("DROP ROLE {owner}"),
@@ -663,13 +660,25 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
     .unwrap();
     tx.commit().await.unwrap();
 
+    let policy = || async {
+        let (roles, qual): (Vec<String>, String) = sqlx::query_as(
+            "SELECT roles::text[], qual FROM pg_policies \
+             WHERE tablename = 'console_sessions' AND policyname = 'console_sessions_lookup'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (roles, qual)
+    };
+    let before = policy().await;
+    // Ownership only: no ALTER POLICY.
     for sql in [
         format!("ALTER TABLE console_sessions OWNER TO {owner}"),
         format!("ALTER FUNCTION console_session_org(bytea) OWNER TO {owner}"),
-        format!("ALTER POLICY console_sessions_lookup ON console_sessions TO {owner}"),
     ] {
         sqlx::query(&sql).execute(&pool).await.unwrap();
     }
+    assert_eq!(policy().await, before, "the policy was changed");
     let (superuser, bypass): (bool, bool) =
         sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
             .bind(&owner)
@@ -677,6 +686,15 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
             .await
             .unwrap();
     assert_eq!((superuser, bypass), (false, false));
+    let owners: (String, String) = sqlx::query_as(
+        "SELECT (SELECT tableowner::text FROM pg_tables WHERE tablename = 'console_sessions'), \
+                pg_get_userbyid(proowner)::text FROM pg_proc \
+         WHERE oid = 'console_session_org(bytea)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, (owner.clone(), owner.clone()));
 
     let lookup = |hash: Vec<u8>| {
         let pool = pool.clone();
@@ -698,22 +716,32 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
     );
     assert_eq!(lookup(vec![9u8; 32]).await, None);
 
-    // The owner's own plain SELECT, unpinned and unmarked: nothing.
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query(&format!("SET LOCAL ROLE {owner}"))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-    assert_eq!(n, 0, "the owner reads sessions without the lookup");
-    tx.rollback().await.unwrap();
+    // Plain SELECTs, unpinned: the new owner without the marker, and
+    // otto_app (not the owner) with the marker set by hand. Neither sees a
+    // row.
+    for (role, marker) in [(owner.as_str(), false), ("otto_app", true)] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(&format!("SET LOCAL ROLE {role}"))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        if marker {
+            sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{role} (marker set: {marker}) read sessions unpinned");
+        tx.rollback().await.unwrap();
+    }
 
-    // Without the policy naming the owner, the lookup finds nothing: the
-    // policy, not the ownership, is what admits it.
-    sqlx::query("ALTER POLICY console_sessions_lookup ON console_sessions TO otto_app")
+    // Without the policy, the lookup finds nothing: the policy, not the
+    // ownership, is what admits it.
+    sqlx::query("DROP POLICY console_sessions_lookup ON console_sessions")
         .execute(&pool)
         .await
         .unwrap();

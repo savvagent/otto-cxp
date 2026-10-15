@@ -144,18 +144,32 @@ maintenance transactions of at most `SESSION_SWEEP_BATCH` rows each.
      (it outlives a cancelled request, because a rotated pair must be stored);
      every other request for that session awaits the same shared result,
      holding no connection.
-  2. Lease: `claim_refresh` takes `refresh_lease_until` (15 s, longer than the
-     platform timeout) and reads the sealed refresh token and `generation` in
-     one short transaction, or answers *fresh* (another refresh won), *leased*
-     (another replica is refreshing), or *gone*.
-  3. The platform call, nothing held.
+  2. Lease: `claim_refresh` sets `refresh_lease_until` to the database's
+     `clock_timestamp()` + 45 s and reads the sealed refresh token in one short
+     transaction, returning the lease it took (generation and expiry), or
+     answers *fresh* (another refresh won), *leased* (another replica is
+     refreshing), or *gone*. The lease is set and compared on the database's
+     clock only; the app's clock decides only whether a token needs a refresh.
+  3. The platform call, nothing held, made only if the claim left room for it:
+     `elapsed since the claim began + 10 s platform timeout + 20 s store
+     allowance <= 45 s`; otherwise the lease is given back unspent and the
+     request is `503`.
   4. `store_refreshed`: a second short transaction writes the new pair only
-     where `generation` is still the claimed one, bumping it and clearing the
-     lease. A sign-out or purge in between wins: nothing is written, the new
-     pair is revoked, and the request is `401`.
-  A replica that finds a live lease polls the row every 250 ms, at most 70
-  times (past one lease, so a dead holder's lease lapses and is taken over),
-  then answers `503`. `invalid_grant` deletes the session at that generation
+     where the row still holds the claimed lease (generation and
+     `refresh_lease_until`), bumping the generation and clearing the lease.
+     A sign-out, a purge, or a newer claim after a lapse wins: nothing is
+     written, the new pair is revoked, and the request is `401`.
+     `release_lease` matches the same pair, so a stale holder never frees a
+     newer claim. A database error on the store also revokes the new pair; the
+     stored refresh token is then spent, and the next claim's `invalid_grant`
+     signs the person out.
+  The arithmetic is in the `cxp_http::console` module docs: the holder's call
+  and store fit in its lease, so no other replica can claim and present the
+  same refresh token while the holder could still store its result. A
+  replica that finds a live lease polls the row every 250 ms, at most 190
+  times (47.5 s, past one lease, so a dead holder's lease lapses and is taken
+  over), then answers `503`. The refresh task frees its single-flight entry
+  from a drop guard, so a panic in it does not leave the session on `503`. `invalid_grant` deletes the session at that generation
   (`401`); an unreachable platform gives the lease back and leaves the session
   untouched (`503`).
 - Keys: `CXP_ENCRYPTION_KEY` is never used directly. `ConsoleKeys::derive`
@@ -208,20 +222,22 @@ loopback. `router` builds the `Console`, mounts `/auth/*`, and replaces the
 fallback with `console_or_not_found`, which serves only under `/console/`: a
 `GET`/`HEAD` there is a file from `CXP_CONSOLE_DIR` if one exists, and
 `index.html` if the request `Accept`s `text/html`; `/console` redirects (`308`)
-to `/console/`. A dotfile or dot segment (plain or percent-encoded) is never
-served, directories are neither listed nor redirected, and a file-server
+to `/console/`. A dotfile or dot segment is never served: the check runs on
+the percent-decoded path split on `/` and `\`, so `x%2F.env` is refused as
+`x/.env` is, and a path that does not decode is refused; directories are neither listed nor redirected, and a file-server
 redirect or `5xx` becomes the JSON error shape. Everything else, `/` included,
 is the JSON `404` as today. `CXP_CONSOLE_DIR` defaults to `apps/web/dist` (a
 `cargo run` from the repo root, after `pnpm build`); the image's Dockerfile
 `ENV` sets `/srv/console`, the one place it is set (a deployment's own
 environment would win). Console responses carry `Cache-Control` (`immutable`
 for hashed `/console/assets/`, `no-cache` otherwise, so a deploy is seen at
-once), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+once), `X-Frame-Options: DENY`,
 `Referrer-Policy: same-origin`, and the CSP `default-src 'self'; script-src
 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; object-src
 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` (inline
 styles only because the toast and dialog libraries inject `<style>` elements;
-no inline script). Every response carries `Strict-Transport-Security:
+no inline script). Every response, JSON included, carries
+`X-Content-Type-Options: nosniff`, and `Strict-Transport-Security:
 max-age=31536000` when the public URL is `https`. With no `index.html` there,
 the console is off (logged at `warn`) and `/console/` is the JSON `404`.
 
@@ -271,17 +287,22 @@ build, that the generated `dist/sw.js` carries them
      Its owner (the migrating role) bypasses RLS today as a superuser; for a
      least-privilege owner (#16) a `SELECT`-only policy `console_sessions_lookup`
      admits an unpinned read only while `app.console_session_lookup = 'on'`,
-     which the function's own `SET` clause sets for the duration of the call.
-     The policy is `TO` the migrating role only (named at migration time with
-     `EXECUTE format('... TO %I', current_user)`), so another role, `otto_app`
-     included, gains nothing by setting the marker itself; if the function's
-     ownership moves, the policy is moved with `ALTER POLICY ... TO`. The full
-     row (tokens included) is then read pinned through `begin_live`. Tests
-     prove an unpinned `otto_app` sees nothing with or without that setting,
-     the function's `prosecdef`, `proconfig`, and grants, and, with a
-     `NOSUPERUSER NOBYPASSRLS` role owning the table and function, that the
-     lookup works through the policy, that role's own plain `SELECT` sees
-     nothing, and without the policy the lookup finds nothing.
+     which the function's own `SET` clause sets for the duration of the call,
+     and only when `current_user` is the function's owner, read at query time
+     (`pg_get_userbyid(proowner)` from `pg_proc` for
+     `'public.console_session_org(bytea)'::regprocedure`). The policy names no
+     role, so it follows the function through `ALTER FUNCTION ... OWNER TO`
+     and #26's `REASSIGN OWNED` with nothing else to move, and another role,
+     `otto_app` included, gains nothing by setting the marker itself. The
+     function is created before the policy, which names it. The full row
+     (tokens included) is then read pinned through `begin_live`. Tests prove an
+     unpinned `otto_app` sees nothing with or without that setting, the
+     function's `prosecdef`, `proconfig`, and grants, and, after a
+     `NOSUPERUSER NOBYPASSRLS` role takes over the table and the function with
+     `ALTER ... OWNER TO` alone (no `ALTER POLICY`), that the lookup works
+     through the policy, that role's own plain `SELECT` sees nothing,
+     `otto_app` setting the marker by hand sees nothing, and with the policy
+     dropped the lookup finds nothing.
 - **Request paths use `begin_live`:** session create, load, claim, store,
   release, and delete all do, each in a short transaction; the sweep uses
   `cxp_core::maintenance`.
@@ -301,8 +322,8 @@ build, that the generated `dist/sw.js` carries them
 
 ## Migration
 
-`0003_console_sessions.sql`: table, index, RLS, two policies (the lookup one
-`TO` the migrating role), the function, grants. Whichever of this PR and #17
+`0003_console_sessions.sql`: table, index, RLS, the function, two policies
+(the lookup one admits the function's current owner), grants. Whichever of this PR and #17
 merges first takes 0003; the other renumbers before it merges (an unmerged
 migration may be renamed). Additive only: the previous release ignores the
 table and the function, so a rollback boots.
@@ -352,9 +373,11 @@ alone turns nothing on:
   unknown or expired one; its definer/search_path/grant properties; the sweep
   needs the maintenance marker.
 - `cxp-core/tests/console_sessions.rs`: seal/open round trip through the table,
-  create refused for a deleted org, the lease (claim, live lease, lapsed lease
-  taken over, release) and the compare-and-swap store (a spent generation and a
-  deleted session write nothing), `take`, sweep in batches.
+  create refused for a deleted org, the lease (claim, live lease on the
+  database's clock whatever the caller's clock says, lapsed lease taken over,
+  release, a stale holder neither releasing nor storing over a newer claim, a
+  lapsed but unclaimed lease still storing) and the compare-and-swap store (a
+  spent lease and a deleted session write nothing), `take`, sweep in batches.
 - `cxp-core/tests/lifecycle.rs`: `TENANT_TABLES` gains `console_sessions` (so
   the purge must cover it); `member.removed` deletes only that user's sessions
   in that org, only on first delivery.
@@ -376,7 +399,8 @@ alone turns nothing on:
 - `cxp-server`: config parsing (console off/on, key required only with the
   client id, key length), the console under `/console/` (HTML navigation gets
   `index.html`, `/console` redirects, `/` and every other path stay the JSON
-  `404`, dotfiles and directories are never served, the CSP and HSTS headers),
+  `404`, dotfiles and directories are never served, encoded slashes included,
+the CSP and HSTS headers, `nosniff` on every response),
   `/auth/login` disabled by default.
 - `apps/web`: `apiFetch` sends credentials and marks the session signed out on
   `401` without navigating; no retry on `401`/`403`; sign-out failures toast;

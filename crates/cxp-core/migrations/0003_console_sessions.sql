@@ -63,25 +63,18 @@ CREATE POLICY console_sessions_tenant_isolation ON console_sessions
 -- given, never a token; the request then pins that org and reads the row under
 -- the tenant policy above.
 --
--- The function is SECURITY DEFINER, so it runs as its owner (the migrating
--- role). While that role is a superuser it bypasses RLS; once it is not (#16),
--- FORCE ROW LEVEL SECURITY binds it too, and this SELECT-only policy is what
--- admits the lookup: for the function's owner only (the role running this
--- migration, named below), unpinned, and only while app.console_session_lookup
--- is 'on', which the function's own SET clause sets for the duration of the
--- call. Any other role, otto_app included, gains nothing by setting it
--- itself, and a request path that forgot to pin still sees nothing. If the
--- function's ownership ever moves (REASSIGN OWNED), move the policy with it:
--- ALTER POLICY console_sessions_lookup ON console_sessions TO <new owner>.
-DO $$
-BEGIN
-  EXECUTE format(
-    'CREATE POLICY console_sessions_lookup ON console_sessions FOR SELECT TO %I '
-    'USING (current_org() IS NULL '
-    'AND current_setting(''app.console_session_lookup'', true) = ''on'')',
-    current_user);
-END $$;
-
+-- The function is SECURITY DEFINER, so it runs as its owner. While the owner
+-- is a superuser it bypasses RLS; once it is not (#16), FORCE ROW LEVEL
+-- SECURITY binds it too, and the SELECT-only policy console_sessions_lookup is
+-- what admits the lookup: unpinned, only while app.console_session_lookup is
+-- 'on' (which the function's own SET clause sets for the duration of the
+-- call), and only for whichever role owns the function at the time of the
+-- query. The policy reads that owner from pg_proc rather than naming a role,
+-- so it follows the function through ALTER FUNCTION ... OWNER TO and REASSIGN
+-- OWNED with nothing else to move. Any other role, otto_app included, gains
+-- nothing by setting the marker itself, and a request path that forgot to pin
+-- still sees nothing. The policy names the function, so the function comes
+-- first.
 CREATE FUNCTION console_session_org(session_hash bytea) RETURNS uuid
   LANGUAGE sql STABLE SECURITY DEFINER
   SET search_path = pg_catalog, public
@@ -92,6 +85,17 @@ AS $$
 $$;
 REVOKE ALL ON FUNCTION console_session_org(bytea) FROM PUBLIC;
 
+CREATE POLICY console_sessions_lookup ON console_sessions FOR SELECT
+  USING (current_org() IS NULL
+         AND current_setting('app.console_session_lookup', true) = 'on'
+         AND current_user = (SELECT pg_catalog.pg_get_userbyid(proowner)
+                             FROM pg_catalog.pg_proc
+                             WHERE oid = 'public.console_session_org(bytea)'::regprocedure));
+
+-- otto_app's EXECUTE grant is what the tests call the lookup through (they run
+-- request work as otto_app). Production calls console_session_org as the
+-- connecting role, before any org is pinned and so before SET LOCAL ROLE
+-- otto_app; the grant changes nothing there.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'otto_app') THEN

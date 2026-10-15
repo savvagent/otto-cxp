@@ -126,6 +126,11 @@ pub fn router(
         .fallback(move |req: Request| console_or_not_found(assets.clone(), req))
         .layer(RequestBodyLimitLayer::new(cxp_api::MAX_BODY_BYTES))
         .layer(middleware::map_response(move |mut res: Response| async move {
+            // Every response, JSON errors and console files alike: never
+            // sniffed into another type.
+            res.headers_mut()
+                .entry(header::X_CONTENT_TYPE_OPTIONS)
+                .or_insert(HeaderValue::from_static("nosniff"));
             if hsts {
                 res.headers_mut()
                     .entry(header::STRICT_TRANSPORT_SECURITY)
@@ -216,12 +221,35 @@ fn wants_html(req: &Request) -> bool {
 }
 
 /// Whether a path under the console names a dotfile or a dot segment,
-/// plainly or percent-encoded. Never served, whatever is on disk.
+/// plainly or percent-encoded. The check runs on the decoded path, split on
+/// both separators, because the file server decodes before it splits:
+/// `x%2F.env` reaches it as `x/.env`. A path that does not decode cleanly
+/// counts as one. Never served, whatever is on disk.
 fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let seg = seg.to_ascii_lowercase();
-        seg.starts_with('.') || seg.starts_with("%2e")
-    })
+    let Some(decoded) = percent_decode(path) else {
+        return true;
+    };
+    decoded.split(['/', '\\']).any(|seg| seg.starts_with('.'))
+}
+
+/// `path` with every `%XX` escape decoded, or `None` if an escape is
+/// malformed or the result is not UTF-8.
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Everything no route serves. Under `/console/`, a `GET` or `HEAD` is a file
@@ -301,10 +329,6 @@ async fn console_or_not_found(assets: Option<ConsoleAssets>, req: Request) -> Re
         "no-cache"
     };
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
     // The console acts with an ambient session cookie: never inside a frame.
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
@@ -593,6 +617,8 @@ mod tests {
         std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/config"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("x")).unwrap();
+        std::fs::write(dir.join("x/.env"), "SECRET=1").unwrap();
         let mut config = Config::for_test();
         config.console_dir = dir.clone();
         let app = app_from(config, PlatformCheck::Accepted);
@@ -658,6 +684,10 @@ mod tests {
             ("/console/.env", Some(NAVIGATION)),
             ("/console/.git/config", None),
             ("/console/%2eenv", None),
+            ("/console/x/.env", None),
+            ("/console/x%2F.env", None),
+            ("/console/x%2f.env", Some(NAVIGATION)),
+            ("/console/x%5C.env", None),
             ("/console/assets", None),
             ("/console/assets/", None),
             ("/auth/nope", Some(NAVIGATION)),
@@ -677,6 +707,7 @@ mod tests {
             );
             assert!(body.contains("not_found"), "{path}: {body}");
             assert!(!body.contains("SECRET"), "{path}");
+            assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
         }
         // /api answers for itself: authentication first, in JSON.
         let (status, _, body) = get_with(app.clone(), "/api/v1/nope", Some(NAVIGATION)).await;
@@ -712,10 +743,30 @@ mod tests {
 
     #[test]
     fn dot_segments_are_found_plain_and_encoded() {
-        for p in ["/.env", "/a/.git/x", "/%2Eenv", "/x/%2e%2e/y", "/.."] {
+        for p in [
+            "/.env",
+            "/a/.git/x",
+            "/%2Eenv",
+            "/x/%2e%2e/y",
+            "/..",
+            "/x%2F.env",
+            "/x%2f%2egit/config",
+            "/x%5C.env",
+            "/x\\.env",
+            "/bad%zz",
+            "/bad%2",
+            "/%ff",
+        ] {
             assert!(has_dot_segment(p), "{p}");
         }
-        for p in ["/", "/assets/app.js", "/a.b/c", "/sw.js"] {
+        for p in [
+            "/",
+            "/assets/app.js",
+            "/a.b/c",
+            "/sw.js",
+            "/a%20b.js",
+            "/a%2Fb.js",
+        ] {
             assert!(!has_dot_segment(p), "{p}");
         }
     }
@@ -724,6 +775,8 @@ mod tests {
     async fn hsts_is_sent_only_for_an_https_public_url() {
         let (_, headers, _) = get_with(app(), "/healthz", None).await;
         assert_eq!(headers["strict-transport-security"], HSTS);
+        // nosniff goes on every response, JSON included.
+        assert_eq!(headers["x-content-type-options"], "nosniff");
         let mut config = Config::for_test();
         config.public_url = "http://localhost:8080".into();
         config.resource_uri = "http://localhost:8080/mcp".into();

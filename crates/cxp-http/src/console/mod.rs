@@ -48,7 +48,45 @@
 //!   times ([`LEASE_POLL`], [`LEASE_POLLS`]) for the fresh token.
 //! - The refresh runs in a spawned task: once the platform has rotated the
 //!   pair, storing it is not optional, and a handler future is dropped when
-//!   its client disconnects.
+//!   its client disconnects. The task frees its single-flight entry from a
+//!   drop guard, so even a panic in it leaves the session refreshable by the
+//!   next request rather than answering `503` until a restart.
+//!
+//! ## Why one refresh token is never presented twice
+//!
+//! The lease lives on the database's clock (`clock_timestamp()` when the
+//! claiming `UPDATE` runs; see `cxp_core::console_sessions`), and the
+//! holder's store and release match the exact lease it claimed (generation
+//! and expiry), so a holder whose lease lapsed and was taken over can neither
+//! store over nor free the newer claim. What remains is to make the holder
+//! finish before its lease can lapse, which the timeouts bound:
+//!
+//! - The lease is [`LEASE`] = 45 s, starting no earlier than the moment the
+//!   holder began its claim (it is set by the `UPDATE`, after any wait for a
+//!   connection). The holder measures from that moment with a monotonic
+//!   clock, so the two clocks are compared only as durations.
+//! - Right before calling the platform, the holder requires
+//!   `elapsed + PLATFORM_TIMEOUT (10 s) + STORE_ALLOWANCE (20 s) <= LEASE`;
+//!   otherwise it gives the lease back unspent and answers `503`. A claim may
+//!   therefore take up to 15 s and still go ahead.
+//! - The platform call is cut off at `PLATFORM_TIMEOUT` (the whole request,
+//!   not just the connect).
+//! - The store then has at least `STORE_ALLOWANCE` = 20 s for its
+//!   compare-and-swap `UPDATE` to take the row: the pool's acquire timeout is
+//!   5 s, and the statements are single-row. Once the `UPDATE` holds the row,
+//!   a competing claim waits on its row lock and then sees the rotated,
+//!   fresh session. The one unbounded wait, the org's lifecycle lock, is held
+//!   exclusively only by an `org.deleted` purge, after which the session is
+//!   gone for every replica alike.
+//!
+//! So no second replica can claim, and present the same refresh token, while
+//! the first could still store its result. If the store fails instead (the
+//! database is down), the new pair is revoked and lost and the stored refresh
+//! token is spent: the next claim presents it, the platform refuses it
+//! (`invalid_grant`), the session is deleted, and the person signs in again.
+//! A waiting replica polls for a little longer than one lease
+//! ([`LEASE_POLL`] x [`LEASE_POLLS`] = 47.5 s), so a lease whose holder died
+//! lapses and is taken over before it gives up.
 //!
 //! | Platform says | Session | Request |
 //! |---|---|---|
@@ -63,13 +101,13 @@ mod routes;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use cxp_core::auth::{self, AuthFailure, Principal};
-use cxp_core::console_sessions::{self, Claim, Refreshed, Session, REFRESH_SKEW_SECS};
+use cxp_core::console_sessions::{self, Claim, Lease, Refreshed, Session, REFRESH_SKEW_SECS};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use hkdf::Hkdf;
 use http::{HeaderMap, Method};
@@ -102,17 +140,44 @@ pub const SESSION_TTL_DAYS: i64 = 30;
 /// Used when the platform's token response omits `expires_in`.
 const DEFAULT_ACCESS_TTL_SECS: i64 = 3600;
 
-/// How long a refresh lease lasts: longer than one platform call may take
-/// ([`oauth::PLATFORM_TIMEOUT`]), so a live refresh never loses it, and short
-/// enough that a replica that died mid-refresh blocks no one for long.
-pub const LEASE: Duration = Duration::from_secs(15);
+/// How long a refresh lease lasts, on the database's clock: long enough for a
+/// claim, one platform call ([`oauth::PLATFORM_TIMEOUT`]), and the store
+/// ([`STORE_ALLOWANCE`]), so a live refresh never loses it (see the module
+/// docs), and short enough that a replica that died mid-refresh blocks no one
+/// for long.
+pub const LEASE: Duration = Duration::from_secs(45);
+
+/// What a lease holder keeps back for storing the new pair after the platform
+/// answers: the pool's acquire timeout (5 s) and the store's two short
+/// statements, with room to spare.
+pub const STORE_ALLOWANCE: Duration = Duration::from_secs(20);
 
 /// How often a request that found another replica's lease looks again.
 pub const LEASE_POLL: Duration = Duration::from_millis(250);
 
 /// How many times it looks before answering `503`: a little past one lease,
 /// so a lease whose holder died lapses and is taken over first.
-pub const LEASE_POLLS: u32 = 70;
+pub const LEASE_POLLS: u32 = 190;
+
+// The arithmetic in the module docs, checked at compile time.
+const _: () = {
+    let budget = oauth::PLATFORM_TIMEOUT.as_millis() + STORE_ALLOWANCE.as_millis();
+    assert!(
+        budget < LEASE.as_millis(),
+        "a claim must leave room for the call and the store"
+    );
+    assert!(
+        LEASE_POLL.as_millis() * LEASE_POLLS as u128 > LEASE.as_millis(),
+        "a waiting replica must outwait a dead holder's lease"
+    );
+};
+
+/// Whether a holder whose claim began `elapsed` ago may still call the
+/// platform: the call and the store must both fit in what is left of the
+/// lease.
+fn fits_in_lease(elapsed: Duration) -> bool {
+    elapsed + oauth::PLATFORM_TIMEOUT + STORE_ALLOWANCE <= LEASE
+}
 
 /// HKDF-SHA256 `info` labels for the two subkeys of `CXP_ENCRYPTION_KEY`.
 pub const SESSION_TOKENS_LABEL: &str = "cxp.console.session-tokens.v1";
@@ -196,8 +261,29 @@ struct Inner {
     /// `scheme://host[:port]` of the public URL, as a browser sends `Origin`.
     origin: String,
     /// The refresh in flight for each session, by cookie hash: the in-process
-    /// single flight. An entry is removed when its refresh finishes.
-    inflight: Mutex<HashMap<[u8; 32], Shared<BoxFuture<'static, RefreshResult>>>>,
+    /// single flight. An entry is removed when its refresh task ends, however
+    /// it ends ([`InflightEntry`]).
+    inflight: Inflight<Shared<BoxFuture<'static, RefreshResult>>>,
+}
+
+/// The in-process single flight: one entry per session being refreshed.
+type Inflight<V> = Arc<Mutex<HashMap<[u8; 32], V>>>;
+
+/// Removes its session's single-flight entry when dropped: when the refresh
+/// task returns, and also when it panics, so a session is never left behind
+/// an entry whose task is gone.
+struct InflightEntry<V> {
+    map: Inflight<V>,
+    key: [u8; 32],
+}
+
+impl<V> Drop for InflightEntry<V> {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
 }
 
 impl Console {
@@ -217,7 +303,7 @@ impl Console {
                 db,
                 platform,
                 settings,
-                inflight: Mutex::default(),
+                inflight: Inflight::default(),
             }),
         }
     }
@@ -300,16 +386,15 @@ impl Console {
                 .entry(id_hash)
                 .or_insert_with(|| {
                     // Detached: see the module docs. It removes its own entry
-                    // when done, which waits for this lock to be released.
+                    // when it ends, which waits for this lock to be released.
                     let this = self.clone();
+                    let entry = InflightEntry {
+                        map: Arc::clone(&self.inner.inflight),
+                        key: id_hash,
+                    };
                     let task = tokio::spawn(async move {
-                        let result = this.refresh(org, id_hash).await;
-                        this.inner
-                            .inflight
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&id_hash);
-                        result
+                        let _entry = entry;
+                        this.refresh(org, id_hash).await
                     });
                     async move {
                         task.await.unwrap_or_else(|e| {
@@ -328,13 +413,17 @@ impl Console {
     /// The refresh protocol across replicas (see the module docs).
     async fn refresh(&self, org: OrgId, id_hash: [u8; 32]) -> RefreshResult {
         let db = &self.inner.db;
-        let lease = chrono::Duration::from_std(LEASE).unwrap_or(chrono::Duration::seconds(15));
+        let lease = chrono::Duration::from_std(LEASE).unwrap_or(chrono::Duration::seconds(45));
         for _ in 0..=LEASE_POLLS {
+            // The lease starts no earlier than this (module docs).
+            let started = Instant::now();
             let claim = console_sessions::claim_refresh(db, org, &id_hash, Utc::now(), lease)
                 .await
                 .map_err(|e| db_failure("claim a console session's refresh", e))?;
             match claim {
-                Claim::Claimed(session) => return self.refresh_claimed(session, id_hash).await,
+                Claim::Claimed(session, lease) => {
+                    return self.refresh_claimed(session, lease, started, id_hash).await
+                }
                 Claim::Fresh(session) => return self.open_access(&session, &id_hash).await,
                 // Signed out, swept, or its member removed since it was found.
                 Claim::Gone => return Err(AuthFailure::Inactive),
@@ -348,9 +437,15 @@ impl Console {
 
     /// Refresh a session this caller holds the lease on. Nothing is held while
     /// the platform answers.
-    async fn refresh_claimed(&self, session: Session, id_hash: [u8; 32]) -> RefreshResult {
+    async fn refresh_claimed(
+        &self,
+        session: Session,
+        lease: Lease,
+        started: Instant,
+        id_hash: [u8; 32],
+    ) -> RefreshResult {
         let i = &self.inner;
-        let (org, user, generation) = (session.org_id, session.user_id, session.generation);
+        let (org, user) = (session.org_id, session.user_id);
         let Ok(refresh_token) = session.refresh_token(&i.keys.session_tokens) else {
             tracing::warn!(
                 "a console session's tokens cannot be opened (was CXP_ENCRYPTION_KEY \
@@ -359,6 +454,16 @@ impl Console {
             self.forget(org, &id_hash).await;
             return Err(AuthFailure::Inactive);
         };
+        if !fits_in_lease(started.elapsed()) {
+            // The claim was slow: what is left of the lease might not cover
+            // the call and the store. Give it back with the token unspent.
+            tracing::warn!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "claiming a console session's refresh took too long; answering 503"
+            );
+            self.release(org, &id_hash, lease).await;
+            return Err(AuthFailure::Unavailable);
+        }
 
         let answer = i
             .oauth
@@ -375,7 +480,7 @@ impl Console {
                     &i.keys.session_tokens,
                     org,
                     &id_hash,
-                    generation,
+                    lease,
                     &Refreshed {
                         access_token: &tokens.access_token,
                         refresh_token: &tokens.refresh_token,
@@ -390,23 +495,28 @@ impl Console {
                         org,
                         user,
                     }),
-                    // Signed out or purged while the platform answered: the
-                    // new pair has nowhere to go, so it must not outlive this.
+                    // Signed out, purged, or claimed anew while the platform
+                    // answered: the new pair has nowhere to go, so it must not
+                    // outlive this.
                     Ok(false) | Err(cxp_core::Error::AccessRevoked) => {
                         self.revoke(&tokens.refresh_token).await;
                         Err(AuthFailure::Inactive)
                     }
                     Err(e) => {
                         // The platform has rotated the pair and it could not be
-                        // stored: the session's refresh token is spent.
-                        Err(db_failure("store a refreshed console session", e))
+                        // stored: the session's refresh token is spent (the next
+                        // claim is refused and signs the person out), and the new
+                        // pair is unreachable, so it must not outlive this either.
+                        let failure = db_failure("store a refreshed console session", e);
+                        self.revoke(&tokens.refresh_token).await;
+                        Err(failure)
                     }
                 }
             }
             Err(TokenError::InvalidGrant) => {
                 tracing::info!(org = %org,
                     "the platform refused a console session's refresh token; dropping the session");
-                console_sessions::delete_generation(&i.db, org, &id_hash, generation)
+                console_sessions::delete_generation(&i.db, org, &id_hash, lease.generation)
                     .await
                     .map_err(|e| db_failure("drop a console session", e))?;
                 Err(AuthFailure::Inactive)
@@ -414,14 +524,14 @@ impl Console {
             Err(TokenError::Unavailable(reason)) => {
                 // Untouched: as far as we know the refresh token is unspent.
                 tracing::warn!(%reason, "could not refresh a console session; answering 503");
-                self.release(org, &id_hash, generation).await;
+                self.release(org, &id_hash, lease).await;
                 Err(AuthFailure::Unavailable)
             }
             Err(TokenError::Rejected(reason)) => {
                 tracing::error!(%reason,
                     "the platform refused the console's refresh request; is CXP_CONSOLE_CLIENT_ID \
                      registered at the platform?");
-                self.release(org, &id_hash, generation).await;
+                self.release(org, &id_hash, lease).await;
                 Err(AuthFailure::Internal)
             }
         }
@@ -485,10 +595,8 @@ impl Console {
     }
 
     /// Give back a refresh lease. Best effort: it lapses on its own.
-    async fn release(&self, org: OrgId, id_hash: &[u8; 32], generation: i64) {
-        if let Err(e) =
-            console_sessions::release_lease(&self.inner.db, org, id_hash, generation).await
-        {
+    async fn release(&self, org: OrgId, id_hash: &[u8; 32], lease: Lease) {
+        if let Err(e) = console_sessions::release_lease(&self.inner.db, org, id_hash, lease).await {
             tracing::warn!(error = %e.log_detail(), "could not release a console session's lease");
         }
     }
@@ -525,6 +633,39 @@ fn access_expiry(expires_in: Option<i64>) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_claim_leaves_the_platform_uncalled() {
+        assert!(fits_in_lease(Duration::ZERO));
+        assert!(fits_in_lease(Duration::from_secs(15)));
+        assert!(!fits_in_lease(Duration::from_millis(15_001)));
+    }
+
+    /// A panic in a refresh task must not leave its session's entry behind:
+    /// every later request would join the dead task and answer 503.
+    #[tokio::test]
+    async fn a_panicking_refresh_task_still_frees_its_single_flight_entry() {
+        let map: Inflight<u8> = Inflight::default();
+        let key = [7u8; 32];
+        map.lock().unwrap().insert(key, 0);
+        map.lock().unwrap().insert([8u8; 32], 0);
+        let entry = InflightEntry {
+            map: Arc::clone(&map),
+            key,
+        };
+        let outcome = tokio::spawn(async move {
+            let _entry = entry;
+            panic!("a refresh task panicked");
+        })
+        .await;
+        assert!(outcome.unwrap_err().is_panic());
+        let left: Vec<[u8; 32]> = map.lock().unwrap().keys().copied().collect();
+        assert_eq!(
+            left,
+            vec![[8u8; 32]],
+            "only the panicked task's entry is gone"
+        );
+    }
 
     #[test]
     fn every_console_scope_is_one_this_service_knows() {
