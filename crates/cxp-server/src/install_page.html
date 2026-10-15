@@ -161,22 +161,26 @@ footer p { margin: 0; }
 for (const button of document.querySelectorAll("button[data-copy]")) {
   const target = document.getElementById(button.dataset.copy);
   const status = document.getElementById(button.dataset.status);
+  if (!target || !status) continue;
   button.hidden = false;
   button.addEventListener("click", async () => {
-    const text = target.textContent.trim();
     status.textContent = "";
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(target.textContent.trim());
       status.textContent = "Copied.";
+      return;
     } catch {
+      // No clipboard access (an insecure context, or the browser refused).
+    }
+    try {
       const range = document.createRange();
       range.selectNodeContents(target);
       const selection = window.getSelection();
-      if (selection) {
-        selection.removeAllRanges();
-        selection.addRange(range);
-      }
+      selection.removeAllRanges();
+      selection.addRange(range);
       status.textContent = "Selected. Press Ctrl+C to copy.";
+    } catch {
+      status.textContent = "Select the text above and copy it.";
     }
   });
 }

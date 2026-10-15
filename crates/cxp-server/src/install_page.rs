@@ -31,7 +31,7 @@ const TEMPLATE: &str = include_str!("install_page.html");
 /// framed.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
      style-src 'sha256-FczW5OVrT2mS0VV+4I1vUxN60McgpyXt7vmlNbtNfGc='; \
-     script-src 'sha256-sQXLBsN1XKHAA1ZR/dNSyr1AEQTQNOqkaW/4UUO/0xo='; \
+     script-src 'sha256-NTLwd0JRu6YZoG8Wgdva2igwwGrtMuA+ECWFiFJOpkM='; \
      base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// The rendered page, shared by every request.
@@ -42,19 +42,23 @@ pub struct InstallPage {
 
 impl InstallPage {
     /// Renders the page for this deployment. Fails only on a platform URL
-    /// that does not parse, which configuration has already refused.
+    /// that does not parse, which configuration has already refused
+    /// (`CXP_PLATFORM_URL` must be http(s), so its origin is never opaque).
+    ///
+    /// The configured address is substituted last, so text in it that looks
+    /// like a placeholder is never replaced.
     pub fn new(resource_uri: &str, platform_url: &str) -> Result<Self> {
         let origin = url::Url::parse(platform_url)
             .context("CXP_PLATFORM_URL is not a URL")?
             .origin()
             .ascii_serialization();
         let html = TEMPLATE
-            .replace("{{CONNECTOR_URL}}", &escape(resource_uri))
             .replace(
                 "{{GUIDE_URL}}",
                 &escape(&format!("{origin}/products/cxp#connect")),
             )
-            .replace("{{CONSOLE_URL}}", &escape(&format!("{origin}/")));
+            .replace("{{CONSOLE_URL}}", &escape(&format!("{origin}/")))
+            .replace("{{CONNECTOR_URL}}", &escape(resource_uri));
         Ok(Self {
             html: Bytes::from(html),
         })
@@ -89,7 +93,8 @@ impl InstallPage {
 /// A browser asking for a page: some `Accept` range is exactly `text/html`
 /// with q > 0, and the request carries no `Authorization` at all (a caller
 /// presenting credentials is a program). `text/*` and `*/*` do not count:
-/// curl sends `*/*`.
+/// curl sends `*/*`. An `Accept` value that is not visible ASCII is ignored,
+/// which leaves the JSON 404.
 pub fn wants_page(headers: &HeaderMap) -> bool {
     !headers.contains_key(header::AUTHORIZATION)
         && headers
@@ -101,7 +106,9 @@ pub fn wants_page(headers: &HeaderMap) -> bool {
 }
 
 /// One media range: `text/html`, case-insensitively, whose `q` (default 1)
-/// is a number in (0, 1]. A `q` that does not parse makes the range not
+/// parses as a float in (0, 1]. This is looser than RFC 9110's `qvalue`
+/// grammar (it takes `.5` or `1e-1`), which only ever means a browser-like
+/// request gets the page. A `q` that does not parse makes the range not
 /// count, which falls back to the JSON 404.
 fn accepts_html(range: &str) -> bool {
     let mut parts = range.split(';');
@@ -177,17 +184,26 @@ mod tests {
     }
 
     /// The CSP admits no inline handler or style attribute, so one would
-    /// silently do nothing.
+    /// silently do nothing. A smoke check over the words of the template, not
+    /// an HTML parse: it catches the usual `onclick="..."` and `style="..."`.
     #[test]
     fn the_template_has_no_inline_handlers_or_style_attributes() {
-        assert!(!TEMPLATE.contains(" style="), "style attribute");
-        assert!(!TEMPLATE.contains("javascript:"), "javascript: URL");
-        for word in TEMPLATE.split(|c: char| c.is_whitespace() || c == '<') {
+        let template = TEMPLATE.to_ascii_lowercase();
+        assert!(!template.contains("style="), "style attribute");
+        assert!(!template.contains("javascript:"), "javascript: URL");
+        for word in template.split(|c: char| c.is_whitespace() || c == '<' || c == '/') {
             assert!(
                 !(word.starts_with("on") && word.contains('=')),
                 "inline handler: {word}"
             );
         }
+    }
+
+    /// `include_str!` embeds the file's bytes, so a CRLF checkout would change
+    /// what the CSP hashes (`.gitattributes` pins the file to LF).
+    #[test]
+    fn the_template_has_lf_line_endings() {
+        assert!(!TEMPLATE.contains('\r'));
     }
 
     /// The script's hash must not depend on configuration, and both copy
@@ -233,6 +249,19 @@ mod tests {
         let html = html(&page);
         assert!(html.contains("<code id=\"address\">https://cxp.example.com/mcp/</code>"));
         assert!(html.contains("href=\"http://127.0.0.1:4000/\""));
+    }
+
+    /// The address goes in last, so placeholder-like text in it is shown,
+    /// not substituted.
+    #[test]
+    fn placeholder_text_in_the_address_is_left_alone() {
+        let page = InstallPage::new(
+            "https://cxp.example.com/{{GUIDE_URL}}/mcp",
+            "https://platform.example.com",
+        )
+        .unwrap();
+        assert!(html(&page)
+            .contains("<code id=\"address\">https://cxp.example.com/{{GUIDE_URL}}/mcp</code>"));
     }
 
     #[test]
