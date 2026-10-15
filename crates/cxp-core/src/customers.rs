@@ -3,6 +3,7 @@
 //! customer-360 view — with its model structs.
 
 use std::future::Future;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use otto_tenant::Tx;
@@ -17,6 +18,93 @@ use crate::paging::Page;
 /// Column list for [`Customer`]; never includes `org_id`.
 pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadata, tags, \
      experience_id, application_id, page_id, component_id, created_at, updated_at";
+
+/// `search_customers`: `$1` org, `$2` the `ILIKE` pattern, `$3` the trimmed
+/// query, `$4`/`$5` limit and offset.
+///
+/// The final `WHERE` is the whole match predicate, exactly as before #17; the
+/// CTEs only choose which rows it is evaluated on, through
+/// `customer_search_grams` (migration 0004), whose lookups are leakproof
+/// btree conditions and so index conditions under RLS. Each candidate set is
+/// a superset of the rows its half of the predicate accepts:
+///
+/// - `substring_hits`: `x ILIKE '%q%'` means lower(x) contains lower(q), so
+///   a match has every 4-character window of lower(q) among its `s` grams.
+///   Each window's posting count is taken up to [`DF_PROBE`] rows, and the
+///   rarest window's customers that also hold the next two rarest are the
+///   candidates; a query under four characters instead takes every customer
+///   with a window starting with it.
+/// - `fuzzy_hits`: `name % q` means similarity >= t (pg_trgm's
+///   `similarity_threshold`): with |A| the name's trigrams, |B| the query's,
+///   and c those they share, c / (|A| + |B| - c) >= t, so
+///   c >= k(|A|) = t(|A| + |B|) / (1 + t), and, as c <= |A|, c >= t|B|
+///   (`kmin`). A match therefore shares at least one of any |B| - kmin + 1
+///   query trigrams; only the rarest that many are looked up (rarity from
+///   the capped counts, ties broken by shape: word-initial trigrams are the
+///   most common), and a customer is a candidate when its count p among them
+///   reaches k(|A|) - (kmin - 1), the most the trigrams left out could add.
+///   The slack of 0.001 covers pg_trgm's float4 rounding. A threshold of 0
+///   or below makes every named customer a match, so it falls back to the
+///   org's customers.
+pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH w AS ( \
+           SELECT DISTINCT 's' || g AS gram FROM search_windows(lower($3)) AS g \
+         ), ranked AS ( \
+           SELECT gram, row_number() OVER (ORDER BY n, gram) AS rk FROM ( \
+             SELECT w.gram, (SELECT count(*) FROM (SELECT 1 FROM customer_search_grams g \
+                              WHERE g.org_id = $1 AND g.gram = w.gram LIMIT {DF_PROBE}) AS p) AS n \
+             FROM w) AS c \
+         ), substring_hits AS ( \
+           SELECT g.customer_id FROM customer_search_grams g \
+           WHERE g.org_id = $1 AND g.gram = (SELECT gram FROM ranked WHERE rk = 1) \
+             AND NOT EXISTS (SELECT 1 FROM ranked r WHERE r.rk IN (2, 3) AND NOT EXISTS ( \
+                   SELECT 1 FROM customer_search_grams g2 \
+                   WHERE g2.org_id = $1 AND g2.gram = r.gram AND g2.customer_id = g.customer_id)) \
+           UNION \
+           SELECT g.customer_id FROM customer_search_grams g \
+           WHERE length(lower($3)) < 4 AND g.org_id = $1 \
+             AND g.gram >= 's' || lower($3) \
+             AND g.gram <= 's' || lower($3) || U&'\\+10FFFF\\+10FFFF\\+10FFFF' \
+         ), fq AS ( \
+           SELECT 't' || t AS gram, \
+                  (SELECT count(*) FROM (SELECT 1 FROM customer_search_grams g \
+                     WHERE g.org_id = $1 AND g.gram = 't' || t LIMIT {DF_PROBE}) AS p) AS n, \
+                  CASE WHEN t LIKE '  %' THEN 2 WHEN t LIKE ' %' THEN 1 ELSE 0 END AS shape \
+           FROM unnest(show_trgm($3)) AS t \
+         ), fz AS ( \
+           SELECT gram, row_number() OVER (ORDER BY n, shape, gram) AS rk FROM fq \
+         ), fp AS ( \
+           SELECT b, th, greatest(ceil(th * b - 0.001), 1) AS kmin FROM ( \
+             SELECT (SELECT count(*) FROM fq) AS b, \
+                    current_setting('pg_trgm.similarity_threshold')::float8 AS th) AS x \
+         ), fuzzy_hits AS ( \
+           SELECT g.customer_id FROM customer_search_grams g \
+           WHERE g.org_id = $1 \
+             AND g.gram = ANY (ARRAY(SELECT gram FROM fz, fp WHERE fz.rk <= fp.b - fp.kmin + 1)) \
+           GROUP BY g.customer_id \
+           HAVING count(*) >= ceil((SELECT th FROM fp) * (max(g.name_grams) + (SELECT b FROM fp)) \
+                                   / (1 + (SELECT th FROM fp)) - 0.001) \
+                              - ((SELECT kmin FROM fp) - 1) \
+           UNION ALL \
+           SELECT id FROM customers \
+           WHERE org_id = $1 AND current_setting('pg_trgm.similarity_threshold')::float8 <= 0 \
+         ) \
+         SELECT {CUSTOMER_COLS} FROM customers \
+         WHERE org_id = $1 \
+           AND id = ANY (ARRAY(SELECT customer_id FROM substring_hits \
+                               UNION SELECT customer_id FROM fuzzy_hits)) \
+           AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
+         ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
+                  similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
+         LIMIT $4 OFFSET $5"
+    )
+});
+
+/// How many postings of one gram search counts before calling it common:
+/// enough to tell a rare gram from a common one, cheap for every window of a
+/// long query.
+pub(crate) const DF_PROBE: i64 = 256;
 
 /// How many recent rows each section of the 360 view carries.
 const RECENT: i64 = 10;
@@ -157,9 +245,12 @@ pub trait CustomersExt {
     ) -> impl Future<Output = Result<(Vec<Customer>, i64)>> + Send;
 
     /// Customers whose email or name contains `query` (case-insensitive), or
-    /// whose name is similar to it; email matches first. Neither `ILIKE` nor
-    /// the trigram `%` is leakproof, so under row-level security no index can
-    /// serve them: this scans the org's customers (#17).
+    /// whose name is similar to it (pg_trgm `%`); email matches first, then
+    /// by name similarity, newest first. Neither `ILIKE` nor `%` is
+    /// leakproof, so under row-level security no index can serve them;
+    /// candidates come from `customer_search_grams` by leakproof btree
+    /// lookups instead, and the original predicate is applied to those
+    /// (`SEARCH_CUSTOMERS_SQL`).
     fn search_customers(
         &mut self,
         query: &str,
@@ -299,21 +390,15 @@ impl CustomersExt for Tx<'_> {
             ));
         }
         let org = self.org();
-        Ok(sqlx::query_as(&format!(
-            "SELECT {CUSTOMER_COLS} FROM customers \
-             WHERE org_id = $1 \
-               AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
-             ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
-                      similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
-             LIMIT $4 OFFSET $5"
-        ))
-        .bind(org)
-        .bind(contains_pattern(query))
-        .bind(query)
-        .bind(page.limit())
-        .bind(page.offset())
-        .fetch_all(self.conn())
-        .await?)
+        crate::without_jit(self).await?;
+        Ok(sqlx::query_as(&SEARCH_CUSTOMERS_SQL)
+            .bind(org)
+            .bind(contains_pattern(query))
+            .bind(query)
+            .bind(page.limit())
+            .bind(page.offset())
+            .fetch_all(self.conn())
+            .await?)
     }
 
     async fn resolve_customer(&mut self, identifier: &str) -> Result<Uuid> {

@@ -714,3 +714,263 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
         .unwrap();
     assert_eq!(msgs[0].id, msg.id);
 }
+
+// ------------------------------------------------- search under RLS (#17)
+
+/// `search_articles` as it was before #17: the match predicate evaluated on
+/// every published article of the org. The indexed search must return
+/// exactly this.
+const ARTICLES_BY_SCAN: &str = "SELECT id FROM knowledge_articles \
+     WHERE org_id = $1 AND published = true \
+       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
+     ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, created_at DESC, id \
+     LIMIT $4";
+
+/// `cxp_core::contains_pattern`, which is crate-private.
+fn like_pattern(q: &str) -> String {
+    let mut out = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
+    let articles: &[(&str, &str, bool)] = &[
+        (
+            "Reset your password",
+            "Open settings, then security, and choose reset password.",
+            true,
+        ),
+        (
+            "Password policy",
+            "Passwords need twelve characters. Resetting is free.",
+            true,
+        ),
+        ("Draft: passwords", "passwords passwords passwords", false),
+        (
+            "Refund policy",
+            "A refund can be requested within a month of purchase.",
+            true,
+        ),
+        (
+            "Shipping times",
+            "Orders ship in two days; express shipping ships overnight.",
+            true,
+        ),
+        (
+            "100% off coupons",
+            "How the coupon_code field works with 50% discounts.",
+            true,
+        ),
+        (
+            "E-mail setup",
+            "Configure e-mail forwarding and the e-mail signature.",
+            true,
+        ),
+        (
+            "Über die Rückgabe",
+            "Rückgabe innerhalb von 30 Tagen. Straße und Hausnummer.",
+            true,
+        ),
+        ("Café menu", "The café serves crème brûlée.", true),
+        (
+            "API v2 webhooks",
+            "POST https://api.example.com/v2/hooks with JSON; see RFC-7231.",
+            true,
+        ),
+        ("The and of or", "the a an and of or to in", true),
+        (
+            "Account security",
+            "Two-factor authentication keeps accounts safe.",
+            true,
+        ),
+        ("中文 帮助", "如何 重置 密码", true),
+    ];
+    for (title, content, published) in articles {
+        let a = tx
+            .create_article(&NewArticle {
+                title: (*title).into(),
+                content: (*content).into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if *published && published_too {
+            tx.update_article(
+                a.id,
+                &ArticleUpdate {
+                    published: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+async fn articles_both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    org: OrgId,
+    q: &str,
+) -> (Vec<Uuid>, Vec<Uuid>) {
+    let indexed: Vec<Uuid> = match tx.search_articles(q).await {
+        Ok(found) => found.iter().map(|a| a.id).collect(),
+        Err(Error::Invalid(_)) => return (vec![], vec![]),
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let scanned: Vec<(Uuid,)> = sqlx::query_as(ARTICLES_BY_SCAN)
+        .bind(org)
+        .bind(q)
+        .bind(like_pattern(q))
+        .bind(cxp_core::knowledge::SEARCH_LIMIT)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    (indexed, scanned.into_iter().map(|(id,)| id).collect())
+}
+
+/// Full-text matches (stemming, several words, stop words, hyphenated and
+/// URL-like tokens, non-ASCII), title substrings of every length (one and
+/// two characters take the prefix path), LIKE wildcards, and misses.
+const KB_QUERIES: &[&str] = &[
+    "password",
+    "passwords",
+    "reset password",
+    "password reset",
+    "resetting",
+    "PASSWORD",
+    "refund",
+    "refunds policy",
+    "ship",
+    "ships",
+    "shipping overnight",
+    "express",
+    "the",
+    "the and",
+    "of or",
+    "e-mail",
+    "email",
+    "e-mail signature",
+    "mail",
+    "über",
+    "Über",
+    "rückgabe",
+    "strasse",
+    "straße",
+    "café",
+    "cafe",
+    "crème brûlée",
+    "https://api.example.com/v2/hooks",
+    "api.example.com",
+    "v2",
+    "rfc-7231",
+    "7231",
+    "json",
+    "100%",
+    "%",
+    "_",
+    "coupon_code",
+    "50%",
+    "Account sec",
+    "acc",
+    "ac",
+    "a",
+    "r",
+    "Re",
+    "two-factor",
+    "factor",
+    "中文",
+    "密码",
+    "帮",
+    "zebra",
+    "x",
+    "policy refund",
+    "security account",
+];
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn indexed_article_search_returns_exactly_what_the_scan_returns(pool: PgPool) {
+    let db = db(pool);
+    let (a, b) = (org(), org());
+    for o in [a, b] {
+        let mut tx = db.begin(o).await.unwrap();
+        seed_kb_corpus(&mut tx, true).await;
+        tx.commit().await.unwrap();
+    }
+    let mut tx = db.begin(a).await.unwrap();
+    // Twice over, so most comparisons run on the generic plan.
+    for _ in 0..2 {
+        for q in KB_QUERIES {
+            let (indexed, scanned) = articles_both_ways(&mut tx, a, q).await;
+            assert_eq!(indexed, scanned, "query {q:?}");
+        }
+    }
+    let mine: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM knowledge_articles WHERE org_id = $1")
+        .bind(a)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let found = tx.search_articles("password").await.unwrap();
+    assert!(!found.is_empty());
+    assert!(
+        found.iter().all(|x| mine.contains(&x.id)),
+        "org B's articles leaked"
+    );
+}
+
+/// Editing an article's title or content re-indexes it; publishing does not
+/// need to; deleting it removes its terms.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_search_index_follows_article_writes(pool: PgPool) {
+    let db = db(pool);
+    let mut tx = db.begin(org()).await.unwrap();
+    let art = tx
+        .create_article(&NewArticle {
+            title: "Gift cards".into(),
+            content: "Gift cards never expire".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Unpublished: indexed, but search still hides it.
+    assert!(tx.search_articles("gift").await.unwrap().is_empty());
+    tx.update_article(
+        art.id,
+        &ArticleUpdate {
+            published: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(tx.search_articles("expire").await.unwrap().len(), 1);
+
+    tx.update_article(
+        art.id,
+        &ArticleUpdate {
+            title: Some("Store credit".into()),
+            content: Some("Store credit lasts a year".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(tx.search_articles("expire").await.unwrap().is_empty());
+    assert!(tx.search_articles("Gift c").await.unwrap().is_empty());
+    assert_eq!(tx.search_articles("lasts").await.unwrap().len(), 1);
+    assert_eq!(tx.search_articles("re cr").await.unwrap().len(), 1);
+
+    tx.delete_article(art.id).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "deleting the article leaves terms behind");
+}

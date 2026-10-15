@@ -395,6 +395,11 @@ const TENANT_TABLES: [&str; 16] = [
     "usage_outbox",
 ];
 
+/// The search index tables (migration 0004): a customer or article has many
+/// rows in them, kept in step by triggers, so they are counted rather than
+/// expected to hold exactly one row.
+const SEARCH_INDEX_TABLES: [&str; 2] = ["customer_search_grams", "knowledge_search_terms"];
+
 // ---------------------------------------------------------------- begin_live
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -479,9 +484,22 @@ async fn org_deleted_purges_every_tenant_table_once_and_spares_other_orgs(pool: 
 
     let mut purged: Vec<&str> = PURGED_TABLES.to_vec();
     purged.sort_unstable();
-    let mut expected = TENANT_TABLES.to_vec();
+    let mut expected: Vec<&str> = TENANT_TABLES
+        .iter()
+        .chain(SEARCH_INDEX_TABLES.iter())
+        .copied()
+        .collect();
     expected.sort_unstable();
     assert_eq!(purged, expected, "the purge must cover every tenant table");
+    let mut indexed = vec![];
+    for table in SEARCH_INDEX_TABLES {
+        let (mine, theirs) = (
+            count(&pool, table, doomed).await,
+            count(&pool, table, other).await,
+        );
+        assert!(mine > 0 && theirs > 0, "{table} indexed nothing");
+        indexed.push((table, mine, theirs));
+    }
 
     let delivery = org_deleted(doomed);
     let Outcome::Applied { detail } = platform_events::apply(&db, &delivery).await.unwrap() else {
@@ -503,6 +521,20 @@ async fn org_deleted_purges_every_tenant_table_once_and_spares_other_orgs(pool: 
     // every table reports the one row the org had in it.
     for table in TENANT_TABLES {
         assert_eq!(detail[table], 1, "{table}: {detail}");
+    }
+    // The search index is purged before its parents too, and only this org's.
+    for (table, mine, theirs) in &indexed {
+        assert_eq!(
+            count(&pool, table, doomed).await,
+            0,
+            "{table} still holds rows"
+        );
+        assert_eq!(
+            count(&pool, table, other).await,
+            *theirs,
+            "{table} lost another org's rows"
+        );
+        assert_eq!(detail[*table], *mine, "{table}: {detail}");
     }
     assert_eq!(count(&pool, "usage_outbox_rejected", doomed).await, 1);
     // The dedupe marker and the tombstone survive the purge.
@@ -547,6 +579,9 @@ async fn org_deleted_purges_more_than_one_batch(pool: PgPool) {
         panic!("the first delivery applies");
     };
     assert_eq!(detail["interactions"], extra + 1, "{detail}");
+    for table in SEARCH_INDEX_TABLES {
+        assert_eq!(count(&pool, table, doomed).await, 0, "{table}");
+    }
     for table in TENANT_TABLES {
         assert_eq!(count(&pool, table, doomed).await, 0, "{table}");
         assert_eq!(count(&pool, table, other).await, 1, "{table}");
@@ -589,7 +624,7 @@ async fn an_interrupted_purge_is_finished_by_the_redelivery(pool: PgPool) {
             .unwrap(),
         Outcome::Applied { .. }
     ));
-    for table in TENANT_TABLES {
+    for table in TENANT_TABLES.iter().chain(SEARCH_INDEX_TABLES.iter()) {
         assert_eq!(count(&pool, table, doomed).await, 0, "{table}");
     }
 }

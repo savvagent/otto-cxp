@@ -1,11 +1,14 @@
 //! The knowledge base: `KnowledgeExt` on `otto_tenant::Tx` —
 //! articles and their full-text search — with its model structs.
 
+use std::sync::LazyLock;
+
 use otto_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::contains_pattern;
+use crate::customers::DF_PROBE;
 use crate::error::{Error, Result};
 use crate::paging::Page;
 
@@ -16,6 +19,63 @@ pub const MAX_QUERY_CHARS: usize = 200;
 
 const ARTICLE_COLS: &str =
     "id, title, content, category, tags, metadata, published, created_at, updated_at";
+
+/// `search_articles`: `$1` org, `$2` the trimmed query, `$3` the title
+/// `ILIKE` pattern, `$4` the limit.
+///
+/// The final `WHERE` is the whole match predicate, exactly as before #17; the
+/// CTEs only choose which rows it is evaluated on, through
+/// `knowledge_search_terms` (migration 0004), whose lookups are leakproof
+/// btree conditions and so index conditions under RLS:
+///
+/// - `fts_hits`: `plainto_tsquery('english', q)` is the AND of the lexemes
+///   `to_tsvector('english', q)` yields (the `english` configuration maps
+///   each token to at most one lexeme), so a match holds all of them as `l`
+///   terms: the candidates are the articles holding every one (the
+///   lexemes' postings, counted per article). A query of stop words alone
+///   has no lexemes and matches nothing, as `@@` with an empty query does.
+/// - `title_hits`: the title windows, exactly as `search_customers` treats
+///   `ILIKE` (see `customers::SEARCH_CUSTOMERS_SQL`).
+pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH lexemes AS ( \
+           SELECT DISTINCT 'l' || l AS term \
+           FROM unnest(tsvector_to_array(to_tsvector('english', $2))) AS l \
+         ), windows AS ( \
+           SELECT DISTINCT 's' || g AS term FROM search_windows(lower($2)) AS g \
+         ), ranked AS ( \
+           SELECT term, row_number() OVER (ORDER BY n, term) AS rk FROM ( \
+             SELECT w.term, (SELECT count(*) FROM (SELECT 1 FROM knowledge_search_terms t \
+                              WHERE t.org_id = $1 AND t.term = w.term LIMIT {DF_PROBE}) AS p) AS n \
+             FROM windows AS w) AS c \
+         ), fts_hits AS ( \
+           SELECT t.article_id FROM knowledge_search_terms t \
+           WHERE t.org_id = $1 AND t.term = ANY (ARRAY(SELECT term FROM lexemes)) \
+           GROUP BY t.article_id \
+           HAVING count(*) = (SELECT count(*) FROM lexemes) \
+         ), title_hits AS ( \
+           SELECT t.article_id FROM knowledge_search_terms t \
+           WHERE t.org_id = $1 \
+             AND t.term = (SELECT term FROM ranked WHERE rk = 1) \
+             AND NOT EXISTS (SELECT 1 FROM ranked r WHERE r.rk IN (2, 3) \
+                   AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t2 \
+                     WHERE t2.org_id = $1 AND t2.term = r.term AND t2.article_id = t.article_id)) \
+           UNION \
+           SELECT t.article_id FROM knowledge_search_terms t \
+           WHERE length(lower($2)) < 4 AND t.org_id = $1 \
+             AND t.term >= 's' || lower($2) \
+             AND t.term <= 's' || lower($2) || U&'\\+10FFFF\\+10FFFF\\+10FFFF' \
+         ) \
+         SELECT {ARTICLE_COLS} FROM knowledge_articles \
+         WHERE org_id = $1 AND published = true \
+           AND id = ANY (ARRAY(SELECT article_id FROM fts_hits \
+                               UNION SELECT article_id FROM title_hits)) \
+           AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
+         ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, \
+                  created_at DESC, id \
+         LIMIT $4"
+    )
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -69,9 +129,11 @@ pub trait KnowledgeExt {
 
     /// Full-text search over published articles, best match first, at most
     /// [`SEARCH_LIMIT`]. An empty query, or one over [`MAX_QUERY_CHARS`], is
-    /// `Invalid`. Matches and ranks the stored `search_tsv`; `@@` is not
-    /// leakproof, so under row-level security this reads the org's published
-    /// articles rather than a full-text index (#17).
+    /// `Invalid`. Matches and ranks the stored `search_tsv`, or a title
+    /// containing the query. Neither `@@` nor `ILIKE` is leakproof, so under
+    /// row-level security no index can serve them; candidates come from
+    /// `knowledge_search_terms` by leakproof btree lookups instead
+    /// (`SEARCH_ARTICLES_SQL`).
     fn search_articles(
         &mut self,
         query: &str,
@@ -133,20 +195,14 @@ impl KnowledgeExt for Tx<'_> {
             )));
         }
         let org = self.org();
-        Ok(sqlx::query_as(&format!(
-            "SELECT {ARTICLE_COLS} FROM knowledge_articles \
-             WHERE org_id = $1 AND published = true \
-               AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
-             ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, \
-                      created_at DESC, id \
-             LIMIT $4"
-        ))
-        .bind(org)
-        .bind(query)
-        .bind(contains_pattern(query))
-        .bind(SEARCH_LIMIT)
-        .fetch_all(self.conn())
-        .await?)
+        crate::without_jit(self).await?;
+        Ok(sqlx::query_as(&SEARCH_ARTICLES_SQL)
+            .bind(org)
+            .bind(query)
+            .bind(contains_pattern(query))
+            .bind(SEARCH_LIMIT)
+            .fetch_all(self.conn())
+            .await?)
     }
 
     async fn list_articles(

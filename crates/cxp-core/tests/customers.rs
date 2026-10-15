@@ -930,3 +930,389 @@ async fn interaction_types_match_the_enum(pool: PgPool) {
     in_db.sort();
     assert_eq!(in_code, in_db);
 }
+
+// ------------------------------------------------- search under RLS (#17)
+
+/// `search_customers` as it was before #17: the match predicate evaluated on
+/// every customer of the org. The indexed search must return exactly this.
+const SEARCH_BY_SCAN: &str = "SELECT id FROM customers \
+     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
+     ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
+              similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
+     LIMIT $4 OFFSET $5";
+
+/// `cxp_core::contains_pattern`, which is crate-private.
+fn like_pattern(q: &str) -> String {
+    let mut out = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// Every query compared against the scan: substrings of every length
+/// (one and two characters take the prefix path), whole emails, typos only
+/// the fuzzy match finds, case and non-ASCII folding, LIKE wildcards and
+/// the escape character, and queries matching nothing.
+const QUERIES: &[&str] = &[
+    "a",
+    "Z",
+    "ra",
+    "é",
+    "@",
+    ".",
+    "%",
+    "_",
+    "\\",
+    "gr",
+    "grace",
+    "GRACE",
+    "hopper",
+    "grace hopper",
+    "Grace Hoper",
+    "Grase Hopper",
+    "navy",
+    "navy.example",
+    "ce@na",
+    "grace@navy.example",
+    "alan@bletchley.example",
+    "100%",
+    "100%@",
+    "a_b",
+    "o'brien",
+    "O'Brien",
+    "José",
+    "JOSÉ",
+    "jose",
+    "zoë",
+    "Zoe",
+    "müller",
+    "MÜLLER",
+    "straße",
+    "STRASSE",
+    "kelvin",
+    "İstanbul",
+    "istanbul",
+    "3m",
+    "x",
+    "xyzzy",
+    "  ",
+    "e h",
+    "lovelace",
+    "Ada Lovelace",
+    "Ada Lovelase",
+    "Lin",
+    "Linus",
+    "torvalds",
+    "TORVALDS",
+    "smith",
+    "Jon Smith",
+    "john smyth",
+    "li",
+    "lee",
+    "le",
+    "wei",
+    "王",
+    "王小明",
+    "小明",
+    "mi",
+];
+
+async fn seed_search_corpus(tx: &mut otto_tenant::Tx<'_>) {
+    let people: &[(&str, Option<&str>)] = &[
+        ("grace@navy.example", Some("Grace Hopper")),
+        ("alan@bletchley.example", Some("Alan Turing")),
+        ("ada@example.com", Some("Ada Lovelace")),
+        ("ada.l@example.org", Some("Ada Lovelase")),
+        ("100%@example.com", Some("Percent")),
+        ("a_b@example.com", Some("Under Score")),
+        ("aXb@example.com", Some("Not Under Score")),
+        ("back\\slash@example.com", Some("Back Slash")),
+        ("obrien@example.com", Some("Conan O'Brien")),
+        ("jose@example.es", Some("José Núñez")),
+        ("zoe@example.fr", Some("Zoë Kravitz")),
+        ("mueller@example.de", Some("Thomas Müller")),
+        ("strasse@example.de", Some("Straße Weg")),
+        ("kelvin@example.com", Some("\u{212A}elvin Temperature")),
+        ("ist@example.tr", Some("İstanbul Office")),
+        ("3m@example.com", Some("3M Company")),
+        ("linus@kernel.example", Some("Linus Torvalds")),
+        ("lin@example.com", Some("Lin")),
+        ("john.smith@example.com", Some("John Smith")),
+        ("jon.smyth@example.com", Some("Jon Smyth")),
+        ("lee@example.com", Some("Lee")),
+        ("wei@example.cn", Some("王小明")),
+        ("noname@example.com", None),
+        ("x@y.z", Some("X")),
+    ];
+    for (email, name) in people {
+        tx.create_customer(&NewCustomer {
+            email: (*email).into(),
+            name: name.map(Into::into),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// The ids the indexed search returns, and the ids the old full scan
+/// returns, for one query and page.
+async fn both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    org: OrgId,
+    q: &str,
+    page: Page,
+) -> (Vec<Uuid>, Vec<Uuid>) {
+    let indexed: Vec<Uuid> = match tx.search_customers(q, page).await {
+        Ok(found) => found.iter().map(|c| c.id).collect(),
+        Err(Error::Invalid(_)) => return (vec![], vec![]),
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let scanned: Vec<(Uuid,)> = sqlx::query_as(SEARCH_BY_SCAN)
+        .bind(org)
+        .bind(like_pattern(q))
+        .bind(q)
+        .bind(page.limit())
+        .bind(page.offset())
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    (indexed, scanned.into_iter().map(|(id,)| id).collect())
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn indexed_search_returns_exactly_what_the_scan_returns(pool: PgPool) {
+    let db = db(pool);
+    let (a, b) = (org(), org());
+    for o in [a, b] {
+        let mut tx = db.begin(o).await.unwrap();
+        seed_search_corpus(&mut tx).await;
+        tx.commit().await.unwrap();
+    }
+    let mut tx = db.begin(a).await.unwrap();
+    // Twice over, so the prepared statement has gone to its generic plan
+    // (after five executions) for most of the comparisons.
+    for _ in 0..2 {
+        for q in QUERIES {
+            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
+            assert_eq!(indexed, scanned, "query {q:?}");
+        }
+    }
+    // Paging cuts the same ordered list.
+    let (indexed, scanned) = both_ways(&mut tx, a, "example", page(3, 2)).await;
+    assert_eq!(indexed.len(), 3);
+    assert_eq!(indexed, scanned);
+    // Org B's identical customers never appear.
+    let all: Vec<Uuid> = tx
+        .search_customers("e", Page::new(Some(200), None))
+        .await
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    let mine: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM customers WHERE org_id = $1")
+        .bind(a)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    assert!(all.iter().all(|id| mine.contains(id)));
+}
+
+/// Fuzzy candidates are bounded with pg_trgm's own threshold, so a session
+/// that changes it still gets what `%` gives, including the threshold of 0
+/// at which every named customer is similar.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn indexed_search_follows_the_similarity_threshold(pool: PgPool) {
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    seed_search_corpus(&mut tx).await;
+    for threshold in ["0", "0.1", "0.5", "0.9", "1"] {
+        sqlx::query(&format!(
+            "SET LOCAL pg_trgm.similarity_threshold = {threshold}"
+        ))
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        for q in ["Grace Hoper", "lin", "smith", "zzzz", "王小明", "%"] {
+            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
+            assert_eq!(indexed, scanned, "threshold {threshold}, query {q:?}");
+        }
+    }
+}
+
+/// Creating, renaming, and deleting a customer keep the search index in
+/// step: the old name and email stop matching and the new ones match.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_search_index_follows_customer_writes(pool: PgPool) {
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    let c = tx
+        .create_customer(&new("first@old.example", "Rosalind Franklin"))
+        .await
+        .unwrap();
+    let ids = |found: Vec<Customer>| found.into_iter().map(|c| c.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(tx
+            .search_customers("rosalind", Page::default())
+            .await
+            .unwrap()),
+        [c.id]
+    );
+
+    // Writing the same values again changes nothing (the trigger skips it).
+    tx.update_customer(c.id, &CustomerUpdate::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(tx
+            .search_customers("old.example", Page::default())
+            .await
+            .unwrap()),
+        [c.id]
+    );
+
+    tx.update_customer(
+        c.id,
+        &CustomerUpdate {
+            email: Some("second@new.example".into()),
+            name: Some("Barbara McClintock".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(tx
+        .search_customers("rosalind", Page::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(tx
+        .search_customers("old.example", Page::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        ids(tx
+            .search_customers("mcclintock", Page::default())
+            .await
+            .unwrap()),
+        [c.id]
+    );
+    assert_eq!(
+        ids(tx
+            .search_customers("Barbra McClintok", Page::default())
+            .await
+            .unwrap()),
+        [c.id]
+    );
+    assert_eq!(
+        ids(tx
+            .search_customers("new.ex", Page::default())
+            .await
+            .unwrap()),
+        [c.id]
+    );
+
+    tx.delete_customer(c.id).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM customer_search_grams")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "deleting the customer leaves grams behind");
+}
+
+/// Writes that bypass this crate (the previous release, which knows nothing
+/// of the index, or raw SQL) are indexed too: the triggers do it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn raw_sql_writes_are_indexed(pool: PgPool) {
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    sqlx::query(
+        "INSERT INTO customers (org_id, email, name) VALUES ($1, 'raw@sql.example', 'Raw Row')",
+    )
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    assert_eq!(
+        tx.search_customers("raw row", Page::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    sqlx::query("UPDATE customers SET name = 'Cooked Row' WHERE org_id = $1")
+        .bind(a)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    assert!(tx
+        .search_customers("raw row", Page::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        tx.search_customers("cooked", Page::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Many near-identical names, so plenty of candidates sit right at the
+/// similarity threshold: a candidate bound that dropped one would show here.
+/// Names and queries are drawn from a few syllables by a fixed generator.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn indexed_search_matches_the_scan_on_near_threshold_names(pool: PgPool) {
+    const SYLLABLES: [&str; 8] = ["an", "na", "ber", "lin", "o", "kar", "el", "ta"];
+    let mut state: u64 = 17;
+    let mut word = |n: usize| {
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                SYLLABLES[(state >> 33) as usize % SYLLABLES.len()]
+            })
+            .collect::<String>()
+    };
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    for i in 0..300 {
+        let name = format!("{} {}", word(2 + i % 3), word(1 + i % 4));
+        tx.create_customer(&new(&format!("c{i}@{}.example", word(2)), &name))
+            .await
+            .unwrap();
+    }
+    let queries: Vec<String> = (0..40)
+        .map(|i| match i % 4 {
+            0 => word(2),
+            1 => format!("{} {}", word(2), word(2)),
+            2 => word(4),
+            _ => format!("{} {}", word(3), word(1)),
+        })
+        .collect();
+    for threshold in ["0.2", "0.3", "0.45"] {
+        sqlx::query(&format!(
+            "SET LOCAL pg_trgm.similarity_threshold = {threshold}"
+        ))
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        for q in &queries {
+            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
+            assert_eq!(indexed, scanned, "threshold {threshold}, query {q:?}");
+        }
+    }
+}

@@ -32,6 +32,11 @@ const DOMAIN_TABLES: [&str; 15] = [
     "components",
 ];
 
+/// The search index tables (migration 0004): org-scoped and isolated like
+/// the domain tables, but derived from them by triggers, many rows per
+/// customer or article.
+const SEARCH_INDEX_TABLES: [&str; 2] = ["customer_search_grams", "knowledge_search_terms"];
+
 /// Bookkeeping tables carrying a `<table>_tenant_isolation` policy.
 const BOOKKEEPING_TABLES: [&str; 3] = ["platform_events", "usage_outbox", "usage_outbox_rejected"];
 
@@ -45,6 +50,7 @@ struct Seeded {
     segment: Uuid,
     session: Uuid,
     survey: Uuid,
+    article: Uuid,
 }
 
 /// Insert one row into every tenant table for `org`, as `otto_app` pinned to
@@ -59,6 +65,7 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
         segment: Uuid::new_v4(),
         session: Uuid::new_v4(),
         survey: Uuid::new_v4(),
+        article: Uuid::new_v4(),
     };
     let email = format!("{}@example.com", Uuid::new_v4());
     let catalog = "$3, $4, $5, $6";
@@ -86,8 +93,8 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
              application_id, page_id, component_id) \
              VALUES ($1, $2, 'Card declined', 'high'::ticket_priority, {catalog})"
         ),
-        "INSERT INTO knowledge_articles (org_id, title, content) \
-         VALUES ($1, 'Refunds', 'How refunds work')"
+        "INSERT INTO knowledge_articles (id, org_id, title, content) \
+         VALUES ($11, $1, 'Refunds', 'How refunds work')"
             .to_string(),
         "INSERT INTO chat_sessions (id, org_id, customer_id) VALUES ($8, $1, $2)".to_string(),
         "INSERT INTO chat_messages (org_id, session_id, role, content) \
@@ -117,7 +124,7 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
     let mut tx = db.begin(org).await.unwrap();
     for sql in &statements {
         // Postgres refuses a bind carrying more parameters than the statement
-        // references, so every statement is prefixed to reference all ten.
+        // references, so every statement is prefixed to reference all eleven.
         sqlx::query(&with_param_types(sql))
             .bind(org)
             .bind(s.customer)
@@ -129,6 +136,7 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
             .bind(s.session)
             .bind(s.survey)
             .bind(&email)
+            .bind(s.article)
             .execute(tx.conn())
             .await
             .unwrap_or_else(|e| panic!("seeding failed on {sql}: {e}"));
@@ -137,12 +145,12 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
     s
 }
 
-/// Prefix a statement with a no-op that references all ten seed parameters,
+/// Prefix a statement with a no-op that references all eleven seed parameters,
 /// so each one's type is known even where `sql` does not use it.
 fn with_param_types(sql: &str) -> String {
     format!(
         "WITH _p AS (SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, \
-         $7::uuid, $8::uuid, $9::uuid, $10::text) {sql}"
+         $7::uuid, $8::uuid, $9::uuid, $10::text, $11::uuid) {sql}"
     )
 }
 
@@ -165,6 +173,7 @@ async fn tenant_isolation_is_enforced_on_every_tenant_table(pool: PgPool) {
 
     let mut expected: Vec<&str> = DOMAIN_TABLES
         .iter()
+        .chain(SEARCH_INDEX_TABLES.iter())
         .chain(BOOKKEEPING_TABLES.iter())
         .copied()
         .collect();
@@ -223,6 +232,32 @@ async fn another_org_can_neither_see_nor_change_an_orgs_rows(pool: PgPool) {
         );
     }
 
+    // The search index: org A's customer and article left rows (many each);
+    // org B sees, changes, and deletes none of them.
+    for table in SEARCH_INDEX_TABLES {
+        let theirs = count(&db, a, table).await;
+        assert!(theirs > 0, "org A's {table} is empty");
+        assert_eq!(count(&db, b, table).await, 0, "org B sees org A's {table}");
+        let mut tx = db.begin(b).await.unwrap();
+        for sql in [
+            format!("UPDATE {table} SET org_id = org_id"),
+            format!("DELETE FROM {table}"),
+        ] {
+            let n = sqlx::query(&sql)
+                .execute(tx.conn())
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(n, 0, "org B changed org A's {table}: {sql}");
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(
+            count(&db, a, table).await,
+            theirs,
+            "org A's {table} survives"
+        );
+    }
+
     // A pinned transaction cannot write a row for, or move a row to, another
     // org: the policy's WITH CHECK refuses it (42501).
     for (table, insert) in [
@@ -242,6 +277,16 @@ async fn another_org_can_neither_see_nor_change_an_orgs_rows(pool: PgPool) {
             "platform_events",
             "INSERT INTO platform_events (event_id, org_id, kind) \
              VALUES (gen_random_uuid(), $1, 'org.deleted')",
+        ),
+        (
+            "customer_search_grams",
+            "INSERT INTO customer_search_grams (org_id, customer_id, gram, name_grams) \
+             VALUES ($1, gen_random_uuid(), 'sabc', 1)",
+        ),
+        (
+            "knowledge_search_terms",
+            "INSERT INTO knowledge_search_terms (org_id, article_id, term) \
+             VALUES ($1, gen_random_uuid(), 'labc')",
         ),
         (
             "usage_outbox",
@@ -276,7 +321,7 @@ async fn unpinned_otto_app_sees_no_domain_rows(pool: PgPool) {
     let a = org();
     seed(&admin, a).await;
 
-    for table in DOMAIN_TABLES {
+    for table in DOMAIN_TABLES.iter().chain(SEARCH_INDEX_TABLES.iter()) {
         let mut tx = as_app_unpinned(&pool).await;
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&mut *tx)
@@ -342,7 +387,7 @@ async fn the_platform_events_sweep_needs_the_maintenance_marker(pool: PgPool) {
 
     // Marked or not, the sweep cannot reach domain tables.
     let mut tx = as_app_maintenance(&pool).await;
-    for table in DOMAIN_TABLES {
+    for table in DOMAIN_TABLES.iter().chain(SEARCH_INDEX_TABLES.iter()) {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&mut *tx)
             .await
@@ -509,6 +554,20 @@ async fn composite_foreign_keys_refuse_cross_org_references(pool: PgPool) {
                 ours.customer
             ),
             theirs.survey,
+        ),
+        (
+            "a search gram for another org's customer",
+            "INSERT INTO customer_search_grams (org_id, customer_id, gram, name_grams) \
+             VALUES ($1, $2, 'sxyz', 1)"
+                .into(),
+            theirs.customer,
+        ),
+        (
+            "a search term for another org's article",
+            "INSERT INTO knowledge_search_terms (org_id, article_id, term) \
+             VALUES ($1, $2, 'lxyz')"
+                .into(),
+            theirs.article,
         ),
         (
             "a ticket moved onto another org's customer",
@@ -741,6 +800,7 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
     let all = ["SELECT", "INSERT", "UPDATE", "DELETE"];
     let mut expected: Vec<(&str, &[&str])> = DOMAIN_TABLES
         .iter()
+        .chain(SEARCH_INDEX_TABLES.iter())
         .chain(BOOKKEEPING_TABLES.iter())
         .map(|t| (*t, &all[..]))
         .collect();

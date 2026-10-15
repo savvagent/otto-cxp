@@ -45,6 +45,17 @@ pub async fn ping(db: &otto_tenant::Db) -> Result<()> {
     Ok(())
 }
 
+/// Turn JIT compilation off for the rest of `tx`. The search queries'
+/// generic plans carry cost estimates far above `jit_above_cost` (the
+/// planner cannot see how few index entries a gram lookup reads), and
+/// compiling them takes longer than running them.
+pub(crate) async fn without_jit(tx: &mut otto_tenant::Tx<'_>) -> Result<()> {
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.conn())
+        .await?;
+    Ok(())
+}
+
 /// A `LIKE`/`ILIKE` pattern matching `q` anywhere, with `q`'s own `\`, `%`,
 /// and `_` escaped (Postgres' default `LIKE` escape is `\`).
 pub(crate) fn contains_pattern(q: &str) -> String {
