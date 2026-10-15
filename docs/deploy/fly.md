@@ -43,9 +43,11 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   database on the instance (`otto_platform` included). Replacing it with a dedicated
   non-superuser role is tracked in
   [#16](https://github.com/savvagent/otto-cxp/issues/16); do it before real customers.
-  Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
-  planner off some index paths; fine at today's volumes, slow at scale. Making them fast is
-  tracked in [#17](https://github.com/savvagent/otto-cxp/issues/17). The pool is
+  Customer and knowledge-base search run under RLS, which keeps the planner from using an
+  index for `ILIKE`, `%`, or `@@`; since [#17](https://github.com/savvagent/otto-cxp/issues/17)
+  they look candidates up in their own search index tables (`customer_search_grams`,
+  `knowledge_search_terms`, migration 0004), which cost roughly 7 kB per customer and 20 kB per
+  article (`docs/specs/2026-10-14-search-under-rls-design.md`). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
