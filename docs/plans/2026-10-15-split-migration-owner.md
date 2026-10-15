@@ -109,7 +109,7 @@ Model: opus (catalog SQL with membership semantics).
   one query for owned objects (database, schemas excluding `pg_catalog`, `information_schema`,
   `pg_toast%`, `pg_temp%`; relations in those schemas with relkind mapped to table, partitioned
   table, view, materialized view, sequence, index, foreign table, composite type; functions;
-  types excluding array types and relation row types; owner where
+  types excluding array types and relation row types; extensions; owner where
   `pg_has_role(user, owner, 'MEMBER')`), ordered by kind then name, `LIMIT MAX_REPORTED`, plus a
   count; one query for relations (`r`,`p`,`v`,`m`,`f`) in those schemas not owned through
   membership where `has_table_privilege(user, oid, 'TRUNCATE')` or `'TRIGGER'`, `LIMIT
