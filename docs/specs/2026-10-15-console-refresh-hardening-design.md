@@ -1,6 +1,6 @@
 # Console refresh hardening before sign-in is enabled
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#38)
 
 ## Brief
 

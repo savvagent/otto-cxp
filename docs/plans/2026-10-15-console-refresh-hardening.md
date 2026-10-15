@@ -63,7 +63,7 @@ workspace building and green.
 
 Model: opus
 
-- [ ] 1. In `crates/cxp-core/tests/console_sessions.rs` add three `#[sqlx::test]`s:
+- [x] 1. In `crates/cxp-core/tests/console_sessions.rs` add three `#[sqlx::test]`s:
   (a) a second connection from the pool begins a transaction and runs
   `SELECT 1 FROM console_sessions WHERE id_hash = $1 FOR UPDATE` (the pool's superuser bypasses
   RLS); with that held, `store_refreshed` against a freshly claimed lease returns `Err` within
@@ -79,12 +79,12 @@ Model: opus
   same pool `SHOW lock_timeout` and `SHOW statement_timeout` must both be `0` (proves
   `set_config(.., true)`, i.e. `SET LOCAL`, not a session setting). Close that pool before the
   test returns.
-- [ ] 2. Make `LIFECYCLE_LOCK` in `crates/cxp-core/src/platform_events.rs` `pub` (doc: the
+- [x] 2. Make `LIFECYCLE_LOCK` in `crates/cxp-core/src/platform_events.rs` `pub` (doc: the
   advisory-lock class of an org's lifecycle lock). Run
   `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`:
   (a)-(c) hang to the 10 s timeout and fail; (d) passes or fails depending on nothing yet (it
   guards the implementation).
-- [ ] 3. Implement: `crates/cxp-core/src/lib.rs` `pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = Duration::from_secs(5);` with a doc line; `crates/cxp-server/src/boot.rs:187` uses it.
+- [x] 3. Implement: `crates/cxp-core/src/lib.rs` `pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = Duration::from_secs(5);` with a doc line; `crates/cxp-server/src/boot.rs:187` uses it.
   `platform_events.rs`: add
   `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Timeouts { pub lock: Duration, pub statement: Duration }`
   (std `Duration`) and `pub async fn begin_live_bounded(db, org, user, t: Timeouts)`; both it and
@@ -105,37 +105,37 @@ Model: opus
   the enforced bound; the lifecycle lock is taken exclusively by `org.deleted`, `member.removed`,
   and `team.deleted` (`exclude_requests`), and the store now times out rather than waits behind
   them; the opening statements before the timeouts are set are assumed, not enforced.
-- [ ] 4. Run the test command from step 2: all pass. Then
+- [x] 4. Run the test command from step 2: all pass. Then
   `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`,
   `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
-- [ ] 5. Commit `fix(core): bound the console refresh store's waits in the database` with a why
+- [x] 5. Commit `fix(core): bound the console refresh store's waits in the database` with a why
   body ending `Refs #31`.
 
 ### Task 2: Lease-aware `delete_generation`
 
 Model: sonnet
 
-- [ ] 1. In `crates/cxp-core/tests/console_sessions.rs` add a test: claim with a 200 ms lease,
+- [x] 1. In `crates/cxp-core/tests/console_sessions.rs` add a test: claim with a 200 ms lease,
   sleep 400 ms, claim again (newer lease, same generation); `delete_generation` with the stale
   lease returns 0 and the session still loads; with the newer lease it returns 1 and the session
   is gone. Update the two existing calls near line 265: bind the second claim with
   `let Claim::Claimed(_, current) = .. else { panic!() }`; the generation-0 call passes
   `Lease { generation: 0, until: current.until }` (still a generation mismatch), the other
   `current`.
-- [ ] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`: fails to compile (signature).
-- [ ] 3. Change `delete_generation(db, org, id_hash, lease: Lease)` to add
+- [x] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test console_sessions --locked`: fails to compile (signature).
+- [x] 3. Change `delete_generation(db, org, id_hash, lease: Lease)` to add
   `AND refresh_lease_until = $4` and bind `lease.until`; doc: a stale holder never deletes a
   session someone else has claimed anew. Update the caller in
   `crates/cxp-http/src/console/mod.rs` (`InvalidGrant` arm) to pass `lease`.
-- [ ] 4. Run the step 2 command, then `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
-- [ ] 5. Commit `fix(core): delete a refused console session only under its own lease`, why body,
+- [x] 4. Run the step 2 command, then `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
+- [x] 5. Commit `fix(core): delete a refused console session only under its own lease`, why body,
   `Refs #31`.
 
 ### Task 3: The lookup policy survives `DROP OWNED BY`
 
 Model: sonnet
 
-- [ ] 1. In `crates/cxp-core/tests/db.rs` add
+- [x] 1. In `crates/cxp-core/tests/db.rs` add
   `the_console_lookup_policy_survives_drop_owned_by_its_previous_owner`: create roles
   `old` and `new` (`NOLOGIN NOSUPERUSER NOBYPASSRLS`, unique names); `ALTER TABLE console_sessions`
   and `ALTER FUNCTION console_session_org(bytea)` `OWNER TO old`; as a control,
@@ -146,17 +146,17 @@ Model: sonnet
   are owned by `new`; the lookup as `otto_app` unpinned returns the seeded org. Run the body in a
   spawned task and always clean up (`REASSIGN OWNED BY new TO <me>`, `DROP OWNED BY new`,
   `DROP ROLE IF EXISTS` both), as the existing ownership test does.
-- [ ] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test db --locked console_lookup`: passes (it guards behavior that already holds; verify it can
+- [x] 2. Run `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test -p cxp-core --test db --locked console_lookup`: passes (it guards behavior that already holds; verify it can
   fail by temporarily giving the lookup policy `TO old` in the test only, see it fail, revert).
-- [ ] 3. `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
-- [ ] 4. Commit `test(core): prove the console lookup policy survives drop owned by`, why body,
+- [x] 3. `DATABASE_URL=postgres://cxp:cxp@localhost:15463/otto_cxp cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`.
+- [x] 4. Commit `test(core): prove the console lookup policy survives drop owned by`, why body,
   `Refs #31`.
 
 ### Task 4: Enabling runbook
 
 Model: haiku
 
-- [ ] 1. In `docs/deploy/fly.md` "## Web console sign-in", after step 3, add step 4 (live
+- [x] 1. In `docs/deploy/fly.md` "## Web console sign-in", after step 3, add step 4 (live
   verification, from the issue): `curl -s https://otto-cxp.savvagent.com/auth/session` shows
   `loginEnabled: true`; sign in at `/console/` and the customers list loads; a cross-site write
   (e.g. `curl -X POST` with the session cookie and `Origin: https://example.com` to an `/api/v1`
@@ -164,4 +164,4 @@ Model: haiku
   longer works; `/auth/session` reports signed out). Note the order constraint (secret staged
   before the `fly.toml` change deploys). Replace the stale "`/` is a JSON `404` until #29" text in
   "## Verify" only if it is wrong on main (it is: #29 shipped).
-- [ ] 2. Commit `docs(deploy): add live verification to the console enabling runbook`, `Refs #31`.
+- [x] 2. Commit `docs(deploy): add live verification to the console enabling runbook`, `Refs #31`.
