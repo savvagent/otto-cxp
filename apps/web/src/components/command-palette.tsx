@@ -52,7 +52,7 @@ export function CommandPalette() {
         ticketsApi.list({ limit: 10 }),
       ]);
       if (customerResults.status === "fulfilled") {
-        setCustomers(customerResults.value.slice(0, 5));
+        setCustomers(customerResults.value.data.slice(0, 5));
       }
       if (ticketResults.status === "fulfilled") {
         const filtered = ticketResults.value.data.filter(

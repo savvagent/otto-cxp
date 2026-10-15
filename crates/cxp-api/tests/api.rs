@@ -546,12 +546,18 @@ async fn routes_answer_in_the_shapes_the_console_reads(pool: PgPool) {
     let found = h
         .call("GET", "/api/v1/customers/search?q=ada", Some(&t), None)
         .await;
-    assert_eq!(found.body.as_array().unwrap().len(), 1);
-    // The body is still the plain array; the count and whether it is capped
-    // ride in headers (#17).
-    assert_eq!(found.headers["x-total-count"], "1");
-    assert_eq!(found.headers["x-total-capped"], "false");
+    assert_eq!(found.status, StatusCode::OK, "{}", found.body);
+    // Search answers the list envelope plus `totalCapped` (#24); the #17
+    // count headers are gone.
+    assert_eq!(found.body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(found.body["total"], 1);
+    assert_eq!(found.body["totalCapped"], false);
+    assert_eq!(found.body["limit"], 50);
+    assert_eq!(found.body["offset"], 0);
+    assert!(found.headers.get("x-total-count").is_none());
+    assert!(found.headers.get("x-total-capped").is_none());
 
+    // The old snake_case body key still works (an alias) ...
     let ticket = h
         .call(
             "POST",
@@ -563,14 +569,60 @@ async fn routes_answer_in_the_shapes_the_console_reads(pool: PgPool) {
     assert_eq!(ticket.status, StatusCode::OK, "{}", ticket.body);
     assert_eq!(ticket.body["priority"], "medium");
     assert_eq!(ticket.body["customerId"], id.as_str());
+    // ... and so does the camelCase one, the convention.
+    let ticket2 = h
+        .call(
+            "POST",
+            "/api/v1/tickets",
+            Some(&t),
+            Some(json!({"customerId": id, "subject": "Also broken", "priority": "low"})),
+        )
+        .await;
+    assert_eq!(ticket2.status, StatusCode::OK, "{}", ticket2.body);
+    assert_eq!(ticket2.body["customerId"], id.as_str());
+    for key in ["customerId", "customer_id"] {
+        let listed = h
+            .call(
+                "GET",
+                &format!("/api/v1/tickets?{key}={id}"),
+                Some(&t),
+                None,
+            )
+            .await;
+        assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+        assert_eq!(listed.body["total"], 2, "{key}");
+    }
+    let unrelated = h
+        .call(
+            "GET",
+            &format!("/api/v1/tickets?customerId={}", Uuid::new_v4()),
+            Some(&t),
+            None,
+        )
+        .await;
+    assert_eq!(unrelated.body["total"], 0);
+    let both = h
+        .call(
+            "POST",
+            "/api/v1/tickets",
+            Some(&t),
+            Some(json!({"customerId": id, "customer_id": id, "subject": "x"})),
+        )
+        .await;
+    assert_eq!(both.status, StatusCode::BAD_REQUEST);
+    assert_eq!(both.body["code"], "invalid_argument");
 
     let metrics = h
         .call("GET", "/api/v1/dashboard/metrics", Some(&t), None)
         .await;
+    // camelCase, plus the snake_case keys this route answered with before
+    // #24, kept for existing consumers.
     assert_eq!(
         metrics.body,
         json!({
-            "total_customers": 1, "total_tickets": 1, "open_tickets": 1,
+            "totalCustomers": 1, "totalTickets": 2, "openTickets": 2,
+            "totalFeedback": 0, "totalSurveys": 0, "totalExperiences": 0,
+            "total_customers": 1, "total_tickets": 2, "open_tickets": 2,
             "total_feedback": 0, "total_surveys": 0, "total_experiences": 0,
         })
     );

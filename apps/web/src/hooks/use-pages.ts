@@ -5,7 +5,7 @@ import type { Page } from "@/lib/types";
 type PageListParams = {
   limit?: number;
   offset?: number;
-  application_id?: string;
+  applicationId?: string;
 };
 
 export const pageKeys = {
@@ -36,8 +36,8 @@ export function useCreatePage() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      application_id?: string;
-      team_id?: string | null;
+      applicationId?: string;
+      teamId?: string | null;
       name: string;
       path?: string;
       description?: string;
@@ -56,7 +56,7 @@ export function useUpdatePage() {
       data,
     }: {
       id: string;
-      data: { name?: string; path?: string; description?: string; team_id?: string | null };
+      data: { name?: string; path?: string; description?: string; teamId?: string | null };
     }) => pagesApi.update(id, data),
     onSuccess: (updatedPage: Page) => {
       queryClient.invalidateQueries({ queryKey: pageKeys.lists() });

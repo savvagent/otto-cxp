@@ -108,7 +108,7 @@ function ApplicationDialog({
             name: values.name,
             description: values.description || undefined,
             platform: values.platform || undefined,
-            team_id: values.team_id || null,
+            teamId: values.team_id || null,
           },
         },
         {
@@ -122,8 +122,8 @@ function ApplicationDialog({
     } else {
       createApplication.mutate(
         {
-          experience_id: values.experience_id || undefined,
-          team_id: values.team_id || undefined,
+          experienceId: values.experience_id || undefined,
+          teamId: values.team_id || undefined,
           name: values.name,
           description: values.description || undefined,
           platform: values.platform || undefined,
@@ -261,7 +261,7 @@ export function ApplicationsPage() {
   const experienceId = searchParams.get("experience_id") ?? undefined;
 
   const { data, isLoading } = useApplications({
-    experience_id: experienceId,
+    experienceId,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });

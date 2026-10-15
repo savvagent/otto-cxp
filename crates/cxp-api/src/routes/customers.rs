@@ -6,15 +6,15 @@ use cxp_core::auth::Principal;
 use cxp_core::customers::{
     Customer, Customer360, CustomerFilter, CustomerUpdate, CustomersExt, NewCustomer,
 };
-use http::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{deleted, Paginated};
+use super::{deleted, CappedPaginated, Paginated};
 use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::{ApiResult, AppState};
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateBody {
     pub email: String,
     pub name: Option<String>,
@@ -25,6 +25,7 @@ pub struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     pub email: Option<String>,
     pub name: Option<String>,
@@ -35,16 +36,22 @@ pub struct UpdateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
+    #[serde(alias = "component_id")]
     pub component_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchParams {
     pub q: String,
     pub limit: Option<i64>,
@@ -70,40 +77,19 @@ pub async fn list(
     Ok(Json(Paginated::new(rows, page)))
 }
 
-/// The headers the search answers with alongside its plain array: the
-/// count of matches up to [`cxp_core::search::TOTAL_CAP`], and whether it is
-/// capped (`true` or `false`).
-pub const TOTAL_COUNT: HeaderName = HeaderName::from_static("x-total-count");
-pub const TOTAL_CAPPED: HeaderName = HeaderName::from_static("x-total-capped");
-
-/// A plain array (not the `{items, total}` envelope), the best matches
-/// first; paged by `limit`/`offset` (default 50). Matches are counted up to
-/// 1000: the count is the `X-Total-Count` header. `X-Total-Capped: false`
-/// means the count and the array are exact; `true` means the count is a
-/// lower bound (more than 1000 match, or the search stopped before counting
-/// every match), the array is then the requested page of the best-ranked
-/// matches found, and a page starting at or past 1000 is empty. The body is
-/// unchanged from before #17; the headers are new.
+/// The best matches first, in the list envelope plus `totalCapped`
+/// ([`CappedPaginated`]); paged by `limit`/`offset` (default 50).
 pub async fn search(
     State(state): State<AppState>,
     Extension(caller): Extension<Principal>,
     ApiQuery(q): ApiQuery<SearchParams>,
-) -> ApiResult<([(HeaderName, HeaderValue); 2], Json<Vec<Customer>>)> {
+) -> ApiResult<Json<CappedPaginated<Customer>>> {
     caller.require_read()?;
     let page = cxp_core::Page::new(q.limit, q.offset);
     let mut tx = state.begin(&caller).await?;
     let found = tx.search_customers(&q.q, page).await?;
     tx.commit().await?;
-    Ok((
-        [
-            (TOTAL_COUNT, HeaderValue::from(found.total)),
-            (
-                TOTAL_CAPPED,
-                HeaderValue::from_static(if found.total_capped { "true" } else { "false" }),
-            ),
-        ],
-        Json(found.items),
-    ))
+    Ok(Json(CappedPaginated::new(found, page)))
 }
 
 pub async fn get(

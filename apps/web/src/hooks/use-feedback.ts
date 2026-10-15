@@ -4,12 +4,12 @@ import { feedbackApi } from "@/lib/api";
 type FeedbackListParams = {
   limit?: number;
   offset?: number;
-  customer_id?: string;
-  feedback_type?: string;
-  experience_id?: string;
-  application_id?: string;
-  page_id?: string;
-  component_id?: string;
+  customerId?: string;
+  feedbackType?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 };
 
 export const feedbackKeys = {

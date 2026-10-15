@@ -106,9 +106,9 @@ function ComponentDialog({
           id: editing.id,
           data: {
             name: values.name,
-            component_type: values.component_type || undefined,
+            componentType: values.component_type || undefined,
             description: values.description || undefined,
-            team_id: values.team_id || null,
+            teamId: values.team_id || null,
           },
         },
         {
@@ -122,10 +122,10 @@ function ComponentDialog({
     } else {
       createComponent.mutate(
         {
-          page_id: values.page_id || undefined,
-          team_id: values.team_id || undefined,
+          pageId: values.page_id || undefined,
+          teamId: values.team_id || undefined,
           name: values.name,
-          component_type: values.component_type || undefined,
+          componentType: values.component_type || undefined,
           description: values.description || undefined,
         },
         {
@@ -266,7 +266,7 @@ export function ComponentsPage() {
   const pageId = searchParams.get("page_id") ?? undefined;
 
   const { data, isLoading } = useComponents({
-    page_id: pageId,
+    pageId,
     limit: PAGE_SIZE,
     offset: currentPage * PAGE_SIZE,
   });

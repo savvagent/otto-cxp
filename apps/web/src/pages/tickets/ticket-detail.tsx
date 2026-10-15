@@ -128,7 +128,7 @@ export function TicketDetailPage() {
   // ---------------------------------------------------------------------------
 
   async function updateField(
-    field: "status" | "priority" | "assigned_to",
+    field: "status" | "priority" | "assignedTo",
     value: string
   ) {
     if (!ticket) return;
@@ -304,7 +304,7 @@ export function TicketDetailPage() {
                   onBlur={(e) => {
                     const val = e.currentTarget.value.trim();
                     if (val !== (ticket.assignedTo ?? "")) {
-                      updateField("assigned_to", val);
+                      updateField("assignedTo", val);
                     }
                   }}
                   onKeyDown={(e) => {

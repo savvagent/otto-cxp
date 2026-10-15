@@ -1,8 +1,8 @@
-// Response models are camelCase, as the server serializes them (the
-// `cxp-core` models use `rename_all = "camelCase"`). Request bodies and query
-// parameters are the opposite: they stay snake_case (see `lib/api/*`).
-// `src/lib/types.test.ts` checks these shapes against the payloads in
-// `crates/cxp-api/tests/fixtures/wire.json`, which a Rust test generates.
+// Responses, request bodies and query parameters are all camelCase: the one
+// `/api/v1` convention (`crates/cxp-api/src/routes/mod.rs`). Enum values stay as
+// the server stores them. `src/lib/types.test.ts` checks these shapes against
+// the payloads in `crates/cxp-api/tests/fixtures/wire.json`, which a Rust test
+// generates.
 
 export interface Customer {
   id: string;
@@ -169,16 +169,16 @@ export interface MyTeam {
 }
 
 /**
- * The one response that stays snake_case: `GET /dashboard/metrics` keeps the
- * keys it has always answered with (crates/cxp-api/src/routes/dashboard.rs).
+ * `GET /dashboard/metrics`. The server also sends deprecated snake_case twins of
+ * these keys, which the console does not read (their removal is #35).
  */
 export interface DashboardMetrics {
-  total_customers: number;
-  total_tickets: number;
-  open_tickets: number;
-  total_feedback: number;
-  total_surveys: number;
-  total_experiences: number;
+  totalCustomers: number;
+  totalTickets: number;
+  openTickets: number;
+  totalFeedback: number;
+  totalSurveys: number;
+  totalExperiences: number;
 }
 
 export interface PaginatedResponse<T> {
@@ -186,4 +186,14 @@ export interface PaginatedResponse<T> {
   total: number;
   limit: number;
   offset: number;
+}
+
+/**
+ * A search response: the list envelope plus whether `total` is capped. With
+ * `totalCapped: false`, `total` and `data` are exact; with `true`, `total` is a
+ * lower bound (matches are counted up to 1000) and `data` is the requested page
+ * of the best-ranked matches found.
+ */
+export interface CappedPaginatedResponse<T> extends PaginatedResponse<T> {
+  totalCapped: boolean;
 }

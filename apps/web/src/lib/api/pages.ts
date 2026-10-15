@@ -5,13 +5,13 @@ export const pagesApi = {
   list: (params?: {
     limit?: number;
     offset?: number;
-    application_id?: string;
+    applicationId?: string;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("limit", String(params?.limit ?? 50));
     searchParams.set("offset", String(params?.offset ?? 0));
-    if (params?.application_id)
-      searchParams.set("application_id", params.application_id);
+    if (params?.applicationId)
+      searchParams.set("applicationId", params.applicationId);
     return apiFetch<PaginatedResponse<Page>>(
       `/pages?${searchParams.toString()}`,
     );
@@ -20,8 +20,8 @@ export const pagesApi = {
   get: (id: string) => apiFetch<Page>(`/pages/${id}`),
 
   create: (data: {
-    application_id?: string;
-    team_id?: string | null;
+    applicationId?: string;
+    teamId?: string | null;
     name: string;
     path?: string;
     description?: string;
@@ -33,7 +33,7 @@ export const pagesApi = {
 
   update: (
     id: string,
-    data: { name?: string; path?: string; description?: string; team_id?: string | null },
+    data: { name?: string; path?: string; description?: string; teamId?: string | null },
   ) =>
     apiFetch<Page>(`/pages/${id}`, {
       method: "PUT",

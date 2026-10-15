@@ -19,6 +19,7 @@ use crate::{ApiResult, AppState};
 pub const CHARGED_AS: &str = "create_survey";
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateBody {
     pub title: String,
     pub description: Option<String>,
@@ -26,6 +27,7 @@ pub struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -34,12 +36,17 @@ pub struct UpdateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
+    #[serde(alias = "component_id")]
     pub component_id: Option<Uuid>,
 }
 
@@ -130,8 +137,10 @@ pub async fn delete(
     Ok(deleted())
 }
 
-/// A plain array (not the `{items, total}` envelope); paged by `limit`/`offset` (default 50).
-/// `404` when the survey is not in the caller's org.
+/// The survey's responses as a plain JSON array, not the [`Paginated`]
+/// envelope (moving it there is #36, which also returns the total this drops),
+/// paged by `limit`/`offset` (default 50). `404` when the survey is not in the
+/// caller's org.
 pub async fn responses(
     State(state): State<AppState>,
     Extension(caller): Extension<Principal>,

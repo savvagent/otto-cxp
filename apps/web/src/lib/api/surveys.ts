@@ -5,21 +5,21 @@ export const surveysApi = {
   list: (params?: {
     limit?: number;
     offset?: number;
-    experience_id?: string;
-    application_id?: string;
-    page_id?: string;
-    component_id?: string;
+    experienceId?: string;
+    applicationId?: string;
+    pageId?: string;
+    componentId?: string;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("limit", String(params?.limit ?? 50));
     searchParams.set("offset", String(params?.offset ?? 0));
-    if (params?.experience_id)
-      searchParams.set("experience_id", params.experience_id);
-    if (params?.application_id)
-      searchParams.set("application_id", params.application_id);
-    if (params?.page_id) searchParams.set("page_id", params.page_id);
-    if (params?.component_id)
-      searchParams.set("component_id", params.component_id);
+    if (params?.experienceId)
+      searchParams.set("experienceId", params.experienceId);
+    if (params?.applicationId)
+      searchParams.set("applicationId", params.applicationId);
+    if (params?.pageId) searchParams.set("pageId", params.pageId);
+    if (params?.componentId)
+      searchParams.set("componentId", params.componentId);
     return apiFetch<PaginatedResponse<Survey>>(
       `/surveys?${searchParams.toString()}`,
     );

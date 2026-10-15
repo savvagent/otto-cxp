@@ -108,7 +108,7 @@ function PageDialog({
             name: values.name,
             path: values.path || undefined,
             description: values.description || undefined,
-            team_id: values.team_id || null,
+            teamId: values.team_id || null,
           },
         },
         {
@@ -122,8 +122,8 @@ function PageDialog({
     } else {
       createPage.mutate(
         {
-          application_id: values.application_id || undefined,
-          team_id: values.team_id || undefined,
+          applicationId: values.application_id || undefined,
+          teamId: values.team_id || undefined,
           name: values.name,
           path: values.path || undefined,
           description: values.description || undefined,
@@ -259,7 +259,7 @@ export function PagesPage() {
   const applicationId = searchParams.get("application_id") ?? undefined;
 
   const { data, isLoading } = usePages({
-    application_id: applicationId,
+    applicationId,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });
