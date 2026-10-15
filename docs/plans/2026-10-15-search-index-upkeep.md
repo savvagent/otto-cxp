@@ -114,7 +114,9 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 `crates/cxp-core/tests/support.rs`, `crates/cxp-core/tests/search_backlog.rs`
 
 - [ ] **Step 1: failing tests** (`crates/cxp-core/tests/customers.rs` unless noted).
-  - `a_search_past_its_timeout_is_query_too_broad`: create a customer in an org; in a separate
+  - `a_search_past_its_timeout_is_query_too_broad`: create and COMMIT a customer in an org in its
+    own transaction first (an uncommitted insert holds a lock on `customer_search_grams` and the
+    `LOCK TABLE` below would wait forever); then in a separate
     superuser transaction on the test's raw `pool` run `LOCK TABLE customer_search_grams IN
     ACCESS EXCLUSIVE MODE` and keep it open; in the org's `db.begin(org)` transaction call
     `search_customers("anything", Page::default())`; assert the error's `code()` is
@@ -123,8 +125,8 @@ limit. Task 4 is docs. Each task leaves the workspace green.
     than failing some other way); then roll back the lock. Take the lock on its own
     connection (`pool.begin()`), in an open transaction, before the search starts. (The search's `SET LOCAL statement_timeout = '2s'` bounds
     the lock wait; the lock is on a table only the search statement reads, so `begin_live`'s
-    own statements are unaffected — if `db.begin` itself blocks, take the lock after
-    `db.begin`.)
+    own statements are unaffected.) Put `SET LOCAL lock_timeout = '5s'` on the lock-holding
+    transaction before its `LOCK TABLE`, so a mistake fails fast instead of hanging.
   - `crates/cxp-core/tests/support.rs` `an_article_search_past_its_timeout_is_query_too_broad`:
     same with `knowledge_search_terms` and `search_articles("anything")`.
   - `rows_are_indexed_whatever_the_insert_says`: in an org's transaction, `INSERT INTO customers
@@ -157,9 +159,8 @@ limit. Task 4 is docs. Each task leaves the workspace green.
     `docs/deploy/fly.md`) indexes them; production had none.
 - [ ] **Step 2:** `DATABASE_URL=postgres://cxp:cxp@localhost:15462/otto_cxp cargo test -p cxp-core
   --test customers --test support --test search_backlog` — the timeout tests fail (code is
-  `internal`), the search_backlog test fails (rows not found after the update? no: it fails
-  before, since search still reads the backlog and finds them), the trigger test passes already
-  (it documents existing behaviour; fine).
+  `internal`); the search_backlog test fails because search still reads the backlog and finds
+  "grace" before the update; the trigger test passes already (it documents existing behaviour).
 - [ ] **Step 3: implement `search.rs`.** Delete `BACKLOG_READ`, `Indexed` (and its impl),
   `index_backlog`, the savepoint block. `prepare` becomes
   `pub(crate) async fn prepare(tx: &mut Tx<'_>) -> Result<()>` running only `SET LOCAL jit = off`
@@ -174,7 +175,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
       move |e| {
           let timed_out = matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("57014"));
           if timed_out {
-              tracing::warn!(search, "a search ran past its statement_timeout");
+              tracing::warn!(search, "search hit its statement_timeout");
               Error::QueryTooBroad
           } else {
               Error::Database(e)
@@ -252,7 +253,7 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 - [ ] **Step 1: fly.md.** In the Infrastructure bullet, replace "Searches also index, a batch at a
   time, the rows written before migration 0004. Watching that size, and retiring the backlog path
   once production has none left, is #34." with a pointer to the new section. Add a section
-  `## Search index storage` (after `## Database role` and its runbooks, before the next `##`)
+  `## Search index storage (#34)` (after `## Database role` and its runbooks, before the next `##`)
   containing exactly the items in the spec's Docs bullet: threshold (100 MB for the two index
   tables together; `otto_cxp` 250 MB; volume 70%), the actions and who decides; the watch query
   (below) and the 2026-10-15 baseline (search index 56 kB; `otto_cxp` 9.5 MB; 0 customers,
@@ -297,3 +298,10 @@ limit. Task 4 is docs. Each task leaves the workspace green.
 - [ ] **Step 4: commit** `docs: document search index storage watch and retire backlog notes` —
   body: the size threshold and query for the 1 GB shared volume, and the LEAKPROOF
   re-evaluation trigger, for #34. `Refs #34`.
+
+### Task 5: record as shipped (same PR, after the PR number exists)
+
+**Model:** orchestrator
+
+- [ ] Set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes; commit
+  `docs: mark search index upkeep implemented` with `Refs #34`; re-run the merge gate.
