@@ -3039,6 +3039,8 @@ async fn boot_without_cxp_app(pool: &PgPool, local: bool) -> String {
 /// A deployment refuses a runtime role that cannot assume `cxp_app`.
 #[sqlx::test(migrations = false)]
 async fn a_deployment_refuses_a_runtime_role_that_cannot_assume_cxp_app(pool: PgPool) {
+    // In a deployment the runtime-grant check ("inheriting cxp_app") refuses first, before the
+    // isolation proof; check_tenant_role itself is reached by the local variant below.
     let _guard = discard_logs();
     let err = boot_without_cxp_app(&pool, false).await;
     assert!(err.contains("refusing to serve"), "{err}");
