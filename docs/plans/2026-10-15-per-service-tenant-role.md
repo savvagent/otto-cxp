@@ -655,8 +655,8 @@ and the services comment: "so the migrations can create and grant otto_app and c
   - `CLAUDE.md`: every place listed above. Tenancy: add one sentence: "Tenant transactions assume
     `cxp_core::TENANT_ROLE` (`cxp_app`, #28); build every `Db` with `cxp_core::tenant_db` (clippy
     forbids `Db::from_pool`/`Db::connect`)." Migrations: "grants to `cxp_app`". Invariant (tenant
-    isolation): "Tenant transactions run as `cxp_app` (`SET LOCAL ROLE`), otto-cxp's own role; a
-    deployment refuses to serve unless it was assumed (`boot::check_tenant_role`)", "requires
+    isolation): "Tenant transactions run as `cxp_app` (`SET LOCAL ROLE`), otto-cxp's own role; boot
+    refuses to serve, on every machine, unless it was assumed (`boot::check_tenant_role`)", "requires
     `INSERT` on `deleted_orgs` (through `cxp_runtime`) and inheriting `cxp_app`", and keep the
     `otto_app` rule sentence ("No service may grant `CONNECT`, or any database-level privilege, to
     the shared `otto_app`; otto-cxp's login leaves it in runbook T5"). Append-only invariant:
@@ -675,9 +675,9 @@ and the services comment: "so the migrations can create and grant otto_app and c
   - The `otto_app` paragraph: keep the rule in bold, say otto-cxp no longer uses `otto_app` since
     #28 (tenant transactions assume `cxp_app`; boot refuses otherwise), and that `cxp_server`
     leaves it in T5; the rule stays for every service while `otto_app` exists.
-  - Boot refusals list: add "a deployment refuses to serve unless tenant transactions assumed
-    `cxp_app` (`tenant transactions run as "…", not otto-cxp's own tenant role cxp_app …`), and
-    warns while the login is still a member of `otto_app`."
+  - Boot refusals list: add "every boot, deployment or not, refuses to serve unless tenant
+    transactions assumed `cxp_app` (`tenant transactions run as "…", not otto-cxp's own tenant
+    role cxp_app …`), and a deployment warns while the login is still a member of `otto_app`."
   - New section after S7: `### Runbook: give otto-cxp its own tenant role (human-only, Rob)` with
     the text below (adapt only line wrapping):
 
