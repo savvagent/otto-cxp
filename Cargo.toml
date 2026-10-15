@@ -56,6 +56,10 @@ dotenvy = "0.15"
 # An HTTP client for cxp-server's lifecycle test, which talks to a real
 # socket. Already in the tree through otto-resource; no default features.
 reqwest = { version = "0.12", default-features = false }
+# The install page's CSP pins its style and script by hash; cxp-server's
+# unit test recomputes both. Already in the tree through otto-resource.
+sha2 = "0.10"
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"

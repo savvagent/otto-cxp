@@ -446,6 +446,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "cxp-api",
  "cxp-core",
@@ -457,6 +458,7 @@ dependencies = [
  "otto-tenant",
  "reqwest",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tower",

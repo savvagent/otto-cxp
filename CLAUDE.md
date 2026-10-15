@@ -32,7 +32,8 @@ Per-package: `cd sdk/typescript && pnpm build`.
 ## Architecture
 
 One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api/v1/...`,
-`POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`.
+`POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, and `/`
+(a connector install page for browsers only; JSON 404 for everything else).
 
 **Crates (`crates/`):**
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
