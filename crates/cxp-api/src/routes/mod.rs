@@ -39,6 +39,7 @@ impl<T: Serialize> Paginated<T> {
 
 /// `?limit=&offset=` on its own.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PageParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -351,5 +352,170 @@ mod wire_fixture {
             committed, actual,
             "a response shape changed: regenerate {FIXTURE} with UPDATE_WIRE_FIXTURES=1 and update apps/web/src/lib/types.ts"
         );
+    }
+}
+
+/// Request structs take camelCase keys and, as aliases, the snake_case
+/// spellings `/api/v1` accepted before #24, so older callers keep working.
+#[cfg(test)]
+mod casing {
+    use axum::extract::Query;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn body<T: DeserializeOwned>(v: serde_json::Value) -> T {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn query<T: DeserializeOwned>(qs: &str) -> T {
+        let uri: http::Uri = format!("/x?{qs}").parse().unwrap();
+        Query::<T>::try_from_uri(&uri).unwrap().0
+    }
+
+    fn query_err<T: DeserializeOwned>(qs: &str) -> bool {
+        let uri: http::Uri = format!("/x?{qs}").parse().unwrap();
+        Query::<T>::try_from_uri(&uri).is_err()
+    }
+
+    const A: Uuid = Uuid::from_u128(1);
+    const B: Uuid = Uuid::from_u128(2);
+    const C: Uuid = Uuid::from_u128(3);
+    const D: Uuid = Uuid::from_u128(4);
+
+    /// `experienceId=A&applicationId=B&pageId=C&componentId=D` in one spelling.
+    fn catalog_qs(camel: bool) -> String {
+        if camel {
+            format!("experienceId={A}&applicationId={B}&pageId={C}&componentId={D}")
+        } else {
+            format!("experience_id={A}&application_id={B}&page_id={C}&component_id={D}")
+        }
+    }
+
+    #[test]
+    fn customer_list_params_take_both_spellings() {
+        for camel in [true, false] {
+            let q: super::customers::ListParams =
+                query(&format!("limit=5&offset=1&{}", catalog_qs(camel)));
+            assert_eq!((q.limit, q.offset), (Some(5), Some(1)));
+            assert_eq!(q.experience_id, Some(A));
+            assert_eq!(q.application_id, Some(B));
+            assert_eq!(q.page_id, Some(C));
+            assert_eq!(q.component_id, Some(D));
+        }
+    }
+
+    #[test]
+    fn survey_list_params_take_both_spellings() {
+        for camel in [true, false] {
+            let q: super::surveys::ListParams = query(&catalog_qs(camel));
+            assert_eq!(
+                (q.experience_id, q.application_id, q.page_id, q.component_id),
+                (Some(A), Some(B), Some(C), Some(D))
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_params_and_bodies_take_both_spellings() {
+        for (customer, rest) in [
+            ("customerId", catalog_qs(true)),
+            ("customer_id", catalog_qs(false)),
+        ] {
+            let q: super::tickets::ListParams =
+                query(&format!("status=open&priority=high&{customer}={A}&{rest}"));
+            assert_eq!(q.customer_id, Some(A));
+            assert_eq!(q.experience_id, Some(A));
+            assert_eq!(q.application_id, Some(B));
+            assert_eq!(q.page_id, Some(C));
+            assert_eq!(q.component_id, Some(D));
+            assert_eq!(q.status.as_deref(), Some("open"));
+        }
+        for key in ["customerId", "customer_id"] {
+            let b: super::tickets::CreateBody = body(json!({ key: A, "subject": "s" }));
+            assert_eq!(b.customer_id, A);
+        }
+        for key in ["assignedTo", "assigned_to"] {
+            let b: super::tickets::UpdateBody = body(json!({ key: "grace" }));
+            assert_eq!(b.assigned_to.as_deref(), Some("grace"));
+        }
+    }
+
+    #[test]
+    fn feedback_params_take_both_spellings() {
+        for (customer, kind, rest) in [
+            ("customerId", "feedbackType", catalog_qs(true)),
+            ("customer_id", "feedback_type", catalog_qs(false)),
+        ] {
+            let q: super::feedback::ListParams =
+                query(&format!("{customer}={A}&{kind}=nps&{rest}"));
+            assert_eq!(q.customer_id, Some(A));
+            assert_eq!(q.feedback_type.as_deref(), Some("nps"));
+            assert_eq!(
+                (q.experience_id, q.application_id, q.page_id, q.component_id),
+                (Some(A), Some(B), Some(C), Some(D))
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_params_and_bodies_take_both_spellings() {
+        use super::catalog::*;
+        for camel in [true, false] {
+            let (exp, app, page, kind, team) = if camel {
+                (
+                    "experienceId",
+                    "applicationId",
+                    "pageId",
+                    "componentType",
+                    "teamId",
+                )
+            } else {
+                (
+                    "experience_id",
+                    "application_id",
+                    "page_id",
+                    "component_type",
+                    "team_id",
+                )
+            };
+            let q: ApplicationParams = query(&format!("{exp}={A}"));
+            assert_eq!(q.experience_id, Some(A));
+            let q: PageParamsByApplication = query(&format!("{app}={B}"));
+            assert_eq!(q.application_id, Some(B));
+            let q: ComponentParams = query(&format!("{page}={C}"));
+            assert_eq!(q.page_id, Some(C));
+
+            let b: CreateExperienceBody = body(json!({ "name": "e", team: D }));
+            assert_eq!(b.team_id, Some(D));
+            let b: UpdateExperienceBody = body(json!({ team: D }));
+            assert_eq!(b.team_id, Some(Some(D)));
+            let b: CreateApplicationBody = body(json!({ "name": "a", exp: A, team: D }));
+            assert_eq!((b.experience_id, b.team_id), (Some(A), Some(D)));
+            let b: UpdateApplicationBody = body(json!({ team: null }));
+            assert_eq!(b.team_id, Some(None));
+            let b: CreatePageBody = body(json!({ "name": "p", app: B, team: D }));
+            assert_eq!((b.application_id, b.team_id), (Some(B), Some(D)));
+            let b: UpdatePageBody = body(json!({ team: D }));
+            assert_eq!(b.team_id, Some(Some(D)));
+            let b: CreateComponentBody =
+                body(json!({ "name": "c", page: C, kind: "button", team: D }));
+            assert_eq!((b.page_id, b.team_id), (Some(C), Some(D)));
+            assert_eq!(b.component_type.as_deref(), Some("button"));
+            let b: UpdateComponentBody = body(json!({ kind: "link", team: D }));
+            assert_eq!(b.component_type.as_deref(), Some("link"));
+            assert_eq!(b.team_id, Some(Some(D)));
+        }
+    }
+
+    #[test]
+    fn both_spellings_of_one_field_are_refused() {
+        let both = serde_json::from_value::<super::tickets::CreateBody>(
+            json!({ "customerId": A, "customer_id": B, "subject": "s" }),
+        );
+        assert!(both.is_err());
+        assert!(query_err::<super::customers::ListParams>(&format!(
+            "pageId={A}&page_id={B}"
+        )));
     }
 }

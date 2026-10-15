@@ -19,6 +19,7 @@ use crate::{ApiResult, AppState};
 pub const CHARGED_AS: &str = "create_survey";
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateBody {
     pub title: String,
     pub description: Option<String>,
@@ -26,6 +27,7 @@ pub struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -34,12 +36,17 @@ pub struct UpdateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
+    #[serde(alias = "component_id")]
     pub component_id: Option<Uuid>,
 }
 

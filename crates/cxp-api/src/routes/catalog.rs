@@ -1,8 +1,8 @@
 //! `/api/v1/{experiences,applications,pages,components}`: the experience
 //! catalog, each entity optionally owned by a platform team.
 //!
-//! **The team field.** Bodies take `team_id` (what the console sends: request
-//! bodies stay snake_case) and `teamId` too (sending both is a `400`). On
+//! **The team field.** Bodies take `teamId` (the convention) and `team_id` as
+//! an alias (sending both is a `400`). On
 //! create, absent or `null` means no team. On update, absent keeps the team,
 //! an explicit `null` clears it, and an id sets it. Any id is verified at the platform
 //! (`cxp_core::catalog::verify_team`) before the transaction opens: a team the
@@ -70,19 +70,21 @@ async fn team_change(
 // ---------------------------------------------------------------- experiences
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateExperienceBody {
     pub name: String,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId")]
+    #[serde(default, alias = "team_id")]
     pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateExperienceBody {
     pub name: Option<String>,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId", deserialize_with = "present")]
+    #[serde(default, alias = "team_id", deserialize_with = "present")]
     pub team_id: Option<Option<Uuid>>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -166,30 +168,35 @@ pub async fn delete_experience(
 // ---------------------------------------------------------------- applications
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateApplicationBody {
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub platform: Option<String>,
-    #[serde(default, alias = "teamId")]
+    #[serde(default, alias = "team_id")]
     pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateApplicationBody {
     pub name: Option<String>,
     pub description: Option<String>,
     pub platform: Option<String>,
-    #[serde(default, alias = "teamId", deserialize_with = "present")]
+    #[serde(default, alias = "team_id", deserialize_with = "present")]
     pub team_id: Option<Option<Uuid>>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApplicationParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
 }
 
@@ -278,30 +285,35 @@ pub async fn delete_application(
 // ---------------------------------------------------------------- pages
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreatePageBody {
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
     pub name: String,
     pub path: Option<String>,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId")]
+    #[serde(default, alias = "team_id")]
     pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdatePageBody {
     pub name: Option<String>,
     pub path: Option<String>,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId", deserialize_with = "present")]
+    #[serde(default, alias = "team_id", deserialize_with = "present")]
     pub team_id: Option<Option<Uuid>>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PageParamsByApplication {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
 }
 
@@ -390,30 +402,37 @@ pub async fn delete_page(
 // ---------------------------------------------------------------- components
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateComponentBody {
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
     pub name: String,
+    #[serde(alias = "component_type")]
     pub component_type: Option<String>,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId")]
+    #[serde(default, alias = "team_id")]
     pub team_id: Option<Uuid>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateComponentBody {
     pub name: Option<String>,
+    #[serde(alias = "component_type")]
     pub component_type: Option<String>,
     pub description: Option<String>,
-    #[serde(default, alias = "teamId", deserialize_with = "present")]
+    #[serde(default, alias = "team_id", deserialize_with = "present")]
     pub team_id: Option<Option<Uuid>>,
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ComponentParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
 }
 

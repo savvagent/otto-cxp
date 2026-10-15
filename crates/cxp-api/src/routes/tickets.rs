@@ -12,7 +12,9 @@ use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::{ApiResult, AppState};
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateBody {
+    #[serde(alias = "customer_id")]
     pub customer_id: Uuid,
     pub subject: String,
     pub description: Option<String>,
@@ -22,9 +24,11 @@ pub struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     pub status: Option<String>,
     pub priority: Option<String>,
+    #[serde(alias = "assigned_to")]
     pub assigned_to: Option<String>,
     pub subject: Option<String>,
     pub description: Option<String>,
@@ -32,15 +36,21 @@ pub struct UpdateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub status: Option<String>,
     pub priority: Option<String>,
+    #[serde(alias = "customer_id")]
     pub customer_id: Option<Uuid>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
+    #[serde(alias = "component_id")]
     pub component_id: Option<Uuid>,
 }
 

@@ -15,6 +15,7 @@ use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::{ApiResult, AppState};
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateBody {
     pub email: String,
     pub name: Option<String>,
@@ -25,6 +26,7 @@ pub struct CreateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBody {
     pub email: Option<String>,
     pub name: Option<String>,
@@ -35,16 +37,22 @@ pub struct UpdateBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListParams {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    #[serde(alias = "experience_id")]
     pub experience_id: Option<Uuid>,
+    #[serde(alias = "application_id")]
     pub application_id: Option<Uuid>,
+    #[serde(alias = "page_id")]
     pub page_id: Option<Uuid>,
+    #[serde(alias = "component_id")]
     pub component_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchParams {
     pub q: String,
     pub limit: Option<i64>,
