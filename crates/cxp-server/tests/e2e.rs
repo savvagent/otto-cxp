@@ -2898,6 +2898,10 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
     let text = logs.text();
     let mut from = 0;
     for line in [
+        // cxp-server migrate, as the owner.
+        "applying migrations".into(),
+        "migrations applied".into(),
+        // The serving process, as the runtime role.
         format!(r#"database role "{role}" holds no superuser-equivalent privilege"#),
         "not migrating".into(),
         r#"tenant isolation enforced as role "otto_app""#.into(),
@@ -2938,8 +2942,17 @@ async fn a_deployment_refuses_an_owner_as_its_runtime_role(pool: PgPool) {
     .expect("a refused boot returns rather than serving");
     let err = format!("{:#}", result.expect_err("boot refused"));
     assert!(err.contains("refusing to serve"), "{err}");
-    assert!(err.contains("owns"), "{err}");
-    assert!(err.contains(&roles.owner), "{err}");
+    // Refused for what it owns, not merely refused: the fixed text says
+    // "owns nothing", so the summary's ownership clause is what counts.
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    assert!(
+        err.contains(&format!(r#"database role "{}""#, roles.owner)),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(r#"it owns database "{database}""#)),
+        "{err}"
+    );
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
 }
 
@@ -3042,6 +3055,8 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
     grant(format!("GRANT pg_read_all_data TO {}", roles.runtime)).await;
     cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
     assert!(alarm.is_raised(), "a privilege granted after boot");
+    let summary = alarm.summary().expect("raised with the role summary");
+    assert!(summary.contains("pg_read_all_data"), "{summary}");
     let (status, body) = readyz(db.clone(), alarm.clone()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
