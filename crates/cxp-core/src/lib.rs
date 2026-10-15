@@ -42,6 +42,10 @@ pub use error::{Error, Result};
 pub use migrate::{migrate, MIGRATOR};
 pub use paging::Page;
 
+/// How long a request waits for a pooled connection before giving up. The
+/// server's pool is built with it, and the console's refresh budget counts it.
+pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether the database answers a trivial query: the readiness probe. Touches
 /// no tenant table, so it needs no org.
 pub async fn ping(db: &otto_tenant::Db) -> Result<()> {

@@ -775,7 +775,7 @@ async fn a_dead_session_is_401(pool: PgPool) {
 /// The app's pool as production sizes it (`CXP_DB_MAX_CONNECTIONS`): five.
 async fn pool_of_five(opts: PgPoolOptions, connect: PgConnectOptions) -> PgPool {
     opts.max_connections(5)
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(cxp_core::POOL_ACQUIRE_TIMEOUT)
         .connect_with(connect)
         .await
         .unwrap()
