@@ -7,6 +7,7 @@
 //!   /mcp                              cxp-mcp   agents: bearer tokens from the platform
 //!   /api/v1/…                         cxp-api   the console: bearer tokens from the platform
 //!   /platform/webhooks                cxp-api   the platform's signed lifecycle events
+//!   /  (GET/HEAD, browsers only)      install   the connector install page
 //!   everything else                   JSON 404
 //! ```
 //!
@@ -34,7 +35,8 @@ use anyhow::{anyhow, Context, Result};
 use axum::response::{IntoResponse, Response};
 use axum::{middleware, Router};
 use cxp_core::usage::Meter;
-use http::{StatusCode, Uri};
+use http::{HeaderMap, Method, StatusCode, Uri};
+use install_page::InstallPage;
 use otto_resource::{ClientConfig, PlatformClient};
 use otto_tenant::Db;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -68,9 +70,10 @@ pub fn meter(platform: Arc<PlatformClient>, config: &Config) -> Arc<Meter> {
 }
 
 /// Every surface on one router. `platform_check` is what boot's credential
-/// check found ([`boot::check_platform`]); `/readyz` reports it. Fails only
-/// on a configuration that would leave `/mcp` open to any `Host` (see
-/// [`Config::allowed_hosts`]).
+/// check found ([`boot::check_platform`]); `/readyz` reports it. Fails on a
+/// configuration that would leave `/mcp` open to any `Host` (see
+/// [`Config::allowed_hosts`]) or a platform URL the install page cannot take
+/// an origin from.
 pub fn router(
     db: Db,
     platform: Arc<PlatformClient>,
@@ -96,6 +99,8 @@ pub fn router(
             webhook_secret: config.platform_webhook_secret.clone(),
         },
     ));
+    // Rendered once: a bad platform URL fails boot, not a request.
+    let page = InstallPage::new(&config.resource_uri, &config.platform_url)?;
     Ok(health::router(db, platform_check)
         // Open, and not part of either surface: every `401` points at it.
         .merge(cxp_http::protected_resource_router(
@@ -104,7 +109,9 @@ pub fn router(
         ))
         .merge(mcp)
         .merge(api)
-        .fallback(not_found)
+        .fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
+            fallback(page, method, uri, headers)
+        })
         .layer(RequestBodyLimitLayer::new(cxp_api::MAX_BODY_BYTES))
         // Outside the limit: its own 413 is plain text, rewritten here to the
         // `{error, code}` shape every other error has.
@@ -143,6 +150,18 @@ async fn json_payload_too_large(res: Response) -> Response {
     res
 }
 
+/// Everything no route serves. A browser opening `/` gets the connector
+/// install page ([`install_page`]); every other request, including any other
+/// method on `/`, gets the JSON 404. Serving the page here rather than from a
+/// `/` route keeps `POST /` and the rest a 404 instead of a 405.
+async fn fallback(page: InstallPage, method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let head = method == Method::HEAD;
+    if uri.path() == "/" && (head || method == Method::GET) && install_page::wants_page(&headers) {
+        return page.response(head);
+    }
+    not_found(uri).await
+}
+
 /// The same `{error, code}` shape as every `/api/v1` error.
 async fn not_found(uri: Uri) -> Response {
     (
@@ -162,7 +181,7 @@ async fn not_found(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use http::Request;
     use tower::ServiceExt;
 
@@ -174,7 +193,11 @@ mod tests {
 
     /// [`app`] as if boot's platform check had found `check`.
     fn app_with(check: PlatformCheck) -> Router {
-        let mut config = Config::for_test();
+        app_from(Config::for_test(), check)
+    }
+
+    /// The whole router over `config`, with an unreachable database.
+    fn app_from(mut config: Config, check: PlatformCheck) -> Router {
         // Nothing listens on port 1: a probe is refused at once.
         config.database_url = "postgres://cxp:cxp@127.0.0.1:1/none".into();
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -223,6 +246,147 @@ mod tests {
             headers,
             serde_json::from_slice(&bytes).unwrap_or_default(),
         )
+    }
+
+    /// The response with its body as bytes: [`send_to`] parses JSON and
+    /// defaults when it cannot, so it can check neither HTML nor exact bytes.
+    async fn send_raw(app: Router, req: Request<Body>) -> (StatusCode, http::HeaderMap, Bytes) {
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, headers, bytes)
+    }
+
+    /// What every browser sends on a navigation.
+    const BROWSER_ACCEPT: &str =
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8";
+
+    fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "cxp.example.com");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.body(Body::empty()).unwrap()
+    }
+
+    /// The JSON 404 the fallback has always given `/`, byte for byte.
+    async fn root_404_bytes() -> Bytes {
+        axum::body::to_bytes(not_found(Uri::from_static("/")).await.into_body(), 1 << 20)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_browser_at_the_root_gets_the_install_page() {
+        let mut config = Config::for_test();
+        config.resource_uri = "https://cxp.example.com/custom/mcp".into();
+        let (status, headers, body) = send_raw(
+            app_from(config, PlatformCheck::Accepted),
+            request("GET", "/", &[("accept", BROWSER_ACCEPT)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        assert_eq!(headers["cache-control"], "public, max-age=3600");
+        assert_eq!(headers["vary"], "Accept, Authorization");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(
+            headers["content-security-policy"],
+            install_page::CONTENT_SECURITY_POLICY
+        );
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("<title>Otto CXP connector</title>"), "{html}");
+        assert!(
+            html.contains("<code id=\"address\">https://cxp.example.com/custom/mcp</code>"),
+            "the address comes from CXP_RESOURCE_URI"
+        );
+        assert!(html.contains("href=\"https://platform.example.com/\""));
+        // A query string does not change the path.
+        let (status, _, _) = send_raw(
+            app(),
+            request("GET", "/?from=console", &[("accept", BROWSER_ACCEPT)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn head_at_the_root_gets_the_headers_and_no_body() {
+        let (status, headers, body) =
+            send_raw(app(), request("HEAD", "/", &[("accept", BROWSER_ACCEPT)])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        assert!(body.is_empty(), "{body:?}");
+    }
+
+    /// curl (`*/*`), agents (`application/json`), and anything presenting
+    /// credentials keep exactly the JSON 404 they got before the page.
+    #[tokio::test]
+    async fn programs_at_the_root_still_get_the_json_404() {
+        let expected = root_404_bytes().await;
+        let cases: [&[(&str, &str)]; 7] = [
+            &[],
+            &[("accept", "*/*")],
+            &[("accept", "application/json")],
+            &[("accept", "text/*")],
+            &[("accept", "text/html;q=0")],
+            &[
+                ("accept", BROWSER_ACCEPT),
+                ("authorization", "Bearer otto_at_x"),
+            ],
+            &[("accept", BROWSER_ACCEPT), ("authorization", "")],
+        ];
+        for headers in cases {
+            let (status, h, body) = send_raw(app(), request("GET", "/", headers)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{headers:?}");
+            assert_eq!(h["content-type"], "application/json", "{headers:?}");
+            assert!(h.get("vary").is_none(), "{headers:?}");
+            assert_eq!(body, expected, "{headers:?}");
+        }
+    }
+
+    /// Only `GET`/`HEAD /` changed: other methods on `/` and every other
+    /// path are the JSON 404 even for a browser.
+    #[tokio::test]
+    async fn other_methods_and_paths_stay_json_404_for_a_browser() {
+        for (method, path) in [
+            ("POST", "/"),
+            ("PUT", "/"),
+            ("DELETE", "/"),
+            ("GET", "/nope"),
+            ("GET", "/index.html"),
+            ("GET", "//"),
+        ] {
+            let (status, h, body) =
+                send_raw(app(), request(method, path, &[("accept", BROWSER_ACCEPT)])).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(h["content-type"], "application/json", "{method} {path}");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "not_found", "{method} {path}");
+        }
+    }
+
+    /// A browser that wanders onto `/mcp` or `/api` is told to authenticate,
+    /// exactly like any other caller.
+    #[tokio::test]
+    async fn a_browser_on_the_protected_surfaces_still_gets_401() {
+        for (method, path) in [("POST", "/mcp"), ("GET", "/api/v1/customers")] {
+            let (status, headers, _) =
+                send_raw(app(), request(method, path, &[("accept", BROWSER_ACCEPT)])).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+            let challenge = headers["www-authenticate"].to_str().unwrap();
+            assert!(
+                challenge.contains(cxp_http::PROTECTED_RESOURCE_PATH),
+                "{challenge}"
+            );
+        }
     }
 
     #[tokio::test]
