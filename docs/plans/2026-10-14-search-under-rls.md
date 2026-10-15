@@ -40,5 +40,29 @@ All commands run in the worktree; `DATABASE_URL` points at a local Postgres only
   - `cargo fmt --all -- --check`
   - `git diff --name-status --diff-filter=MDR origin/main...HEAD -- 'crates/*/migrations/*'` prints nothing
   - `podman build -t otto-cxp:check .`
-- [ ] **8. Final commit before merge:** set the spec's `**Status:**` to `IMPLEMENTED (#33)` and tick
+- [x] **8. Review rework (PR #33 review).**
+  - Failing tests first, each seen to fail on the reviewed SQL: `set password` and
+    `reset account passw` in `KB_QUERIES` (with the corpus where `set` is commoner than
+    `password`, and a title-only match that `ts_rank` puts above full matches), and
+    `random_article_corpora_search_like_the_scan` in `crates/cxp-core/tests/support.rs`.
+  - `crates/cxp-core/src/knowledge.rs`: an `fts_hits` CTE, which the title branch excludes;
+    several-word queries rank title-only matches with `ts_rank`; the backlog read takes published
+    articles only; `MAX_TITLE_CHARS` (500) on create and update.
+  - `crates/cxp-core/src/search.rs`: one `MAX_QUERY_CHARS` (256) for both searches; a statement
+    timeout and a savepoint around the backlog batch in `prepare` (the error logged by SQLSTATE
+    only); `FOR NO KEY UPDATE SKIP LOCKED`; `NEWEST_READ`; `index_backlog` and `Indexed` hidden.
+  - `crates/cxp-core/src/customers.rs`: the query cap; `MAX_EMAIL_CHARS` (320) and
+    `MAX_NAME_CHARS` (255) on create and update; the newest-first `sub_new` read when the substring
+    read is cut (kept: every benchmark query stays under 50 ms p50, and it never sets
+    `totalCapped: false` without having read the whole org).
+  - Migration 0004, edited in place (still unmerged): `lock_timeout`, insert-vacuum settings,
+    schema-qualified `search_windows`, a clamped `name_grams`, and the published-first article
+    backlog index.
+  - Tests in `crates/cxp-core/tests/customers.rs`: each read bound hit
+    (`a_cut_substring_read_*`, `a_cut_fuzzy_read_is_capped`,
+    `a_backlog_larger_than_its_read_is_capped_until_indexed`), the failing and the locked backlog
+    row, the length limits, and `random_corpora_search_like_the_scan`.
+  - Tool descriptions, REST docs, `CLAUDE.md`, `docs/deploy/fly.md`, and the spec's contract and
+    numbers (re-measured on Postgres 18; `gen.py` no longer collapses spaces inside literals).
+- [ ] **9. Final commit before merge:** set the spec's `**Status:**` to `IMPLEMENTED (#33)` and tick
   this box.

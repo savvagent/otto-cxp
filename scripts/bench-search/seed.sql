@@ -11,8 +11,11 @@
 -- RLS to load fast). About 15 minutes and 15 GB on a laptop. Article text is
 -- drawn Zipf-like from the lowercase words read on standard input (any word
 -- list, one word per line); customer names from common first and last names plus
--- invented surnames. The search index tables are filled in bulk at the end
--- with the same statements migration 0004 backfills with.
+-- invented surnames. The search index tables are filled in bulk at the end,
+-- from migration 0004's own gram functions (the triggers write the same rows
+-- a row at a time). A bulk load packs the btrees about 25-30% denser than
+-- inserts one at a time do, so production's index will be that much larger
+-- per row than this database's.
 \set ON_ERROR_STOP 1
 SELECT setseed(0.17);
 SET maintenance_work_mem = '1GB';
@@ -143,7 +146,7 @@ DROP INDEX knowledge_search_terms_org_article_idx;
 DROP INDEX knowledge_search_terms_frequent_idx;
 TRUNCATE customer_search_grams, knowledge_search_terms;
 INSERT INTO customer_search_grams (org_id, customer_id, gram, name_grams)
-SELECT c.org_id, c.id, g, cardinality(show_trgm(coalesce(c.name, '')))
+SELECT c.org_id, c.id, g, least(cardinality(show_trgm(coalesce(c.name, ''))), 32767)
 FROM customers AS c, customer_search_grams_of(c.email, c.name) AS g;
 INSERT INTO knowledge_search_terms (org_id, article_id, term, tf)
 SELECT a.org_id, a.id, t.term, t.tf

@@ -114,6 +114,14 @@ Append-only: add `crates/cxp-core/migrations/NNNN_<name>.sql`, never edit an app
 tables need `org_id`, forced RLS with a `<table>_tenant_isolation` policy, grants to `otto_app`, and
 composite `(org_id, id)` foreign keys.
 
+### Search index (#17)
+`search_customers` and `search_articles` read `customer_search_grams` / `knowledge_search_terms`
+(migration 0004), which triggers keep in step with every write. Searches are `cxp:read` yet write:
+each indexes a batch of its org's pre-0004 backlog (`cxp_core::search::index_backlog`). Making a new
+column searchable means a new migration that changes the gram function, the sync trigger, and its
+`WHEN` clause together, and rebuilds the affected rows; extend the equivalence corpora in
+`crates/cxp-core/tests` with it. `totalCapped: false` promises results identical to a full scan.
+
 ## Configuration
 
 All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the local template,
