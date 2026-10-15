@@ -45,10 +45,10 @@ and `cxp_server` can open only `otto_cxp`.
   passes for any connecting role that is neither superuser nor BYPASSRLS (`cxp_server` is
   neither). A deployment whose `cxp_app` was never created would serve tenant transactions as
   `cxp_server` itself, which also holds the background grants (the tombstone), and no check would
-  say so. Boot therefore refuses, in a deployment, unless the isolation report says
-  `tenant_role_assumed` and the effective role is `cxp_app`.
+  say so. Boot therefore refuses, everywhere (not only in a deployment), unless the isolation
+  report says `tenant_role_assumed` and the effective role is `cxp_app`.
 - **Every `Db` must be built the same way.** `Db::from_pool` and `Db::connect` default to
-  `otto_app` and are called in 25 places (production: `boot.rs` twice; tests in every crate). One
+  `otto_app` and are called in 27 places (production: `boot.rs` twice; tests in every crate). One
   missed call would run that path's tenant transactions as the shared role, and tests could
   silently pass on a role production does not use. One helper builds every `Db`, and clippy's
   `disallowed-methods` forbids the two constructors everywhere else, tests included.
@@ -89,7 +89,7 @@ and the runtime login can then leave `otto_app`, so no grant another service mak
 reaches otto-cxp.
 
 - `tenant isolation enforced as role "cxp_app" (assumed via SET LOCAL ROLE cxp_app); …` in every
-  boot log and in the boot isolation test; a deployment whose `cxp_app` is missing, or not
+  boot log and in the boot isolation test; any boot (deployment or not) whose `cxp_app` is missing, or not
   assumable by the runtime login, refuses to serve and names the fix.
 - Every `Db` in the workspace is built by `cxp_core::tenant_db`; `cargo clippy` fails on a direct
   `otto_tenant::Db::from_pool` / `Db::connect` anywhere else.
@@ -104,7 +104,7 @@ reaches otto-cxp.
 **In:** `cxp_core::TENANT_ROLE` and `cxp_core::tenant_db`; `clippy.toml` (`disallowed-methods`);
 migration `0007_cxp_app_tenant_role.sql`; `db_role::RUNTIME_GRANTS` ("inheriting cxp_app") and
 `missing_runtime_grants`; `db_role::holds_shared_tenant_role` (boot warns while the runtime login
-still belongs to `otto_app`); `boot::check_tenant_role` (refuse unless assumed, in a deployment);
+still belongs to `otto_app`); `boot::check_tenant_role` (refuse unless assumed, everywhere);
 every `Db` construction moved to the helper; the tests (core, api, mcp, server, e2e) moved from
 `otto_app` to `TENANT_ROLE`, plus new tests; CI's role setup; `.env.example`, `fly.toml` comment,
 README, CLAUDE.md; `docs/deploy/fly.md` (Database role, the rule, the runbook, Verify, First
@@ -240,16 +240,19 @@ functions too (owned by `cxp_owner` since S3's `REASSIGN OWNED`), as 0001's did 
 ### `cxp-server`
 
 - `boot.rs`, `lib.rs`, `health.rs`: every `Db::from_pool` becomes `cxp_core::tenant_db`.
-- New `pub fn check_tenant_role(report: &IsolationReport, deployment: bool) -> Result<()>`, called
+- New `pub fn check_tenant_role(report: &IsolationReport, login: &str) -> Result<()>`, called
   right after `verify_tenant_isolation` in `run_with`:
   - assumed and `effective_role == TENANT_ROLE` → `Ok` (the `info` summary already logged);
-  - otherwise, in a deployment → `error` log and refusal: `refusing to serve: tenant transactions
-    run as "<effective>", not otto-cxp's own tenant role cxp_app (it does not exist, or "<login>"
-    cannot assume it): as a superuser, CREATE ROLE cxp_app NOLOGIN; GRANT cxp_app TO "<login>";
-    then migrate (docs/deploy/fly.md, runbook T1)`;
-  - otherwise locally → `warn` with the same text and "allowed only because this is not a
-    deployment".
-  `deployment` is the existing `is_deployment(&role, &config)`; `<login>` is `role.current_user`.
+  - otherwise → `error` log and refusal, **on every machine, not only in a deployment**:
+    `refusing to serve: tenant transactions run as "<effective>", not otto-cxp's own tenant role
+    cxp_app (it does not exist, or "<login>" cannot assume it): as a superuser, CREATE ROLE
+    cxp_app NOLOGIN; GRANT cxp_app TO "<login>"; then migrate (docs/deploy/fly.md, runbook T1)`.
+  `<login>` is `role.current_user`. Why no local exception (unlike the privilege checks, which
+  only warn locally because a local Postgres hands out a superuser): a local superuser creates
+  `cxp_app` in 0007 and can `SET ROLE` to it, so the check passes there anyway; CI and the tests
+  create it; and a local non-superuser runtime that cannot assume it would be exactly the silent
+  fallback this exists to stop. Refusing everywhere means no configuration ever runs tenant
+  transactions as anything but `cxp_app`.
 - After the runtime-grant check, in a deployment only: if `holds_shared_tenant_role` →
   `warn`: `database role "<login>" is still a member of otto_app, the tenant role the otto services
   share; this release no longer uses it: REVOKE otto_app FROM "<login>" once it is verified
@@ -353,7 +356,8 @@ change"). No new secret, config key, or scope; no recurring cost.
   LOCAL ROLE` fails and every tenant transaction errors (fails closed); the hourly runtime-grant
   re-check logs `error`. A restart refuses with the fix.
 - **Local superuser:** creates `cxp_app` in 0007 and may `SET ROLE` to anything; `check_tenant_role`
-  passes (assumed). A local non-superuser runtime that cannot assume `cxp_app`: warns.
+  passes (assumed). A local non-superuser runtime that cannot assume `cxp_app`: refused, like a
+  deployment (no local exception).
 - **A local non-superuser, non-CREATEROLE owner migrating a cluster with no `cxp_app`:** 0007
   fails (where 0001 only logged a NOTICE for `otto_app`), naming the fix. `.env.example`'s local
   split recipe creates `cxp_app` first.
@@ -401,8 +405,10 @@ changes. Plus a manual check: a direct `otto_tenant::Db::from_pool` in a test ma
     `otto_app` case where the test is about a grant to the shared role).
 - Other core test files, `cxp-api`, `cxp-mcp`: `Db::from_pool` → `cxp_core::tenant_db`; `SET ROLE
   otto_app` → `TENANT_ROLE`.
+- `crates/cxp-server/tests/e2e.rs` also: `a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally`
+  (local config, where the runtime-grant check only warns, so `check_tenant_role` itself refuses).
 - `crates/cxp-server/src/boot.rs` unit: `check_tenant_role` for assumed / not assumed / assumed
-  but a different effective role, deployment and local; `missing_grants` text names `cxp_app`.
+  but a different effective role (refused on every machine); `missing_grants` text names `cxp_app`.
 - `crates/cxp-server/tests/e2e.rs`:
   - `shared_roles` creates `otto_app`, `cxp_app`, `cxp_runtime`; `RUNTIME_GROUPS = ["cxp_app",
     "cxp_runtime"]`; every boot-log assertion names `cxp_app`.
