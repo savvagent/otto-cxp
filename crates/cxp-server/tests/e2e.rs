@@ -15,8 +15,10 @@
 //!    accepted;
 //! 4. lifecycle webhooks are verified and applied once.
 //!
-//! And for #16: the whole service runs as a least-privilege database owner,
-//! and a deployment refuses a superuser.
+//! And for #16 and #27: the whole service runs as a runtime role that owns
+//! nothing, after migrating as the database owner; a deployment refuses a
+//! superuser, an owning runtime role, and a serving process that would
+//! migrate; and the hourly role re-check holds readiness back.
 //!
 //! Needs `DATABASE_URL` (see `compose.yaml`).
 
@@ -2323,29 +2325,90 @@ fn database_url_as(pool: &PgPool, user: Option<(&str, &str)>) -> String {
     url.to_string()
 }
 
-/// What docs/deploy/fly.md sets up on `otto-db`, on this test's (empty)
-/// database: a login role that is not a superuser, not BYPASSRLS, cannot
-/// create roles or databases, is a member of `otto_app`, may set the
-/// console lookup's parameter, and owns the database, which only it may
-/// connect to. Returns its connection URL.
-async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
-    let database = pool.connect_options().get_database().unwrap().to_string();
+/// Creates `otto_app` and `cxp_runtime` if they do not exist. Both are
+/// cluster-wide and shared by every test (and other services' tests), so
+/// they are never dropped; a concurrent test creating one first is fine.
+async fn shared_roles(pool: &PgPool) {
+    for role in ["otto_app", "cxp_runtime"] {
+        sqlx::query(&format!(
+            "DO $$ BEGIN CREATE ROLE {role} NOLOGIN; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// A login role holding no superuser-equivalent privilege, with a fresh
+/// password; returns the password.
+async fn plain_login(pool: &PgPool, role: &str) -> String {
     let password = Uuid::new_v4().simple().to_string();
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD '{password}' \
+         NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    password
+}
+
+/// The custom parameter 0003's console lookup sets.
+const LOOKUP_PARAMETER: &str = "app.console_session_lookup";
+
+/// An arbitrary key for [`with_parameter_acl_lock`].
+const PARAMETER_ACL_LOCK: i64 = 0x0cc5_0027;
+
+/// Runs each of `stmts` on `conn`, in its own transaction, holding a
+/// cluster-wide lock: every role's `SET` grant on one parameter lives in a
+/// single `pg_parameter_acl` row, so tests granting or revoking it at once
+/// fail with "tuple concurrently updated". Advisory locks are per database
+/// and every test has its own, so the lock is taken in `DATABASE_URL`'s
+/// database, on a connection of its own, before the statements' transactions
+/// begin (so they see the previous holder's commit).
+async fn with_parameter_acl_lock(
+    conn: &mut sqlx::PgConnection,
+    stmts: &[String],
+) -> Result<(), sqlx::Error> {
+    use sqlx::Connection;
+    let mut lock =
+        sqlx::PgConnection::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(PARAMETER_ACL_LOCK)
+        .execute(&mut lock)
+        .await?;
+    let mut result = Ok(());
+    for stmt in stmts {
+        result = sqlx::query(stmt).execute(&mut *conn).await.map(drop);
+        if result.is_err() {
+            break;
+        }
+    }
+    // Closing the session releases the lock.
+    lock.close().await?;
+    result
+}
+
+/// The migration owner docs/deploy/fly.md sets up on `otto-db`, on this
+/// test's (empty) database: a login role that is not privileged, may set the
+/// console lookup's parameter, and owns the database, which only the roles
+/// granted `CONNECT` may connect to. Returns its connection URL.
+async fn owner_role(pool: &PgPool, role: &str) -> String {
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    let password = plain_login(pool, role).await;
+    // 0003's console_session_org sets this custom parameter in its SET
+    // clause, which only a superuser, or a role granted SET on it, may
+    // define (Postgres 15+). The runbook's R1 grants the same.
+    with_parameter_acl_lock(
+        &mut pool.acquire().await.unwrap(),
+        &[format!(
+            "GRANT SET ON PARAMETER {LOOKUP_PARAMETER} TO {role}"
+        )],
+    )
+    .await
+    .unwrap();
     for stmt in [
-        format!(
-            "CREATE ROLE {role} LOGIN PASSWORD '{password}' \
-             NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
-        ),
-        // The runbook assumes otto_app exists (another service's migrations
-        // or this one's created it); on a fresh cluster this test creates it.
-        "DO $$ BEGIN CREATE ROLE otto_app NOLOGIN; \
-         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
-            .to_string(),
-        format!("GRANT otto_app TO {role}"),
-        // 0003's console_session_org sets this custom parameter in its SET
-        // clause, which only a superuser, or a role granted SET on it, may
-        // define (Postgres 15+). The runbook's R1 grants the same.
-        format!("GRANT SET ON PARAMETER app.console_session_lookup TO {role}"),
         format!("ALTER DATABASE \"{database}\" OWNER TO {role}"),
         format!("REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"),
         format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
@@ -2353,6 +2416,84 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> String {
         sqlx::query(&stmt).execute(pool).await.unwrap();
     }
     database_url_as(pool, Some((role, &password)))
+}
+
+/// The runtime role the service serves as: a login role that is not
+/// privileged, owns nothing, and is a member of `otto_app` (the tenant role)
+/// and `cxp_runtime` (the tombstone grant). Returns its connection URL.
+async fn runtime_role(pool: &PgPool, role: &str) -> String {
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    shared_roles(pool).await;
+    let password = plain_login(pool, role).await;
+    for stmt in [
+        format!("GRANT otto_app TO {role}"),
+        format!("GRANT cxp_runtime TO {role}"),
+        format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
+    ] {
+        sqlx::query(&stmt).execute(pool).await.unwrap();
+    }
+    database_url_as(pool, Some((role, &password)))
+}
+
+/// Production's shape on the test database: an owner and a runtime role
+/// (each dropped when the guard is), created before anything migrates, since
+/// 0005 grants to `cxp_runtime` only if it exists when it runs.
+struct Split {
+    owner: String,
+    owner_url: String,
+    runtime: String,
+    runtime_url: String,
+    _drop: (DropRoleOnExit, DropRoleOnExit),
+}
+
+async fn split(pool: &PgPool) -> Split {
+    let id = Uuid::new_v4().simple();
+    let (owner, runtime) = (format!("cxp_ow_{id}"), format!("cxp_rt_{id}"));
+    let drop = (
+        DropRoleOnExit::new(pool, &runtime),
+        DropRoleOnExit::new(pool, &owner),
+    );
+    shared_roles(pool).await;
+    let owner_url = owner_role(pool, &owner).await;
+    let runtime_url = runtime_role(pool, &runtime).await;
+    Split {
+        owner,
+        owner_url,
+        runtime,
+        runtime_url,
+        _drop: drop,
+    }
+}
+
+/// A deployment `Config` (a non-loopback public URL) serving as
+/// `database_url`, migrating as `migration_url`.
+fn deployed(database_url: &str, migration_url: Option<&str>) -> Config {
+    let mut config = Config::for_test();
+    config.database_url = database_url.into();
+    config.migration_database_url = migration_url.map(Into::into);
+    assert!(config.is_deployment());
+    config
+}
+
+/// A subscriber that discards what it gets, for a test that runs boot code
+/// without asserting its logs: every callsite it logs through then gets an
+/// interest computed with a subscriber present, so the log assertions of a
+/// boot test running concurrently on another thread see their lines.
+fn discard_logs() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(Logs::default)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    )
+}
+
+/// Whether anything has migrated the test database.
+async fn migrated(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// Drops `role` when the test ends, failed or not: roles are cluster-wide
@@ -2385,21 +2526,26 @@ impl Drop for DropRoleOnExit {
             rt.block_on(async move {
                 use sqlx::Connection;
                 let mut conn = sqlx::PgConnection::connect_with(&options).await?;
-                for stmt in [
-                    format!(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                         WHERE usename = '{role}'"
-                    ),
-                    format!(
-                        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') \
-                         THEN REASSIGN OWNED BY {role} TO CURRENT_USER; DROP OWNED BY {role}; \
-                         END IF; END $$"
-                    ),
-                    format!("DROP ROLE IF EXISTS {role}"),
-                ] {
-                    sqlx::query(&stmt).execute(&mut conn).await?;
-                }
-                Ok::<_, sqlx::Error>(())
+                sqlx::query(&format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE usename = '{role}'"
+                ))
+                .execute(&mut conn)
+                .await?;
+                // DROP OWNED revokes the role's parameter grant, in the row
+                // every test's grant shares: under the same lock.
+                with_parameter_acl_lock(
+                    &mut conn,
+                    &[
+                        format!(
+                            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = \
+                             '{role}') THEN REASSIGN OWNED BY {role} TO CURRENT_USER; \
+                             DROP OWNED BY {role}; END IF; END $$"
+                        ),
+                        format!("DROP ROLE IF EXISTS {role}"),
+                    ],
+                )
+                .await
             })
         })
         .join();
@@ -2414,35 +2560,38 @@ impl Drop for DropRoleOnExit {
     }
 }
 
-/// The whole service as the least-privilege role production connects as
-/// (#16), in a deployment (a non-loopback public URL, where boot refuses a
-/// privileged role): that role migrates a fresh database it owns (the
-/// baseline's role, extension, and SECURITY DEFINER statements included),
-/// passes the boot checks, serves requests as `otto_app`, applies an
-/// `org.deleted` (the tombstone is written as the role itself), and runs the
-/// retention sweep and the usage shipper, both of which row-level security
-/// now binds (FORCE applies to the table owner), through their maintenance
-/// policies.
+/// The whole service split as production runs it (#27), in a deployment (a
+/// non-loopback public URL): `cxp-server migrate` migrates a fresh database
+/// as its owner (the baseline's role, extension, and SECURITY DEFINER
+/// statements included); the service then serves as a runtime role that
+/// owns nothing, passes the boot checks, serves requests as `otto_app`,
+/// applies an `org.deleted` (the tombstone is written as the runtime role,
+/// through `cxp_runtime`), and runs the retention sweep and the usage
+/// shipper through their maintenance policies, which bind it. The runtime
+/// role cannot switch row-level security off or empty a table past it.
 #[sqlx::test(migrations = false)]
-#[ignore = "rewritten for the split in the next commit (#27)"]
-async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool) {
+async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool) {
     let (logs, _guard) = Logs::capture();
 
-    let role = format!("cxp_lp_{}", Uuid::new_v4().simple());
-    let _drop_role = DropRoleOnExit::new(&pool, &role);
-    let role_url = least_privilege_owner(&pool, &role).await;
+    let roles = split(&pool).await;
+    let role = roles.runtime.clone();
 
-    // Migrations, as the role, into the database it owns.
-    let as_role = Db::connect(&role_url).await.unwrap();
-    cxp_core::migrate(&as_role)
+    // `cxp-server migrate`: as the owner, into the database it owns.
+    let migrator = cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
         .await
         .expect("the owner migrates");
-    let owner: String =
-        sqlx::query_scalar("SELECT tableowner::text FROM pg_tables WHERE tablename = 'customers'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(owner, role);
+    assert!(
+        migrator.starts_with(&format!(r#"database role "{}""#, roles.owner)),
+        "{migrator}"
+    );
+    let owners: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT tableowner::text FROM pg_tables WHERE schemaname = 'public'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, std::slice::from_ref(&roles.owner));
+    let as_role = Db::connect(&roles.runtime_url).await.unwrap();
 
     // Rows only the background maintenance may remove, across orgs.
     let (stale_org, stale_event) = (Uuid::new_v4(), Uuid::new_v4());
@@ -2479,13 +2628,13 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     let (base, mock) = start_platform().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut config = Config::for_test();
-    config.database_url = role_url;
+    // A deployment, served here on a loopback socket; it never reads the
+    // owner's credential, so none is given.
+    let mut config = deployed(&roles.runtime_url, None);
+    config.run_migrations = false;
     config.bind = addr;
     config.platform_url = base;
-    // A deployment, served here on a loopback socket.
     assert_eq!(config.public_url, PUBLIC_URL);
-    assert!(config.is_deployment());
     config.extra_allowed_hosts = vec![addr.to_string()];
 
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
@@ -2560,8 +2709,8 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             );
         }
 
-        // org.deleted for B: the tombstone is written as the role itself,
-        // the purge as otto_app pinned to B.
+        // org.deleted for B: the tombstone is written as the runtime role
+        // (cxp_runtime's grant), the purge as otto_app pinned to B.
         let (body, sig) = signed(Uuid::new_v4(), "org.deleted", json!({"org_id": b}));
         let res = http
             .post(format!("{base}/platform/webhooks"))
@@ -2592,13 +2741,20 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     let boot = boot.expect("a clean stop");
 
     // Not privileged, and the per-test databases beside its own (PUBLIC's
-    // default CONNECT, not another service's) do not count.
+    // default CONNECT, not another service's) do not count; and it owns
+    // nothing.
     assert!(
         boot.database_role.contains(
             "holds no superuser-equivalent privilege (SUPERUSER, BYPASSRLS, CREATEROLE, \
              CREATEDB, REPLICATION, or a cross-service predefined role), directly or through \
              membership, and can connect to no other service's database"
         ),
+        "{}",
+        boot.database_role
+    );
+    assert!(
+        boot.database_role
+            .contains("it owns nothing in this database"),
         "{}",
         boot.database_role
     );
@@ -2646,9 +2802,10 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
         1
     );
 
-    // The console's cookie lookup, the one unpinned read a request makes:
-    // console_session_org runs as its owner, the role, which FORCE binds,
-    // and console_sessions_lookup admits it because it owns the function.
+    // The console's cookie lookup, the one unpinned read a request makes,
+    // called as the runtime role: console_session_org runs as its owner,
+    // which FORCE binds, and console_sessions_lookup admits it because it
+    // owns the function.
     let owner: String = sqlx::query_scalar(
         "SELECT pg_get_userbyid(proowner)::text FROM pg_proc \
          WHERE oid = 'console_session_org(bytea)'::regprocedure",
@@ -2656,7 +2813,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(owner, role);
+    assert_eq!(owner, roles.owner);
     let cookie = "e2e-least-privilege-cookie";
     cxp_core::console_sessions::create(
         &Db::from_pool(pool.clone()),
@@ -2688,11 +2845,16 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             .map(|o| o.as_uuid())
         }
     };
-    assert_eq!(org_of(cookie).await, Some(a), "the lookup as the owner");
+    assert_eq!(
+        org_of(cookie).await,
+        Some(a),
+        "the lookup as the runtime role"
+    );
     assert_eq!(org_of("no-such-cookie").await, None);
 
-    // Row-level security binds the role itself: unpinned and unmarked, the
-    // owner sees none of A's rows, and cannot reach the bookkeeping either.
+    // Row-level security binds the runtime role itself: unpinned and
+    // unmarked, it sees none of A's rows, and cannot reach the bookkeeping
+    // either.
     for table in [
         "customers",
         "feedback",
@@ -2704,16 +2866,40 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             .fetch_one(as_role.pool())
             .await
             .unwrap();
-        assert_eq!(n, 0, "{table} as the unpinned owner");
+        assert_eq!(n, 0, "{table} as the unpinned runtime role");
+    }
+
+    // Nor can it switch row-level security off, or empty a table past it:
+    // each needs ownership or a privilege it does not hold.
+    for stmt in [
+        "ALTER TABLE customers NO FORCE ROW LEVEL SECURITY",
+        "ALTER TABLE customers DISABLE ROW LEVEL SECURITY",
+        "DROP POLICY customers_tenant_isolation ON customers",
+        "TRUNCATE customers",
+    ] {
+        let err = sqlx::query(stmt)
+            .execute(as_role.pool())
+            .await
+            .expect_err(stmt);
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{stmt}: {err}"
+        );
     }
     as_role.pool().close().await;
+    assert_eq!(
+        count("SELECT count(*) FROM customers WHERE org_id = $1", a).await,
+        1,
+        "nothing was emptied"
+    );
 
     // What docs/deploy/fly.md tells an operator to look for, in order.
     let text = logs.text();
     let mut from = 0;
     for line in [
         format!(r#"database role "{role}" holds no superuser-equivalent privilege"#),
-        "applying migrations".into(),
+        "not migrating".into(),
         r#"tenant isolation enforced as role "otto_app""#.into(),
         "the otto platform accepted this service's credential".into(),
         "cxp-server listening".into(),
@@ -2723,6 +2909,165 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
         from += at + line.len();
     }
+}
+
+/// A deployment refuses to serve as the database owner, the role that
+/// can switch row-level security off without any privilege; nothing
+/// listens.
+#[sqlx::test(migrations = false)]
+async fn a_deployment_refuses_an_owner_as_its_runtime_role(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.owner_url, None);
+    config.run_migrations = false;
+    config.bind = addr;
+    config.platform_url = base;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(err.contains("refusing to serve"), "{err}");
+    assert!(err.contains("owns"), "{err}");
+    assert!(err.contains(&roles.owner), "{err}");
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+}
+
+/// A deployment whose serving process is told to migrate refuses: its
+/// runtime role owns nothing, so it could not, and the release command
+/// migrates as the owner. Nothing runs first.
+#[sqlx::test(migrations = false)]
+async fn a_deployment_refuses_to_migrate_as_the_runtime_role(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.runtime_url, None);
+    assert!(config.run_migrations);
+    config.bind = addr;
+    config.platform_url = base;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(err.contains("refusing to serve"), "{err}");
+    assert!(err.contains("CXP_RUN_MIGRATIONS"), "{err}");
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    assert!(!migrated(&pool).await, "nothing migrated");
+}
+
+/// `cxp-server migrate` in a deployment needs the owner's own credential,
+/// never the runtime role's, and refuses a superuser one.
+#[sqlx::test(migrations = false)]
+async fn migrate_needs_its_own_credential_in_a_deployment(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    let err = format!(
+        "{:#}",
+        cxp_server::boot::migrate(&deployed(&roles.runtime_url, None))
+            .await
+            .expect_err("no migration URL")
+    );
+    assert!(err.contains("CXP_MIGRATION_DATABASE_URL"), "{err}");
+    assert!(!migrated(&pool).await, "nothing migrated");
+
+    // The test pool's own role: a superuser.
+    let superuser = database_url_as(&pool, None);
+    let err = format!(
+        "{:#}",
+        cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&superuser)))
+            .await
+            .expect_err("a superuser migration role")
+    );
+    assert!(err.contains("refusing to migrate"), "{err}");
+    assert!(err.contains("SUPERUSER"), "{err}");
+    assert!(!migrated(&pool).await, "nothing migrated");
+}
+
+/// `/readyz` over `db` with `alarm`, as boot builds it.
+async fn readyz(db: Db, alarm: cxp_server::health::RoleAlarm) -> (StatusCode, Value) {
+    let res = cxp_server::health::router(
+        db,
+        cxp_server::health::Readiness::new(cxp_server::PlatformCheck::Accepted)
+            .with_role_alarm(alarm),
+    )
+    .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+    .await
+    .unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// The hourly re-check, on the live database: a privilege granted to the
+/// runtime role after boot raises the alarm, which holds `/readyz` back with
+/// a fixed reason; revoking it clears the alarm on the next pass.
+#[sqlx::test(migrations = false)]
+async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+    let config = deployed(&roles.runtime_url, None);
+    let db = Db::connect(&roles.runtime_url).await.unwrap();
+    let alarm = cxp_server::health::RoleAlarm::default();
+
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(!alarm.is_raised(), "a clean runtime role");
+    let (status, _) = readyz(db.clone(), alarm.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let grant = |stmt: String| {
+        let pool = pool.clone();
+        async move { sqlx::query(&stmt).execute(&pool).await.unwrap() }
+    };
+    grant(format!("GRANT pg_read_all_data TO {}", roles.runtime)).await;
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(alarm.is_raised(), "a privilege granted after boot");
+    let (status, body) = readyz(db.clone(), alarm.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({ "status": "unready", "reason": "database role refused" })
+    );
+
+    grant(format!("REVOKE pg_read_all_data FROM {}", roles.runtime)).await;
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(!alarm.is_raised(), "fixed");
+    let (status, _) = readyz(db.clone(), alarm).await;
+    assert_eq!(status, StatusCode::OK);
+    db.pool().close().await;
+}
+
+/// A re-check that cannot read the role leaves a raised alarm raised: an
+/// unreachable database is no evidence the role was fixed.
+#[sqlx::test(migrations = false)]
+async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: PgPool) {
+    let _guard = discard_logs();
+    let db = Db::connect(&database_url_as(&pool, None)).await.unwrap();
+    let alarm = cxp_server::health::RoleAlarm::default();
+    alarm.raise("database role refused at the last pass".into());
+    db.pool().close().await;
+    cxp_server::boot::recheck_db_role(&db, &Config::for_test(), &alarm).await;
+    assert!(alarm.is_raised());
 }
 
 /// A deployment refuses a superuser connection before running anything as
