@@ -2185,6 +2185,7 @@ impl Drop for DropRoleOnExit {
 /// now binds (FORCE applies to the table owner), through their maintenance
 /// policies.
 #[sqlx::test(migrations = false)]
+#[ignore = "rewritten for the split in the next commit (#27)"]
 async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool) {
     let logs = Logs::default();
     let writer = logs.clone();

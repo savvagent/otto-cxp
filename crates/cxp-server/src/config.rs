@@ -14,6 +14,12 @@ use anyhow::{anyhow, Context, Result};
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
+    /// `CXP_MIGRATION_DATABASE_URL` (secret): the database owner's login,
+    /// read only by `cxp-server migrate` (Fly's release command). The
+    /// serving process never reads it: it connects as a runtime role that
+    /// owns nothing. Required for `migrate` in a deployment; a developer's
+    /// machine without it migrates as `database_url`.
+    pub migration_database_url: Option<String>,
     pub db_max_connections: u32,
     pub run_migrations: bool,
     pub bind: SocketAddr,
@@ -73,6 +79,10 @@ pub enum LogFormat {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field(
+                "migration_database_url",
+                &self.migration_database_url.as_ref().map(|_| "<redacted>"),
+            )
             .field("db_max_connections", &self.db_max_connections)
             .field("run_migrations", &self.run_migrations)
             .field("bind", &self.bind)
@@ -128,6 +138,7 @@ impl Config {
                 .ok_or_else(|| {
                     anyhow!("CXP_DATABASE_URL (or DATABASE_URL) is required and not set")
                 })?,
+            migration_database_url: vars.optional("CXP_MIGRATION_DATABASE_URL"),
             db_max_connections: vars.parse("CXP_DB_MAX_CONNECTIONS", "5", |s| {
                 // The production database is small and shared by every
                 // otto service: a typo here must not take its connections.
@@ -240,6 +251,7 @@ impl Config {
     pub fn for_test() -> Self {
         Self {
             database_url: "postgres://localhost/test".into(),
+            migration_database_url: None,
             db_max_connections: 5,
             run_migrations: true,
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -812,5 +824,32 @@ mod tests {
             assert!(!s.contains(secret), "{secret} leaked: {s}");
         }
         assert!(s.contains("otto-cxp.savvagent.com"), "{s}");
+    }
+
+    /// The owner's credential is read for `cxp-server migrate` only, absent
+    /// unless set, and never printed.
+    #[test]
+    fn the_migration_database_url_is_optional_and_never_printed() {
+        let c = load(&env(&[])).unwrap();
+        assert_eq!(c.migration_database_url, None);
+        assert!(Config::for_test().migration_database_url.is_none());
+
+        let c = load(&env(&[(
+            "CXP_MIGRATION_DATABASE_URL",
+            "postgres://cxp_owner:sw0rdfish@db.internal/otto_cxp",
+        )]))
+        .unwrap();
+        assert_eq!(
+            c.migration_database_url.as_deref(),
+            Some("postgres://cxp_owner:sw0rdfish@db.internal/otto_cxp")
+        );
+        let s = format!("{c:?}");
+        assert!(!s.contains("sw0rdfish") && !s.contains("cxp_owner"), "{s}");
+        assert!(
+            s.contains(r#"migration_database_url: Some("<redacted>")"#),
+            "{s}"
+        );
+        let s = format!("{:?}", load(&env(&[])).unwrap());
+        assert!(s.contains("migration_database_url: None"), "{s}");
     }
 }
