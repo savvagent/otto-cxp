@@ -81,7 +81,12 @@ The issue's three comments are in scope (PR #33 re-reviews, all Minor or defence
   as roughly 30 printed pages: far above any real help article, while bounding an article's
   index rows (one `l` row per distinct lexeme) and its `to_tsvector` cost. No route or tool
   writes articles today, so the limit rejects nothing live.
-- **The timeout code is `query_too_broad`, retriable.** A search can hit its 2 s timeout either
+- **The timeout code is `query_too_broad`, NOT retriable (revised in PR review).** The PR #40
+  reviewers (security, silent-failure, Rust, architect) pointed out that a retriable 503 invites
+  generic retry layers and agents to repeat a 2 s broad query on the 5-connection shared pool.
+  It is now REST 422 with no `Retry-After`, MCP `INVALID_PARAMS` with `retriable: false`, and the
+  message says to narrow the query; a cold-cache timeout is rare and the caller's next, narrower
+  search runs warm. The original reasoning follows. A search can hit its 2 s timeout either
   because it is broad in a large org or because the first search after a resume reads a cold
   cache (Fly suspends the machine; the shared instance's cache is not ours). Either a narrower
   query or a plain retry can succeed, so it is retriable and the message says both. REST answers
@@ -103,7 +108,7 @@ re-reviews, and give Rob a threshold and a query to know when the index's storag
 
 - `cxp_core::search` has no `index_backlog`, `Indexed`, `BACKLOG_READ`, or savepoint; neither
   search statement has a `backlog` CTE; searches no longer write.
-- A search that hits `statement_timeout` returns `query_too_broad` (retriable), proven by a test
+- A search that hits `statement_timeout` returns `query_too_broad` (not retriable), proven by a test
   that blocks search on a lock past the timeout.
 - `fp` reads the threshold with `current_setting(..., true)` and a 0.3 fallback; the 20,001-row
   count runs only when the match count has not already capped the result.
@@ -164,12 +169,12 @@ search (#24); lowering `NEWEST_READ`.
 
 - New variant `Error::QueryTooBroad`, `Display`: "this search ran longer than otto-cxp allows;
   narrow the query (more characters or more specific words), or retry". `code()` →
-  `"query_too_broad"`; `retriable()` → true; `is_internal()` → false.
+  `"query_too_broad"`; `retriable()` → false (revised; see Assumptions); `is_internal()` → false.
 - `search::on_timeout(kind: &'static str) -> impl FnOnce(sqlx::Error) -> Error`: SQLSTATE `57014`
   becomes `QueryTooBroad` after `tracing::warn!(search = kind, "search hit its statement_timeout")`;
   anything else is `Error::Database(e)`. Applied with `map_err` to both statements of each search
   (the hits statement and the rows-by-id read), since both run under the timeout.
-- `cxp-api` `status_for`: `QueryTooBroad` → 503 (so `Retry-After` is attached); the module's
+- `cxp-api` `status_for`: `QueryTooBroad` → 422, no `Retry-After` (revised from 503); the module's
   code table gains the row. `cxp-mcp` `from_core` needs no change (non-internal, falls to
   `INVALID_PARAMS`); its test table gains the case.
 - Public interface change: one new, additive error code on `search_customers`,
@@ -187,7 +192,7 @@ search (#24); lowering `NEWEST_READ`.
   link a new section **"Search index storage (#34)"** that holds:
   - the threshold: act when the two index tables together pass **100 MB** (10% of the 1 GB
     `otto-db` volume; about 10k customers or 3k published articles at the measured per-row cost,
-    less once grown a row at a time), or `otto_cxp` passes 250 MB, or the volume passes 70% used.
+    less once grown a row at a time), or `otto_cxp` passes 250 MB, or the volume passes 60% used (lowered from 70% in PR review: rebuild and WAL headroom).
     The actions, in order of preference: split otto-cxp onto its own instance (recurring cost:
     Rob), or slim the index via the LEAKPROOF route;
   - the SELECT-only watch query (tables via `pg_stat_user_tables`, indexes via
@@ -197,7 +202,7 @@ search (#24); lowering `NEWEST_READ`.
   - the backlog note: no row can be written unindexed; a restore with triggers disabled must be
     followed by an index rebuild, with the exact SQL (a human step: `UPDATE … SET search_indexed =
     true` per table, run as a superuser, which fires the triggers);
-  - the first-search timeout: `query_too_broad` after a resume is acceptable and retriable;
+  - the first-search timeout: `query_too_broad` from a cold cache is acceptable;
     measure one cold search once an org nears the threshold;
   - **LEAKPROOF re-evaluation**: when to revisit (index past the threshold, or long fuzzy queries
     reported capped/incomplete), what it is (Rob, superuser, `ALTER FUNCTION
@@ -230,7 +235,7 @@ Rob to run; it is SELECT-only.
 ## Error handling & edge cases
 
 - A 57014 raised for another reason (an operator's `pg_cancel_backend`) also reads as
-  `query_too_broad`; retriable is still right.
+  `query_too_broad`; telling the caller to narrow the query is harmless.
 - `statement_timeout` is `SET LOCAL`, so it ends with the transaction; nothing else changes.
 - A threshold placeholder set to an unparsable string still errors as before (`22P02` →
   `invalid_argument`); not reachable through any surface.
@@ -247,7 +252,7 @@ path changes.
   `rows_are_indexed_whatever_the_insert_says` (an insert and an update naming
   `search_indexed = false` read back true and have grams) and
   `a_search_past_its_timeout_is_query_too_broad` (a superuser holds `ACCESS EXCLUSIVE` on
-  `customer_search_grams`; the search fails after 2 s with `query_too_broad`, retriable, no
+  `customer_search_grams`; the search fails after 2 s with `query_too_broad`, not retriable, no
   database text). The random corpus test counts uncapped queries and asserts >= 95%.
 - `tests/support.rs`: the article corpus test asserts >= 95% uncapped;
   `article_content_is_length_limited` (create and update, at and past the limit); an article
@@ -257,7 +262,7 @@ path changes.
   search_indexed = true` in each org's own pinned transaction indexes that org's rows (org B's
   stay untouched by A's), and search is then exact. The file's doc says this is the rebuild the
   runbook describes.
-- `crates/cxp-core/src/error.rs` unit tests: the new code, retriable, not internal, fixed text.
+- `crates/cxp-core/src/error.rs` unit tests: the new code, not retriable, not internal, fixed text.
 - `crates/cxp-api/src/error.rs`: status 503 with `Retry-After` for the new variant.
 - `crates/cxp-mcp/src/error.rs`: the new code in its table.
 - Existing equivalence and threshold tests (`indexed_search_follows_the_similarity_threshold`)

@@ -4,8 +4,10 @@
 //! There is no backlog of unindexed rows (#34): every row is indexed by its
 //! table's triggers. `search_mark_indexed` (migration 0004) sets
 //! `search_indexed` on every insert and update, and the sync triggers write
-//! the row's index rows with it, so no row can be written unindexed. The
-//! column and its partial indexes remain only because migrations are
+//! the row's index rows with it, so no ordinary write can leave a row
+//! unindexed. A load that bypasses triggers can (a restore with triggers
+//! off); docs/deploy/fly.md ("No backlog") detects and rebuilds such rows.
+//! The column and its partial indexes remain only because migrations are
 //! additive.
 //!
 //! Under row-level security no index can serve `ILIKE`, pg_trgm's `%`, or
@@ -149,4 +151,26 @@ pub(crate) fn in_order<T>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::fake::db;
+
+    /// Only a timeout (57014) reads as too broad; every other database
+    /// failure stays an internal database error, so a real fault is never
+    /// disguised as the caller's query.
+    #[test]
+    fn only_a_timeout_reads_as_too_broad() {
+        let e = on_timeout("search_customers")(db("57014"));
+        assert!(matches!(e, Error::QueryTooBroad), "{e:?}");
+        for code in ["23505", "40001", "53300", "57P01"] {
+            let e = on_timeout("search_customers")(db(code));
+            assert!(matches!(e, Error::Database(_)), "{code}: {e:?}");
+            assert_eq!(e.code(), "internal", "{code}");
+        }
+        let e = on_timeout("search_articles")(sqlx::Error::PoolTimedOut);
+        assert!(matches!(e, Error::Database(_)), "{e:?}");
+    }
 }

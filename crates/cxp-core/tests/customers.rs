@@ -1263,9 +1263,10 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
 
 /// Migration 0004's `search_mark_indexed` trigger sets `search_indexed` on
 /// every insert and update, whatever the statement says, and the sync
-/// triggers write the row's index rows with it: no write can leave a row
-/// unindexed. That is why search reads no backlog of unindexed rows (#34);
-/// the only rows ever unindexed were those written before 0004 existed.
+/// triggers write the row's index rows with it: no ordinary write can leave
+/// a row unindexed. That is why search reads no backlog of unindexed rows
+/// (#34); only rows written before 0004, or loaded with triggers off (see
+/// `the_rebuild_runbook_restores_lost_index_rows`), can be.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
     use cxp_core::knowledge::KnowledgeExt;
@@ -1340,9 +1341,107 @@ async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
     );
 }
 
+/// The detection and rebuild runbook in docs/deploy/fly.md ("No backlog"),
+/// statement for statement: rows whose index rows were lost (a load with
+/// triggers off) still read `search_indexed = true`, so the runbook finds
+/// them by their missing index rows and rebuilds them in two steps. If the
+/// sync triggers' `WHEN` clauses change, this and the runbook change
+/// together.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_rebuild_runbook_restores_lost_index_rows(pool: PgPool) {
+    use cxp_core::knowledge::KnowledgeExt;
+    const MISSING_CUSTOMERS: &str = "SELECT count(*) FROM customers c \
+         WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g \
+                           WHERE g.org_id = c.org_id AND g.customer_id = c.id)";
+    const MISSING_ARTICLES: &str = "SELECT count(*) FROM knowledge_articles a \
+         WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector) \
+           AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t \
+                           WHERE t.org_id = a.org_id AND t.article_id = a.id)";
+    let su = pool.clone();
+    let db = db(pool);
+    let org = org();
+    add(&db, org, new("lost@example.com", "Lost Person")).await;
+    let mut tx = db.begin(org).await.unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published) \
+         VALUES ($1, 'Lost article', 'Some lost content', true)",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // What a load without the index tables leaves: the rows, flagged
+    // indexed, with no index rows.
+    sqlx::query("DELETE FROM customer_search_grams")
+        .execute(&su)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM knowledge_search_terms")
+        .execute(&su)
+        .await
+        .unwrap();
+    let count = |sql: &'static str| {
+        let su = su.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&su)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        (
+            count(MISSING_CUSTOMERS).await,
+            count(MISSING_ARTICLES).await
+        ),
+        (1, 1)
+    );
+    let flagged: i64 = sqlx::query_scalar("SELECT count(*) FROM customers WHERE search_indexed")
+        .fetch_one(&su)
+        .await
+        .unwrap();
+    assert_eq!(flagged, 1, "the flag does not show the loss");
+
+    let mut step1 = su.begin().await.unwrap();
+    for stmt in [
+        "SET LOCAL session_replication_role = replica",
+        "UPDATE customers c SET search_indexed = false \
+         WHERE NOT EXISTS (SELECT 1 FROM customer_search_grams g \
+                           WHERE g.org_id = c.org_id AND g.customer_id = c.id)",
+        "UPDATE knowledge_articles a SET search_indexed = false \
+         WHERE a.published AND (a.title <> '' OR a.search_tsv <> ''::tsvector) \
+           AND NOT EXISTS (SELECT 1 FROM knowledge_search_terms t \
+                           WHERE t.org_id = a.org_id AND t.article_id = a.id)",
+    ] {
+        sqlx::query(stmt).execute(&mut *step1).await.unwrap();
+    }
+    step1.commit().await.unwrap();
+    for stmt in [
+        "UPDATE customers SET search_indexed = true WHERE NOT search_indexed",
+        "UPDATE knowledge_articles SET search_indexed = true WHERE NOT search_indexed",
+    ] {
+        sqlx::query(stmt).execute(&su).await.unwrap();
+    }
+
+    assert_eq!(
+        (
+            count(MISSING_CUSTOMERS).await,
+            count(MISSING_ARTICLES).await
+        ),
+        (0, 0)
+    );
+    let mut tx = db.begin(org).await.unwrap();
+    let found = tx.search_customers("lost", Page::default()).await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1, false));
+    let found = tx.search_articles("lost").await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1, false));
+}
+
 /// A search that runs past its `statement_timeout` (here, waiting on a lock
 /// on the index table that only the search statement reads) is
-/// `query_too_broad`: retriable, and saying nothing of statements or
+/// `query_too_broad`: not retriable, and saying nothing of statements or
 /// cancellation, rather than an internal error.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn a_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
@@ -1379,7 +1478,7 @@ async fn a_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
     lock.rollback().await.unwrap();
 
     assert_eq!(e.code(), "query_too_broad", "{e:?}");
-    assert!(e.retriable());
+    assert!(!e.retriable());
     let text = e.to_string();
     assert!(!text.contains("statement"), "{text}");
     assert!(!text.contains("cancel"), "{text}");

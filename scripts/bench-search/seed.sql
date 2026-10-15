@@ -133,8 +133,7 @@ SELECT o.org,
 FROM orgs o CROSS JOIN LATERAL generate_series(1, o.articles) g;
 
 -- The search index, in bulk: keys dropped, rows inserted, keys rebuilt, and
--- every row marked indexed (what cxp_core's per-org backlog indexing does a
--- batch at a time, through the triggers).
+-- every row marked indexed (what the tables' triggers do row by row).
 ALTER TABLE customers DISABLE TRIGGER USER;
 ALTER TABLE knowledge_articles DISABLE TRIGGER USER;
 ALTER TABLE customer_search_grams DISABLE TRIGGER ALL;

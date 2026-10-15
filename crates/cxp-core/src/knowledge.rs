@@ -21,11 +21,10 @@ pub const SEARCH_LIMIT: i64 = 20;
 /// window of a title (migration 0004), so its length is what an article's
 /// title index rows grow with.
 pub const MAX_TITLE_CHARS: usize = 500;
-/// Longest article content, in characters (about 30 printed pages). Search
+/// Longest article content, in characters (about 15,000 words). Search
 /// indexes one row per distinct lexeme of a published article (migration
 /// 0004), and `to_tsvector` runs over the content on every write, so this
-/// bounds both. No route or tool writes articles yet; the limit is in place
-/// before one does (#34).
+/// caps both. Set before any route or tool writes articles (#34).
 pub const MAX_CONTENT_CHARS: usize = 100_000;
 
 const ARTICLE_COLS: &str =

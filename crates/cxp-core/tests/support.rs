@@ -1164,7 +1164,7 @@ async fn an_article_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
     lock.rollback().await.unwrap();
 
     assert_eq!(e.code(), "query_too_broad", "{e:?}");
-    assert!(e.retriable());
+    assert!(!e.retriable());
     let text = e.to_string();
     assert!(!text.contains("statement"), "{text}");
     assert!(!text.contains("cancel"), "{text}");

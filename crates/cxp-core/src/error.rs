@@ -61,12 +61,13 @@ pub enum Error {
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
-    /// A search ran past its `statement_timeout` (SQLSTATE 57014): too broad
-    /// for this org, or the first search on a cold cache. A narrower query or
-    /// a plain retry can succeed.
+    /// A search ran past its `statement_timeout` (SQLSTATE 57014), almost
+    /// always because the query is too broad for this org. Not retriable:
+    /// repeating the same broad query would hold one of the small pool's
+    /// connections for the whole timeout again; a narrower query succeeds.
     #[error(
         "this search ran longer than otto-cxp allows; narrow the query (more characters \
-         or more specific words), or retry"
+         or more specific words) and try again"
     )]
     QueryTooBroad,
 
@@ -206,7 +207,6 @@ impl Error {
         }
         match self {
             Error::Unavailable => true,
-            Error::QueryTooBroad => true,
             Error::Platform(p) => p.is_retriable(),
             _ => false,
         }
@@ -466,9 +466,11 @@ mod tests {
     fn a_search_past_its_timeout_reads_as_too_broad() {
         let e = Error::QueryTooBroad;
         assert!(!e.is_internal());
+        // Repeating the same broad query cannot help, and would hold a
+        // pooled connection for the whole timeout again.
+        assert!(!e.retriable());
         let text = e.to_string();
         assert!(text.contains("narrow the query"), "{text}");
-        assert!(text.contains("retry"), "{text}");
     }
 
     #[test]
@@ -478,7 +480,6 @@ mod tests {
             Error::Database(sqlx::Error::PoolTimedOut),
             Error::Tenant(otto_tenant::Error::Db(db("40001"))),
             Error::Unavailable,
-            Error::QueryTooBroad,
             Error::Platform(otto_resource::Error::Status {
                 status: 503,
                 body: String::new(),
@@ -488,6 +489,7 @@ mod tests {
         }
         for no in [
             Error::NotFound { kind: "customer" },
+            Error::QueryTooBroad,
             Error::Invalid("bad".into()),
             Error::Conflict("dup".into()),
             Error::UnknownTeam,

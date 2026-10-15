@@ -74,8 +74,9 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 ///   [`FUZZY_CHECKED`] candidates are checked, most shared trigrams first.
 ///   A threshold of 0 or below makes every named customer a match, so the
 ///   candidates are then simply the org's customers. `fp` reads the
-///   threshold with `current_setting(..., true)`, which is NULL until
-///   pg_trgm is loaded in the session, so it falls back to pg_trgm's default
+///   threshold with `current_setting(..., true)`, which is NULL (or '', for
+///   a placeholder set and reset) until pg_trgm is loaded in the session, so
+///   it falls back to pg_trgm's default
 ///   of 0.3 (a value set earlier, as a placeholder, is what pg_trgm adopts
 ///   when it loads, and is read as set); it no longer depends on the order
 ///   the CTEs are evaluated in.
