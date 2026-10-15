@@ -1,6 +1,6 @@
 # The web console signs in with the otto platform
 
-**Status:** DRAFT (#14)
+**Status:** IMPLEMENTED (#30)
 
 ## Brief
 
