@@ -54,6 +54,12 @@ export const surveysApi = {
   delete: (id: string) =>
     apiFetch<{ deleted: boolean }>(`/surveys/${id}`, { method: "DELETE" }),
 
-  getResponses: (id: string) =>
-    apiFetch<SurveyResponse[]>(`/surveys/${id}/responses`),
+  getResponses: (id: string, params?: { limit?: number; offset?: number }) => {
+    const searchParams = new URLSearchParams();
+    searchParams.set("limit", String(params?.limit ?? 50));
+    searchParams.set("offset", String(params?.offset ?? 0));
+    return apiFetch<PaginatedResponse<SurveyResponse>>(
+      `/surveys/${id}/responses?${searchParams.toString()}`,
+    );
+  },
 };

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import wire from "../../../../crates/cxp-api/tests/fixtures/wire.json";
 import { customersApi } from "./api/customers";
 import { experiencesApi } from "./api/experiences";
+import { surveysApi } from "./api/surveys";
 import type {
   Application,
   Component,
@@ -72,6 +73,7 @@ const typed = {
   ticketList: wire.ticketList satisfies PaginatedResponse<Ticket>,
   feedbackList: wire.feedbackList satisfies PaginatedResponse<Feedback>,
   surveyList: wire.surveyList satisfies PaginatedResponse<Survey>,
+  surveyResponseList: wire.surveyResponseList satisfies PaginatedResponse<SurveyResponse>,
   experienceList: wire.experienceList satisfies PaginatedResponse<Experience>,
   applicationList: wire.applicationList satisfies PaginatedResponse<Application>,
   pageList: wire.pageList satisfies PaginatedResponse<Page>,
@@ -129,6 +131,7 @@ describe("types match the server's JSON", () => {
       [typed.ticketList, keys.ticket],
       [typed.feedbackList, keys.feedback],
       [typed.surveyList, keys.survey],
+      [typed.surveyResponseList, keys.surveyResponse],
       [typed.experienceList, keys.experience],
       [typed.applicationList, keys.application],
       [typed.pageList, keys.page],
@@ -187,5 +190,14 @@ describe("api calls decode the server's payloads", () => {
     expect(view.recentTickets[0].createdAt).toBe("2026-10-03T12:30:00Z");
     expect(view.recentFeedback[0].feedbackType).toBe("nps");
     expect(view.recentInteractions[0].interactionType).toBe("page_view");
+  });
+
+  it("survey responses come in the list envelope with their total", async () => {
+    respondWith(wire.surveyResponseList);
+    const page = await surveysApi.getResponses(wire.survey.id);
+    expect(page.total).toBe(1);
+    expect(page.data[0].surveyId).toBe(wire.surveyResponse.surveyId);
+    const url = String(vi.mocked(fetch).mock.calls[0][0]);
+    expect(url).toContain(`/surveys/${wire.survey.id}/responses?limit=50&offset=0`);
   });
 });
