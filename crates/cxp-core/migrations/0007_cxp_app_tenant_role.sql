@@ -15,9 +15,11 @@ BEGIN
       WHEN duplicate_object OR unique_violation THEN
         NULL; -- another database in this cluster created it first
       WHEN insufficient_privilege THEN
-        RAISE EXCEPTION 'role cxp_app does not exist and % may not create it', current_user
-          USING HINT = 'As a superuser: CREATE ROLE cxp_app NOLOGIN; GRANT cxp_app TO <the '
-                       'runtime login>; then migrate again (docs/deploy/fly.md, runbook T1).';
+        -- The fix goes in the message itself: sqlx reports a migration's error message and
+        -- drops its HINT.
+        RAISE EXCEPTION 'role cxp_app does not exist and % may not create it: as a superuser, '
+                        'CREATE ROLE cxp_app NOLOGIN; GRANT cxp_app TO <the runtime login>; then '
+                        'migrate again (docs/deploy/fly.md, runbook T1)', current_user;
     END;
   END IF;
 END $$;
