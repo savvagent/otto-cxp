@@ -23,8 +23,8 @@ One binary, `cxp-server`, on port 8080:
 Tokens must carry the `cxp:read` or `cxp:write` scope and be issued for this service's
 audience (`CXP_RESOURCE_URI`).
 
-**Tenancy.** Every row belongs to an org. Isolation is Postgres row-level security under the
-`otto_app` role, with composite `(org_id, id)` foreign keys, and `cxp-server` refuses to boot if
+**Tenancy.** Every row belongs to an org. Isolation is Postgres row-level security under
+otto-cxp's own `cxp_app` role, with composite `(org_id, id)` foreign keys, and `cxp-server` refuses to boot if
 the isolation check fails. Org and user ids are opaque uuids issued by the platform.
 
 ## Connecting an MCP client
