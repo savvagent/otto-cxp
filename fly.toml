@@ -9,7 +9,8 @@
 # real customers). otto-cxp serves as `cxp_server`, which owns nothing and holds
 # no superuser-equivalent privilege; boot refuses a privileged role, one that
 # can connect to another service's database, or one that owns anything in
-# `otto_cxp` or may TRUNCATE a table, here (FLY_APP_NAME is set on every Fly
+# `otto_cxp`, may TRUNCATE or add a TRIGGER to a table, or may CREATE or create
+# TEMPORARY tables there, here (FLY_APP_NAME is set on every Fly
 # machine). Migrations run in the release command as `cxp_owner`, the owner
 # (#27; docs/deploy/fly.md, "Database role"). Isolation
 # rests on `SET LOCAL ROLE otto_app` under row-level security; cxp-server

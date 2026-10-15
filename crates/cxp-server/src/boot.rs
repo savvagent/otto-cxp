@@ -409,12 +409,14 @@ fn log_recheck_failure(failures: u32, what: &str, why: &str) {
 fn missing_grants(missing: &[&str], role: &str) -> String {
     let role = sql_identifier(role);
     let mut fixes = Vec::new();
-    if missing.contains(&"INSERT on deleted_orgs") {
+    // Matched on the constant itself, so rewording an entry cannot drop its fix.
+    let [tombstone, otto_app] = cxp_core::db_role::RUNTIME_GRANTS;
+    if missing.contains(&tombstone) {
         fixes.push(format!(
             "GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO {role}"
         ));
     }
-    if missing.contains(&"inheriting otto_app") {
+    if missing.contains(&otto_app) {
         fixes.push(format!("GRANT otto_app TO {role} WITH INHERIT TRUE"));
     }
     format!(
