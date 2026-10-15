@@ -306,7 +306,9 @@ export function SurveyDetailPage() {
       <div className="space-y-3">
         <h3 className="text-lg font-semibold">
           Responses
-          {responsesLoading ? "" : ` (${responsesCount(responses.length, total)})`}
+          {responsesData
+            ? ` (${responsesCount(responses.length, total)})`
+            : ""}
         </h3>
         {responsesLoading ? (
           <LoadingTable />
