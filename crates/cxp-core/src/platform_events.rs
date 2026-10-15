@@ -137,9 +137,10 @@ pub async fn begin_live(db: &Db, org: OrgId, user: Option<UserId>) -> Result<Tx<
 
 /// Database-side bounds on a transaction's waits: `lock_timeout` and
 /// `statement_timeout`, both transaction-local.
-/// Both are sent in whole milliseconds, and PostgreSQL reads `0` as "no
-/// limit", so a bound under 1 ms would turn itself off; each must be at
-/// least 1 ms.
+///
+/// Both are sent in whole milliseconds, at least 1: PostgreSQL reads `0` as
+/// "no limit", so a bound under 1 ms is raised to 1 ms rather than turning
+/// itself off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     /// The longest any one lock wait may last (`lock_timeout`).
@@ -171,14 +172,18 @@ async fn begin_live_inner(
 ) -> Result<Tx<'static>> {
     let mut tx = db.begin(org).await?;
     if let Some(t) = timeouts {
-        // Milliseconds as text: `set_config` takes the setting's string form,
-        // and a bare number is read in the setting's unit, milliseconds.
+        // `set_config` takes the setting's string form; a bare number is read
+        // in the setting's unit, milliseconds. Never 0, which means no limit.
+        // Every statement after this one counts against a caller's budget
+        // (`console_sessions::STORE_STATEMENTS`): adding one here means
+        // raising that count.
+        let ms = |d: Duration| d.as_millis().max(1).to_string();
         sqlx::query(
             "SELECT set_config('lock_timeout', $1, true), \
                     set_config('statement_timeout', $2, true)",
         )
-        .bind(t.lock.as_millis().to_string())
-        .bind(t.statement.as_millis().to_string())
+        .bind(ms(t.lock))
+        .bind(ms(t.statement))
         .execute(tx.conn())
         .await?;
     }

@@ -321,7 +321,9 @@ async fn a_lapsed_lease_is_taken_over_and_its_stale_holder_changes_nothing(pool:
     let o = org();
     let hash = new_session(&db, o, user(), Duration::days(1)).await;
     let soon = Utc::now() + Duration::minutes(60);
-    let short = Duration::milliseconds(200);
+    // Long enough that the second claim below still finds it live on a
+    // loaded machine, short enough to wait out.
+    let short = Duration::seconds(2);
 
     let Claim::Claimed(_, stale) = console_sessions::claim_refresh(&db, o, &hash, soon, short)
         .await
@@ -335,7 +337,7 @@ async fn a_lapsed_lease_is_taken_over_and_its_stale_holder_changes_nothing(pool:
             .unwrap(),
         Claim::Leased
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
     // Lapsed: taken over, at the same generation, under a new lease.
     let Claim::Claimed(s, newer) =
@@ -500,19 +502,21 @@ async fn claimed_session(db: &Db, o: OrgId) -> ([u8; 32], Lease) {
 /// on its lock forever fails rather than hangs.
 const NO_LONGER_THAN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Whether `result` failed because a database-side bound cut a wait off:
-/// `55P03` (`lock_timeout`) or `57014` (`statement_timeout`), and not for
-/// some unrelated reason.
-fn timed_out<T: std::fmt::Debug>(result: &Result<T, Error>) -> bool {
-    let db = match result {
-        Err(Error::Database(e)) | Err(Error::Tenant(otto_tenant::Error::Db(e))) => e,
-        _ => return false,
-    };
-    matches!(
-        db.as_database_error().and_then(|d| d.code()).as_deref(),
-        Some("55P03" | "57014")
-    )
+/// The SQLSTATE `result` failed with, if it failed in the database: `55P03`
+/// when `lock_timeout` cut a lock wait off, `57014` when `statement_timeout`
+/// cut a statement off.
+fn sqlstate_of<T: std::fmt::Debug>(result: &Result<T, Error>) -> Option<String> {
+    match result {
+        Err(Error::Database(e)) | Err(Error::Tenant(otto_tenant::Error::Db(e))) => e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned()),
+        _ => None,
+    }
 }
+
+/// `lock_timeout`'s SQLSTATE: a lock wait ran past [`console_sessions::STORE_TIMEOUTS`].
+const LOCK_TIMED_OUT: &str = "55P03";
 
 /// The store runs inside the lease holder's `STORE_ALLOWANCE`; a row lock
 /// held elsewhere must make it fail in time, not wait it out, and the failed
@@ -545,7 +549,11 @@ async fn a_store_behind_a_held_row_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the store waited out the row lock");
-    assert!(timed_out(&stored), "{stored:?}");
+    assert_eq!(
+        sqlstate_of(&stored).as_deref(),
+        Some(LOCK_TIMED_OUT),
+        "{stored:?}"
+    );
     holder.rollback().await.unwrap();
 
     let s = console_sessions::load(&db, o, &hash)
@@ -579,7 +587,23 @@ async fn a_release_behind_a_held_row_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the release waited out the row lock");
-    assert!(timed_out(&released), "{released:?}");
+    assert_eq!(
+        sqlstate_of(&released).as_deref(),
+        Some(LOCK_TIMED_OUT),
+        "{released:?}"
+    );
+    // So is deleting a refused generation, which runs in the same window.
+    let deleted = tokio::time::timeout(
+        NO_LONGER_THAN,
+        console_sessions::delete_generation(&db, o, &hash, lease),
+    )
+    .await
+    .expect("the delete waited out the row lock");
+    assert_eq!(
+        sqlstate_of(&deleted).as_deref(),
+        Some(LOCK_TIMED_OUT),
+        "{deleted:?}"
+    );
     holder.rollback().await.unwrap();
 
     let s = console_sessions::load(&db, o, &hash)
@@ -614,7 +638,11 @@ async fn a_store_behind_the_lifecycle_lock_times_out(pool: PgPool) {
     )
     .await
     .expect("the store waited out the lifecycle lock");
-    assert!(timed_out(&stored), "{stored:?}");
+    assert_eq!(
+        sqlstate_of(&stored).as_deref(),
+        Some(LOCK_TIMED_OUT),
+        "{stored:?}"
+    );
     holder.rollback().await.unwrap();
 
     assert!(
@@ -640,30 +668,89 @@ async fn the_store_timeouts_do_not_outlive_its_transaction(pool: PgPool) {
     // `Db::begin` would otherwise run on a second connection while holding
     // the only one.
     one.verify_tenant_isolation().await.expect("isolation");
+    // The one connection's backend and its settings, before any store.
+    let settings = || async {
+        sqlx::query_as::<_, (i32, String, String)>(
+            "SELECT pg_backend_pid(), current_setting('lock_timeout'), \
+                    current_setting('statement_timeout')",
+        )
+        .fetch_one(one.pool())
+        .await
+        .unwrap()
+    };
+    let before = settings().await;
+    assert_ne!(
+        before.1, "2s",
+        "the server default already equals the bound"
+    );
+
+    // A store that lands (COMMIT)...
     let o = org();
     let (hash, lease) = claimed_session(&one, o).await;
-    assert!(console_sessions::store_refreshed(
-        &one,
-        &cipher(),
-        o,
-        &hash,
-        lease,
-        &pair(
-            "otto_at_next",
-            "otto_rt_next",
-            Utc::now() + Duration::days(30)
-        )
-    )
-    .await
-    .unwrap());
-    for setting in ["lock_timeout", "statement_timeout"] {
-        let value: String = sqlx::query_scalar(&format!("SHOW {setting}"))
-            .fetch_one(one.pool())
+    let next = pair(
+        "otto_at_next",
+        "otto_rt_next",
+        Utc::now() + Duration::days(30),
+    );
+    assert!(
+        console_sessions::store_refreshed(&one, &cipher(), o, &hash, lease, &next)
+            .await
+            .unwrap()
+    );
+    assert_eq!(settings().await, before, "after a store that committed");
+
+    // ...and one cut off by its bound (ROLLBACK) both leave the connection
+    // as they found it.
+    let (hash, lease) = claimed_session(&one, o).await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM console_sessions WHERE id_hash = $1 FOR UPDATE")
+        .bind(&hash[..])
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let stored = console_sessions::store_refreshed(&one, &cipher(), o, &hash, lease, &next).await;
+    assert_eq!(
+        sqlstate_of(&stored).as_deref(),
+        Some(LOCK_TIMED_OUT),
+        "{stored:?}"
+    );
+    holder.rollback().await.unwrap();
+    assert_eq!(settings().await, before, "after a store that timed out");
+    one.pool().close().await;
+}
+
+/// `begin_live_bounded` sets exactly the bounds it is given, and the statement
+/// bound cuts off a statement that waits on no lock at all; plain
+/// `begin_live`, which every other request path uses, sets none.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn only_a_bounded_transaction_carries_the_bounds(pool: PgPool) {
+    let db = db(pool);
+    let o = org();
+    let show = "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')";
+
+    let mut tx = platform_events::begin_live(&db, o, None).await.unwrap();
+    let plain: (String, String) = sqlx::query_as(show).fetch_one(tx.conn()).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert_ne!(plain, ("2s".to_string(), "3s".to_string()));
+
+    let mut tx =
+        platform_events::begin_live_bounded(&db, o, None, console_sessions::STORE_TIMEOUTS)
             .await
             .unwrap();
-        assert_eq!(value, "0", "{setting}");
-    }
-    one.pool().close().await;
+    let bounded: (String, String) = sqlx::query_as(show).fetch_one(tx.conn()).await.unwrap();
+    assert_eq!(bounded, ("2s".to_string(), "3s".to_string()));
+    let slept = tokio::time::timeout(
+        NO_LONGER_THAN,
+        sqlx::query("SELECT pg_sleep(4)").execute(tx.conn()),
+    )
+    .await
+    .expect("the statement bound did not cut pg_sleep off");
+    let code = slept
+        .unwrap_err()
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("57014"), "statement_timeout");
 }
 
 /// Sign-out deletes and hands back what the row held, once.

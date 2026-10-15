@@ -616,7 +616,7 @@ fly secrets set -a otto-cxp --stage CXP_ENCRYPTION_KEY="$(openssl rand -base64 3
 The redirect URI is registered **exactly**: a deployment that moves to another hostname registers
 a new client.
 
-4. Verify live, after the deploy:
+**Step 4: verify live, after the deploy.**
 
 ```bash
 # Sign-in is on: "loginEnabled": true ("signedIn": false without a cookie).
@@ -625,21 +625,30 @@ curl -s https://otto-cxp.savvagent.com/auth/session
 
 - Open `https://otto-cxp.savvagent.com/console/`, sign in at the platform, and check that the
   customers list loads; `GET /auth/session` from that browser answers `"signedIn": true`.
-- A cross-site write is refused. Copy the `__Host-cxp_session` cookie from the browser's dev
-  tools, then:
+- A cross-site write is refused. Copy the `__Host-cxp_session` cookie's value from the browser's
+  dev tools and read it into the shell without echoing it or leaving it in history:
 
   ```bash
+  read -rs CXP_COOKIE
   curl -s -i -X POST https://otto-cxp.savvagent.com/api/v1/customers \
-    -H 'cookie: __Host-cxp_session=<value>' -H 'origin: https://example.com' \
+    -H "cookie: __Host-cxp_session=$CXP_COOKIE" -H 'origin: https://example.com' \
     -H 'content-type: application/json' -d '{}'
-  # -> 403, "error": "cross_site_request". The empty body is invalid, so even a broken origin
-  #    check writes nothing (it would answer a 4xx validation error instead).
+  # -> 403 with "code": "cross_site_request". The empty body is invalid, so even a broken
+  #    origin check writes nothing (it would answer a 4xx validation error instead).
   ```
 
-- Sign out in the console. `GET /auth/session` from that browser answers `"signedIn": false`, and
-  the copied cookie no longer works (`curl -s -o /dev/null -w '%{http_code}' -H 'cookie:
-  __Host-cxp_session=<value>' https://otto-cxp.savvagent.com/api/v1/customers` prints `401`):
-  the row is deleted and its refresh token revoked at the platform.
+- Sign out in the console (do not skip this: it is what ends the session behind the copied
+  cookie). `GET /auth/session` from that browser answers `"signedIn": false`, and the copied
+  cookie no longer works:
+
+  ```bash
+  curl -s -o /dev/null -w '%{http_code}\n' -H "cookie: __Host-cxp_session=$CXP_COOKIE" \
+    https://otto-cxp.savvagent.com/api/v1/customers   # -> 401
+  unset CXP_COOKIE
+  ```
+
+  The row is deleted, and its refresh token revoked at the platform (best effort: a platform
+  outage at that moment leaves the token to expire on its own).
 
 **Rotating `CXP_ENCRYPTION_KEY` signs every console user out** (sessions that no longer open are
 deleted on their next use). The platform rotates a refresh token on every use and revokes the
@@ -648,8 +657,9 @@ machine coalesces its own requests in memory, claims a short lease on the sessio
 on the database's clock), calls the platform holding no database connection or lock only if the
 call and the store still fit in the lease, and stores the new pair only if the row still holds
 that lease (a compare-and-swap, its waits cut off in the database: 2 s for a lock, 3 s per
-statement); another machine that finds the lease waits for the
-result. A sign-out or `org.deleted` during that call wins, and the new pair is revoked. Sessions are deleted on sign-out, by the
+statement); another machine that finds the lease waits for the result. A sign-out or
+`org.deleted` during that call wins, and the new pair is revoked; so is a pair whose store fails
+or times out (that person signs in again). Sessions are deleted on sign-out, by the
 `org.deleted` and `member.removed` webhooks, and by the hourly sweep once expired (30 days
 without a refresh).
 

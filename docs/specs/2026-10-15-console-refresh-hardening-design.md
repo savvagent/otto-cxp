@@ -46,8 +46,9 @@ runbook with the issue's exact steps, including the live verification.
 - `release_lease` gets the same timeouts: it is best effort already (a lapsed
   lease frees itself), so failing fast costs nothing.
 - `delete_generation` takes the whole `Lease` (generation and expiry), as
-  `store_refreshed` and `release_lease` do; it gets no timeouts (not asked,
-  and nothing waits on its timing).
+  `store_refreshed` and `release_lease` do. Review of #38 also put it under
+  `STORE_TIMEOUTS`: it runs in the same window after the platform call, and
+  a bounded wait there costs nothing.
 - The pool's acquire timeout moves to one constant,
   `cxp_core::POOL_ACQUIRE_TIMEOUT`, used by `cxp-server`'s pool and by the
   compile-time budget check in `cxp-http`, so the arithmetic cannot drift.

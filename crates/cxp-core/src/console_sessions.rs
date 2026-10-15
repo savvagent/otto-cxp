@@ -90,17 +90,12 @@ pub const STORE_TIMEOUTS: Timeouts = Timeouts {
 
 /// How many statements a store runs under [`STORE_TIMEOUTS`], each bounded
 /// by its `statement` timeout: the shared lifecycle lock, the revocation
-/// check, the compare-and-swap `UPDATE`, and the `COMMIT`. The transaction's
-/// opening statements (`BEGIN`, the role, the org pin, the timeouts
-/// themselves) run before the bounds are set and are assumed, not enforced,
-/// to wait on nothing.
+/// check (both in `platform_events::begin_live_bounded`), the
+/// compare-and-swap `UPDATE`, and the `COMMIT`. Kept by hand: a statement
+/// added to either function raises it. The transaction's opening statements
+/// (`BEGIN`, the role, the org pin, the timeouts themselves) run before the
+/// bounds are set and are assumed, not enforced, to wait on nothing.
 pub const STORE_STATEMENTS: u32 = 4;
-
-// A bound under 1 ms is sent as `0`, which PostgreSQL reads as no limit.
-const _: () = assert!(
-    STORE_TIMEOUTS.lock.as_millis() >= 1 && STORE_TIMEOUTS.statement.as_millis() >= 1,
-    "a store timeout under 1 ms would disable the bound"
-);
 
 /// The most expired sessions one sweep transaction deletes.
 pub const SWEEP_BATCH: i64 = 1000;
@@ -339,6 +334,8 @@ pub struct Refreshed<'a> {
 ///
 /// Runs under [`STORE_TIMEOUTS`]: an `Err` (the database failed, or a wait
 /// ran past a bound) wrote nothing, and the lease stands until it lapses.
+/// The pair the platform just issued is then lost, and the stored refresh
+/// token is spent (see the module docs on a failed store).
 pub async fn store_refreshed(
     db: &Db,
     cipher: &Cipher,
@@ -396,14 +393,16 @@ pub async fn release_lease(db: &Db, org: OrgId, id_hash: &[u8; 32], lease: Lease
 /// the platform refused the refresh token that generation holds. A holder
 /// whose lease lapsed and was claimed anew at the same generation deletes
 /// nothing, so it never ends a session out from under the newer holder,
-/// whose own refresh decides the session's fate.
+/// whose own refresh decides the session's fate. Runs under
+/// [`STORE_TIMEOUTS`], like [`store_refreshed`]: it runs in the same window
+/// after the platform call.
 pub async fn delete_generation(
     db: &Db,
     org: OrgId,
     id_hash: &[u8; 32],
     lease: Lease,
 ) -> Result<u64> {
-    let mut tx = begin_live(db, org, None).await?;
+    let mut tx = begin_live_bounded(db, org, None, STORE_TIMEOUTS).await?;
     let n = sqlx::query(
         "DELETE FROM console_sessions \
          WHERE org_id = $1 AND id_hash = $2 AND generation = $3 AND refresh_lease_until = $4",

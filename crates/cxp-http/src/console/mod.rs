@@ -43,7 +43,8 @@
 //! - **Across replicas**, the refresh claims a lease on the row
 //!   (`cxp_core::console_sessions::claim_refresh`, one short transaction),
 //!   calls the platform with nothing held, and stores the new pair as a
-//!   compare-and-swap on the row's generation (a second short transaction).
+//!   compare-and-swap on the lease it claimed (generation and expiry; a
+//!   second short transaction).
 //!   A replica that finds a live lease polls the row a bounded number of
 //!   times ([`LEASE_POLL`], [`LEASE_POLLS`]) for the fresh token.
 //! - The refresh runs in a spawned task: once the platform has rotated the
@@ -72,16 +73,20 @@
 //! - The platform call is cut off at `PLATFORM_TIMEOUT` (the whole request,
 //!   not just the connect).
 //! - The store then has at least `STORE_ALLOWANCE` = 20 s for its
-//!   compare-and-swap `UPDATE` to take the row, and the database enforces
-//!   what it may spend: the pool's acquire timeout
+//!   compare-and-swap `UPDATE` to take the row, and what it may spend waiting
+//!   is bounded: the pool's acquire timeout
 //!   (`cxp_core::POOL_ACQUIRE_TIMEOUT`, 5 s), then a transaction that sets
 //!   `cxp_core::console_sessions::STORE_TIMEOUTS` (a 3 s `statement_timeout`,
 //!   a 2 s `lock_timeout`) before it waits on anything, and runs
 //!   `STORE_STATEMENTS` = 4 statements under them (the shared lifecycle lock,
 //!   the revocation check, the `UPDATE`, the `COMMIT`): at most 5 + 4 x 3 =
-//!   17 s, checked at compile time. The transaction's opening statements,
-//!   before the bounds are set, wait on nothing; that is assumed, not
-//!   enforced. Once the `UPDATE` holds the row, a competing claim waits on its
+//!   17 s of database time, the arithmetic checked at compile time. Assumed,
+//!   not enforced: the transaction's opening statements, before the bounds
+//!   are set, wait on nothing; the network round trips are quick. If a
+//!   `COMMIT` is cut off after the commit was written (in practice only while
+//!   waiting on synchronous replication), the caller sees a failure for a
+//!   store that landed, revokes that pair, and the person signs in again: the
+//!   same worst case as below. Once the `UPDATE` holds the row, a competing claim waits on its
 //!   row lock and then sees the rotated, fresh session. The org's lifecycle
 //!   lock is taken exclusively by an `org.deleted`, `member.removed`, or
 //!   `team.deleted` cleanup; the store times out behind one rather than
@@ -90,7 +95,7 @@
 //!
 //! So no second replica can claim, and present the same refresh token, while
 //! the first could still store its result. If the store fails instead (the
-//! database is down), the new pair is revoked and lost and the stored refresh
+//! database is down, or a bound above cut a wait off), the new pair is revoked and lost and the stored refresh
 //! token is spent: the next claim presents it, the platform refuses it
 //! (`invalid_grant`), the session is deleted, and the person signs in again.
 //! A waiting replica polls for a little longer than one lease
@@ -157,11 +162,11 @@ const DEFAULT_ACCESS_TTL_SECS: i64 = 3600;
 pub const LEASE: Duration = Duration::from_secs(45);
 
 /// What a lease holder keeps back for storing the new pair after the platform
-/// answers. The store cannot spend more: the pool's acquire timeout
+/// answers. The store's waits fit inside it: the pool's acquire timeout
 /// ([`cxp_core::POOL_ACQUIRE_TIMEOUT`]) plus
-/// [`console_sessions::STORE_STATEMENTS`] statements, each cut off by
-/// [`console_sessions::STORE_TIMEOUTS`] in the database, fit inside it
-/// (checked at compile time below).
+/// [`console_sessions::STORE_STATEMENTS`] statements, each cut off in the
+/// database by [`console_sessions::STORE_TIMEOUTS`] (checked at compile time
+/// below; network time is not counted, see the module docs).
 pub const STORE_ALLOWANCE: Duration = Duration::from_secs(20);
 
 /// How often a request that found another replica's lease looks again.

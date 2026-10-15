@@ -799,15 +799,16 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
     );
 }
 
-/// #26's runbook moves the tables and functions from the role that created
+/// The "Database role" runbook in `docs/deploy/fly.md` (#26) moves the
+/// tables and functions from the role that created
 /// them to `cxp_server` with `REASSIGN OWNED`, then clears the old role out
 /// with `DROP OWNED BY` and `DROP ROLE`. `DROP OWNED BY` also drops every
 /// policy whose only target is the dropped role; `console_sessions_lookup`
 /// names no role (it admits the function's owner, read from `pg_proc` at
 /// query time), so it must come through those steps unchanged and keep
-/// admitting the lookup under the new owner. A control policy aimed at the
-/// old role alone is dropped by the same steps, so the test would see a
-/// lookup policy written `TO` that role vanish. Both owners are
+/// admitting the lookup under the new owner. The control policy
+/// `cxp_test_named`, aimed at the old role alone, must disappear: that proves
+/// the steps really do act on policies. Both owners are
 /// `NOSUPERUSER NOBYPASSRLS`, so the policy, not a bypass, is what admits
 /// the lookup. The roles are cluster-wide, so they are dropped whatever the
 /// test does.
@@ -931,6 +932,17 @@ async fn lookup_survives_drop_owned(pool: PgPool, old: String, new: String) {
     .await
     .unwrap();
     assert_eq!(owners, (new.clone(), new.clone()));
+    // otto_app keeps what the requests need: the grants moved with the
+    // ownership rather than leaving with the dropped role.
+    let (table, function): (bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('otto_app', 'console_sessions', \
+                                    'SELECT, INSERT, UPDATE, DELETE'), \
+                has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((table, function), (true, true), "otto_app's grants");
 
     let lookup = |hash: Vec<u8>| {
         let pool = pool.clone();
