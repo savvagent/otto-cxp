@@ -535,7 +535,8 @@ where
             ),
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e.log_detail(),
-                "could not read whether the database role still belongs to otto_app"),
+                "could not read whether the database role still belongs to {}",
+                cxp_core::db_role::SHARED_TENANT_ROLE),
         }
     }
 
@@ -699,7 +700,7 @@ pub fn check_tenant_role(
     let why = format!(
         "tenant transactions run as {:?}, not otto-cxp's own tenant role {role} (it does not \
          exist, or {} cannot assume it): as a superuser, CREATE ROLE {role} NOLOGIN; GRANT \
-         {role} TO {}; then migrate (docs/deploy/fly.md, runbook T1)",
+         {role} TO {} WITH INHERIT TRUE; then migrate (docs/deploy/fly.md, runbook T1)",
         report.effective_role,
         sql_identifier(login),
         sql_identifier(login),

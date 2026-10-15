@@ -246,7 +246,8 @@ functions too (owned by `cxp_owner` since S3's `REASSIGN OWNED`), as 0001's did 
   - otherwise → `error` log and refusal, **on every machine, not only in a deployment**:
     `refusing to serve: tenant transactions run as "<effective>", not otto-cxp's own tenant role
     cxp_app (it does not exist, or "<login>" cannot assume it): as a superuser, CREATE ROLE
-    cxp_app NOLOGIN; GRANT cxp_app TO "<login>"; then migrate (docs/deploy/fly.md, runbook T1)`.
+    cxp_app NOLOGIN; GRANT cxp_app TO "<login>" WITH INHERIT TRUE; then migrate (docs/deploy/fly.md,
+    runbook T1)` (`WITH INHERIT TRUE`, so the hint also fixes a member that does not inherit).
   `<login>` is `role.current_user`. Why no local exception (unlike the privilege checks, which
   only warn locally because a local Postgres hands out a superuser): a local superuser creates
   `cxp_app` in 0007 and can `SET ROLE` to it, so the check passes there anyway; CI and the tests
