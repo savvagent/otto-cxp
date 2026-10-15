@@ -89,7 +89,7 @@ API client, hook, and survey detail page read `data`/`total`.
   `surveyResponseList` yet.
 - [ ] **Step 5: Commit**: `feat(api): answer survey responses in the list envelope`, body: the
   route was the last list answering a bare array and dropped the total cxp-core computes; ends
-  `Refs #36`.
+  `Fixes #36`.
 
 ### Task 2: The console reads the envelope and shows the total
 
@@ -133,4 +133,4 @@ API client, hook, and survey detail page read `data`/`total`.
   plus test, lint, format, extra, and the container build.
 - [ ] **Step 5: Commit**: `feat(web): read survey responses from the list envelope`, body: the
   route now answers `{data, total, limit, offset}`; the detail page shows the total; ends
-  `Refs #36`.
+  `Fixes #36`.
