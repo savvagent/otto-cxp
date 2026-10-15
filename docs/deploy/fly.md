@@ -672,6 +672,9 @@ fly secrets set -a otto-cxp CXP_RUN_MIGRATIONS=false
 curl -s https://otto-cxp.savvagent.com/readyz      # ready
 ```
 
+From here until #27 deploys, nothing runs migrations: merge no other PR that adds one before
+#27 (its release would ship without migrating).
+
 **S2. Prove `cxp_owner` before giving it anything (read-only).** `fly proxy 15499:5432 -a otto-db`
 in a second terminal, then log in to the `postgres` database (it cannot open `otto_cxp` until it
 owns it in S3: R3 revoked `PUBLIC`'s `CONNECT` there), with the password from S1:
@@ -801,11 +804,13 @@ FROM pg_roles r CROSS JOIN pg_namespace n
 WHERE pg_has_role('cxp_server', r.oid, 'MEMBER')
   AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_t%'
   AND has_schema_privilege(r.oid, n.oid, 'CREATE');
--- t, t, t, t: it connects, inherits otto_app, writes the tombstone, and runs the console lookup.
+-- t, t, t, t, t: it connects, inherits otto_app, writes the tombstone, runs the console lookup,
+-- and runs the sweep's tombstone expiry.
 SELECT has_database_privilege('cxp_server', 'otto_cxp', 'CONNECT') AS connects,
        pg_has_role('cxp_server', 'otto_app', 'USAGE') AS assumes_otto_app,
        has_table_privilege('cxp_server', 'public.deleted_orgs', 'INSERT') AS tombstone,
-       has_function_privilege('cxp_server', 'public.console_session_org(bytea)', 'EXECUTE') AS lookup;
+       has_function_privilege('cxp_server', 'public.console_session_org(bytea)', 'EXECUTE') AS lookup,
+       has_function_privilege('cxp_server', 'public.expire_removed_members()', 'EXECUTE') AS sweep;
 -- NULL, with no error: the console's cookie lookup as the runtime role, running as its new owner
 -- (it needs cxp_owner's SET grant from S1). Read-only.
 SET ROLE cxp_server;
@@ -831,7 +836,8 @@ fly logs -a otto-cxp --no-tail                     # CXP_RUN_MIGRATIONS is off; 
 **S5. Undo, only before S6.** S3 alone, back to `cxp_server` owning everything (as postgres; the
 `\c` matters: run from the `postgres` database, `REASSIGN OWNED` would move only the database and
 leave the tables with `cxp_owner`). The `TEMPORARY` and `CREATE` revokes stay: the old release
-needs neither.
+needs neither. `CXP_RUN_MIGRATIONS=false` stays too; unset it (`fly secrets unset -a otto-cxp
+CXP_RUN_MIGRATIONS`) only if the old release should migrate at boot again.
 
 ```sql
 \c otto_cxp
@@ -845,6 +851,11 @@ BEGIN
   END IF;
   IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = 'cxp_owner'::regrole AND datname <> 'otto_cxp') THEN
     RAISE EXCEPTION 'cxp_owner owns another database, which REASSIGN OWNED would move too';
+  END IF;
+  -- Migration 0005 runs only in #27's release command: once it has, S6 happened, and the new
+  -- release refuses an owning runtime role.
+  IF EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version >= 5) THEN
+    RAISE EXCEPTION '#27 is deployed (migration 0005 applied): roll the code back first, never S3';
   END IF;
 END $$;
 REASSIGN OWNED BY cxp_owner TO cxp_server;

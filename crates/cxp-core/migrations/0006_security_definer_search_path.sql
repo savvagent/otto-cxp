@@ -15,7 +15,8 @@
 -- console_sessions_lookup policy, which names console_session_org by signature, follows it.
 --
 -- CREATE OR REPLACE of console_session_org restates its SET app.console_session_lookup clause,
--- which needs the migrating role to hold SET on that custom parameter (runbook R1), as 0003 did.
+-- which needs the migrating role to hold SET on that custom parameter, as 0003 did: cxp_owner
+-- gets it in the split runbook's S1 (docs/deploy/fly.md).
 
 CREATE OR REPLACE FUNCTION expire_removed_members() RETURNS bigint
   LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
