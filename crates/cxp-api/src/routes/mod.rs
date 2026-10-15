@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 /// `limit` and `offset` are the page actually served (clamped by
 /// [`cxp_core::Page`]: limit 1..=200, default 50; offset never negative).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Paginated<T: Serialize> {
     pub data: Vec<T>,
     pub total: i64,
@@ -31,6 +32,34 @@ impl<T: Serialize> Paginated<T> {
         Self {
             data,
             total,
+            limit: page.limit(),
+            offset: page.offset(),
+        }
+    }
+}
+
+/// A search response: [`Paginated`] plus `totalCapped`. `total` counts
+/// matches up to [`cxp_core::search::TOTAL_CAP`]; `totalCapped: false` means
+/// `total` and `data` are exact, `true` that `total` is a lower bound (more
+/// matches than the cap, or the search stopped before counting them all),
+/// `data` is then the requested page of the best-ranked matches found, and a
+/// page starting at or past the cap is empty.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CappedPaginated<T: Serialize> {
+    pub data: Vec<T>,
+    pub total: i64,
+    pub total_capped: bool,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+impl<T: Serialize> CappedPaginated<T> {
+    pub fn new(found: cxp_core::search::SearchPage<T>, page: cxp_core::Page) -> Self {
+        Self {
+            data: found.items,
+            total: found.total,
+            total_capped: found.total_capped,
             limit: page.limit(),
             offset: page.offset(),
         }
@@ -320,14 +349,24 @@ mod wire_fixture {
                 slug: "growth".into(),
                 name: "Growth".into(),
             },
-            "dashboardMetrics": super::dashboard::Metrics {
-                total_customers: 1,
-                total_tickets: 2,
-                open_tickets: 1,
-                total_feedback: 3,
-                total_surveys: 1,
-                total_experiences: 1,
-            },
+            "dashboardMetrics": super::dashboard::Metrics::from(
+                cxp_core::dashboard::DashboardMetrics {
+                    total_customers: 1,
+                    total_tickets: 2,
+                    open_tickets: 1,
+                    total_feedback: 3,
+                    total_surveys: 1,
+                    total_experiences: 1,
+                }
+            ),
+            "customerSearch": super::CappedPaginated::new(
+                cxp_core::search::SearchPage {
+                    items: vec![customer()],
+                    total: 1,
+                    total_capped: false,
+                },
+                page
+            ),
             "customerList": Paginated::new((vec![customer()], 1), page),
             "ticketList": Paginated::new((vec![ticket()], 1), page),
             "feedbackList": Paginated::new((vec![feedback()], 1), page),

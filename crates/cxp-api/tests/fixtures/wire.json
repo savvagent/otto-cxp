@@ -171,8 +171,41 @@
     "tags": [],
     "updatedAt": "2026-10-01T12:30:00Z"
   },
+  "customerSearch": {
+    "data": [
+      {
+        "applicationId": "00000000-0000-0000-0000-00000000000b",
+        "company": "Analytical Engines",
+        "componentId": "00000000-0000-0000-0000-00000000000d",
+        "createdAt": "2026-10-01T12:30:00Z",
+        "email": "ada@example.com",
+        "experienceId": "00000000-0000-0000-0000-00000000000a",
+        "id": "00000000-0000-0000-0000-000000000001",
+        "metadata": {
+          "plan": "pro"
+        },
+        "name": "Ada Lovelace",
+        "pageId": "00000000-0000-0000-0000-00000000000c",
+        "phone": "+15550100",
+        "tags": [
+          "vip"
+        ],
+        "updatedAt": "2026-10-02T12:30:00Z"
+      }
+    ],
+    "limit": 25,
+    "offset": 0,
+    "total": 1,
+    "totalCapped": false
+  },
   "dashboardMetrics": {
+    "openTickets": 1,
     "open_tickets": 1,
+    "totalCustomers": 1,
+    "totalExperiences": 1,
+    "totalFeedback": 3,
+    "totalSurveys": 1,
+    "totalTickets": 2,
     "total_customers": 1,
     "total_experiences": 1,
     "total_feedback": 3,
