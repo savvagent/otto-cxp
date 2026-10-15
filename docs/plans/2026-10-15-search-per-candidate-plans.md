@@ -66,6 +66,10 @@ Task 1 writes the failing plan-shape tests and the accessors, then adds the fenc
 Task 2 builds the benchmark tooling, which reads the statements Task 1 changed. Task 3 is the
 one-line CLAUDE.md pointer. Each task leaves the workspace green.
 
+Every Bash call starts a fresh shell: run each command as `cd <worktree> && ...` (and set `S=...`
+in the same call where a step uses it). The record-as-shipped commit (spec `**Status:**` and these
+boxes) is the orchestrator's, after the PR opens.
+
 ---
 
 ### Task 1: Plan-shape tests and the per-candidate fences
@@ -382,8 +386,9 @@ Expected: both tests FAIL — `customer_matches_probe_each_candidate` with "matc
 candidates to customers with a Hash Join" (or Merge Join, or a non-index read of customers), and
 `search_index_probes_are_never_hashed` with "search_articles: SubPlan N is hashed and reads
 [(\"Seq Scan\", \"knowledge_articles\")]". Record exactly which assertion failed in each test (for the PR). If
-either test passes on the unfenced statements, stop and report DONE_WITH_CONCERNS with the plan
-output: the test would not guard anything.
+either test passes on the unfenced statements, first raise the seed (e.g. 2,000 customers and
+1,000 articles per org) and rerun; if it still passes, stop and report DONE_WITH_CONCERNS with
+the plan output: the test would not guard anything.
 
 - [ ] **Step 4: Add the fences**
 
