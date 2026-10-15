@@ -549,12 +549,39 @@ mod casing {
 
     #[test]
     fn both_spellings_of_one_field_are_refused() {
-        let both = serde_json::from_value::<super::tickets::CreateBody>(
+        use super::catalog::*;
+        /// The error serde gives for a key sent in both spellings.
+        fn duplicate<T: DeserializeOwned + std::fmt::Debug>(v: serde_json::Value) {
+            let err = serde_json::from_value::<T>(v).unwrap_err().to_string();
+            assert!(err.contains("duplicate field"), "{err}");
+        }
+        duplicate::<super::tickets::CreateBody>(
             json!({ "customerId": A, "customer_id": B, "subject": "s" }),
         );
-        assert!(both.is_err());
+        duplicate::<super::tickets::UpdateBody>(json!({ "assignedTo": "a", "assigned_to": "b" }));
+        duplicate::<UpdateComponentBody>(json!({ "componentType": "a", "component_type": "b" }));
+        duplicate::<CreateExperienceBody>(json!({ "name": "e", "teamId": A, "team_id": B }));
+        duplicate::<UpdateExperienceBody>(json!({ "teamId": A, "team_id": null }));
         assert!(query_err::<super::customers::ListParams>(&format!(
             "pageId={A}&page_id={B}"
         )));
+    }
+
+    /// Each field takes either spelling on its own, so an older caller can
+    /// mix them while it migrates.
+    #[test]
+    fn spellings_mix_per_field() {
+        let q: super::tickets::ListParams = query(&format!("customerId={A}&page_id={C}"));
+        assert_eq!((q.customer_id, q.page_id), (Some(A), Some(C)));
+    }
+
+    /// An update body without the team key keeps the team (`None`), in
+    /// either casing of the rest of the body.
+    #[test]
+    fn an_absent_team_key_keeps_the_team() {
+        let b: super::catalog::UpdatePageBody = body(json!({ "name": "p" }));
+        assert_eq!(b.team_id, None);
+        let b: super::catalog::UpdateComponentBody = body(json!({ "componentType": "x" }));
+        assert_eq!(b.team_id, None);
     }
 }
