@@ -48,8 +48,8 @@ is a JSON 404.
   `begin_live`), `usage` (metering, outbox shipper), `console_sessions` (the web console's sign-in
   sessions; tokens sealed with an HKDF subkey of `CXP_ENCRYPTION_KEY`; refresh by lease +
   compare-and-swap), `sealed` (`nonce || ciphertext`), `search` (#17: the search index tables'
-  bounds, a count capped at 1000 with `totalCapped`, and the per-org backlog of rows written before
-  migration 0004, indexed a batch per search), `maintenance` (the only cross-org access).
+  bounds, a count capped at 1000 with `totalCapped`, and a search's 2 s `statement_timeout`, read as
+  `query_too_broad`), `maintenance` (the only cross-org access).
 - `cxp-http` - the axum side of auth, shared by `/mcp` and `/api/v1`: `Authenticator`, `require_bearer`,
   `refuse`, and the `/.well-known/oauth-protected-resource` router; `console/` (the PKCE sign-in
   against the platform, `/auth/*`, the session cookie, a token refresh coalesced in memory and
@@ -117,8 +117,10 @@ composite `(org_id, id)` foreign keys.
 
 ### Search index (#17)
 `search_customers` and `search_articles` read `customer_search_grams` / `knowledge_search_terms`
-(migration 0004), which triggers keep in step with every write. Searches are `cxp:read` yet write:
-each indexes a batch of its org's pre-0004 backlog (`cxp_core::search::index_backlog`). Making a new
+(migration 0004), which triggers keep in step with every write; `search_mark_indexed` marks every
+write indexed, so there is no backlog and searches only read (#34). A search past its 2 s
+`statement_timeout` is `query_too_broad` (retriable). Storage threshold and watch query:
+`docs/deploy/fly.md` ("Search index storage"). Making a new
 column searchable means a new migration that changes the gram function, the sync trigger, and its
 `WHEN` clause together, and rebuilds the affected rows; extend the equivalence corpora in
 `crates/cxp-core/tests` with it. `totalCapped: false` promises results identical to a full scan.
