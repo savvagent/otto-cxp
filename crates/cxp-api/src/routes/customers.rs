@@ -6,6 +6,7 @@ use cxp_core::auth::Principal;
 use cxp_core::customers::{
     Customer, Customer360, CustomerFilter, CustomerUpdate, CustomersExt, NewCustomer,
 };
+use http::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -69,18 +70,38 @@ pub async fn list(
     Ok(Json(Paginated::new(rows, page)))
 }
 
-/// A plain array (not the `{items, total}` envelope); paged by `limit`/`offset` (default 50).
+/// The headers the search answers with alongside its plain array: the
+/// count of matches up to [`cxp_core::search::TOTAL_CAP`], and whether it is
+/// capped (`true` or `false`).
+pub const TOTAL_COUNT: HeaderName = HeaderName::from_static("x-total-count");
+pub const TOTAL_CAPPED: HeaderName = HeaderName::from_static("x-total-capped");
+
+/// A plain array (not the `{items, total}` envelope), the best matches
+/// first; paged by `limit`/`offset` (default 50). Matches are counted up to
+/// 1000: the count is the `X-Total-Count` header, and `X-Total-Capped: true`
+/// says there may be more (the array is then the requested page of the best
+/// matches found, and a page starting at or past 1000 is empty). The body is
+/// unchanged from before #17; the headers are new.
 pub async fn search(
     State(state): State<AppState>,
     Extension(caller): Extension<Principal>,
     ApiQuery(q): ApiQuery<SearchParams>,
-) -> ApiResult<Json<Vec<Customer>>> {
+) -> ApiResult<([(HeaderName, HeaderValue); 2], Json<Vec<Customer>>)> {
     caller.require_read()?;
     let page = cxp_core::Page::new(q.limit, q.offset);
     let mut tx = state.begin(&caller).await?;
-    let rows = tx.search_customers(&q.q, page).await?;
+    let found = tx.search_customers(&q.q, page).await?;
     tx.commit().await?;
-    Ok(Json(rows))
+    Ok((
+        [
+            (TOTAL_COUNT, HeaderValue::from(found.total)),
+            (
+                TOTAL_CAPPED,
+                HeaderValue::from_static(if found.total_capped { "true" } else { "false" }),
+            ),
+        ],
+        Json(found.items),
+    ))
 }
 
 pub async fn get(

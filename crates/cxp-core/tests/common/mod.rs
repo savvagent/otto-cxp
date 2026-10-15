@@ -173,3 +173,141 @@ impl TeamPlatform {
         self.state.down.store(down, Ordering::SeqCst);
     }
 }
+
+// ------------------------------------------------- the search oracle (#17)
+
+use cxp_core::customers::CustomersExt;
+use cxp_core::knowledge::KnowledgeExt;
+use cxp_core::search::TOTAL_CAP;
+use cxp_core::{Error, Page};
+
+/// `search_customers` as it was before #17: the match predicate evaluated on
+/// every customer of the org, ordered as search orders. `$2` is the `ILIKE`
+/// pattern, `$3` the query, `$4`/`$5` limit and offset.
+const CUSTOMERS_BY_SCAN: &str = "SELECT id FROM customers \
+     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
+     ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
+              similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
+     LIMIT $4 OFFSET $5";
+const CUSTOMERS_BY_SCAN_COUNT: &str = "SELECT count(*) FROM customers \
+     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3)";
+
+/// `search_articles` as it was before #17. `$2` is the query, `$3` the title
+/// pattern, `$4` the limit.
+const ARTICLES_BY_SCAN: &str = "SELECT id FROM knowledge_articles \
+     WHERE org_id = $1 AND published = true \
+       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
+     ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, created_at DESC, id \
+     LIMIT $4";
+const ARTICLES_BY_SCAN_COUNT: &str = "SELECT count(*) FROM knowledge_articles \
+     WHERE org_id = $1 AND published = true \
+       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3)";
+
+/// `cxp_core::contains_pattern`, which is crate-private.
+pub fn like_pattern(q: &str) -> String {
+    let mut out = String::from("%");
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// What a search gave, or what the scan gives: the page's ids, the count,
+/// and whether the count is capped.
+#[derive(Debug, PartialEq)]
+pub struct Searched {
+    pub ids: Vec<Uuid>,
+    pub total: i64,
+    pub capped: bool,
+}
+
+/// The scan's answer, as search must give it: every match counted up to
+/// the cap, `capped` exactly when there are more.
+fn as_capped(ids: Vec<Uuid>, count: i64) -> Searched {
+    Searched {
+        ids,
+        total: count.min(TOTAL_CAP),
+        capped: count > TOTAL_CAP,
+    }
+}
+
+/// `search_customers` and the pre-#17 scan, for one query and page, in the
+/// same transaction. `None` when search refuses the query as invalid.
+pub async fn customers_both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    q: &str,
+    page: Page,
+) -> Option<(Searched, Searched)> {
+    let org = tx.org();
+    let found = match tx.search_customers(q, page).await {
+        Ok(found) => found,
+        Err(Error::Invalid(_)) => return None,
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let ids: Vec<Uuid> = sqlx::query_scalar(CUSTOMERS_BY_SCAN)
+        .bind(org)
+        .bind(like_pattern(q))
+        .bind(q)
+        .bind(page.limit().min((TOTAL_CAP - page.offset()).max(0)))
+        .bind(page.offset())
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(CUSTOMERS_BY_SCAN_COUNT)
+        .bind(org)
+        .bind(like_pattern(q))
+        .bind(q)
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    Some((
+        Searched {
+            ids: found.items.iter().map(|c| c.id).collect(),
+            total: found.total,
+            capped: found.total_capped,
+        },
+        as_capped(ids, count),
+    ))
+}
+
+/// `search_articles` and the pre-#17 scan, as [`customers_both_ways`].
+pub async fn articles_both_ways(
+    tx: &mut otto_tenant::Tx<'_>,
+    q: &str,
+) -> Option<(Searched, Searched)> {
+    let org = tx.org();
+    let found = match tx.search_articles(q).await {
+        Ok(found) => found,
+        Err(Error::Invalid(_)) => return None,
+        Err(e) => panic!("{q:?}: {e:?}"),
+    };
+    let q = q.trim();
+    let ids: Vec<Uuid> = sqlx::query_scalar(ARTICLES_BY_SCAN)
+        .bind(org)
+        .bind(q)
+        .bind(like_pattern(q))
+        .bind(cxp_core::knowledge::SEARCH_LIMIT)
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(ARTICLES_BY_SCAN_COUNT)
+        .bind(org)
+        .bind(q)
+        .bind(like_pattern(q))
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    Some((
+        Searched {
+            ids: found.items.iter().map(|a| a.id).collect(),
+            total: found.total,
+            capped: found.total_capped,
+        },
+        as_capped(ids, count),
+    ))
+}

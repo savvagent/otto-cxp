@@ -33,6 +33,7 @@ pub mod paging;
 pub mod platform_events;
 pub mod scopes;
 pub mod sealed;
+pub mod search;
 pub mod segments;
 pub mod tickets;
 pub mod usage;
@@ -45,17 +46,6 @@ pub use paging::Page;
 /// no tenant table, so it needs no org.
 pub async fn ping(db: &otto_tenant::Db) -> Result<()> {
     sqlx::query("SELECT 1").execute(db.pool()).await?;
-    Ok(())
-}
-
-/// Turn JIT compilation off for the rest of `tx`. The search queries'
-/// generic plans carry cost estimates far above `jit_above_cost` (the
-/// planner cannot see how few index entries a gram lookup reads), and
-/// compiling them takes longer than running them.
-pub(crate) async fn without_jit(tx: &mut otto_tenant::Tx<'_>) -> Result<()> {
-    sqlx::query("SET LOCAL jit = off")
-        .execute(tx.conn())
-        .await?;
     Ok(())
 }
 

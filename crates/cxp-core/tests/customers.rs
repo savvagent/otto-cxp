@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{db, org, sqlstate};
+use common::{customers_both_ways, db, org, sqlstate};
 use cxp_core::customers::{Customer, CustomerFilter, CustomerUpdate, CustomersExt, NewCustomer};
 use cxp_core::interactions::{parse_json, InteractionsExt, NewInteraction, INTERACTION_TYPES};
 use cxp_core::segments::{NewSegment, SegmentsExt};
@@ -231,20 +231,33 @@ async fn search_matches_email_and_name_and_escapes_wildcards(pool: PgPool) {
         .await
         .unwrap();
 
-    let by_email = tx.search_customers("NAVY", Page::default()).await.unwrap();
+    let by_email = tx
+        .search_customers("NAVY", Page::default())
+        .await
+        .unwrap()
+        .items;
     assert_eq!(by_email.len(), 1);
     assert_eq!(by_email[0].email, "grace@navy.example");
 
     let by_name = tx
         .search_customers("turing", Page::default())
         .await
-        .unwrap();
+        .unwrap()
+        .items;
     assert_eq!(by_name.len(), 1);
 
     // `%` is a literal here, not "match everything".
-    let pct = tx.search_customers("100%", Page::default()).await.unwrap();
+    let pct = tx
+        .search_customers("100%", Page::default())
+        .await
+        .unwrap()
+        .items;
     assert_eq!(pct.len(), 1);
-    let none = tx.search_customers("zzzz", Page::default()).await.unwrap();
+    let none = tx
+        .search_customers("zzzz", Page::default())
+        .await
+        .unwrap()
+        .items;
     assert!(none.is_empty());
 
     let e = tx
@@ -253,7 +266,11 @@ async fn search_matches_email_and_name_and_escapes_wildcards(pool: PgPool) {
         .unwrap_err();
     assert_eq!(e.code(), "invalid_argument");
 
-    let one = tx.search_customers("example", page(1, 0)).await.unwrap();
+    let one = tx
+        .search_customers("example", page(1, 0))
+        .await
+        .unwrap()
+        .items;
     assert_eq!(one.len(), 1);
 }
 
@@ -791,6 +808,7 @@ async fn one_org_cannot_see_or_touch_anothers_customer_data(pool: PgPool) {
         .search_customers("alice", Page::default())
         .await
         .unwrap()
+        .items
         .is_empty());
     assert!(matches!(
         tx.get_customer(cust.id).await,
@@ -933,27 +951,6 @@ async fn interaction_types_match_the_enum(pool: PgPool) {
 
 // ------------------------------------------------- search under RLS (#17)
 
-/// `search_customers` as it was before #17: the match predicate evaluated on
-/// every customer of the org. The indexed search must return exactly this.
-const SEARCH_BY_SCAN: &str = "SELECT id FROM customers \
-     WHERE org_id = $1 AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
-     ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
-              similarity(name, $3) DESC NULLS LAST, created_at DESC, id \
-     LIMIT $4 OFFSET $5";
-
-/// `cxp_core::contains_pattern`, which is crate-private.
-fn like_pattern(q: &str) -> String {
-    let mut out = String::from("%");
-    for c in q.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('%');
-    out
-}
-
 /// Every query compared against the scan: substrings of every length
 /// (one and two characters take the prefix path), whole emails, typos only
 /// the fuzzy match finds, case and non-ASCII folding, LIKE wildcards and
@@ -1060,30 +1057,13 @@ async fn seed_search_corpus(tx: &mut otto_tenant::Tx<'_>) {
     }
 }
 
-/// The ids the indexed search returns, and the ids the old full scan
-/// returns, for one query and page.
-async fn both_ways(
-    tx: &mut otto_tenant::Tx<'_>,
-    org: OrgId,
-    q: &str,
-    page: Page,
-) -> (Vec<Uuid>, Vec<Uuid>) {
-    let indexed: Vec<Uuid> = match tx.search_customers(q, page).await {
-        Ok(found) => found.iter().map(|c| c.id).collect(),
-        Err(Error::Invalid(_)) => return (vec![], vec![]),
-        Err(e) => panic!("{q:?}: {e:?}"),
-    };
-    let q = q.trim();
-    let scanned: Vec<(Uuid,)> = sqlx::query_as(SEARCH_BY_SCAN)
-        .bind(org)
-        .bind(like_pattern(q))
-        .bind(q)
-        .bind(page.limit())
-        .bind(page.offset())
-        .fetch_all(tx.conn())
-        .await
-        .unwrap();
-    (indexed, scanned.into_iter().map(|(id,)| id).collect())
+/// The indexed search and the old full scan agree on `q` and `page`: the
+/// same ids in the same order, and a total that is the exact count (none of
+/// these corpora reaches the cap or a read bound).
+async fn same_both_ways(tx: &mut otto_tenant::Tx<'_>, q: &str, page: Page, what: &str) {
+    if let Some((indexed, scanned)) = customers_both_ways(tx, q, page).await {
+        assert_eq!(indexed, scanned, "{what}, query {q:?}");
+    }
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -1100,19 +1080,21 @@ async fn indexed_search_returns_exactly_what_the_scan_returns(pool: PgPool) {
     // (after five executions) for most of the comparisons.
     for _ in 0..2 {
         for q in QUERIES {
-            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
-            assert_eq!(indexed, scanned, "query {q:?}");
+            same_both_ways(&mut tx, q, Page::new(Some(200), None), "all").await;
         }
     }
-    // Paging cuts the same ordered list.
-    let (indexed, scanned) = both_ways(&mut tx, a, "example", page(3, 2)).await;
-    assert_eq!(indexed.len(), 3);
+    // Paging cuts the same ordered list, and counts the same total.
+    let (indexed, scanned) = customers_both_ways(&mut tx, "example", page(3, 2))
+        .await
+        .unwrap();
+    assert_eq!(indexed.ids.len(), 3);
     assert_eq!(indexed, scanned);
     // Org B's identical customers never appear.
     let all: Vec<Uuid> = tx
         .search_customers("e", Page::new(Some(200), None))
         .await
         .unwrap()
+        .items
         .iter()
         .map(|c| c.id)
         .collect();
@@ -1141,8 +1123,8 @@ async fn indexed_search_follows_the_similarity_threshold(pool: PgPool) {
         .await
         .unwrap();
         for q in ["Grace Hoper", "lin", "smith", "zzzz", "王小明", "%"] {
-            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
-            assert_eq!(indexed, scanned, "threshold {threshold}, query {q:?}");
+            let what = format!("threshold {threshold}");
+            same_both_ways(&mut tx, q, Page::new(Some(200), None), &what).await;
         }
     }
 }
@@ -1163,7 +1145,8 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
         ids(tx
             .search_customers("rosalind", Page::default())
             .await
-            .unwrap()),
+            .unwrap()
+            .items),
         [c.id]
     );
 
@@ -1175,7 +1158,8 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
         ids(tx
             .search_customers("old.example", Page::default())
             .await
-            .unwrap()),
+            .unwrap()
+            .items),
         [c.id]
     );
 
@@ -1193,31 +1177,36 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
         .search_customers("rosalind", Page::default())
         .await
         .unwrap()
+        .items
         .is_empty());
     assert!(tx
         .search_customers("old.example", Page::default())
         .await
         .unwrap()
+        .items
         .is_empty());
     assert_eq!(
         ids(tx
             .search_customers("mcclintock", Page::default())
             .await
-            .unwrap()),
+            .unwrap()
+            .items),
         [c.id]
     );
     assert_eq!(
         ids(tx
             .search_customers("Barbra McClintok", Page::default())
             .await
-            .unwrap()),
+            .unwrap()
+            .items),
         [c.id]
     );
     assert_eq!(
         ids(tx
             .search_customers("new.ex", Page::default())
             .await
-            .unwrap()),
+            .unwrap()
+            .items),
         [c.id]
     );
 
@@ -1247,6 +1236,7 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
         tx.search_customers("raw row", Page::default())
             .await
             .unwrap()
+            .items
             .len(),
         1
     );
@@ -1259,11 +1249,13 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
         .search_customers("raw row", Page::default())
         .await
         .unwrap()
+        .items
         .is_empty());
     assert_eq!(
         tx.search_customers("cooked", Page::default())
             .await
             .unwrap()
+            .items
             .len(),
         1
     );
@@ -1311,8 +1303,116 @@ async fn indexed_search_matches_the_scan_on_near_threshold_names(pool: PgPool) {
         .await
         .unwrap();
         for q in &queries {
-            let (indexed, scanned) = both_ways(&mut tx, a, q, Page::new(Some(200), None)).await;
-            assert_eq!(indexed, scanned, "threshold {threshold}, query {q:?}");
+            let what = format!("threshold {threshold}");
+            same_both_ways(&mut tx, q, Page::new(Some(200), None), &what).await;
         }
+    }
+}
+
+/// The ids of `found`, ordered as the pre-#17 search orders them: a page
+/// past the cap must still be in that order.
+async fn in_search_order(tx: &mut otto_tenant::Tx<'_>, q: &str, ids: &[Uuid]) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM customers WHERE org_id = $1 AND id = ANY ($4) \
+         ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
+                  similarity(name, $3) DESC NULLS LAST, created_at DESC, id",
+    )
+    .bind(tx.org())
+    .bind(common::like_pattern(q))
+    .bind(q)
+    .bind(ids)
+    .fetch_all(tx.conn())
+    .await
+    .unwrap()
+}
+
+/// Past the cap, search counts to it and says so: `total` is the cap,
+/// `total_capped` is set, the page holds matches in the usual order, and a
+/// page starting at or past the cap is empty. Exactly at the cap, and below
+/// it, the count is exact and uncapped and the results are the scan's.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn search_counts_up_to_the_cap(pool: PgPool) {
+    let db = db(pool);
+    let a = org();
+    let mut tx = db.begin(a).await.unwrap();
+    // 1,100 customers at navy.example, exactly 1,000 named Zeta, and one
+    // Unique Person: the triggers index every one.
+    sqlx::query(
+        "INSERT INTO customers (org_id, email, name, created_at) \
+         SELECT $1, 'sailor' || n || '@navy.example', \
+                (ARRAY['Grace','Alan','Ada','Linus'])[1 + n % 4] || ' Sailor' || n, \
+                now() - make_interval(secs => n) \
+         FROM generate_series(1, 1100) AS n",
+    )
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO customers (org_id, email, name) \
+         SELECT $1, 'z' || n || '@example.org', 'Zeta Member' || n \
+         FROM generate_series(1, 1000) AS n",
+    )
+    .bind(a)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    tx.create_customer(&new("unique@example.net", "Unique Person"))
+        .await
+        .unwrap();
+
+    for q in ["navy", "navy.example", "na"] {
+        let found = tx.search_customers(q, Page::default()).await.unwrap();
+        assert_eq!((found.total, found.total_capped), (1000, true), "{q:?}");
+        let ids: Vec<Uuid> = found.items.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), 50, "{q:?}");
+        assert_eq!(in_search_order(&mut tx, q, &ids).await, ids, "{q:?} order");
+        let lower = q.to_lowercase();
+        assert!(
+            found.items.iter().all(|c| c.email.contains(&lower)
+                || c.name
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&lower)),
+            "{q:?}: a non-match"
+        );
+    }
+    // The page past the cap's edge is cut at it, and past it is empty.
+    let edge = tx.search_customers("navy", page(50, 990)).await.unwrap();
+    assert_eq!(
+        (edge.items.len(), edge.total, edge.total_capped),
+        (10, 1000, true)
+    );
+    let past = tx.search_customers("navy", page(50, 1000)).await.unwrap();
+    assert_eq!(
+        (past.items.len(), past.total, past.total_capped),
+        (0, 1000, true)
+    );
+
+    // Exactly the cap: counted exactly, not capped.
+    let (indexed, scanned) = customers_both_ways(&mut tx, "zeta", page(200, 0))
+        .await
+        .unwrap();
+    assert_eq!((indexed.total, indexed.capped), (1000, false));
+    assert_eq!(indexed, scanned);
+    let (indexed, scanned) = customers_both_ways(&mut tx, "zeta", page(200, 900))
+        .await
+        .unwrap();
+    assert_eq!(indexed.ids.len(), 100);
+    assert_eq!(indexed, scanned);
+
+    // Below it, among all these: exact.
+    for q in [
+        "unique",
+        "Unique Persn",
+        "sailor77@navy.example",
+        "zeta member7",
+    ] {
+        let (indexed, scanned) = customers_both_ways(&mut tx, q, Page::default())
+            .await
+            .unwrap();
+        assert!(!indexed.capped, "{q:?}");
+        assert_eq!(indexed, scanned, "{q:?}");
     }
 }

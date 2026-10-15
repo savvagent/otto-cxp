@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{db, org};
+use common::{articles_both_ways, db, org};
 use cxp_core::chat::ChatExt;
 use cxp_core::knowledge::{ArticleUpdate, KnowledgeExt, NewArticle};
 use cxp_core::tickets::{NewTicket, TicketFilter, TicketUpdate, TicketsExt};
@@ -423,7 +423,7 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
         ids.insert(title, a.id);
     }
 
-    let found = tx.search_articles("password").await.unwrap();
+    let found = tx.search_articles("password").await.unwrap().items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles.len(), 2, "{titles:?}");
     assert!(
@@ -433,14 +433,17 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
     assert!(!titles.contains(&"Shipping"));
 
     // Stemming: "ships" matches "ship"; a title substring matches too.
-    assert_eq!(tx.search_articles("ships").await.unwrap().len(), 1);
-    assert_eq!(tx.search_articles("Account sec").await.unwrap().len(), 1);
-    assert!(tx.search_articles("zebra").await.unwrap().is_empty());
+    assert_eq!(tx.search_articles("ships").await.unwrap().items.len(), 1);
+    assert_eq!(
+        tx.search_articles("Account sec").await.unwrap().items.len(),
+        1
+    );
+    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
     // LIKE wildcards are literal.
-    let pct = tx.search_articles("%").await.unwrap();
+    let pct = tx.search_articles("%").await.unwrap().items;
     assert_eq!(pct.len(), 1);
     assert_eq!(pct[0].id, ids["100% off"]);
-    assert!(tx.search_articles("_").await.unwrap().is_empty());
+    assert!(tx.search_articles("_").await.unwrap().items.is_empty());
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -472,7 +475,7 @@ async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: P
         .await
         .unwrap();
     }
-    let found = tx.search_articles("refund").await.unwrap();
+    let found = tx.search_articles("refund").await.unwrap().items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles, ["Refund policy", "Billing"]);
 
@@ -484,6 +487,7 @@ async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: P
         .search_articles(&"x".repeat(200))
         .await
         .unwrap()
+        .items
         .is_empty());
 }
 
@@ -500,7 +504,7 @@ async fn knowledge_search_is_capped(pool: PgPool) {
     .execute(tx.conn())
     .await
     .unwrap();
-    assert_eq!(tx.search_articles("gadget").await.unwrap().len(), 20);
+    assert_eq!(tx.search_articles("gadget").await.unwrap().items.len(), 20);
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -657,7 +661,7 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
     not_found(tx.delete_ticket(ticket.id).await, "ticket");
     // Articles.
     not_found(tx.get_article(article.id).await, "article");
-    assert!(tx.search_articles("zebra").await.unwrap().is_empty());
+    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
     assert_eq!(tx.list_articles(None, Page::default()).await.unwrap().1, 0);
     not_found(
         tx.update_article(
@@ -716,28 +720,6 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
 }
 
 // ------------------------------------------------- search under RLS (#17)
-
-/// `search_articles` as it was before #17: the match predicate evaluated on
-/// every published article of the org. The indexed search must return
-/// exactly this.
-const ARTICLES_BY_SCAN: &str = "SELECT id FROM knowledge_articles \
-     WHERE org_id = $1 AND published = true \
-       AND (search_tsv @@ plainto_tsquery('english', $2) OR title ILIKE $3) \
-     ORDER BY ts_rank(search_tsv, plainto_tsquery('english', $2)) DESC, created_at DESC, id \
-     LIMIT $4";
-
-/// `cxp_core::contains_pattern`, which is crate-private.
-fn like_pattern(q: &str) -> String {
-    let mut out = String::from("%");
-    for c in q.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('%');
-    out
-}
 
 async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
     let articles: &[(&str, &str, bool)] = &[
@@ -814,28 +796,6 @@ async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
     }
 }
 
-async fn articles_both_ways(
-    tx: &mut otto_tenant::Tx<'_>,
-    org: OrgId,
-    q: &str,
-) -> (Vec<Uuid>, Vec<Uuid>) {
-    let indexed: Vec<Uuid> = match tx.search_articles(q).await {
-        Ok(found) => found.iter().map(|a| a.id).collect(),
-        Err(Error::Invalid(_)) => return (vec![], vec![]),
-        Err(e) => panic!("{q:?}: {e:?}"),
-    };
-    let q = q.trim();
-    let scanned: Vec<(Uuid,)> = sqlx::query_as(ARTICLES_BY_SCAN)
-        .bind(org)
-        .bind(q)
-        .bind(like_pattern(q))
-        .bind(cxp_core::knowledge::SEARCH_LIMIT)
-        .fetch_all(tx.conn())
-        .await
-        .unwrap();
-    (indexed, scanned.into_iter().map(|(id,)| id).collect())
-}
-
 /// Full-text matches (stemming, several words, stop words, hyphenated and
 /// URL-like tokens, non-ASCII), title substrings of every length (one and
 /// two characters take the prefix path), LIKE wildcards, and misses.
@@ -908,8 +868,9 @@ async fn indexed_article_search_returns_exactly_what_the_scan_returns(pool: PgPo
     // Twice over, so most comparisons run on the generic plan.
     for _ in 0..2 {
         for q in KB_QUERIES {
-            let (indexed, scanned) = articles_both_ways(&mut tx, a, q).await;
-            assert_eq!(indexed, scanned, "query {q:?}");
+            if let Some((indexed, scanned)) = articles_both_ways(&mut tx, q).await {
+                assert_eq!(indexed, scanned, "query {q:?}");
+            }
         }
     }
     let mine: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM knowledge_articles WHERE org_id = $1")
@@ -917,7 +878,7 @@ async fn indexed_article_search_returns_exactly_what_the_scan_returns(pool: PgPo
         .fetch_all(tx.conn())
         .await
         .unwrap();
-    let found = tx.search_articles("password").await.unwrap();
+    let found = tx.search_articles("password").await.unwrap().items;
     assert!(!found.is_empty());
     assert!(
         found.iter().all(|x| mine.contains(&x.id)),
@@ -940,7 +901,7 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
         .await
         .unwrap();
     // Unpublished: indexed, but search still hides it.
-    assert!(tx.search_articles("gift").await.unwrap().is_empty());
+    assert!(tx.search_articles("gift").await.unwrap().items.is_empty());
     tx.update_article(
         art.id,
         &ArticleUpdate {
@@ -950,7 +911,7 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert_eq!(tx.search_articles("expire").await.unwrap().len(), 1);
+    assert_eq!(tx.search_articles("expire").await.unwrap().items.len(), 1);
 
     tx.update_article(
         art.id,
@@ -962,10 +923,10 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert!(tx.search_articles("expire").await.unwrap().is_empty());
-    assert!(tx.search_articles("Gift c").await.unwrap().is_empty());
-    assert_eq!(tx.search_articles("lasts").await.unwrap().len(), 1);
-    assert_eq!(tx.search_articles("re cr").await.unwrap().len(), 1);
+    assert!(tx.search_articles("expire").await.unwrap().items.is_empty());
+    assert!(tx.search_articles("Gift c").await.unwrap().items.is_empty());
+    assert_eq!(tx.search_articles("lasts").await.unwrap().items.len(), 1);
+    assert_eq!(tx.search_articles("re cr").await.unwrap().items.len(), 1);
 
     tx.delete_article(art.id).await.unwrap();
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
@@ -973,4 +934,61 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(left, 0, "deleting the article leaves terms behind");
+}
+
+/// Past the cap, article search counts to it and says so. For a one-word
+/// query whose matches all fit the read bound, the articles are still
+/// exactly the scan's (they are chosen by the word's count of positions,
+/// which orders `ts_rank` for one word); a several-word query's are matches
+/// in `ts_rank` order. Below the cap, among the same articles, it is exact.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn article_search_counts_up_to_the_cap(pool: PgPool) {
+    let db = db(pool);
+    let org = org();
+    let mut tx = db.begin(org).await.unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published, created_at) \
+         SELECT $1, 'Guide ' || n, repeat('gadget ', 1 + n % 40) || 'widget manual', true, \
+                now() - make_interval(secs => n) \
+         FROM generate_series(1, 1100) AS n",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO knowledge_articles (org_id, title, content, published) \
+         VALUES ($1, 'Rare gadget', 'the only sprocket', true)",
+    )
+    .bind(org)
+    .execute(tx.conn())
+    .await
+    .unwrap();
+
+    let (indexed, scanned) = articles_both_ways(&mut tx, "gadget").await.unwrap();
+    assert_eq!((indexed.total, indexed.capped), (1000, true));
+    assert_eq!(indexed.ids, scanned.ids, "one word: the scan's best");
+
+    let found = tx.search_articles("gadget widget").await.unwrap();
+    assert_eq!((found.total, found.total_capped), (1000, true));
+    let ids: Vec<Uuid> = found.items.iter().map(|a| a.id).collect();
+    assert_eq!(ids.len(), 20);
+    let ordered: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM knowledge_articles WHERE org_id = $1 AND id = ANY ($2) \
+           AND search_tsv @@ plainto_tsquery('english', 'gadget widget') \
+         ORDER BY ts_rank(search_tsv, plainto_tsquery('english', 'gadget widget')) DESC, \
+                  created_at DESC, id",
+    )
+    .bind(org)
+    .bind(&ids)
+    .fetch_all(tx.conn())
+    .await
+    .unwrap();
+    assert_eq!(ordered, ids, "matches, in ts_rank order");
+
+    for q in ["sprocket", "rare", "Guide 1099", "gadget sprocket"] {
+        let (indexed, scanned) = articles_both_ways(&mut tx, q).await.unwrap();
+        assert!(!indexed.capped, "{q:?}");
+        assert_eq!(indexed, scanned, "{q:?}");
+    }
 }

@@ -98,8 +98,10 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
              application_id, page_id, component_id) \
              VALUES ($1, $2, 'Card declined', 'high'::ticket_priority, {catalog})"
         ),
-        "INSERT INTO knowledge_articles (id, org_id, title, content) \
-         VALUES ($11, $1, 'Refunds', 'How refunds work')"
+        // Published, so the search index holds it (it holds published
+        // articles only).
+        "INSERT INTO knowledge_articles (id, org_id, title, content, published) \
+         VALUES ($11, $1, 'Refunds', 'How refunds work', true)"
             .to_string(),
         "INSERT INTO chat_sessions (id, org_id, customer_id) VALUES ($8, $1, $2)".to_string(),
         "INSERT INTO chat_messages (org_id, session_id, role, content) \

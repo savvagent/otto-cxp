@@ -237,7 +237,10 @@ impl Cxp {
     #[tool(
         name = "search_knowledge_base",
         description = "Search the published knowledge base articles; best matches first, at most \
-                       20. Returns {items}.",
+                       20. Returns {items, total, totalCapped}. total counts matches up to 1000; \
+                       totalCapped true means there may be more than total (past 1000, or the \
+                       query was too broad to count), and items are then the best of the matches \
+                       found.",
         annotations(read_only_hint = true)
     )]
     pub async fn search_knowledge_base(
@@ -250,7 +253,7 @@ impl Cxp {
         let mut tx = self.tx(&caller).await?;
         let found = tx.search_articles(&p.query).await.mcp()?;
         tx.commit().await.mcp()?;
-        Ok(Json(List::uncounted(found)))
+        Ok(Json(List::searched(found)))
     }
 
     #[tool(

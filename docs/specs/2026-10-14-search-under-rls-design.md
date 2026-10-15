@@ -3,6 +3,8 @@
 **Status:** DRAFT (#17)
 **Issue:** #17 "Make customer and knowledge-base search fast under row-level security"
 **Plan:** `docs/plans/2026-10-14-search-under-rls.md`
+**Decision:** Rob chose option (c) on 2026-10-14: accept a search-semantics change above a cap so
+that broad queries are fast too.
 
 ## Brief
 
@@ -10,95 +12,182 @@
 > ahead of the RLS predicate. `ILIKE`, the trigram `%` operator and full-text `@@` are not
 > leakproof, so customer search and knowledge-base search scan every row of the caller's org.
 
-Acceptance criteria (verbatim from #17):
+Acceptance criteria (#17): search stays under ~50 ms at 300k rows per org as `otto_app` under
+forced RLS, and the approach is recorded with its security reasoning.
 
-1. Customer and knowledge-base search stay under ~50 ms at 300k rows per org when run as
-   `otto_app` under forced RLS.
-2. The chosen approach (e.g. marking `texticlike`, `similarity_op`, `ts_match_vq` LEAKPROOF on
-   `otto-db`, or a search design that doesn't depend on them) is recorded with its security
-   reasoning.
+The first version of this change kept results exactly as before for every query. Selective
+queries became fast, but broad ones (thousands of matches) stayed at 130 to 650 ms, because every
+match had to be fetched and ranked. LEAKPROOF plus GIN indexes would have been no better on broad
+queries. Rob chose option (c). Its binding requirements:
 
-Risk (verbatim): marking operators LEAKPROOF is a superuser change on the shared instance and a
-security decision; owner Rob.
-
-**Outcome in one paragraph.** This change ships a search design that needs no superuser: each
-customer and article gets rows in an org-scoped inverted index (`customer_search_grams`,
-`knowledge_search_terms`), looked up with text equality and prefix ranges, which are leakproof and
-so serve as index conditions under RLS. The original predicate still decides every result, so
-results are identical to before. Selective queries now take 3 to 70 ms instead of 1 to 3 s.
-Criterion 1 is **met for selective queries and missed for broad ones**: a query matching thousands
-of rows still takes 85 to 650 ms, because every match has to be fetched and ranked. Indexing costs
-about 7 kB per customer and 22 kB per article. The LEAKPROOF option needs a fraction of the
-storage and is about twice as fast on broad queries. It is written up below as a decision for Rob
-(see Human hand-off). Nothing in this change marks anything LEAKPROOF.
+1. p50 under ~50 ms for every benchmark query at 300k rows per org, broad ones included (`ab`,
+   `navy`, `account`, an exact email), run as `otto_app` under forced RLS.
+2. Semantics:
+   - The page is ranked by today's ordering, chosen from the best-ranked candidates.
+   - Below the cap (1000 matches), rows, order, and total are identical to today.
+   - `total` is exact up to the cap. Above it, `total` is 1000 and a new additive
+     `totalCapped: true` is set.
+   - Offsets past the cap return an empty page.
+   - No query scans or ranks an unbounded number of rows.
+3. The migration needs neither BYPASSRLS nor superuser. A backfill runs per org (maintenance or
+   pinned transactions) in bounded batches. A test proves this under a NOSUPERUSER NOBYPASSRLS
+   owner.
+4. Storage proportionate to a small shared database, well below the first version's 6.8 kB per
+   customer and 22 kB per article if possible.
+5. No superuser change unless it is genuinely needed. If it is, it becomes a hand-off.
+6. The usual tenant-table invariants.
 
 ## Premise corrections
 
-Measured as `otto_app` with forced RLS, `max_parallel_workers_per_gather = 0`, on the benchmark
-below. `EXPLAIN (ANALYZE, BUFFERS)` of the pre-#17 `search_customers` for `navy`:
+Measured as `otto_app` with forced RLS. These are unchanged from the first version:
 
-```
-Limit (actual time=1013.920..1013.927 rows=50)
-  -> Sort  (top-N heapsort)
-     -> Result  One-Time Filter: ((NULLIF(current_setting('app.org_id', true), ''))::uuid = '…0a'::uuid)
-        -> Seq Scan on customers (actual time=0.904..957.917 rows=17861)
-             Filter: ((org_id = '…0a') AND ((email ~~* '%navy%') OR (name ~~* '%navy%') OR (name % 'navy')))
-             Rows Removed by Filter: 402139
-```
+- **The RLS predicate itself is not the cost.** `current_org()` is inlined. The planner merges
+  `org_id = current_org()` with the query's `org_id = $1` and evaluates the setting once.
+  Counting an org's 300k customers is an index-only scan (about 25 ms).
+- **The cost is evaluating the text operators on every org row.** On 300k customers:
+  - `email ILIKE` alone takes about 290 ms.
+  - `name % q` alone takes about 480 ms.
+  - All three operators together take about 1 s.
+- **Knowledge-base search was worse than the ticket said:** 1 to 1.7 s at 300k articles. Most of
+  that is de-TOASTing every `search_tsv`.
+- **LEAKPROOF is per database.** `ALTER FUNCTION … LEAKPROOF` in `otto_cxp` changes only that
+  database's `pg_proc`. The other services' databases are not affected.
 
-- **The RLS predicate itself is not the cost.** `current_org()` is an inlined SQL function. The
-  planner merges `org_id = current_org()` with the query's own `org_id = $1` into one equivalence
-  class, evaluates `current_setting` once (the one-time filter), and could use `(org_id, …)`
-  indexes for the org. Counting the org's 300k customers as `otto_app` is an index-only scan
-  (about 25 ms). Here it chose a sequential scan because the org is 70% of the table.
-- **The cost is evaluating the text operators on every org row.** `email ILIKE` alone takes 290 ms
-  across 300k rows, `name % q` alone takes 480 ms (it builds the trigrams of every name), and all
-  three together take about 1 s. A GIN trigram index can't help because those operators aren't
-  leakproof. That part of the ticket is right.
-- **Knowledge-base search is worse than the ticket implies:** 1.1 to 3 s at 300k articles, not
-  ~1 s. Most of the time goes to de-TOASTing every article's stored `search_tsv` (1M buffer hits
-  per query) before `@@` can run on it.
-- **Marking the operators LEAKPROOF would not touch the other services.** `pg_proc` is
-  per-database: `ALTER FUNCTION texticlike(text, text) LEAKPROOF` run in `otto_cxp` changes only
-  `otto_cxp`'s catalog. `otto_platform`, `otto_factory`, and `otto_flags` would not see it. It
-  still needs a superuser, and it is still a security decision (see below).
-- **Two smaller corrections.** `search_customers` returns no total (`List::uncounted`), so there
-  is no count query to speed up. `resolve_customer`'s substring fallback scans the org the same
-  way, but it stops at 2 rows and is not search (out of scope).
+New with option (c):
+
+- **"Identical below the cap" and "bounded work" cannot both hold for every query, under any
+  index.** Two kinds of query need unbounded reads to be exact:
+  - A fuzzy (`%`) query with many trigrams. A long query needs many shared trigrams, but it can
+    be built only from common ones.
+  - A several-word full-text query whose words are each common while their AND is rare.
+
+  For both, proving that fewer than 1000 rows match means reading posting lists whose length
+  grows with the org. GIN does the same, only faster: a GIN `%` lookup for `ab` read 53k
+  candidates and took 106 ms. This design is exact below the cap whenever its reads finish
+  within their bounds, which covers every sub-cap query in the benchmark except one (the exact
+  email; see Semantics). When a read bound cuts a search short, the response says so with
+  `totalCapped: true`.
+- **`search_customers` and `search_knowledge_base` returned no total before.** The REST route
+  `GET /api/v1/customers/search` returns a bare JSON array. A JSON field cannot be added to it
+  without breaking it, so the count rides in headers (Assumptions).
 
 ## Assumptions
 
-- "300k rows per org" applies to both customers and articles. A real knowledge base is closer to
-  10² to 10⁴ articles. The 300k-article numbers below are a stress case.
-- Benchmark host: a laptop running Postgres 16.13 in podman, `shared_buffers = 4GB`, warm cache,
-  JIT on (the default), no parallel workers (production runs on a shared-cpu-1x machine).
-  Production `otto-db` is smaller and shared, so its absolute numbers will be worse. Other agents'
-  test runs shared the host during the final run, so the "before" figures are noisy (an earlier,
-  quieter run gave 0.65 to 1.3 s for the same customer queries).
-- Search semantics must not change at all: the same rows in the same order, for every query,
-  page, and `pg_trgm.similarity_threshold`. The tests check exactly this against the old SQL.
-- Migration number `0004`: `0003` is reserved for #14's `0003_console_sessions.sql`. On this
-  branch alone, `migrate::tests::versions_are_contiguous_from_one` therefore fails until #14
-  lands (expected; the orchestrator rebases or renumbers).
+- "300k rows per org" applies to customers and articles alike. A real knowledge base holds 10² to
+  10⁴ articles, so 300k articles is a stress case.
+- Benchmark host:
+  - A laptop running Postgres 16.13 in podman, `shared_buffers = 4GB`, warm cache.
+  - One client, prepared statements, no parallel workers.
+  - Other agents' test runs shared the host, at load average 3 to 11. That inflates the "before"
+    figures most.
+  - Production (`otto-db`, a shared small machine) will be slower in absolute terms.
+- `pg_trgm.similarity_threshold` stays at its default of 0.3 in production. Other thresholds are
+  supported and tested.
+- **When a read bound is hit below the cap, `totalCapped` is true and `total` is a lower bound**
+  (the matches found). Rob's rule "past the cap, total is 1000 and totalCapped is true" is kept
+  exactly. A capped total below 1000 means that the search could not finish counting, and the
+  tool descriptions say so.
+- REST: `GET /api/v1/customers/search` keeps its bare array body. It gains `X-Total-Count` and
+  `X-Total-Capped` headers. The web console's command palette reads the array and only shows the
+  first five, so neither its types nor `crates/cxp-api/tests/fixtures/wire.json` change.
+  `@cxp/sdk`'s `callList` returns `items` and ignores the new fields.
+- There is no REST knowledge-base search, so only the MCP tool gains `total` and `totalCapped`.
 
 ## Goal & success criteria
 
-- `search_customers` and `search_articles` return exactly what the pre-#17 SQL returns (ids and
-  order, any page) for every query, including one- to three-character queries, LIKE wildcards,
-  non-ASCII text, and any similarity threshold.
-- No index-assisted path depends on a non-leakproof operator, a `SECURITY DEFINER` function, or
-  any other way around RLS. Every new table is a tenant table under the usual invariants.
-- Measured before/after numbers and storage costs are recorded here, and the LEAKPROOF
-  alternative is written up with its exact SQL for Rob.
+| Requirement | Result |
+|---|---|
+| 1. p50 < 50 ms, every benchmark query | Met. Worst p50 is 20.6 ms; worst p95 is 21.5 ms (Measurements) |
+| 2. Exact below the cap | Met for every sub-cap query whose reads fit the bounds. This is tested on all equivalence corpora (Testing). In the benchmark, `zzzz`, `antiprimer`, and `zebrafishy` are exact; the exact-email query is not (Semantics) |
+| 2. Total / `totalCapped` / offsets / bounds | Met, and tested (`search_counts_up_to_the_cap`, `article_search_counts_up_to_the_cap`) |
+| 3. No superuser, per-org batches, proven | Met. The migration reads no tenant rows; `the_index_is_built_per_org_under_a_least_privilege_owner`; the e2e least-privilege test passes |
+| 4. Storage well below 6.8 / 22 kB | **Not met.** 7.1 kB per customer, 25 kB per published article (Storage). Reaching it needs GIN, and so LEAKPROOF |
+| 5. No superuser change | Met. LEAKPROOF is an optional hand-off, not needed for the latency target |
+| 6. Invariants | Met (Invariants impact) |
+
+## Semantics
+
+Customers (`search_customers`, MCP and REST) and articles (`search_knowledge_base`):
+
+- **Predicate and order are today's.**
+  - Customers: `email ILIKE '%q%' OR name ILIKE '%q%' OR name % q`. Email matches first, then
+    by `similarity` descending, then newest first, then by id.
+  - Articles: published, and `search_tsv @@ plainto_tsquery('english', q) OR title ILIKE '%q%'`.
+    By `ts_rank` descending, then newest first, then by id.
+- **`total`** counts matches up to 1000.
+- **`totalCapped`** is false when `total` is exact. It is true when more than 1000 rows match
+  (`total` is then 1000), or when a read bound stopped the search before it had seen every match
+  (`total` is then the matches it found, a lower bound).
+- **The page** is the requested page of the matches found, in today's order.
+  - Below the cap, with no bound hit, the matches found are all the matches. Rows, order, and
+    total are then identical to today.
+  - Above the cap, the matches found are the first 1001 in candidate order:
+    - substring candidates (in index order, so effectively arbitrary), then fuzzy candidates
+      with the most shared rare trigrams, then not-yet-indexed rows;
+    - for one-word full-text queries, the most occurrences first;
+    - for several words, the rarest word's articles with the most occurrences first.
+- **Offsets:** a customer page starting at or past 1000 is empty, with `total` 1000 and
+  `totalCapped` true. A page crossing 1000 is cut there. Article search has no offset (20 rows).
+- **Bounds, per query** (`crates/cxp-core/src/search.rs`):
+
+| Step | Bound |
+|---|---|
+| Rarity probes | 256 index rows per query window, trigram, or lexeme |
+| Substring candidates (customers; article titles) | 2,000 index rows (the rarest window's, or a short query's prefix range), each checked against at most two more windows |
+| Fuzzy candidates | 10,000 index rows of the rarest needed trigrams; 1,500 candidates checked (500 once the read is cut) |
+| Full-text candidates | 2,000 index rows of the rarest lexeme, probed for the others |
+| Not-yet-indexed rows | 200 read directly; 50 customers or 10 articles indexed per search |
+| Rows checked against the table | until 1,001 match, at most the sum of the candidate bounds |
+| Rows ranked | at most 1,001 (customers); for articles, the matches up to 1,001, ranked by `tf` with no `ts_rank`, or up to 1,000 (200 past the cap) by `ts_rank` for several words |
+
+Matches against today on the benchmark (`page_same` compares the first page's ids and order):
+
+| Query | Matches | `total` | `totalCapped` | Page overlap with today |
+|---|---:|---:|---|---:|
+| `navy` | 17,861 | 1000 | true | 1 / 50 |
+| `grace` | 2,438 | 1000 | true | 23 / 50 |
+| `hopper` | 1,567 | 1000 | true | 28 / 50 |
+| `grace hopper` | 3,041 | 514 | true | 17 / 50 |
+| `Grace Hoper` | 1,849 | 487 | true | 10 / 50 |
+| `catherine.straski1@initech.example` | **92** | **7** | true | 5 / 50 (the email itself is first) |
+| `zzzz` | 0 | 0 | false | identical |
+| `lee` | 4,038 | 1000 | true | 31 / 50 |
+| `ab` | 23,049 | 1000 | true | 0 / 50 |
+| `password reset` | 4,577 | 125 | true | 7 / 20 |
+| `account` | 42,148 | 1000 | true | **identical** |
+| `aulicism`, `arbuscula`, `arrhythmic`, `acc` | 1,226 to 12,907 | 1000 | true | **identical** |
+| `antiprimer` | 539 | 539 | false | identical |
+| `Angiasthenia Aleurones` | 5,787 | 318 | true | 10 / 20 |
+| `zebrafishy` | 0 | 0 | false | identical |
+
+Broad customer pages differ from today because today's order for a broad substring query is
+mostly "newest first". The index has no creation time, so the matches found are an arbitrary
+1000. One-word article queries keep today's page because `ts_rank` is a function of the word's
+occurrences, which the index holds, and a partial index serves those occurrences in descending
+order.
+
+**The one sub-cap benchmark query that is not exact is the exact email.** Its 91 fuzzy name
+matches ("Catherine Stra…", similarity ≥ 0.3 to the whole email) share trigrams with the query
+only through common lists. Finding all of them means reading about 82k index rows, which no
+bounded read reaches. The customer with that email is still found exactly and listed first.
+`totalCapped: true` and `total: 7` say that the count is incomplete. The LEAKPROOF hand-off
+below is the way to make this class exact (33 ms measured).
 
 ## Scope
 
-In: migration 0004 (two tables, their triggers and helper functions, and a backfill),
-`SEARCH_CUSTOMERS_SQL` and `SEARCH_ARTICLES_SQL`, the purge list, tests, the benchmark
-(`scripts/bench-search/`), this spec, and the plan.
+In:
+- migration 0004, rewritten;
+- `cxp_core::search` (new), `SEARCH_CUSTOMERS_SQL`, and `SEARCH_ARTICLES_SQL`;
+- `SearchPage` returned by `search_customers` and `search_articles`;
+- the MCP `List.totalCapped` field and tool descriptions, and the REST headers;
+- tests, `scripts/bench-search/`, this spec, and the plan.
 
-Out: `resolve_customer`'s fallback scan; changing search semantics (prefix-only search, a total,
-different ranking); any LEAKPROOF change (a hand-off); `list_*` queries (already index-served).
+Out:
+- `resolve_customer`'s substring fallback (it stops at 2 rows);
+- `list_*` queries (already index-served);
+- LEAKPROOF and GIN (a hand-off);
+- a creation-time column in the customer index, which would make broad pages "newest first"
+  (more storage; open question).
 
 ## Architecture
 
@@ -106,262 +195,292 @@ different ranking); any LEAKPROOF change (a hand-off); `list_*` queries (already
 
 | Design | Result |
 |---|---|
-| GIN trigram / full-text index | Its operators (`%`, `~~*`, `@@`, `@>` …) are all non-leakproof (checked in `pg_amop`), so RLS keeps it from ever being an index condition. |
-| Bloom-filter signature per row (bit columns, `(sig & m) = m`) | Prototyped. It is still a scan of every org row (the filter can't be indexed): 160 ms to 4.6 s. Rejected. |
-| A table, view, or materialized view without RLS, or a `SECURITY DEFINER` function | Bypasses RLS. Forbidden. |
-| Search predicate inside a restrictive policy (policies run at security level 0, so non-leakproof is allowed) | Puts query text in a GUC and makes every customer query pay for it. Too clever and fragile. Rejected. |
-| **Inverted index in tenant tables, looked up with leakproof btree operators** | Chosen. |
-
-Leakproof operators that a btree can use (checked in `pg_proc` on PG16): `texteq`, `text_lt/le/gt/ge`,
-`starts_with`, `uuid_eq`, and the integer comparisons. An index on `(org_id, gram, id)` queried
-with `org_id = $1 AND gram = $2` is therefore an index condition under RLS. Its rows are filtered
-by the tables' own `org_id = current_org()` policy like any other tenant row.
+| GIN trigram / full-text index | Its operators are non-leakproof, so RLS never lets it be an index condition. With LEAKPROOF it is exact and fast on long fuzzy queries, but unbounded on short ones (`ab` fuzzy: 106 ms) and on broad ones |
+| A capped scan of the base table, no index tables | Selective queries need the whole org scanned to be exact: about 1 s |
+| Bloom signatures per row | Still a scan of every org row: 160 ms to 4.6 s |
+| A table without RLS, `SECURITY DEFINER`, or the search inside a policy | Bypasses or bends RLS. Rejected |
+| Name-side prefix filtering (ranked trigrams per name) for exact long fuzzy queries | Prototyped: the email query took 65 to 90 ms, and storage went up. Rejected |
+| **Inverted index in tenant tables, read with leakproof btree conditions, bounded reads, counted to a cap** | Chosen |
 
 ### Schema (`crates/cxp-core/migrations/0004_search_index_tables.sql`)
 
-- `customer_search_grams (org_id, customer_id, gram text COLLATE "C", name_grams smallint)`, with
-  PK `(org_id, gram, customer_id) INCLUDE (name_grams)` and an `(org_id, customer_id)` index for
-  the trigger, the cascade, and the purge. It has a composite FK to `customers (org_id, id)` with
-  `ON DELETE CASCADE`.
-- `knowledge_search_terms (org_id, article_id, term text COLLATE "C")`, with PK
-  `(org_id, term, article_id)` and an `(org_id, article_id)` index. It has a composite FK to
-  `knowledge_articles` with cascade.
-- Grams and terms are tagged by kind:
-  - `s` + every 4-character window of a lowercased string, padded with three U+0001 so that
-    every position starts a window (email and name; article title).
-  - `t` + each `show_trgm(name)` trigram: exactly the set `similarity()` compares.
-  - `l` + each lexeme of `search_tsv`.
-- `name_grams = cardinality(show_trgm(name))`, which the fuzzy bound needs for each candidate.
-- AFTER INSERT and AFTER UPDATE OF email/name (title/content) triggers, `SECURITY INVOKER`,
-  rebuild a row's grams. The `WHEN` clauses skip updates that change nothing, because
-  `update_customer` and `update_article` name every column in their SET lists. The triggers run
-  as the writer under RLS, so a pinned `otto_app` transaction writes only its own org's grams.
-- Helper functions `search_windows`, `customer_search_grams_of`, and `knowledge_search_terms_of`
-  are `IMMUTABLE`, with `search_path` pinned. The trigger, the backfill, and (for
-  `search_windows`) the queries all share them.
-- The backfill runs at migration time and needs a superuser or `BYPASSRLS` role: that is
-  production's connecting role today. Under any other role it would see no rows and silently
-  leave existing customers unsearchable, so it raises an exception whenever `customers` or
-  `knowledge_articles` holds data.
+- **`customer_search_grams (org_id, customer_id, gram text COLLATE "C", name_grams smallint)`**
+  - PK `(org_id, gram, customer_id) INCLUDE (name_grams)`, plus an `(org_id, customer_id)` index.
+  - Composite FK to `customers` with `ON DELETE CASCADE`.
+- **`knowledge_search_terms (org_id, article_id, term text COLLATE "C", tf smallint)`**
+  - PK `(org_id, term, article_id) INCLUDE (tf)`, plus an `(org_id, article_id)` index.
+  - Partial index `(org_id, term, tf DESC, article_id) WHERE tf >= 2`, which is about one lexeme
+    row in nine.
+  - Composite FK to `knowledge_articles` with cascade.
+  - Holds published articles only, so counts need no table read.
+- **Grams by kind:**
+  - `s` + every 4-character window of a lowercased string, padded with three U+0001 so that every
+    position starts one. These come from email and name, or from the article title.
+  - `t` + each `show_trgm(name)` trigram.
+  - `l` + each `search_tsv` lexeme, with `tf` = its number of positions.
+- **The `search_indexed` flag on `customers` and `knowledge_articles`.**
+  - `ADD COLUMN … DEFAULT false` gives every existing row `false` without reading or rewriting
+    one (a catalog default).
+  - `SET DEFAULT true` and a BEFORE trigger make every later write `true`.
+  - Partial indexes `(org_id, id) WHERE NOT search_indexed` hold the backlog. They are empty
+    once it is done.
+- **AFTER triggers (`SECURITY INVOKER`) rebuild a row's grams** on insert, on a change of
+  email/name or title/content/published, and when a row is first indexed. They run as the
+  writer under RLS.
+- Tenant-table rules apply to both tables: forced RLS, `<table>_tenant_isolation`, grants to
+  `otto_app`, and `PURGED_TABLES`.
+
+### No backfill in the migration; the backlog per org
+
+Under #16 the migrating role (`cxp_server`) is bound by RLS and sees no tenant rows, so 0004
+reads none. It only adds structure.
+
+Rows that predate 0004 are indexed in each org's own pinned transaction, through
+`cxp_core::search::index_backlog`:
+- It flips `search_indexed` for up to N rows chosen in a CTE (`FOR UPDATE SKIP LOCKED`), and the
+  triggers do the indexing.
+- Every search first indexes a batch of its org's backlog (50 customers or 10 articles).
+- It then reads the rest directly (up to 200 rows) and checks each against the full predicate,
+  so search is complete during the transition.
+
+Production holds tens of customers per org, so each org's first search indexes everything. An
+org's backlog is never touched by another org (RLS). No maintenance policy is added.
+`the_index_is_built_per_org_under_a_least_privilege_owner` proves the path end to end.
 
 ### Queries
 
-`SEARCH_CUSTOMERS_SQL` (`crates/cxp-core/src/customers.rs`) and `SEARCH_ARTICLES_SQL`
-(`crates/cxp-core/src/knowledge.rs`) end in the pre-#17 `WHERE … ORDER BY … LIMIT` unchanged. The
-only addition is `AND id = ANY (ARRAY(<candidates>))`, served by `UNIQUE (org_id, id)`. Each
-candidate set is a superset of the rows its half of the predicate accepts:
+`SEARCH_CUSTOMERS_SQL` (`crates/cxp-core/src/customers.rs`) returns one row
+`(total, capped, ids)`. A second statement fetches the page's rows by id.
 
-- **Substring (`ILIKE '%q%'`).** On a multibyte database Postgres evaluates `x ILIKE p` as
-  `lower(x) LIKE lower(p)`. So every match holds every 4-character window of `lower(q)` as an `s`
-  gram, and a `q` shorter than four characters is the prefix of one of the match's windows (a
-  byte range under `COLLATE "C"`). The query counts each window's postings up to `DF_PROBE` (256),
-  takes the rarest window's rows, and keeps those that also hold the next two rarest windows
-  (index probes).
-- **Fuzzy (`name % q`).** With |A| the name's trigrams, |B| the query's, and c shared:
-  `c / (|A| + |B| − c) ≥ t` gives `c ≥ k(|A|) = t(|A| + |B|) / (1 + t)`, and since `c ≤ |A|`,
-  also `c ≥ kmin = ⌈t|B|⌉`. Every match therefore shares one of any `|B| − kmin + 1` query
-  trigrams, so only the rarest that many are looked up (rarity from the capped counts, ties broken
-  word-initial-last). A customer is a candidate when its count among them reaches
-  `k(|A|) − (kmin − 1)`. A slack of 0.001 absorbs pg_trgm's float4 rounding. `t` is read from
-  `pg_trgm.similarity_threshold` at query time; when `t ≤ 0` every named customer matches and
-  the query falls back to the org's customers.
-- **Full text (`search_tsv @@ plainto_tsquery('english', q)`).** With the `english` config,
-  `plainto_tsquery` is the AND of the lexemes `to_tsvector('english', q)` yields. The candidates
-  are the articles holding all of them (postings grouped and counted). A query of stop words
-  alone has no lexemes and matches nothing, as `@@` with an empty query does.
-- `crate::without_jit` runs `SET LOCAL jit = off` first. The planner can't see how few rows a
-  gram lookup reads, so the generic plan's cost passes `jit_above_cost`, and JIT compilation
-  alone took about 300 ms.
+1. **Substring.** The query's windows are counted (capped at 256) to find the rarest. Up to
+   2,000 of its index rows are read; a query under 4 characters reads a prefix range instead.
+   Candidates are those holding the next two rarest windows too.
+2. **Fuzzy.** The rarest `|B| − kmin + 1` trigrams are read, rarest first, up to 10,000 index
+   rows:
+   - `kmin` is the larger of `t|B|` and `k(2)`, because a matching name has at least two
+     trigrams.
+   - When the read finishes, the count bound `p ≥ k(|A|) − (kmin − 1)` selects candidates, with
+     0.001 slack for float4.
+   - Up to 1,500 candidates are checked, most shared trigrams first (500 when the read was cut).
+   - A threshold of 0 or below makes the org's customers the candidates.
+3. **Backlog.** Unindexed rows, up to 200.
+4. **`matches`.** Candidates are checked against the original predicate, substring first, until
+   1,001 match.
+   - This is a `UNION ALL` under a `LIMIT`: Postgres runs its branches in order and stops when
+     the limit is reached. A broad substring query never computes its fuzzy candidates.
+   - The capped flags are an `OR` chain that short-circuits the same way.
+5. **The page** is `matches` in today's order, cut at 1000.
 
-`PURGED_TABLES` lists both tables before their parents, so `org.deleted` deletes them in batches
-like everything else rather than by cascade.
+`SEARCH_ARTICLES_SQL` (`crates/cxp-core/src/knowledge.rs`):
+
+- **Full text.** The rarest lexeme's rows are read, `tf >= 2` first in `tf` order (the partial
+  index), then the rest, up to 2,000. Probing the other lexemes makes a candidate an exact `@@`
+  match.
+- **Title.** Windows are read as for customers and checked with `title ILIKE` on the row.
+- **Backlog.** Read directly and checked with the whole predicate.
+- **Ranking.**
+  - One lexeme (`numnode = 1`): ranking needs no `ts_rank`. For a single lexeme with default
+    weights it is `Σ_{j<tf} 0.1/(j+1)² / 1.6449`, strictly increasing in `tf`. An article without
+    the lexeme ranks 0, below all with it. Every row read whose `tf` ties the page's last is
+    ranked with its creation time.
+  - Several lexemes: `ts_rank` on every match up to the cap, or on the 200 with the highest
+    `tf` of the rarest lexeme past it.
+
+Both start with `SET LOCAL jit = off`, because the generic plans' cost estimates pass
+`jit_above_cost` and compiling took about 300 ms.
+
+Two plan pitfalls are fixed and recorded in comments:
+- Prefix-range bounds must be expressions on the bind parameter, not a CTE column. Otherwise
+  the generic plan scans the org's whole index (6.7 s for `lee`).
+- The tf of a title candidate is a scalar subquery, not a lateral join. Otherwise it is
+  hash-joined against the whole lexeme list.
 
 ## Measurements
 
-Data (`scripts/bench-search/seed.sql`, deterministic): org A has 300,000 customers and 300,000
-articles (270,000 published, 5-word titles, 150-word bodies drawn Zipf-like from
-`/usr/share/dict/words`). Orgs B and C each have 50,000 customers and 20,000 articles; org D has
-20,000 customers and 5,000 articles. In total that is 420,000 customers and 345,000 articles.
-Names come from 125 first names and 110 surnames (60%) or invented surnames (40%); emails are
-`first.lastN@domain`, across 17 domains.
+Data: `scripts/bench-search/seed.sql`, deterministic.
+- Org A has 300,000 customers and 300,000 articles (270,000 published).
+- Orgs B and C have 50,000 customers and 20,000 articles each; org D has 20,000 and 5,000.
+- In total: 420,000 customers and 345,000 articles.
 
-Method (`scripts/bench-search/run.sh`): pgbench, one client, `-M prepared` (as sqlx runs it, so
-the plan cache goes generic after five runs), each transaction `SET LOCAL ROLE otto_app` +
-`set_config('app.org_id', A)` + the search, `LIMIT 50` (customers) / `20` (articles). The figures
-are whole-transaction latency after 6 warm-up runs: 40 runs after, 10 runs before (each run of
-the old scan takes 1 to 3 s).
+Method: `scripts/bench-search/run.sh`. pgbench runs each search as a request does: one
+transaction as `otto_app` pinned to org A, the backlog statement, the search, and the row fetch.
+Each search runs on its generic plan after warm-up. The figures are p50 / p95 in ms: 60 runs
+after, 10 runs before (each run of the old scan takes about a second). The "before" runs had
+the heavier host load.
 
-### Customers (org A, 300k)
+| Customers (org A, 300k) | Matches | Before p50 / p95 | After p50 / p95 |
+|---|---:|---:|---:|
+| `navy` | 17,861 | 754 / 844 | **6.6 / 8.5** |
+| `grace` | 2,438 | 723 / 884 | **10.1 / 11.2** |
+| `hopper` | 1,567 | 1135 / 1809 | **13.0 / 13.8** |
+| `grace hopper` | 3,041 | 996 / 1515 | **16.2 / 17.8** |
+| `Grace Hoper` (fuzzy only) | 1,849 | 841 / 972 | **14.1 / 14.7** |
+| `catherine.straski1@initech.example` | 92 | 2242 / 3477 | **17.8 / 19.1** |
+| `zzzz` | 0 | 913 / 1186 | **0.9 / 1.0** |
+| `lee` (3 chars) | 4,038 | 945 / 1421 | **7.6 / 8.7** |
+| `ab` (2 chars) | 23,049 | 1016 / 1423 | **8.5 / 9.4** |
 
-| query | matches | before p50 / p95 | after p50 / p95 | LEAKPROOF+GIN p50 / p95 † |
-|---|---:|---:|---:|---:|
-| `zzzz` | 0 | 1974 / 2133 | **4.3 / 5.2** | 0.9 / 1.1 |
-| `catherine.straski1@initech.example` | 92 | 2076 / 2377 | 190 / 242 | 28 / 29 |
-| `hopper` | 1,567 | 1989 / 2199 | **49 / 64** | 16 / 18 |
-| `grace` | 2,438 | 1893 / 2042 | **50 / 53** | 43 / 49 |
-| `Grace Hoper` (typo; fuzzy only) | 1,849 | 2182 / 2326 | 85 / 92 | 39 / 44 |
-| `grace hopper` | 3,041 | 1610 / 2242 | 86 / 98 | 46 / 49 |
-| `lee` (3 chars: prefix path) | 4,038 | 1658 / 1945 | 101 / 110 | 52 / 66 |
-| `navy` | 17,861 | 856 / 1736 | 133 / 155 | 85 / 88 |
-| `ab` (2 chars) | 23,049 | 1174 / 1839 | 316 / 327 | 1199 / 2165 |
+| Knowledge base (org A, 270k published) | Matches | Before p50 / p95 | After p50 / p95 |
+|---|---:|---:|---:|
+| `password reset` | 4,577 | 1369 / 1889 | **10.0 / 12.5** |
+| `account` | 42,148 | 1203 / 1435 | **4.4 / 5.1** |
+| `aulicism` | 12,412 | 1089 / 1182 | **4.4 / 5.1** |
+| `arbuscula` | 3,793 | 1727 / 1935 | **5.0 / 6.7** |
+| `arrhythmic` | 1,226 | 1104 / 1146 | **5.4 / 6.4** |
+| `antiprimer` | 539 | 1044 / 1065 | **3.1 / 3.7** |
+| `Angiasthenia Aleurones` | 5,787 | 1574 / 1887 | **20.6 / 21.5** |
+| `acc` (3 chars) | 12,907 | 1037 / 1131 | **5.2 / 6.1** |
+| `zebrafishy` | 0 | 1009 / 1069 | **0.9 / 1.2** |
 
-### Knowledge base (org A, 270k published)
+For comparison, the first version (exact for every query, unbounded) took 85 to 316 ms on
+broad customer queries and 133 to 652 ms on broad article queries.
 
-| query | matches | before p50 / p95 | after p50 / p95 | LEAKPROOF+GIN p50 / p95 † |
-|---|---:|---:|---:|---:|
-| `zebrafishy` | 0 | 1202 / 2121 | **3.2 / 4.6** | 1.3 / 1.6 |
-| `antiprimer` | 539 | 1586 / 2991 | **16 / 22** | ≈ 8 ‡ |
-| `arrhythmic` | 1,226 | 2863 / 3041 | **32 / 39** | ≈ 10 ‡ |
-| `arbuscula` | 3,793 | 1220 / 1441 | 69 / 90 | ≈ 39 ‡ |
-| `password reset` | 4,577 | 2979 / 3013 | 133 / 142 | 52 / 80 |
-| `Angiasthenia Aleurones` (title words) | 5,787 | 1480 / 2016 | 212 / 291 | — |
-| `aulicism` | 12,412 | 1895 / 2685 | 204 / 248 | — |
-| `acc` (3 chars: title prefix path) | 12,907 | 1117 / 1374 | 210 / 239 | 52 / 62 |
-| `account` | 42,148 | 1285 / 1490 | 652 / 756 | 294 / 325 |
+### Storage and write cost (420k customers / 310.5k published articles)
 
-† The LEAKPROOF figures come from the same scripts, measured on this container with the three
-functions marked LEAKPROOF and GIN indexes `(org_id, email gin_trgm_ops)`,
-`(org_id, name gin_trgm_ops)`, `(org_id, search_tsv)`, and `(org_id, title gin_trgm_ops)`
-(btree_gin), then reverted. ‡ These were measured on an earlier article corpus with the same
-volume and a different vocabulary, on words of similar document frequency, so they are
-indicative only.
+| | Rows | Heap | PK | Other indexes | Total | Per row | Per entity |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `customer_search_grams` | 22.2M (52.8 per customer) | 1444 MB | 1249 MB | 161 MB | **2.86 GB** | 135 B | **7.1 kB** per customer |
+| `knowledge_search_terms` | 51.4M (165 per article) | 3615 MB | 3293 MB | 350 + 278 MB | **7.54 GB** | 154 B | **25 kB** per published article |
+| for comparison: `customers` / `knowledge_articles` | | | | | 178 MB / 1290 MB | | 0.4 kB / 3.7 kB |
 
-What remains slow is the work the result size requires, not finding the rows. A query matching
-N rows must fetch and rank all N (`ORDER BY similarity` / `ts_rank` over the whole match set),
-and so must the GIN plan. GIN fetches in physical order from a bitmap; this design fetches by id,
-which costs about twice as much per row. The email query is the outlier: its 35 trigrams fuzzy-
-match every "… Straski" customer, so about 18k candidates need a heap recheck.
+**This misses the storage aim.** The cost is per row:
+- a heap tuple header and two uuids, about 68 B;
+- a unique btree entry, about 56 B;
+- a deduplicated FK index entry, about 8 B.
 
-### Storage and write cost (420k customers / 345k articles)
+Row counts are close to the minimum for exactness: one row per character position for substring
+search, one per trigram, one per distinct lexeme. Fewer rows would mean prefix-only matching,
+which is not identical below the cap. Smaller rows would mean surrogate integer keys, saving
+about 18%. Neither reaches "well below".
 
-| | rows | heap + PK + FK index | per entity | LEAKPROOF+GIN equivalent |
-|---|---:|---:|---:|---:|
-| `customer_search_grams` | 22.2M (53 per customer) | 2.86 GB | ≈ 6.8 kB | 49 MB (two trigram GINs) |
-| `knowledge_search_terms` | 57.1M (165 per article) | 7.7 GB | ≈ 22 kB | 200 MB (tsvector + title GIN) |
-| for comparison: `customers` / `knowledge_articles` | | 200 MB / 1.28 GB | 0.5 kB / 3.7 kB | |
+GIN stores the same postings compressed, at about 1 to 2 B each: about 49 MB for customers and
+200 MB for articles. GIN is usable only with LEAKPROOF (Human hand-off).
 
-Most of the size is per-row overhead: a heap tuple header and a full btree entry for every
-(entity, gram) pair, where GIN stores compressed posting lists. At today's production volumes
-(tens of customers) this is negligible. At 10k customers it is about 70 MB; at 2k articles, about
-45 MB. Writes: inserting a customer goes from 0.02 ms to 1 ms (53 grams), and inserting an
-article from 0.4 ms to 4 ms. Updates that change no searchable text cost nothing extra.
+At today's production volumes (tens of customers), the cost is negligible. At 10k customers it is
+about 70 MB; at 2k articles, about 50 MB.
+
+Writes, measured on the 420k / 345k database:
+- Inserting a customer goes from 0.24 ms to 3 ms.
+- Inserting a published article goes from 0.3 ms to about 36 ms. The cold-cache btree inserts
+  into multi-GB indexes dominate this; on small tables it is a few ms.
+- An update that changes no searchable text costs nothing extra (0.1 ms per row).
 
 ## Invariants impact
 
-- **Append-only migrations:** a new `0004`; nothing applied is edited.
-- **Additive, previous release compatible:** the old binary never reads the new tables, but its
-  writes fire the triggers, so the index stays correct while it runs (`raw_sql_writes_are_indexed`).
-  Its deletes cascade.
-- **Tenant isolation:** both tables have `org_id`, enable and force RLS, carry
-  `<table>_tenant_isolation`, and are granted to `otto_app`. Composite `(org_id, x_id)` FKs
-  cover them. They are added to every check in `tests/db.rs` (isolation report, cross-org,
-  unpinned, maintenance marker, composite FKs, grants) and to the purge tests in
-  `tests/lifecycle.rs`.
-- **No bypass:** the triggers are `SECURITY INVOKER`, nothing is `SECURITY DEFINER`, and nothing
-  is marked LEAKPROOF.
-- **No SQL outside cxp-core; runtime `query`/`query_as` only:** unchanged.
-- **Untrusted text:** queries are bound parameters. Gram text is derived data that never reaches a
-  response.
-- **Small shared database:** see Storage. No unbounded lists: results are still `LIMIT`ed, and
-  candidate arrays are bounded by the org's own rows.
-- **No GIN index:** `tests/db.rs` still forbids them, and none is added.
+- **Append-only:** 0004 is new and still unmerged. Nothing on `main` changes.
+- **Additive; the previous release keeps working:**
+  - It never reads the new tables or columns.
+  - Its writes fire the triggers, so the index stays correct (`raw_sql_writes_are_indexed`).
+  - Its inserts take the new column's default `true`.
+- **Tenant isolation:** both tables have `org_id`, ENABLE and FORCE RLS, a `_tenant_isolation`
+  policy, and grants to `otto_app`. Composite `(org_id, x_id)` FKs cover them. They are in every
+  check in `tests/db.rs` and in `PURGED_TABLES` (children first, `tests/lifecycle.rs`).
+- **No bypass:** the triggers are `SECURITY INVOKER`; nothing is `SECURITY DEFINER` or LEAKPROOF.
+  The backlog runs in the org's pinned transaction.
+- **Request paths use `begin_live`:** unchanged. A search's backlog batch runs inside it.
+  Searches now write (index rows of their own org) as well as read. The MCP tools stay
+  `read_only_hint`, since nothing a caller can see changes.
+- **No SQL outside cxp-core:** unchanged. Only runtime `query`/`query_as` is used.
+- **Small shared database:** every read is bounded (Semantics). The pool is unchanged. Storage
+  is discussed above.
+- **Untrusted text:** queries are bind parameters. Grams never reach a response.
 
 ## Migration
 
-`0004_search_index_tables.sql`: functions, tables, policies, triggers, an RLS-role guard, a
-backfill, and grants. It runs at boot under sqlx's advisory lock. On production volumes the
-backfill takes milliseconds. On large data it is slow, because of row-by-row FK checks
-(`seed.sql` loads in bulk instead).
+`0004_search_index_tables.sql` contains:
+- the helper functions;
+- two tables with FORCE RLS and policies;
+- `search_indexed` columns and partial indexes;
+- triggers and grants.
+
+It needs no superuser and no BYPASSRLS, and reads no tenant rows. `ALTER TABLE … ADD COLUMN …
+DEFAULT false` takes a brief ACCESS EXCLUSIVE lock and does not rewrite the table. Building the
+backlog partial index reads both tables once (milliseconds at production volumes). The
+migration runs at boot under sqlx's advisory lock.
 
 ## Out-of-band
 
-- None needed for this design: no new config, secret, or scope.
-- **Ordering with #16 (least-privilege role):** the backfill needs RLS-exempt privileges. If #16's
-  role switch reaches production before this migration runs, the migration refuses to apply and
-  the deploy stops at boot. Either deploy this first, or exempt the role for one boot (Human
-  hand-off 2).
+None. There is no new config, secret, or scope. Deploy order with #16 no longer matters: this
+works under `cxp_server` as it is today.
 
 ## Error handling & edge cases
 
-- An empty or whitespace query is `Invalid`, as before. The knowledge base keeps its
-  200-character cap.
-- Queries under four characters take the prefix path (a range scan over every window starting
-  with them). That is correct, but it is as slow as the match set is large (`ab`: 316 ms).
-- `pg_trgm.similarity_threshold` is honoured, including 0 (fallback to the org's customers).
-- A NULL name has no grams and never fuzzy-matches, as `%` returns NULL.
-- Non-ASCII text, LIKE wildcards, and the escape character are covered by the oracle tests.
-- A `pg_trgm` upgrade that changed `show_trgm` output would leave stored `t` grams stale. The
-  oracle tests catch that in CI; the fix is a migration that rebuilds the table.
+- An empty query is `Invalid`. The knowledge base keeps its 200-character cap.
+- Queries under four characters take the prefix path, bounded like the rest.
+- `pg_trgm.similarity_threshold` is honored. Thresholds of 0 and below use the org's customers as
+  candidates (bounded, so a large org is capped).
+- A NULL name has no trigrams and never fuzzy-matches, as `%` returns NULL.
+- Unpublished articles have no index rows. Publishing or unpublishing re-indexes.
+- A row locked by a writer is skipped by the backlog and indexed by a later search. Meanwhile it
+  is read directly.
+- A `pg_trgm` upgrade that changed `show_trgm` would leave stored trigrams stale. The equivalence
+  tests catch that, and the fix is a migration that rebuilds the table.
 
 ## Testing approach
 
-Oracle tests compare each indexed search with the pre-#17 SQL, run in the same transaction, and
-repeat each set so most comparisons run on the generic plan:
-
-- `tests/customers.rs`: 60 queries over a mixed corpus in two orgs, five thresholds, and 300
-  near-identical generated names at three thresholds. Writes and raw-SQL writes are covered too.
-- `tests/support.rs`: 54 article queries (stemming, stop words, hyphens, URLs, non-ASCII, title
-  substrings of every length), and edits and deletes.
-
-Mutation checks were run by hand: disabling the short-query path, removing the fuzzy slack, or
-probing one trigram too few each fail these tests. Isolation and purge are covered as listed
-under Invariants.
+- **Equivalence below the cap** (ids, order, total, `totalCapped == false`) against the pre-#17
+  SQL, in `tests/common`'s `customers_both_ways` / `articles_both_ways`:
+  - 60 customer queries over a mixed corpus, five thresholds, and 300 near-threshold names at
+    three thresholds;
+  - 54 article queries.
+- **Cap behavior:**
+  - `search_counts_up_to_the_cap`: 1,100 matches → 1000, capped, ordered page, an edge page of
+    10, an empty page past the cap; exactly 1000 matches → exact and uncapped; sub-cap queries
+    among them stay exact.
+  - `article_search_counts_up_to_the_cap`: one word is still the scan's page; several words give
+    matches in `ts_rank` order; sub-cap queries stay exact.
+- **Least privilege:** `the_index_is_built_per_org_under_a_least_privilege_owner`:
+  - migrations 0001–0003 and seed rows in two orgs, all as a NOSUPERUSER NOBYPASSRLS owner;
+  - 0004 as that owner indexes nothing;
+  - searches are exact while the backlog is read directly and indexed a batch at a time;
+  - batches are bounded and per org;
+  - at the end, every row is indexed.
+- **Writes, isolation, purge, grants:** as in the first version (`tests/db.rs`,
+  `tests/lifecycle.rs`).
+- **Wire:** the MCP tests assert `total` and `totalCapped` on both search tools and their absence
+  on other lists. The REST test asserts the headers.
 
 ## Risks & open questions
 
-- **The ~50 ms criterion is not met for broad queries** (thousands of matches), either here or
-  with LEAKPROOF+GIN. Reaching it would need a semantic change: a bounded top-k without exact
-  global ranking, or prefix-only search. That is Rob's call and is not done here.
-- **Storage** at large-org scale is 15 to 40 times the GIN alternative. If Rob prefers LEAKPROOF,
-  a follow-up migration can drop both tables and their triggers, and these queries revert to the
-  plain predicate plus GIN indexes.
-- The backfill's role guard ties deploy order to #16 (see Out-of-band).
+- **Long fuzzy queries in large orgs are not exact below the cap.** The exact-email query is the
+  example: `totalCapped` says so, and the exact email is still first. The fix is LEAKPROOF (below).
+- **Broad customer pages are not "newest first".** Storing `created_at` in the index (about
+  +0.4 kB per customer) would fix it. Open question for Rob.
+- **Storage** is about 30 to 100 times that of GIN. The LEAKPROOF route would let a follow-up drop
+  the `t` and `l` rows: most of the article table and a quarter of the customer table.
+- **Searches write.** The first search of an org that predates 0004 pays for one backlog batch.
+  At production volumes this is a few ms, once.
 
 ## Human hand-off (Rob)
 
-1. **Decide whether to keep this design or switch to LEAKPROOF + GIN.** Neither is needed before
-   merge: this change is correct and safe as it stands.
+**Not needed for the latency target, and nothing is needed before merge.** One optional
+decision remains: whether to make long fuzzy customer queries exact, and later shrink storage,
+by marking pg_trgm's `similarity_op` LEAKPROOF in the `otto_cxp` database. A follow-up change
+would then add a GIN `(name gin_trgm_ops)` index and use it for queries with many trigrams. This
+change does neither.
 
-   LEAKPROOF, if chosen, needs a superuser connected to the `otto_cxp` database only:
+```sql
+-- as a superuser, connected to otto_cxp only:  fly postgres connect -a otto-db -d otto_cxp
+ALTER FUNCTION public.similarity_op(text, text) LEAKPROOF;   -- pg_trgm's %
+```
 
-   ```sql
-   -- fly postgres connect -a otto-db -d otto_cxp   (as postgres)
-   ALTER FUNCTION pg_catalog.texticlike(text, text) LEAKPROOF;      -- ILIKE
-   ALTER FUNCTION public.similarity_op(text, text) LEAKPROOF;       -- pg_trgm %
-   ALTER FUNCTION pg_catalog.ts_match_vq(tsvector, tsquery) LEAKPROOF; -- @@
-   ```
+Security reasoning:
 
-   It then needs a migration that adds `btree_gin` and four GIN indexes and drops this change's
-   tables, plus a change to `tests/db.rs`'s "no GIN index" rule. Security reasoning:
-   - **What "leakproof" promises.** The function reveals nothing about its arguments except
-     through its return value. Under RLS it may then run on rows the policy has not yet filtered
-     out, here other orgs' rows that a GIN index returns. The usual leak is an error, a notice,
-     or a timing difference that depends on the row's value.
-   - **`texticlike`.** Its errors (invalid escape, pattern ending in the escape character) depend
-     only on the pattern, which is the caller's own query. No error depends on the stored text.
-   - **`similarity_op`.** It builds trigrams of both strings and compares counts. It raises no
-     data-dependent error.
-   - **`ts_match_vq`.** It evaluates a parsed query against a stored vector and raises no
-     data-dependent error.
-   - **Timing.** Timing differs with row content for all three, but leakproofness never covered
-     timing, and the bitmap or index scan's own timing already varies with other orgs' data.
-   - **Residual risks.**
-     - Core Postgres has not audited these functions as leakproof.
-     - A future Postgres or pg_trgm release could add a data-dependent error path.
-     - The flag lives in this database's `pg_proc` only, so it is lost on dump/restore, a
-       `pg_upgrade` to a new major version, or an extension upgrade. Search would then silently
-       become slow again (never wrong). A boot check could detect that.
-     - It affects only `otto_cxp`, not the other databases on `otto-db`.
-2. **Deploy order with #16.** Today the connecting role is a superuser, so 0004 backfills on its
-   first boot with nothing to do by hand. If #16 has already switched production to a role that
-   RLS binds, 0004 refuses with `migration 0004 must run as a superuser or BYPASSRLS role …` and
-   the deploy fails its readiness check (the previous release keeps serving). Then, as a
-   superuser on `otto_cxp`, lift the exemption for that one boot:
+- **What "leakproof" promises.** The function reveals nothing about its arguments except through
+  its return value. Under RLS it may then run on rows that the policy has not yet filtered out,
+  here other orgs' names returned by a GIN index.
+- **`similarity_op`.** It builds the trigrams of both strings and compares the counts. It raises
+  no error that depends on the data.
+- **Timing.** Timing varies with the row's content, but leakproofness never covered timing. An
+  index scan's own timing already varies with other orgs' data.
+- **Residual risks.**
+  - Core Postgres has not audited this function as leakproof.
+  - A future pg_trgm release could add a data-dependent error.
+  - The flag lives only in this database's `pg_proc`. Dump/restore, `pg_upgrade`, or
+    `ALTER EXTENSION pg_trgm UPDATE` would lose it, and search would then fall back to this
+    design (never wrong). A boot check could warn when that happens.
+  - Nothing outside `otto_cxp` is affected.
 
-   ```sql
-   ALTER ROLE <cxp connecting role> BYPASSRLS;   -- before redeploying
-   -- redeploy; confirm "applying migrations" and the boot lines in fly logs
-   ALTER ROLE <cxp connecting role> NOBYPASSRLS; -- right after
-   ```
-
-   Simplest: let 0004 deploy before #16 switches the role.
+Measured on this benchmark with the flag set and a GIN name index (then reverted): the
+exact-email fuzzy lookup took 33 ms and was exact, but `ab` took 106 ms (GIN reads every name
+starting with "a"). Any follow-up must therefore keep this design for short queries.

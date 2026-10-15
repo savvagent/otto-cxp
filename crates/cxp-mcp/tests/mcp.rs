@@ -429,13 +429,16 @@ async fn list_tools_return_items_and_total(pool: PgPool) {
         .unwrap();
     assert_ne!(page["items"][0]["id"], next["items"][0]["id"]);
 
-    // A search has no count: `total` is omitted, not null.
+    // A search counts its matches up to 1000 and says whether it stopped
+    // there (#17); other lists carry no `totalCapped`.
     let found = h
         .tool(&writer, "search_customers", json!({"query": "ada"}))
         .await
         .unwrap();
     assert_eq!(found["items"][0]["email"], "ada@example.com", "{found}");
-    assert!(found.get("total").is_none(), "{found}");
+    assert_eq!(found["total"], 1, "{found}");
+    assert_eq!(found["totalCapped"], false, "{found}");
+    assert!(page.get("totalCapped").is_none(), "{page}");
 
     // A bad JSON argument is invalid_argument, not internal.
     let bad = h
@@ -785,6 +788,8 @@ async fn knowledge_articles_and_unknown_uris(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(found["items"][0]["id"], article.id.to_string(), "{found}");
+    assert_eq!(found["total"], 1, "{found}");
+    assert_eq!(found["totalCapped"], false, "{found}");
 
     for bad in ["file:///etc/passwd", "knowledge://articles/not-a-uuid"] {
         let refused = h

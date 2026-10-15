@@ -129,34 +129,39 @@ SELECT o.org,
        'general', g % 10 <> 0, now() - make_interval(secs => g * 61)
 FROM orgs o CROSS JOIN LATERAL generate_series(1, o.articles) g;
 
-ALTER TABLE customers ENABLE TRIGGER USER;
-ALTER TABLE knowledge_articles ENABLE TRIGGER USER;
-
--- The search index, in bulk: keys dropped, rows inserted, keys rebuilt.
+-- The search index, in bulk: keys dropped, rows inserted, keys rebuilt, and
+-- every row marked indexed (what cxp_core's per-org backlog indexing does a
+-- batch at a time, through the triggers).
+ALTER TABLE customers DISABLE TRIGGER USER;
+ALTER TABLE knowledge_articles DISABLE TRIGGER USER;
 ALTER TABLE customer_search_grams DISABLE TRIGGER ALL;
 ALTER TABLE knowledge_search_terms DISABLE TRIGGER ALL;
 ALTER TABLE customer_search_grams DROP CONSTRAINT customer_search_grams_pkey;
 DROP INDEX customer_search_grams_org_customer_idx;
 ALTER TABLE knowledge_search_terms DROP CONSTRAINT knowledge_search_terms_pkey;
 DROP INDEX knowledge_search_terms_org_article_idx;
+DROP INDEX knowledge_search_terms_frequent_idx;
 TRUNCATE customer_search_grams, knowledge_search_terms;
 INSERT INTO customer_search_grams (org_id, customer_id, gram, name_grams)
 SELECT c.org_id, c.id, g, cardinality(show_trgm(coalesce(c.name, '')))
 FROM customers AS c, customer_search_grams_of(c.email, c.name) AS g;
-
-INSERT INTO knowledge_search_terms (org_id, article_id, term)
-SELECT a.org_id, a.id, t
-FROM knowledge_articles AS a, knowledge_search_terms_of(a.title, a.search_tsv) AS t;
-
+INSERT INTO knowledge_search_terms (org_id, article_id, term, tf)
+SELECT a.org_id, a.id, t.term, t.tf
+FROM knowledge_articles AS a, knowledge_search_terms_of(a.title, a.search_tsv) AS t WHERE a.published;
 ALTER TABLE customer_search_grams ADD PRIMARY KEY (org_id, gram, customer_id) INCLUDE (name_grams);
 CREATE INDEX customer_search_grams_org_customer_idx ON customer_search_grams (org_id, customer_id);
-ALTER TABLE knowledge_search_terms ADD PRIMARY KEY (org_id, term, article_id);
+ALTER TABLE knowledge_search_terms ADD PRIMARY KEY (org_id, term, article_id) INCLUDE (tf);
 CREATE INDEX knowledge_search_terms_org_article_idx ON knowledge_search_terms (org_id, article_id);
+CREATE INDEX knowledge_search_terms_frequent_idx
+  ON knowledge_search_terms (org_id, term, tf DESC, article_id) WHERE tf >= 2;
+UPDATE customers SET search_indexed = true;
+UPDATE knowledge_articles SET search_indexed = true;
+ALTER TABLE customers ENABLE TRIGGER USER;
+ALTER TABLE knowledge_articles ENABLE TRIGGER USER;
 ALTER TABLE customer_search_grams ENABLE TRIGGER ALL;
 ALTER TABLE knowledge_search_terms ENABLE TRIGGER ALL;
-
-VACUUM ANALYZE customers;
-VACUUM ANALYZE knowledge_articles;
+VACUUM (FULL, ANALYZE) customers;
+VACUUM (FULL, ANALYZE) knowledge_articles;
 VACUUM ANALYZE customer_search_grams;
 VACUUM ANALYZE knowledge_search_terms;
 SELECT relname, n_live_tup, pg_size_pretty(pg_total_relation_size(relid)) AS size

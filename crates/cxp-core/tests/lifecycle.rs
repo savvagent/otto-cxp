@@ -318,7 +318,9 @@ async fn seed(db: &Db, org: OrgId, team: Uuid) {
     .await;
     exec(
         &mut tx,
-        "INSERT INTO knowledge_articles (org_id, title, content) VALUES ($1, 'Refunds', 'How')",
+        // Published, so the search index holds it too.
+        "INSERT INTO knowledge_articles (org_id, title, content, published) \
+         VALUES ($1, 'Refunds', 'How', true)",
         &[o],
     )
     .await;

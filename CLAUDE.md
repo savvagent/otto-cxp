@@ -47,7 +47,9 @@ is a JSON 404.
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
   `begin_live`), `usage` (metering, outbox shipper), `console_sessions` (the web console's sign-in
   sessions; tokens sealed with an HKDF subkey of `CXP_ENCRYPTION_KEY`; refresh by lease +
-  compare-and-swap), `sealed` (`nonce || ciphertext`), `maintenance` (the only cross-org access).
+  compare-and-swap), `sealed` (`nonce || ciphertext`), `search` (#17: the search index tables'
+  bounds, a count capped at 1000 with `totalCapped`, and the per-org backlog of rows written before
+  migration 0004, indexed a batch per search), `maintenance` (the only cross-org access).
 - `cxp-http` - the axum side of auth, shared by `/mcp` and `/api/v1`: `Authenticator`, `require_bearer`,
   `refuse`, and the `/.well-known/oauth-protected-resource` router; `console/` (the PKCE sign-in
   against the platform, `/auth/*`, the session cookie, a token refresh coalesced in memory and

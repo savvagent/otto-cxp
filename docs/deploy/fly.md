@@ -50,8 +50,9 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   Customer and knowledge-base search run under RLS, whose per-row policy checks keep the
   planner off index paths for `ILIKE`, `%`, and `@@`; since
   [#17](https://github.com/savvagent/otto-cxp/issues/17) they look candidates up in their own
-  search index tables (migration 0004) and cap the work per query
-  (`docs/specs/2026-10-14-search-under-rls-design.md`). The pool is
+  search index tables (migration 0004), read a bounded number of rows per query, and count
+  matches up to 1000 (`docs/specs/2026-10-14-search-under-rls-design.md`). The index costs about
+  7 kB per customer and 25 kB per published article. The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
