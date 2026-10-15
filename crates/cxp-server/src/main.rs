@@ -23,18 +23,23 @@ fn main() -> Result<()> {
     // Decided before anything else, so a mistyped release command never
     // falls through to serving.
     const USAGE: &str = "usage: cxp-server [migrate]";
-    let migrating = match std::env::args().nth(1).as_deref() {
+    // args_os: an argument that is not UTF-8 is reported, not a panic.
+    let mut args = std::env::args_os().skip(1);
+    let migrating = match args.next() {
         None => false,
-        Some("migrate") => true,
+        Some(arg) if arg == "migrate" => true,
         Some(other) => anyhow::bail!("unknown argument {other:?}; {USAGE}"),
     };
-    if let Some(extra) = std::env::args().nth(2) {
+    if let Some(extra) = args.next() {
         anyhow::bail!("unexpected argument {extra:?}; {USAGE}");
     }
     if !migrating {
         // Does not return when it had something to remove.
         secret_env::reexec_without_migration_secret()?;
     }
+    // Read and removed before anything else reads the environment (and
+    // before .env, which never overrides a set variable).
+    let reexecuted = secret_env::take_reexec_marker();
     // Never overrides a variable already set, so a deployment's environment
     // always wins over a stray .env.
     let dotenv = dotenvy::dotenv();
@@ -49,7 +54,7 @@ fn main() -> Result<()> {
     if let Ok(path) = dotenv {
         tracing::debug!(path = %path.display(), "loaded .env");
     }
-    if !migrating && (secret_env::was_reexecuted() || forgot_dotenv_secret) {
+    if !migrating && (reexecuted || forgot_dotenv_secret) {
         tracing::info!(
             "removed {} from the serving process's environment; only cxp-server migrate uses it",
             secret_env::MIGRATION_SECRET

@@ -27,7 +27,9 @@ use std::ffi::{OsStr, OsString};
 pub const MIGRATION_SECRET: &str = "CXP_MIGRATION_DATABASE_URL";
 
 /// Set in the re-executed process's environment, so its boot can log that the
-/// secret was removed (the new process cannot otherwise tell).
+/// secret was removed (the new process cannot otherwise tell). Read once and
+/// removed ([`take_reexec_marker`]), so a stale copy cannot mislead anything
+/// that reads the environment later.
 pub const SCRUBBED_MARKER: &str = "CXP_MIGRATION_SECRET_REMOVED";
 
 /// The environment to re-execute with, or `None` when `vars` holds no
@@ -56,18 +58,27 @@ where
 /// any thread starts (it is the first thing `main` does when serving).
 #[cfg(unix)]
 pub fn reexec_without_migration_secret() -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
     use anyhow::Context;
     use std::os::unix::process::CommandExt;
 
     let Some(env) = without_migration_secret(std::env::vars_os()) else {
         return Ok(());
     };
+    // /proc/self/exe is the running image itself, even if its path has
+    // since been replaced or removed; current_exe() resolves that link to a
+    // path, which could by now name another binary.
+    #[cfg(target_os = "linux")]
+    let exe = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
     let exe = std::env::current_exe().context("could not find this executable to re-exec")?;
-    let err = std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env_clear()
-        .envs(env)
-        .exec();
+    let mut args = std::env::args_os();
+    let mut command = std::process::Command::new(exe);
+    // Keep argv[0] as it was, rather than the path exec was given.
+    if let Some(arg0) = args.next() {
+        command.arg0(arg0);
+    }
+    let err = command.args(args).env_clear().envs(env).exec();
     // exec returns only on failure. Refuse to serve rather than carry on with
     // the owner's credential in memory.
     Err(anyhow::Error::new(err).context(format!(
@@ -93,9 +104,15 @@ pub fn forget_migration_secret() -> bool {
     present
 }
 
-/// Whether this process is the re-executed copy (see [`SCRUBBED_MARKER`]).
-pub fn was_reexecuted() -> bool {
-    std::env::var_os(SCRUBBED_MARKER).is_some()
+/// Whether this process is the re-executed copy (see [`SCRUBBED_MARKER`]),
+/// removing the marker from the environment either way. Call once, while the
+/// process has one thread.
+pub fn take_reexec_marker() -> bool {
+    let present = std::env::var_os(SCRUBBED_MARKER).is_some();
+    if present {
+        std::env::remove_var(SCRUBBED_MARKER);
+    }
+    present
 }
 
 #[cfg(test)]

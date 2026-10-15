@@ -52,6 +52,14 @@ fn a_serving_process_reexecutes_without_the_migration_secret() {
         {
             break env;
         }
+        // A child that exited early (a refused config, a failed exec) never
+        // shows the marker: say why rather than wait out the deadline.
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the serving process exited early ({status}): {}",
+                output_of(&mut child)
+            );
+        }
         assert!(
             Instant::now() < deadline,
             "the serving process did not re-execute itself"
@@ -71,25 +79,25 @@ fn a_serving_process_reexecutes_without_the_migration_secret() {
 
     let _ = child.kill();
     let _ = child.wait();
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
+    let out = output_of(&mut child);
     assert!(!out.contains(SECRET), "logged: {out}");
     assert!(
         out.contains("removed CXP_MIGRATION_DATABASE_URL from the serving process's environment"),
         "{out}"
     );
     drop(silent);
+}
+
+/// Everything an exited `child` wrote, stdout then stderr.
+fn output_of(child: &mut std::process::Child) -> String {
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_string(&mut out).unwrap();
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        stderr.read_to_string(&mut out).unwrap();
+    }
+    out
 }
 
 /// `migrate` keeps it: it is the one command that needs it. With no database
