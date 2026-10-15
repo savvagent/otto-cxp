@@ -1,16 +1,19 @@
-//! Migration 0004 and the search index's backlog under the role production
-//! connects as (#16, #17): a login role that is not a superuser and not
-//! BYPASSRLS, owns the database, and is a member of `otto_app`. Row-level
-//! security binds it, so the migration can read no org's rows; the rows
-//! that predate the index are indexed afterwards, one org at a time, in that
-//! org's own pinned transactions.
+//! Migration 0004 under the role production connects as (#16, #17): a
+//! login role that is not a superuser and not BYPASSRLS, owns the database,
+//! and is a member of `otto_app`. Row-level security binds it, so the
+//! migration sees no org's rows and indexes none: rows that predate 0004
+//! stay unindexed, and search does not find them, until an ordinary write
+//! indexes them (the update below, one org at a time in that org's own
+//! pinned transaction, or the superuser rebuild in docs/deploy/fly.md).
+//! Since #34 search reads no backlog of such rows; production had none.
 
 mod common;
 
 use std::borrow::Cow;
 
 use common::{articles_both_ways, customers_both_ways, org};
-use cxp_core::search::{index_backlog, Indexed};
+use cxp_core::customers::CustomersExt;
+use cxp_core::knowledge::KnowledgeExt;
 use cxp_core::Page;
 use otto_tenant::ids::OrgId;
 use otto_tenant::Db;
@@ -144,6 +147,22 @@ async fn search_is_exact(db: &Db, org: OrgId) {
     tx.commit().await.unwrap();
 }
 
+/// Index this org's rows that predate the index, as any write to them
+/// would: setting the flag fires the sync triggers.
+async fn index_org(db: &Db, org: OrgId) {
+    let mut tx = db.begin(org).await.unwrap();
+    for table in ["customers", "knowledge_articles"] {
+        sqlx::query(&format!(
+            "UPDATE {table} SET search_indexed = true WHERE org_id = $1"
+        ))
+        .bind(org)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
 #[sqlx::test(migrations = false)]
 async fn the_index_is_built_per_org_under_a_least_privilege_owner(pool: PgPool) {
     let role = format!("cxp_search_{}", Uuid::new_v4().simple());
@@ -190,56 +209,35 @@ async fn build_under(pool: PgPool, role: String) {
         180
     );
 
-    // Org A's first searches index its backlog a batch at a time, and are
-    // exact meanwhile: what is not indexed yet is read directly.
-    search_is_exact(&db, a).await;
-    let left = |kind: &str| {
+    // Search reads only the index, so org A's rows that predate it are not
+    // found yet.
+    let mut tx = db.begin(a).await.unwrap();
+    assert!(tx
+        .search_customers("grace", Page::default())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert!(tx.search_articles("gadget").await.unwrap().items.is_empty());
+    tx.commit().await.unwrap();
+
+    // An ordinary write indexes them: the triggers write the index rows.
+    index_org(&db, a).await;
+    let left = |table: &str, org: OrgId| {
         format!(
-            "SELECT count(*) FROM {kind} WHERE NOT search_indexed AND org_id = '{}'",
-            a.as_uuid()
+            "SELECT count(*) FROM {table} WHERE NOT search_indexed AND org_id = '{}'",
+            org.as_uuid()
         )
     };
-    // Seven customer searches, 50 each; five article searches, 10 each.
-    assert_eq!(count(&pool, &left("customers")).await, 0);
-    assert_eq!(count(&pool, &left("knowledge_articles")).await, 80);
+    assert_eq!(count(&pool, &left("customers", a)).await, 0);
+    assert_eq!(count(&pool, &left("knowledge_articles", a)).await, 0);
+    // Org B's rows are untouched by A's update (row-level security).
+    assert_eq!(count(&pool, &left("customers", b)).await, 30);
     search_is_exact(&db, a).await;
-    assert_eq!(count(&pool, &left("knowledge_articles")).await, 30);
-    let mut tx = db.begin(a).await.unwrap();
-    while index_backlog(&mut tx, Indexed::KnowledgeArticles, 25)
-        .await
-        .unwrap()
-        > 0
-    {}
-    tx.commit().await.unwrap();
-    assert_eq!(count(&pool, &left("knowledge_articles")).await, 0);
 
-    // Org B's backlog is untouched by A's work (row-level security), and
-    // indexes in bounded batches of its own.
-    let b_left = format!(
-        "SELECT count(*) FROM customers WHERE NOT search_indexed AND org_id = '{}'",
-        b.as_uuid()
-    );
-    assert_eq!(count(&pool, &b_left).await, 30);
-    let mut batches = 0;
-    loop {
-        let mut tx = db.begin(b).await.unwrap();
-        let n = index_backlog(&mut tx, Indexed::Customers, 7).await.unwrap();
-        tx.commit().await.unwrap();
-        assert!(n <= 7);
-        if n == 0 {
-            break;
-        }
-        batches += 1;
-    }
-    assert_eq!(batches, 5, "30 rows, 7 at a time");
-    assert_eq!(count(&pool, &b_left).await, 0);
-    let mut tx = db.begin(b).await.unwrap();
-    while index_backlog(&mut tx, Indexed::KnowledgeArticles, 7)
-        .await
-        .unwrap()
-        > 0
-    {}
-    tx.commit().await.unwrap();
+    index_org(&db, b).await;
+    assert_eq!(count(&pool, &left("customers", b)).await, 0);
+    search_is_exact(&db, b).await;
 
     // Everything is indexed: every customer, and every published article,
     // has index rows, and no unpublished one does.

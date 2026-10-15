@@ -11,8 +11,8 @@ use crate::contains_pattern;
 use crate::error::{Error, Result};
 use crate::paging::Page;
 use crate::search::{
-    self, Hits, Indexed, SearchPage, BACKLOG_READ, DF_PROBE, FULL_TEXT_READ, MAX_QUERY_CHARS,
-    RANKED_PAST_CAP, SUBSTRING_READ, TOTAL_CAP,
+    self, Hits, SearchPage, DF_PROBE, FULL_TEXT_READ, MAX_QUERY_CHARS, RANKED_PAST_CAP,
+    SUBSTRING_READ, TOTAL_CAP,
 };
 
 /// Most articles a search returns.
@@ -49,8 +49,6 @@ const ARTICLE_COLS: &str =
 ///   title itself. Only the articles `fts_hits` already holds are left out
 ///   here: one that has the rarest lexeme but lacks another is not a
 ///   full-text match, yet may still match by title.
-/// - `backlog`: published articles that predate the index, up to
-///   [`BACKLOG_READ`], checked with the whole predicate.
 ///
 /// Ranking needs no `ts_rank` for a one-lexeme query: there it is a strictly
 /// increasing function of the lexeme's count of positions (`tf`), which the
@@ -105,10 +103,6 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
            WHERE NOT EXISTS (SELECT 1 FROM tw WHERE tw.rk IN (2, 3) AND NOT EXISTS ( \
                    SELECT 1 FROM knowledge_search_terms t \
                    WHERE t.org_id = $1 AND t.term = tw.gram AND t.article_id = r.article_id)) \
-         ), backlog AS MATERIALIZED ( \
-           SELECT id AS article_id FROM knowledge_articles \
-           WHERE org_id = $1 AND published AND NOT search_indexed \
-           LIMIT {backlog} \
          ), fts_hits AS MATERIALIZED ( \
            SELECT r.article_id, r.tf FROM fts_read r \
            WHERE NOT EXISTS (SELECT 1 FROM lxr WHERE lxr.rk > 1 AND NOT EXISTS ( \
@@ -135,15 +129,7 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
                AND (x.fts OR EXISTS ( \
                  SELECT 1 FROM knowledge_articles a \
                  WHERE a.org_id = $1 AND a.id = h.article_id AND a.published \
-                   AND a.title ILIKE $3)) \
-             UNION ALL \
-             SELECT a.id, a.search_tsv @@ tsq.q, \
-                    (SELECT coalesce(cardinality(u.positions), 1)::smallint \
-                     FROM unnest(a.search_tsv) AS u \
-                     WHERE 'l' || u.lexeme = (SELECT term FROM lxr WHERE rk = 1)) \
-             FROM backlog b, tsq, knowledge_articles a \
-             WHERE a.org_id = $1 AND a.id = b.article_id AND a.published \
-               AND (a.search_tsv @@ tsq.q OR a.title ILIKE $3)) AS u \
+                   AND a.title ILIKE $3))) AS u \
            LIMIT {cap_read} \
          ), ranked AS ( \
            SELECT m.article_id, a.created_at, \
@@ -168,13 +154,11 @@ pub(crate) static SEARCH_ARTICLES_SQL: LazyLock<String> = LazyLock::new(|| {
          SELECT least((SELECT count(*) FROM matches), {cap}) AS total, \
                 (SELECT count(*) FROM matches) > {cap} \
                   OR (SELECT count(*) FROM fts_read) > {FULL_TEXT_READ} \
-                  OR (SELECT count(*) FROM title_read) > {SUBSTRING_READ} \
-                  OR (SELECT count(*) FROM backlog) > {BACKLOG_READ} AS capped, \
+                  OR (SELECT count(*) FROM title_read) > {SUBSTRING_READ} AS capped, \
                 ARRAY(SELECT article_id FROM ranked \
                       ORDER BY rank DESC, created_at DESC, article_id LIMIT $4) AS ids",
         fts_read = FULL_TEXT_READ + 1,
         title_read = SUBSTRING_READ + 1,
-        backlog = BACKLOG_READ + 1,
         cap_read = cap + 1,
     )
 });
@@ -312,21 +296,23 @@ impl KnowledgeExt for Tx<'_> {
             )));
         }
         let org = self.org();
-        search::prepare(self, Indexed::KnowledgeArticles).await?;
+        search::prepare(self).await?;
         let hits: Hits = sqlx::query_as(&SEARCH_ARTICLES_SQL)
             .bind(org)
             .bind(query)
             .bind(contains_pattern(query))
             .bind(SEARCH_LIMIT)
             .fetch_one(self.conn())
-            .await?;
+            .await
+            .map_err(search::on_timeout("search_articles"))?;
         let rows: Vec<KnowledgeArticle> = sqlx::query_as(&format!(
             "SELECT {ARTICLE_COLS} FROM knowledge_articles WHERE org_id = $1 AND id = ANY ($2)"
         ))
         .bind(org)
         .bind(&hits.ids)
         .fetch_all(self.conn())
-        .await?;
+        .await
+        .map_err(search::on_timeout("search_articles"))?;
         Ok(SearchPage {
             items: search::in_order(&hits.ids, rows, |a| a.id),
             total: hits.total,

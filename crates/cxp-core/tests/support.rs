@@ -1082,6 +1082,9 @@ async fn random_article_corpora_search_like_the_scan(pool: PgPool) {
         .unwrap();
         titles.push(title);
     }
+    // Queries search answered, and how many of those were uncapped (exact):
+    // a corpus that capped most of them would prove little.
+    let (mut run, mut uncapped) = (0, 0);
     for i in 0..250 {
         let (nw, t) = (1 + rng.below(3), titles[rng.below(titles.len())].clone());
         let q = match i % 3 {
@@ -1095,12 +1098,73 @@ async fn random_article_corpora_search_like_the_scan(pool: PgPool) {
         let Some((found, scanned)) = articles_both_ways(&mut tx, &q).await else {
             continue;
         };
+        run += 1;
+        uncapped += usize::from(!found.capped);
         if found.capped {
             assert!(found.total <= scanned.total, "{q:?}");
         } else {
             assert_eq!(found, scanned, "query {q:?}");
         }
     }
+    // Measured when this bound was set (#34): 250 of 250 uncapped.
+    assert!(uncapped * 5 >= run * 4, "{uncapped} of {run} uncapped");
+}
+
+/// An article search past its `statement_timeout` is `query_too_broad`, as
+/// a customer search is (`a_search_past_its_timeout_is_query_too_broad`).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn an_article_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
+    let su = pool.clone();
+    let db = db(pool);
+    let org = org();
+    // Committed first: an uncommitted insert would hold a lock on the index
+    // table, and the `LOCK TABLE` below would wait on it.
+    let mut tx = db.begin(org).await.unwrap();
+    let art = tx
+        .create_article(&NewArticle {
+            title: "Timeouts".into(),
+            content: "Anything at all".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tx.update_article(
+        art.id,
+        &ArticleUpdate {
+            published: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut lock = su.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    sqlx::query("LOCK TABLE knowledge_search_terms IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let mut tx = db.begin(org).await.unwrap();
+    let started = std::time::Instant::now();
+    let e = tx.search_articles("anything").await.unwrap_err();
+    let waited = started.elapsed();
+    drop(tx);
+    lock.rollback().await.unwrap();
+
+    assert_eq!(e.code(), "query_too_broad", "{e:?}");
+    assert!(e.retriable());
+    let text = e.to_string();
+    assert!(!text.contains("statement"), "{text}");
+    assert!(!text.contains("cancel"), "{text}");
+    assert!(
+        waited >= std::time::Duration::from_millis(1900),
+        "failed after {waited:?}, before the timeout"
+    );
 }
 
 /// A title must fit its limit, on create and on update.

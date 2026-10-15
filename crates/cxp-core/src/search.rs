@@ -1,6 +1,12 @@
 //! What customer and knowledge-base search share (#17): the capped result,
-//! the bounds every search stays within, and the backlog of rows written
-//! before the search index existed.
+//! the bounds every search stays within, and the timeout that backs them.
+//!
+//! There is no backlog of unindexed rows (#34): every row is indexed by its
+//! table's triggers. `search_mark_indexed` (migration 0004) sets
+//! `search_indexed` on every insert and update, and the sync triggers write
+//! the row's index rows with it, so no row can be written unindexed. The
+//! column and its partial indexes remain only because migrations are
+//! additive.
 //!
 //! Under row-level security no index can serve `ILIKE`, pg_trgm's `%`, or
 //! full-text `@@` (none is leakproof), so search looks candidates up in its
@@ -67,10 +73,6 @@ pub(crate) const FULL_TEXT_READ: i64 = 2000;
 /// matches; up to the cap, every match is ranked.
 pub(crate) const RANKED_PAST_CAP: i64 = 200;
 
-/// Most not-yet-indexed rows a search reads directly (see
-/// [`index_backlog`]).
-pub(crate) const BACKLOG_READ: i64 = 200;
-
 /// One page of search results. The contract:
 ///
 /// - `total_capped` false: `items`, their order, and `total` are identical
@@ -96,100 +98,13 @@ pub(crate) struct Hits {
     pub ids: Vec<uuid::Uuid>,
 }
 
-/// The table whose backlog [`index_backlog`] works through. Public only for
-/// the backlog tests (`tests/search_backlog.rs`); searches call it through
-/// [`prepare`].
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Indexed {
-    Customers,
-    KnowledgeArticles,
-}
-
-impl Indexed {
-    fn table(self) -> &'static str {
-        match self {
-            Indexed::Customers => "customers",
-            Indexed::KnowledgeArticles => "knowledge_articles",
-        }
-    }
-
-    /// How many rows of the backlog a search indexes before it searches. A
-    /// customer writes about 50 index rows and an article about 160, so a
-    /// batch is a few hundred to a few thousand index rows: tens of
-    /// milliseconds once, on the volumes otto-cxp holds today.
-    fn batch(self) -> i64 {
-        match self {
-            Indexed::Customers => 50,
-            Indexed::KnowledgeArticles => 10,
-        }
-    }
-
-    /// The order a batch is taken in: the partial backlog index's. Articles
-    /// take published ones first, the only ones search reads.
-    fn batch_order(self) -> &'static str {
-        match self {
-            Indexed::Customers => "id",
-            Indexed::KnowledgeArticles => "published DESC, id DESC",
-        }
-    }
-}
-
-/// Index up to `limit` of this org's rows that predate the search index
-/// (`search_indexed` is false), returning how many it indexed. Setting the
-/// flag is the whole job: the tables' triggers write the index rows.
-///
-/// This is why a search, a `cxp:read` request, may write: it writes only
-/// its own org's index rows (and the flag), which no caller can see, so
-/// the search tools keep `read_only_hint`. Public only for the backlog
-/// tests; searches call it through [`prepare`].
-///
-/// Migration 0004 cannot do this itself: the migrating role is bound by
-/// row-level security (#16) and sees no org's rows. So each org's backlog is
-/// indexed in its own pinned transaction, in bounded batches: every search
-/// indexes one small batch of its org's first, and reads what is left
-/// directly (up to [`BACKLOG_READ`] rows), so search is complete meanwhile.
-/// Rows locked by a concurrent writer are skipped, not waited for, and the
-/// lock taken is `FOR NO KEY UPDATE`, which does not block a concurrent
-/// insert that references the row (a ticket for that customer, say, takes
-/// `FOR KEY SHARE`). Once an org's backlog is empty this is one probe of an
-/// empty partial index.
-///
-/// The batch is chosen once, in a CTE: as an `IN (...)` subquery it can be
-/// run again as the update proceeds, and the lock then skips the rows this
-/// statement already updated and hands out more, past the limit.
-#[doc(hidden)]
-pub async fn index_backlog(tx: &mut Tx<'_>, kind: Indexed, limit: i64) -> Result<u64> {
-    let org = tx.org();
-    let table = kind.table();
-    let order = kind.batch_order();
-    Ok(sqlx::query(&format!(
-        "WITH batch AS MATERIALIZED ( \
-           SELECT id FROM {table} WHERE org_id = $1 AND NOT search_indexed \
-           ORDER BY {order} LIMIT $2 FOR NO KEY UPDATE SKIP LOCKED) \
-         UPDATE {table} t SET search_indexed = true FROM batch \
-         WHERE t.org_id = $1 AND t.id = batch.id"
-    ))
-    .bind(org)
-    .bind(limit)
-    .execute(tx.conn())
-    .await?
-    .rows_affected())
-}
-
 /// Before every search, for the rest of the transaction: JIT off (the
 /// search statements' generic plans carry cost estimates far above
 /// `jit_above_cost`, since the planner cannot see how few index rows a
 /// lookup reads, and compiling them takes longer than running them) and
-/// [`STATEMENT_TIMEOUT`]; then one batch of the org's backlog indexed.
-///
-/// The batch runs under a savepoint. If it fails (a row whose index rows
-/// cannot be written, say), the search must not: the batch is rolled back,
-/// logged with its SQLSTATE only (never the database's text, which may
-/// quote customer data), and the search reads that row directly with the
-/// rest of the backlog. A failure of the savepoint commands themselves
-/// fails the search.
-pub(crate) async fn prepare(tx: &mut Tx<'_>, kind: Indexed) -> Result<()> {
+/// [`STATEMENT_TIMEOUT`]. A search statement past the timeout is
+/// [`Error::QueryTooBroad`] ([`on_timeout`]).
+pub(crate) async fn prepare(tx: &mut Tx<'_>) -> Result<()> {
     sqlx::query("SET LOCAL jit = off")
         .execute(tx.conn())
         .await?;
@@ -198,30 +113,24 @@ pub(crate) async fn prepare(tx: &mut Tx<'_>, kind: Indexed) -> Result<()> {
     ))
     .execute(tx.conn())
     .await?;
-    sqlx::query("SAVEPOINT search_backlog")
-        .execute(tx.conn())
-        .await?;
-    if let Err(e) = index_backlog(tx, kind, kind.batch()).await {
-        let code = match &e {
-            Error::Database(db) => db
-                .as_database_error()
-                .and_then(|d| d.code())
-                .map(|c| c.into_owned()),
-            _ => None,
-        };
-        tracing::warn!(
-            table = kind.table(),
-            code = code.as_deref().unwrap_or("none"),
-            "indexing a batch of the search backlog failed; searching without it"
-        );
-        sqlx::query("ROLLBACK TO SAVEPOINT search_backlog")
-            .execute(tx.conn())
-            .await?;
-    }
-    sqlx::query("RELEASE SAVEPOINT search_backlog")
-        .execute(tx.conn())
-        .await?;
     Ok(())
+}
+
+/// A search statement's failure: past [`STATEMENT_TIMEOUT`] (SQLSTATE
+/// 57014) it is [`Error::QueryTooBroad`], logged at `warn` with the search
+/// it was (never the query, which may be customer data); anything else is
+/// a database error.
+pub(crate) fn on_timeout(search: &'static str) -> impl FnOnce(sqlx::Error) -> Error {
+    move |e| {
+        let timed_out =
+            matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("57014"));
+        if timed_out {
+            tracing::warn!(search, "search hit its statement_timeout");
+            Error::QueryTooBroad
+        } else {
+            Error::Database(e)
+        }
+    }
 }
 
 /// `rows` in the order of `ids` (the order search ranked them in). A row
