@@ -75,7 +75,8 @@ Model: opus (catalog SQL with membership semantics).
 
 - [ ] **Step 1: failing tests** in `crates/cxp-core/tests/db.rs` (reuse `TestRoles`; extend its
   `Drop` to run `REASSIGN OWNED BY <name> TO CURRENT_USER; DROP OWNED BY <name>` per role before
-  `DROP ROLE`, since owner roles now own objects in the test database):
+  `DROP ROLE`, guarded by `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = …)` as
+  `DropRoleOnExit` in `e2e.rs` does, since owner roles now own objects in the test database):
   - `the_database_role_check_sees_what_a_role_owns_and_can_truncate`: as the migrated test
     database:
     - a login that is only a member of `otto_app`: `owned` empty, `owned_total == 0`,
@@ -94,13 +95,13 @@ Model: opus (catalog SQL with membership semantics).
   - `missing_runtime_grants_names_the_tombstone_insert`: superuser → empty; a login in
     `otto_app` only → `["INSERT on deleted_orgs"]`; after `GRANT INSERT ON deleted_orgs TO
     cxp_runtime` (create `cxp_runtime` with the `DO $$ … EXCEPTION WHEN duplicate_object OR
-    unique_violation` pattern, never drop it) and `GRANT cxp_runtime TO <login>` → empty; on an
-    unmigrated database (`#[sqlx::test(migrations = false)]` variant or a fresh `TestRoles`
-    database) → empty.
+    unique_violation` pattern, never drop it) and `GRANT cxp_runtime TO <login>` → empty.
+  - `missing_runtime_grants_is_empty_before_migrations`: a separate
+    `#[sqlx::test(migrations = false)]` test on the unmigrated database → empty.
   - `migration_0005_grants_the_tombstone_insert_to_cxp_runtime`: with `cxp_runtime` existing
     before migrating (`#[sqlx::test(migrations = false)]`, create the role, run
     `cxp_core::migrate`), `has_table_privilege('cxp_runtime', 'deleted_orgs', 'INSERT')` is true.
-  - Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-core --test db the_database_role_check_sees_what missing_runtime migration_0005`
+  - Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-core --test db -- the_database_role_check_sees_what missing_runtime migration_0005`
     — expect compile failure / failures.
 - [ ] **Step 2: implement** in `crates/cxp-core/src/db_role.rs` per the spec's "cxp_core::db_role"
   section: types `OwnedObject { user, kind: &'static str, name, owner }`,
@@ -114,7 +115,8 @@ Model: opus (catalog SQL with membership semantics).
   count; one query for relations (`r`,`p`,`v`,`m`,`f`) in those schemas not owned through
   membership where `has_table_privilege(user, oid, 'TRUNCATE')` or `'TRIGGER'`, `LIMIT
   MAX_REPORTED`. Methods `owns_objects()`, `can_alter_tables()`. Summary: append the clause from
-  the spec before the shared-instance clause (prefix items with `session user "…" ` /
+  the spec before the shared-instance clause (omit it for a session whose user is a superuser:
+  its owned objects are not read, so "owns nothing" would mislead) (prefix items with `session user "…" ` /
   `current user "…" ` when the users differ, like the privilege items). Module docs: a paragraph
   on ownership and TRUNCATE/TRIGGER (#27). `pub const RUNTIME_GRANTS` and
   `pub async fn missing_runtime_grants(db: &Db) -> Result<Vec<&'static str>>` (only
@@ -168,7 +170,8 @@ Model: opus (boot lifecycle and readiness state).
     `is_refused_in_a_deployment() || can_alter_tables()`; deployment = `config.is_deployment() ||
     role.shares_the_instance()`); `check_db_role` built on it (messages per spec);
     `check_migration_role` (only `is_refused_in_a_deployment`); `pub fn migration_url(config) ->
-    Result<&str>`; `pub async fn migrate(config: &Config) -> Result<String>` (2-connection pool,
+    Result<&str>`; `pub async fn migrate(config: &Config) -> Result<String>` (the spec's `MigrateReport` is this
+  `String`, the migrating role's summary; 2-connection pool,
     5 s acquire timeout, inspect, `check_migration_role`, `applying migrations`, migrate,
     `migrations applied`, close; returns the role summary). In `run_with`: after
     `check_db_role`, refuse `run_migrations` in a deployment (message per spec); log the
@@ -184,8 +187,10 @@ Model: opus (boot lifecycle and readiness state).
 - [ ] **Step 3: run** `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-server --lib`,
   then `cargo test --workspace --locked` with the same `DATABASE_URL` (e2e callers of
   `router(... PlatformCheck::...)` must compile unchanged; the existing least-privilege e2e test
-  is expected to fail now — the owner it serves as is refused; Task 3 rewrites it. Note it in the
-  report rather than weakening the check). Clippy, fmt.
+  would fail now — the owner it serves as is refused; mark it
+  `#[ignore = "rewritten for the split in the next commit (#27)"]` so no commit fails the gate;
+  Task 3 rewrites it and removes the marker. Never weaken the check). Also branch on `migrate`
+  in `main.rs` before the listener is bound. Clippy, fmt.
 - [ ] **Step 4: commit** `feat(server): refuse an owning runtime role and migrate as the owner` —
   body: release-command rationale, re-check, `Refs #27`.
 
@@ -199,7 +204,9 @@ Model: sonnet.
   the database, `REVOKE CONNECT … FROM PUBLIC`, `GRANT CONNECT` to it) and
   `runtime_role(pool, name)` (LOGIN, not privileged, member of `otto_app` and `cxp_runtime`,
   `GRANT CONNECT`); `otto_app` and `cxp_runtime` created idempotently, never dropped;
-  `DropRoleOnExit` for both logins.
+  `DropRoleOnExit` for both logins. Order matters: create `otto_app`, `cxp_runtime`, and both
+  logins **before** calling `cxp_server::boot::migrate`, because 0005 grants to `cxp_runtime`
+  only if it exists when it runs. Remove Task 2's `#[ignore]` marker.
   - `the_service_runs_whole_as_a_runtime_role_that_owns_nothing` (from
     `the_service_runs_whole_as_a_least_privilege_database_owner`): `cxp_server::boot::migrate`
     with a deployment `Config` whose `migration_database_url` is the owner and `database_url` the
@@ -235,7 +242,7 @@ Model: sonnet.
 
 Model: orchestrator (docs; reviewed like code).
 
-- [ ] **Step 1:** `fly.toml`: `[deploy] release_command = "migrate"` (the image ENTRYPOINT is `cxp-server`, so Fly runs `cxp-server migrate`);
+- [ ] **Step 1:** `fly.toml`: `[deploy] release_command = "migrate"` (the image ENTRYPOINT is `cxp-server`, so Fly runs `cxp-server migrate`); the `/readyz` check's grace-period comment (migrations no longer run at startup);
   `CXP_RUN_MIGRATIONS = "false"` in `[env]`; header comments (roles, secrets list gains
   `CXP_MIGRATION_DATABASE_URL`).
 - [ ] **Step 2:** `.env.example`: `CXP_MIGRATION_DATABASE_URL` (commented, with what it is and
@@ -243,7 +250,15 @@ Model: orchestrator (docs; reviewed like code).
 - [ ] **Step 3:** `docs/deploy/fly.md`: Infrastructure and Migrations paragraphs; secrets table
   row; "Database role" rewritten for the split (roles table, what boot refuses, the re-check);
   new runbook "Split the migration owner from the runtime role" S0–S7 with exact commands, guards,
-  read-only proofs, rollback; First deploy note; Verify lines (release command, boot, `/readyz`
+  read-only proofs, rollback, covering every item of the spec's Out-of-band step 1 and Error
+  handling: Postgres 15+ check; `CXP_RUN_MIGRATIONS=false` secret first (permanent, and that it
+  shadows `[env]`); create `cxp_owner` (+ `SET` on `app.console_session_lookup`) and
+  `cxp_runtime` (granted to `cxp_server`); `CXP_MIGRATION_DATABASE_URL`; one transaction:
+  `REASSIGN OWNED` (moves the database, tables, functions, and the `pg_trgm` extension), re-grant
+  `CONNECT` on `otto_cxp` to `cxp_server`, `INSERT` on `deleted_orgs` to `cxp_runtime`, default
+  privileges moved, parameter grant revoked from `cxp_server`; proofs incl. calling
+  `console_session_org` as `cxp_server`; restart the old release; undo; merge; rollback via revert
+  or the previous `fly.toml` (release-command timeout); the readiness-outage note and recovery; First deploy note; Verify lines (release command, boot, `/readyz`
   reason).
 - [ ] **Step 4:** `CLAUDE.md`: config table rows (`CXP_RUN_MIGRATIONS` note,
   `CXP_MIGRATION_DATABASE_URL`), Build & Run note on `cxp-server migrate`, the tenant-isolation
@@ -252,7 +267,22 @@ Model: orchestrator (docs; reviewed like code).
 - [ ] **Step 6: commit** `docs(deploy): run migrations as the owner in the release command` —
   body, `Refs #27`.
 
-### Task 5: Record as shipped (after reviews, before the PR is handed off)
+### Task 5: Manual proofs (orchestrator)
+
+- [ ] **Image as Fly runs it:** `podman build -t otto-cxp:check-issue27 .`, then on a scratch
+  database in the worktree's container with a non-privileged owner login and a runtime login:
+  `podman run --rm --network host -e CXP_PUBLIC_URL=https://cxp.example.com -e
+  CXP_PLATFORM_URL=https://platform.example.com -e CXP_INTROSPECTION_SECRET=otto_rs_x -e
+  CXP_PLATFORM_WEBHOOK_SECRET=otto_whsec_x -e DATABASE_URL=<runtime> -e
+  CXP_MIGRATION_DATABASE_URL=<owner> otto-cxp:check-issue27 migrate` exits 0 and logs
+  `migrations applied`; without `CXP_MIGRATION_DATABASE_URL` it exits non-zero naming it.
+- [ ] **Runbook rehearsal:** a scratch database put in production's #16 state (`cxp_server`-like
+  login owning it and everything, migrated by it, `PUBLIC` `CONNECT` revoked, explicit `CONNECT`
+  to it), then the runbook's S1 SQL, S3 block, S4 proofs, verbatim with the role names
+  substituted; then the new binary serves as the runtime login (deployment config,
+  `run_migrations=false`) after `migrate` as the owner. Record outputs in the PR.
+
+### Task 6: Record as shipped (after reviews, before the PR is handed off)
 
 - [ ] Set the spec's `**Status:**` to `IMPLEMENTED (#<PR>)` and tick this plan's boxes in one
   final docs commit (`docs: record the migration-owner split as implemented`, `Refs #27`).
