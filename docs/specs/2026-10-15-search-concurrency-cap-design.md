@@ -71,9 +71,11 @@ Out of scope (#42): per-caller rate limiting across all tools.
 
 ## Goal & Success Criteria
 
-No number of concurrent searches can hold more than half of the database pool. A search that
-cannot start soon is turned away with a retriable `unavailable`, without holding a connection
-while it waits.
+No number of concurrent searches can hold more than half of the database pool for their search
+transactions. (Every request's bearer authentication still makes one short pooled query,
+`platform_events::revoked`, before the handler runs; that is brief and unchanged, and it is not
+held while waiting for a permit.) A search that cannot start soon is turned away with a retriable
+`unavailable`, without holding a connection while it waits.
 
 - At most `max(1, pool / 2)` searches hold a connection at once, across `/api` and `/mcp`.
 - A search waits at most 500 ms for a permit, holding no connection, then fails with
@@ -96,10 +98,15 @@ In:
   before `tx`.
 - `cxp-server`: builds one `SearchLimiter::for_pool(config.db_max_connections)` and passes it to
   both.
-- Tests: a unit test of the limiter, a flood test, and updated call sites of the search methods in
-  the existing tests.
+- Tests: a unit test of the limiter, a flood test, and updated call sites:
+  - the search methods in `crates/cxp-core/tests/{common/mod.rs,customers.rs,support.rs,search_backlog.rs}`;
+  - `AppState::new` in `crates/cxp-api/src/lib.rs` (unit test), `crates/cxp-api/tests/api.rs`,
+    `crates/cxp-api/tests/console.rs` and `crates/cxp-server/src/lib.rs`;
+  - `cxp_mcp::router` and `Cxp::new` in `crates/cxp-mcp/tests/mcp.rs` and the server.
+- `cxp-core`'s tokio dev-dependency gains `test-util` for the paused-time unit test. The tokio
+  package is unchanged, so `Cargo.lock` still satisfies `--locked`.
 - Docs: `Error::Unavailable`'s doc comment, the `cxp-api` error table, `docs/deploy/fly.md`'s pool
-  note if it mentions search, and one CLAUDE.md line.
+  note (it covers search: add that searches hold at most half the pool), and one CLAUDE.md line.
 
 Out:
 
@@ -206,12 +213,18 @@ Gate: `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test --wor
   - `a_search_flood_cannot_starve_a_write`: a harness whose pool has 5 connections and a short
     acquire timeout, and a limiter `for_pool(5)`. One connection holds an `ACCESS EXCLUSIVE` lock
     on `customer_search_grams`, so every customer search blocks until its 2 s
-    `statement_timeout`. The test fires 8 concurrent `GET /api/v1/customers/search` requests,
-    waits until the 2 permits are taken, then issues a write that doesn't touch the locked table
-    and asserts it succeeds while the searches are still blocked. The turned-away searches
+    `statement_timeout`. (The lock is taken after the test's customer exists, since creating or
+    renaming a customer writes `customer_search_grams` through migration 0004's triggers.) The test
+    fires 8 concurrent `GET /api/v1/customers/search` requests, waits until the 2 permits are
+    taken, then issues `POST /api/v1/tickets` for that customer (a ticket write touches no search
+    table) and asserts it succeeds (201) while the searches are still blocked. The pool's acquire
+    timeout is well under the 2 s `statement_timeout` (for example 500 ms), so the write lands
+    inside the window. The turned-away searches
     answer 503 with `Retry-After`, and the blocked ones `query_too_broad`.
-  - A control in the same test file: the same flood against a limiter as large as the pool shows
-    the write's connection acquire timing out. This proves the test can tell the difference.
+  - A control in the same test file: the same flood against a limiter as large as the pool. The
+    write then gets no connection, so it does not succeed: the test asserts only "not 2xx", because
+    the write fails in auth's `revoked` query or in `begin` (pool timeout), whichever comes first.
+    This proves the test can tell the difference.
   - A REST mapping check: the search route answers 503 `unavailable` with `Retry-After` when no
     permit is free.
 - `cxp-mcp`: an existing tool test (or a new one) shows `search_customers` returns the retriable
