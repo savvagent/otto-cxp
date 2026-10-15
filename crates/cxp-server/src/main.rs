@@ -2,9 +2,13 @@
 //! [`cxp_server::run`] until SIGINT or SIGTERM. Everything else (boot checks,
 //! background tasks, the bounded drain and final usage flush) lives in the
 //! library, where the e2e tests run it whole.
+//!
+//! `cxp-server migrate` instead applies the migrations as the database owner
+//! ([`cxp_server::migrate`]) and exits, binding no port: it is Fly's release
+//! command (`release_command = "migrate"`, given to the image's entrypoint).
 
 use anyhow::{Context, Result};
-use cxp_server::{run, Config, LogFormat};
+use cxp_server::{migrate, run, Config, LogFormat};
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -12,6 +16,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Decided before anything else, so a mistyped release command never
+    // falls through to serving.
+    let migrating = match std::env::args().nth(1).as_deref() {
+        None => false,
+        Some("migrate") => true,
+        Some(other) => anyhow::bail!("unknown argument {other:?}; usage: cxp-server [migrate]"),
+    };
     // Never overrides a variable already set, so a deployment's environment
     // always wins over a stray .env.
     let dotenv = dotenvy::dotenv();
@@ -28,6 +39,12 @@ async fn main() -> Result<()> {
     }
     if let Ok(path) = dotenv {
         tracing::debug!(path = %path.display(), "loaded .env");
+    }
+
+    if migrating {
+        // An error exits non-zero, which aborts the deploy.
+        migrate(&config).await?;
+        return Ok(());
     }
 
     let listener = TcpListener::bind(config.bind)

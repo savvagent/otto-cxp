@@ -52,7 +52,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-pub use boot::{run, run_with, Boot, PlatformCheck};
+pub use boot::{migrate, run, run_with, Boot, PlatformCheck};
 pub use config::{Config, LogFormat};
 
 /// The one client every platform call goes through (it holds the caches).
@@ -75,8 +75,10 @@ pub fn meter(platform: Arc<PlatformClient>, config: &Config) -> Arc<Meter> {
     Arc::new(Meter::new(platform, config.upgrade_url()))
 }
 
-/// Every surface on one router. `platform_check` is what boot's credential
-/// check found ([`boot::check_platform`]); `/readyz` reports it. Fails on a
+/// Every surface on one router. `readiness` is what boot's credential check
+/// found ([`boot::check_platform`]), with the database-role alarm the
+/// sweeper raises ([`health::Readiness`]); `/readyz` reports both. A bare
+/// [`PlatformCheck`] converts, with an alarm nothing raises. Fails on a
 /// configuration that would leave `/mcp` open to any `Host` (see
 /// [`Config::allowed_hosts`]) or a platform URL the install page cannot take
 /// an origin from.
@@ -86,7 +88,7 @@ pub fn router(
     meter: Arc<Meter>,
     search: cxp_core::search::SearchLimiter,
     config: &Config,
-    platform_check: PlatformCheck,
+    readiness: impl Into<health::Readiness>,
 ) -> Result<Router> {
     // `search` is one limiter for the whole process, so `/api` and `/mcp`
     // together hold at most half the pool with searches (#42).
@@ -119,7 +121,7 @@ pub fn router(
     let hsts = config.public_url.starts_with("https://");
     // Rendered once: a bad platform URL fails boot, not a request.
     let page = InstallPage::new(&config.resource_uri, &config.platform_url)?;
-    Ok(health::router(db, platform_check)
+    Ok(health::router(db, readiness)
         // Open, and not part of either surface: every `401` points at it.
         .merge(cxp_http::protected_resource_router(
             &config.resource_uri,
