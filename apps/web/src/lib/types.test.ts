@@ -7,6 +7,7 @@ import type {
   Application,
   Component,
   Customer,
+  CappedPaginatedResponse,
   Customer360,
   DashboardMetrics,
   Experience,
@@ -40,7 +41,8 @@ const keys = {
   component: { id: true, pageId: true, teamId: true, name: true, componentType: true, description: true, metadata: true, createdAt: true, updatedAt: true } satisfies Record<keyof Component, true>,
   customer360: { customer: true, recentTickets: true, recentInteractions: true, recentFeedback: true } satisfies Record<keyof Customer360, true>,
   team: { id: true, slug: true, name: true } satisfies Record<keyof MyTeam, true>,
-  dashboardMetrics: { total_customers: true, total_tickets: true, open_tickets: true, total_feedback: true, total_surveys: true, total_experiences: true } satisfies Record<keyof DashboardMetrics, true>,
+  dashboardMetrics: { totalCustomers: true, totalTickets: true, openTickets: true, totalFeedback: true, totalSurveys: true, totalExperiences: true } satisfies Record<keyof DashboardMetrics, true>,
+  cappedPaginated: { data: true, total: true, totalCapped: true, limit: true, offset: true } satisfies Record<keyof CappedPaginatedResponse<unknown>, true>,
   paginated: { data: true, total: true, limit: true, offset: true } satisfies Record<keyof PaginatedResponse<unknown>, true>,
 };
 
@@ -65,6 +67,7 @@ const typed = {
   customer360: wire.customer360 satisfies Customer360,
   team: wire.team satisfies MyTeam,
   dashboardMetrics: wire.dashboardMetrics satisfies DashboardMetrics,
+  customerSearch: wire.customerSearch satisfies CappedPaginatedResponse<Customer>,
   customerList: wire.customerList satisfies PaginatedResponse<Customer>,
   ticketList: wire.ticketList satisfies PaginatedResponse<Ticket>,
   feedbackList: wire.feedbackList satisfies PaginatedResponse<Feedback>,
@@ -90,7 +93,19 @@ describe("types match the server's JSON", () => {
     sameKeys(typed.page, keys.page);
     sameKeys(typed.component, keys.component);
     sameKeys(typed.team, keys.team);
-    sameKeys(typed.dashboardMetrics, keys.dashboardMetrics);
+  });
+
+  it("answers dashboard metrics in camelCase, with the legacy snake_case keys alongside", () => {
+    const snake = (k: string) => k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    const camel = Object.keys(keys.dashboardMetrics);
+    sameKeys(wire.dashboardMetrics, Object.fromEntries([...camel, ...camel.map(snake)].map((k) => [k, true])));
+    const m = wire.dashboardMetrics as Record<string, number>;
+    for (const k of camel) expect(m[snake(k)]).toBe(m[k]);
+  });
+
+  it("answers search in the list envelope with totalCapped", () => {
+    sameKeys(wire.customerSearch, keys.cappedPaginated);
+    sameKeys(wire.customerSearch.data[0], keys.customer);
   });
 
   it("the customer 360 view nests summaries, not full rows", () => {
@@ -126,7 +141,7 @@ describe("types match the server's JSON", () => {
     }
   });
 
-  it("only the dashboard metrics keep snake_case keys", () => {
+  it("only the dashboard's legacy keys are snake_case", () => {
     const snake = (value: unknown, path: string): string[] => {
       if (Array.isArray(value)) {
         return value.flatMap((v, i) => snake(v, `${path}[${i}]`));

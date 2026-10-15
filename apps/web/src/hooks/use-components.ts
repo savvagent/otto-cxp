@@ -5,7 +5,7 @@ import type { Component } from "@/lib/types";
 type ComponentListParams = {
   limit?: number;
   offset?: number;
-  page_id?: string;
+  pageId?: string;
 };
 
 export const componentKeys = {
@@ -36,10 +36,10 @@ export function useCreateComponent() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      page_id?: string;
-      team_id?: string | null;
+      pageId?: string;
+      teamId?: string | null;
       name: string;
-      component_type?: string;
+      componentType?: string;
       description?: string;
     }) => componentsApi.create(data),
     onSuccess: () => {
@@ -56,7 +56,7 @@ export function useUpdateComponent() {
       data,
     }: {
       id: string;
-      data: { name?: string; component_type?: string; description?: string; team_id?: string | null };
+      data: { name?: string; componentType?: string; description?: string; teamId?: string | null };
     }) => componentsApi.update(id, data),
     onSuccess: (updatedComponent: Component) => {
       queryClient.invalidateQueries({ queryKey: componentKeys.lists() });

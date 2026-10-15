@@ -43,27 +43,27 @@ export function DashboardPage() {
   const cards = [
     {
       title: "Total Customers",
-      value: metrics?.total_customers,
+      value: metrics?.totalCustomers,
       icon: Users,
     },
     {
       title: "Open Tickets",
-      value: metrics?.open_tickets,
+      value: metrics?.openTickets,
       icon: Ticket,
     },
     {
       title: "Total Feedback",
-      value: metrics?.total_feedback,
+      value: metrics?.totalFeedback,
       icon: MessageSquare,
     },
     {
       title: "Total Surveys",
-      value: metrics?.total_surveys,
+      value: metrics?.totalSurveys,
       icon: ClipboardList,
     },
     {
       title: "Total Experiences",
-      value: metrics?.total_experiences,
+      value: metrics?.totalExperiences,
       icon: Layers,
     },
   ];

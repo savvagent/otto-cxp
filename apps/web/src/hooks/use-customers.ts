@@ -14,10 +14,10 @@ export const customerKeys = {
 export function useCustomers(params?: {
   limit?: number;
   offset?: number;
-  experience_id?: string;
-  application_id?: string;
-  page_id?: string;
-  component_id?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 }) {
   return useQuery({
     queryKey: customerKeys.list(params ?? {}),

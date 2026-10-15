@@ -13,10 +13,37 @@ import { Button } from "@/components/ui/button";
 import { FilterX } from "lucide-react";
 
 export interface CatalogFilterValues {
-  experience_id?: string;
-  application_id?: string;
-  page_id?: string;
-  component_id?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
+}
+
+/** The console's own URL parameter for each catalog filter (router state, not the API wire). */
+const URL_PARAM: Record<keyof CatalogFilterValues, string> = {
+  experienceId: "experience_id",
+  applicationId: "application_id",
+  pageId: "page_id",
+  componentId: "component_id",
+};
+
+export function catalogFiltersFromUrl(params: URLSearchParams): CatalogFilterValues {
+  const out: CatalogFilterValues = {};
+  for (const [key, name] of Object.entries(URL_PARAM) as [keyof CatalogFilterValues, string][]) {
+    const v = params.get(name);
+    if (v) out[key] = v;
+  }
+  return out;
+}
+
+export function withCatalogFilters(prev: URLSearchParams, values: CatalogFilterValues): URLSearchParams {
+  const next = new URLSearchParams(prev);
+  for (const [key, name] of Object.entries(URL_PARAM) as [keyof CatalogFilterValues, string][]) {
+    const v = values[key];
+    if (v) next.set(name, v);
+    else next.delete(name);
+  }
+  return next;
 }
 
 interface CatalogFilterBarProps {
@@ -36,10 +63,10 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
   const components = componentsData?.data ?? [];
 
   const hasFilters = !!(
-    value.experience_id ||
-    value.application_id ||
-    value.page_id ||
-    value.component_id
+    value.experienceId ||
+    value.applicationId ||
+    value.pageId ||
+    value.componentId
   );
 
   function setFilter(key: keyof CatalogFilterValues, val: string | undefined) {
@@ -53,9 +80,9 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
   return (
     <div className="flex flex-wrap items-center gap-3">
       <Select
-        value={value.experience_id ?? "_all"}
+        value={value.experienceId ?? "_all"}
         onValueChange={(v) =>
-          setFilter("experience_id", v === "_all" ? undefined : v)
+          setFilter("experienceId", v === "_all" ? undefined : v)
         }
       >
         <SelectTrigger className="w-[180px]" aria-label="Filter by experience">
@@ -72,9 +99,9 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
       </Select>
 
       <Select
-        value={value.application_id ?? "_all"}
+        value={value.applicationId ?? "_all"}
         onValueChange={(v) =>
-          setFilter("application_id", v === "_all" ? undefined : v)
+          setFilter("applicationId", v === "_all" ? undefined : v)
         }
       >
         <SelectTrigger
@@ -94,9 +121,9 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
       </Select>
 
       <Select
-        value={value.page_id ?? "_all"}
+        value={value.pageId ?? "_all"}
         onValueChange={(v) =>
-          setFilter("page_id", v === "_all" ? undefined : v)
+          setFilter("pageId", v === "_all" ? undefined : v)
         }
       >
         <SelectTrigger className="w-[180px]" aria-label="Filter by page">
@@ -113,9 +140,9 @@ export function CatalogFilterBar({ value, onChange }: CatalogFilterBarProps) {
       </Select>
 
       <Select
-        value={value.component_id ?? "_all"}
+        value={value.componentId ?? "_all"}
         onValueChange={(v) =>
-          setFilter("component_id", v === "_all" ? undefined : v)
+          setFilter("componentId", v === "_all" ? undefined : v)
         }
       >
         <SelectTrigger className="w-[180px]" aria-label="Filter by component">

@@ -28,6 +28,8 @@ import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import {
   CatalogFilterBar,
   type CatalogFilterValues,
+  catalogFiltersFromUrl,
+  withCatalogFilters,
 } from "@/components/shared/catalog-filter-bar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -112,30 +114,12 @@ export function TicketsPage() {
   const page = parseInt(searchParams.get("page") ?? "0", 10);
   const offset = page * PAGE_SIZE;
 
-  const catalogFilters: CatalogFilterValues = {
-    experience_id: searchParams.get("experience_id") ?? undefined,
-    application_id: searchParams.get("application_id") ?? undefined,
-    page_id: searchParams.get("page_id") ?? undefined,
-    component_id: searchParams.get("component_id") ?? undefined,
-  };
+  const catalogFilters = catalogFiltersFromUrl(searchParams);
 
   const handleCatalogChange = useCallback(
     (values: CatalogFilterValues) => {
       setSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        const keys = [
-          "experience_id",
-          "application_id",
-          "page_id",
-          "component_id",
-        ] as const;
-        for (const key of keys) {
-          if (values[key]) {
-            next.set(key, values[key]);
-          } else {
-            next.delete(key);
-          }
-        }
+        const next = withCatalogFilters(prev, values);
         next.delete("page");
         return next;
       });
@@ -211,7 +195,7 @@ export function TicketsPage() {
   async function handleCreate(values: CreateTicketForm) {
     try {
       await createTicket.mutateAsync({
-        customer_id: values.customer_id,
+        customerId: values.customer_id,
         subject: values.subject,
         description: values.description || undefined,
         priority: values.priority || undefined,
@@ -245,10 +229,10 @@ export function TicketsPage() {
   const hasFilters = !!(
     statusFilter ||
     priorityFilter ||
-    catalogFilters.experience_id ||
-    catalogFilters.application_id ||
-    catalogFilters.page_id ||
-    catalogFilters.component_id
+    catalogFilters.experienceId ||
+    catalogFilters.applicationId ||
+    catalogFilters.pageId ||
+    catalogFilters.componentId
   );
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const hasPrev = page > 0;

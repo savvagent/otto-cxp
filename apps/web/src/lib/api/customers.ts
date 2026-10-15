@@ -1,25 +1,25 @@
 import { apiFetch } from "../api-client";
-import type { Customer, Customer360, PaginatedResponse } from "../types";
+import type { CappedPaginatedResponse, Customer, Customer360, PaginatedResponse } from "../types";
 
 export const customersApi = {
   list: (params?: {
     limit?: number;
     offset?: number;
-    experience_id?: string;
-    application_id?: string;
-    page_id?: string;
-    component_id?: string;
+    experienceId?: string;
+    applicationId?: string;
+    pageId?: string;
+    componentId?: string;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("limit", String(params?.limit ?? 50));
     searchParams.set("offset", String(params?.offset ?? 0));
-    if (params?.experience_id)
-      searchParams.set("experience_id", params.experience_id);
-    if (params?.application_id)
-      searchParams.set("application_id", params.application_id);
-    if (params?.page_id) searchParams.set("page_id", params.page_id);
-    if (params?.component_id)
-      searchParams.set("component_id", params.component_id);
+    if (params?.experienceId)
+      searchParams.set("experienceId", params.experienceId);
+    if (params?.applicationId)
+      searchParams.set("applicationId", params.applicationId);
+    if (params?.pageId) searchParams.set("pageId", params.pageId);
+    if (params?.componentId)
+      searchParams.set("componentId", params.componentId);
     return apiFetch<PaginatedResponse<Customer>>(
       `/customers?${searchParams.toString()}`,
     );
@@ -58,7 +58,7 @@ export const customersApi = {
     apiFetch<{ deleted: boolean }>(`/customers/${id}`, { method: "DELETE" }),
 
   search: (q: string) =>
-    apiFetch<Customer[]>(`/customers/search?q=${encodeURIComponent(q)}`),
+    apiFetch<CappedPaginatedResponse<Customer>>(`/customers/search?q=${encodeURIComponent(q)}`),
 
   get360: (id: string) => apiFetch<Customer360>(`/customers/${id}/360`),
 };

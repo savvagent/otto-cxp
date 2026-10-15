@@ -7,11 +7,11 @@ type TicketListParams = {
   offset?: number;
   status?: string;
   priority?: string;
-  customer_id?: string;
-  experience_id?: string;
-  application_id?: string;
-  page_id?: string;
-  component_id?: string;
+  customerId?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 };
 
 export const ticketKeys = {
@@ -42,7 +42,7 @@ export function useCreateTicket() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      customer_id: string;
+      customerId: string;
       subject: string;
       description?: string;
       priority?: string;
@@ -65,7 +65,7 @@ export function useUpdateTicket() {
       data: {
         status?: string;
         priority?: string;
-        assigned_to?: string;
+        assignedTo?: string;
         subject?: string;
         description?: string;
         tags?: string[];

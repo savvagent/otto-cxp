@@ -2,11 +2,11 @@ import { apiFetch } from "../api-client";
 import type { Component, PaginatedResponse } from "../types";
 
 export const componentsApi = {
-  list: (params?: { limit?: number; offset?: number; page_id?: string }) => {
+  list: (params?: { limit?: number; offset?: number; pageId?: string }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("limit", String(params?.limit ?? 50));
     searchParams.set("offset", String(params?.offset ?? 0));
-    if (params?.page_id) searchParams.set("page_id", params.page_id);
+    if (params?.pageId) searchParams.set("pageId", params.pageId);
     return apiFetch<PaginatedResponse<Component>>(
       `/components?${searchParams.toString()}`,
     );
@@ -15,10 +15,10 @@ export const componentsApi = {
   get: (id: string) => apiFetch<Component>(`/components/${id}`),
 
   create: (data: {
-    page_id?: string;
-    team_id?: string | null;
+    pageId?: string;
+    teamId?: string | null;
     name: string;
-    component_type?: string;
+    componentType?: string;
     description?: string;
   }) =>
     apiFetch<Component>("/components", {
@@ -28,7 +28,7 @@ export const componentsApi = {
 
   update: (
     id: string,
-    data: { name?: string; component_type?: string; description?: string; team_id?: string | null },
+    data: { name?: string; componentType?: string; description?: string; teamId?: string | null },
   ) =>
     apiFetch<Component>(`/components/${id}`, {
       method: "PUT",

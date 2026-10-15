@@ -15,10 +15,10 @@ export const surveyKeys = {
 export function useSurveys(params?: {
   limit?: number;
   offset?: number;
-  experience_id?: string;
-  application_id?: string;
-  page_id?: string;
-  component_id?: string;
+  experienceId?: string;
+  applicationId?: string;
+  pageId?: string;
+  componentId?: string;
 }) {
   return useQuery({
     queryKey: surveyKeys.list(params ?? {}),

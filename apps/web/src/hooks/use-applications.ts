@@ -5,7 +5,7 @@ import type { Application } from "@/lib/types";
 type ApplicationListParams = {
   limit?: number;
   offset?: number;
-  experience_id?: string;
+  experienceId?: string;
 };
 
 export const applicationKeys = {
@@ -36,8 +36,8 @@ export function useCreateApplication() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: {
-      experience_id?: string;
-      team_id?: string | null;
+      experienceId?: string;
+      teamId?: string | null;
       name: string;
       description?: string;
       platform?: string;
@@ -56,7 +56,7 @@ export function useUpdateApplication() {
       data,
     }: {
       id: string;
-      data: { name?: string; description?: string; platform?: string; team_id?: string | null };
+      data: { name?: string; description?: string; platform?: string; teamId?: string | null };
     }) => applicationsApi.update(id, data),
     onSuccess: (updatedApplication: Application) => {
       queryClient.invalidateQueries({ queryKey: applicationKeys.lists() });

@@ -7,26 +7,26 @@ export const ticketsApi = {
     offset?: number;
     status?: string;
     priority?: string;
-    customer_id?: string;
-    experience_id?: string;
-    application_id?: string;
-    page_id?: string;
-    component_id?: string;
+    customerId?: string;
+    experienceId?: string;
+    applicationId?: string;
+    pageId?: string;
+    componentId?: string;
   }) => {
     const searchParams = new URLSearchParams();
     searchParams.set("limit", String(params?.limit ?? 50));
     searchParams.set("offset", String(params?.offset ?? 0));
     if (params?.status) searchParams.set("status", params.status);
     if (params?.priority) searchParams.set("priority", params.priority);
-    if (params?.customer_id)
-      searchParams.set("customer_id", params.customer_id);
-    if (params?.experience_id)
-      searchParams.set("experience_id", params.experience_id);
-    if (params?.application_id)
-      searchParams.set("application_id", params.application_id);
-    if (params?.page_id) searchParams.set("page_id", params.page_id);
-    if (params?.component_id)
-      searchParams.set("component_id", params.component_id);
+    if (params?.customerId)
+      searchParams.set("customerId", params.customerId);
+    if (params?.experienceId)
+      searchParams.set("experienceId", params.experienceId);
+    if (params?.applicationId)
+      searchParams.set("applicationId", params.applicationId);
+    if (params?.pageId) searchParams.set("pageId", params.pageId);
+    if (params?.componentId)
+      searchParams.set("componentId", params.componentId);
     return apiFetch<PaginatedResponse<Ticket>>(
       `/tickets?${searchParams.toString()}`,
     );
@@ -35,7 +35,7 @@ export const ticketsApi = {
   get: (id: string) => apiFetch<Ticket>(`/tickets/${id}`),
 
   create: (data: {
-    customer_id: string;
+    customerId: string;
     subject: string;
     description?: string;
     priority?: string;
@@ -51,7 +51,7 @@ export const ticketsApi = {
     data: {
       status?: string;
       priority?: string;
-      assigned_to?: string;
+      assignedTo?: string;
       subject?: string;
       description?: string;
       tags?: string[];
