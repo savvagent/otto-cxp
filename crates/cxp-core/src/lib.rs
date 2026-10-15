@@ -7,7 +7,8 @@
 //! This is otto-cxp's own database, separate from the platform's. Tenant
 //! isolation comes from `otto_tenant::{Db, Tx}`: every tenant query is a
 //! method on an [`otto_tenant::Tx`], which cannot exist without an org, and
-//! runs under row-level security as `otto_app`. Query methods are extension
+//! runs under row-level security as `cxp_app`
+//! ([`TENANT_ROLE`]). Query methods are extension
 //! traits (`customers::CustomersExt`, `tickets::TicketsExt`, ...) because `Tx`
 //! is defined in otto-tenant. Request paths open their transactions with
 //! `platform_events::begin_live`, never `Db::begin` directly, so a deleted org
@@ -46,6 +47,26 @@ pub use paging::Page;
 /// server's pool is built with it, and the console's refresh budget counts it.
 pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The role every tenant transaction assumes (`SET LOCAL ROLE`): otto-cxp's own (#28), never
+/// the `otto_app` the otto services on a shared instance may share, so a privilege another
+/// service grants `otto_app` never reaches a tenant transaction here. A NOLOGIN role holding
+/// `otto_cxp`'s tenant grants and nothing else (migration 0007); the runtime login is a member
+/// of it (and inherits its grants for the background work it does as itself).
+pub const TENANT_ROLE: &str = "cxp_app";
+
+/// The only way to make an [`otto_tenant::Db`] in this workspace: `Db::from_pool` and
+/// `Db::connect` default to the shared `otto_app` and are forbidden elsewhere (`clippy.toml`),
+/// so production and every test pin [`TENANT_ROLE`] alike.
+///
+/// otto-tenant skips `SET LOCAL ROLE` when the role is missing or not assumable rather than
+/// failing; `cxp-server`'s boot refuses that in a deployment (`boot::check_tenant_role`).
+pub fn tenant_db(pool: sqlx::PgPool) -> otto_tenant::Db {
+    #[allow(clippy::disallowed_methods)] // the one sanctioned constructor
+    otto_tenant::Db::from_pool(pool)
+        .with_tenant_role(TENANT_ROLE)
+        .expect("TENANT_ROLE is a valid role name")
+}
+
 /// Whether the database answers a trivial query: the readiness probe. Touches
 /// no tenant table, so it needs no org.
 pub async fn ping(db: &otto_tenant::Db) -> Result<()> {
@@ -70,6 +91,17 @@ pub(crate) fn contains_pattern(q: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_tenant_role_is_otto_cxps_own_and_every_db_assumes_it() {
+        assert_eq!(super::TENANT_ROLE, "cxp_app");
+        assert!(otto_tenant::db::validate_role_name(super::TENANT_ROLE).is_ok());
+        assert_ne!(super::TENANT_ROLE, otto_tenant::db::DEFAULT_TENANT_ROLE);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://x@127.0.0.1:1/none")
+            .unwrap();
+        assert_eq!(super::tenant_db(pool).tenant_role(), super::TENANT_ROLE);
+    }
+
     #[test]
     fn contains_pattern_escapes_wildcards() {
         assert_eq!(super::contains_pattern("a%b_c\\d"), "%a\\%b\\_c\\\\d%");

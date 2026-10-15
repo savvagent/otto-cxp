@@ -298,7 +298,7 @@ mod tests {
         );
         let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
         let state = AppState::new(
-            Db::from_pool(pool),
+            cxp_core::tenant_db(pool),
             platform,
             meter,
             Config {

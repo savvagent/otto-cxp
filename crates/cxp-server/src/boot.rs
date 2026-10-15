@@ -277,7 +277,7 @@ pub async fn migrate(config: &Config) -> Result<String> {
         .connect(url)
         .await
         .context("could not connect to the database to migrate")?;
-    let db = Db::from_pool(pool);
+    let db = cxp_core::tenant_db(pool);
     let result = migrate_on(&db, config).await;
     db.pool().close().await;
     result
@@ -472,7 +472,7 @@ where
         .connect(&config.database_url)
         .await
         .context("could not connect to the database")?;
-    let db = Db::from_pool(pool);
+    let db = cxp_core::tenant_db(pool);
 
     // Before anything runs as this role, migrations included.
     let role = cxp_core::db_role::inspect(&db)

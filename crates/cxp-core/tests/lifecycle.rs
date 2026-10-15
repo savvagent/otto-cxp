@@ -1,7 +1,7 @@
 //! The platform integration against a real Postgres and a stub otto platform:
 //! `begin_live`'s refusals, the lifecycle webhooks (`org.deleted`,
 //! `member.removed`, `team.deleted`, unknown kinds) applied once and
-//! acknowledged as duplicates on replay, the retention sweep as `otto_app`,
+//! acknowledged as duplicates on replay, the retention sweep as `cxp_app`,
 //! usage metering and shipping, and bearer-token authentication.
 
 mod common;
@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use chrono::Utc;
-use common::{db, org, otto_app_db, user};
+use common::{db, org, tenant_role_db, user};
 use cxp_core::auth::{self, AuthFailure};
 use cxp_core::platform_events::{self, begin_live, Outcome, PURGED_TABLES};
 use cxp_core::usage::{self, Meter, ShipError, ShipperConfig};
@@ -250,7 +250,7 @@ async fn exec(tx: &mut otto_tenant::Tx<'_>, sql: &str, binds: &[Uuid]) {
 }
 
 /// One row in every domain table, plus one unshipped usage event and one
-/// console session, for `org`, written as `otto_app` pinned to it. Catalog
+/// console session, for `org`, written as `cxp_app` pinned to it. Catalog
 /// entities belong to `team`.
 async fn seed(db: &Db, org: OrgId, team: Uuid) {
     let o = org.as_uuid();
@@ -829,7 +829,7 @@ async fn unknown_events_are_ignored(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn the_sweep_deletes_old_rows_as_otto_app(pool: PgPool) {
+async fn the_sweep_deletes_old_rows_as_the_tenant_role(pool: PgPool) {
     let (a, b) = (org(), org());
     let keep_days = 30;
     for o in [a, b] {
@@ -857,14 +857,14 @@ async fn the_sweep_deletes_old_rows_as_otto_app(pool: PgPool) {
         }
     }
 
-    // Every connection of this Db is otto_app, so RLS applies to the sweep:
+    // Every connection of this Db is the tenant role (cxp_app), so RLS applies to the sweep:
     // only the maintenance marker lets it reach rows unpinned.
-    let app_db = otto_app_db(&pool).await;
+    let app_db = tenant_role_db(&pool).await;
     let role: String = sqlx::query_scalar("SELECT current_user::text")
         .fetch_one(app_db.pool())
         .await
         .unwrap();
-    assert_eq!(role, "otto_app");
+    assert_eq!(role, cxp_core::TENANT_ROLE);
     let swept = platform_events::sweep(&app_db, keep_days).await.unwrap();
     assert_eq!(
         swept, 4,
@@ -879,7 +879,7 @@ async fn the_sweep_deletes_old_rows_as_otto_app(pool: PgPool) {
 }
 
 /// The sweep forgets refused usage after REJECTED_USAGE_KEEP_DAYS, across
-/// orgs, as otto_app under the maintenance marker; newer rows stay.
+/// orgs, as cxp_app under the maintenance marker; newer rows stay.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_sweep_forgets_old_rejected_usage(pool: PgPool) {
     let (a, b) = (org(), org());
@@ -899,7 +899,7 @@ async fn the_sweep_forgets_old_rejected_usage(pool: PgPool) {
             .unwrap();
         }
     }
-    let app_db = otto_app_db(&pool).await;
+    let app_db = tenant_role_db(&pool).await;
     assert_eq!(platform_events::sweep(&app_db, 30).await.unwrap(), 2);
     app_db.pool().close().await;
     for o in [a, b] {
@@ -1110,7 +1110,7 @@ async fn ship_once_ships_deletes_and_handles_duplicates_and_rejections(pool: PgP
 /// The shipper runs unpinned across every org through `maintenance`; as
 /// `otto_app`, RLS applies to it, so this proves its policies admit it.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn ship_once_drains_every_org_as_otto_app(pool: PgPool) {
+async fn ship_once_drains_every_org_as_the_tenant_role(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), false, "https://x");
@@ -1120,15 +1120,15 @@ async fn ship_once_drains_every_org_as_otto_app(pool: PgPool) {
     let refused = outbox(&pool).await[0].0;
     stub.lock().unwrap().reject.insert(refused);
 
-    let app_db = otto_app_db(&pool).await;
+    let app_db = tenant_role_db(&pool).await;
     let role: String = sqlx::query_scalar("SELECT current_user::text")
         .fetch_one(app_db.pool())
         .await
         .unwrap();
-    assert_eq!(role, "otto_app");
+    assert_eq!(role, cxp_core::TENANT_ROLE);
     let cfg = ShipperConfig::default();
 
-    // A failure reschedules as otto_app too.
+    // A failure reschedules as the tenant role too.
     stub.lock().unwrap().usage_down = true;
     assert!(usage::ship_once(&app_db, &platform, &cfg).await.is_err());
     let rows = outbox(&pool).await;
@@ -1287,7 +1287,7 @@ async fn authenticate_resolves_a_live_token_and_says_why_it_will_not(pool: PgPoo
         Err(AuthFailure::Unavailable)
     );
     // ...or the tombstones cannot be read.
-    let closed = otto_tenant::Db::from_pool(db.pool().clone());
+    let closed = cxp_core::tenant_db(db.pool().clone());
     closed.pool().close().await;
     assert_eq!(
         auth::authenticate(&closed, &platform, Some(&format!("Bearer {fresh}"))).await,

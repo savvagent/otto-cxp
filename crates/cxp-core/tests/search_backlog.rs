@@ -1,6 +1,6 @@
 //! Migration 0004 under the role production connects as (#16, #17): a
 //! login role that is not a superuser and not BYPASSRLS, owns the database,
-//! and is a member of `otto_app`. Row-level security binds it, so the
+//! and is a member of `otto_app` and `cxp_app`. Row-level security binds it, so the
 //! migration sees no org's rows and indexes none: rows that predate 0004
 //! stay unindexed, and search does not find them, until an ordinary write
 //! indexes them (the update below, one org at a time in that org's own
@@ -32,10 +32,13 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> PgPool {
             "CREATE ROLE {role} LOGIN PASSWORD '{password}' \
              NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
         ),
+        // The database starts as the previous release left it, whose tenant role was otto_app
+        // (0001 to 0003 grant to it; cxp_app arrives with 0007).
         "DO $$ BEGIN CREATE ROLE otto_app NOLOGIN; \
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
             .to_string(),
         format!("GRANT otto_app TO {role}"),
+        format!("GRANT {} TO {role}", cxp_core::TENANT_ROLE),
         format!("GRANT SET ON PARAMETER app.console_session_lookup TO {role}"),
         format!("ALTER DATABASE \"{database}\" OWNER TO {role}"),
         format!("REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"),
@@ -184,10 +187,15 @@ async fn build_under(pool: PgPool, role: String) {
 
     // A database as it was before #17, with rows in two orgs.
     before_the_index().run(&as_role).await.unwrap();
-    let db = Db::from_pool(as_role.clone());
+    // The rows predate 0007, so they are written as the tenant role of that release.
+    #[allow(clippy::disallowed_methods)]
+    let before = Db::from_pool(as_role.clone())
+        .with_tenant_role("otto_app")
+        .unwrap();
     let (a, b) = (org(), org());
-    seed(&db, a, 150, 130).await;
-    seed(&db, b, 30, 20).await;
+    seed(&before, a, 150, 130).await;
+    seed(&before, b, 30, 20).await;
+    let db = cxp_core::tenant_db(as_role.clone());
 
     // 0004, as the owner. Row-level security hides every org's rows from
     // it, and it needs none of them: it indexes nothing and refuses nothing.
