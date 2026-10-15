@@ -1,6 +1,6 @@
 # Search under row-level security — design
 
-**Status:** DRAFT (#17)
+**Status:** IMPLEMENTED (#33)
 **Issue:** #17 "Make customer and knowledge-base search fast under row-level security"
 **Plan:** `docs/plans/2026-10-14-search-under-rls.md`
 **Decision:** Rob chose option (c) on 2026-10-14: accept a search-semantics change above a cap so
@@ -31,8 +31,8 @@ queries. Rob chose option (c). Its binding requirements:
    - No query scans or ranks an unbounded number of rows.
 
    Review of #33 restated the second and third points as the contract below (Semantics), since no
-   bounded design can be identical below the cap for every query. Rob is asked to confirm it; this
-   change implements it as proposed.
+   bounded design can be identical below the cap for every query. Rob confirmed it on 2026-10-15,
+   together with the storage cost (tracked in #34).
 3. The migration needs neither BYPASSRLS nor superuser. A backfill runs per org (maintenance or
    pinned transactions) in bounded batches. A test proves this under a NOSUPERUSER NOBYPASSRLS
    owner.
@@ -570,7 +570,7 @@ works under `cxp_server` as it is today.
 - **Broad customer pages in large orgs are not today's.** The newest-first fallback helps where
   recency decides the order, not where similarity does (Semantics). Adding `created_at` to the
   index key was decided against.
-- **The contract restatement** awaits Rob's confirmation (Brief).
+- **The contract restatement** was confirmed by Rob on 2026-10-15 (Brief).
 - **Storage** is about 30 to 100 times that of GIN. The LEAKPROOF route would let a follow-up drop
   the `t` and `l` rows: most of the article table and a quarter of the customer table.
 - **Searches write.** The first search of an org that predates 0004 pays for one backlog batch.

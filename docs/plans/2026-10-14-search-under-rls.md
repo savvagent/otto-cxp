@@ -64,5 +64,5 @@ All commands run in the worktree; `DATABASE_URL` points at a local Postgres only
     row, the length limits, and `random_corpora_search_like_the_scan`.
   - Tool descriptions, REST docs, `CLAUDE.md`, `docs/deploy/fly.md`, and the spec's contract and
     numbers (re-measured on Postgres 18; `gen.py` no longer collapses spaces inside literals).
-- [ ] **9. Final commit before merge:** set the spec's `**Status:**` to `IMPLEMENTED (#33)` and tick
+- [x] **9. Final commit before merge:** set the spec's `**Status:**` to `IMPLEMENTED (#33)` and tick
   this box.
