@@ -812,6 +812,27 @@ async fn seed(s: &Server, a: &Caller) -> Seeded {
         .await;
     assert_eq!(found["items"][0]["id"], article.id.to_string(), "{found}");
 
+    // A web console session (no route creates one without the platform's
+    // sign-in, so it is stored directly, as the callback stores it).
+    cxp_core::console_sessions::create(
+        &s.db,
+        &otto_tenant::crypto::Cipher::from_base64_key(
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        )
+        .unwrap(),
+        &cxp_core::console_sessions::NewSession {
+            id_hash: cxp_core::console_sessions::hash_cookie(t),
+            org_id: a.org.into(),
+            user_id: a.user.into(),
+            access_token: t,
+            refresh_token: "otto_rt_e2e",
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            expires_at: Utc::now() + chrono::Duration::days(1),
+        },
+    )
+    .await
+    .unwrap();
+
     Seeded {
         team,
         customer,

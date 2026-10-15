@@ -1,7 +1,8 @@
 # Hosting: Fly.io
 
 otto-cxp runs as one Fly app, `otto-cxp` (org `savvagent`, region `iad`), serving every surface
-on one port: the MCP endpoint agents use, the REST API apps use, and the platform's webhooks.
+on one port: the MCP endpoint agents use, the REST API apps use, the web console (signed in
+through the platform), and the platform's webhooks.
 Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
 
 ## Topology
@@ -58,6 +59,7 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
 | `DATABASE_URL` | Postgres URL for `otto_cxp` | `fly postgres attach` |
 | `CXP_INTROSPECTION_SECRET` | `otto_rs_...`, authenticates every call to the platform | `resource rotate-secret` |
 | `CXP_PLATFORM_WEBHOOK_SECRET` | `otto_whsec_...`, verifies platform webhooks | `resource set-webhook` |
+| `CXP_ENCRYPTION_KEY` | 32 bytes, base64; seals the web console's session tokens at rest and its in-flight sign-in cookie. Required only once `CXP_CONSOLE_CLIENT_ID` is set | `openssl rand -base64 32` |
 
 Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set -a otto-cxp
 --stage NAME=...` before the release that reads it, plus a row here and in `.env.example`.
@@ -119,6 +121,47 @@ exactly the registered URI: it is the token audience and the HTTP Basic user on 
 call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name); the host of
 `CXP_PUBLIC_URL` is always accepted.
 
+## Web console sign-in
+
+The console (`apps/web`, built into the image and served at `/`) signs people in with an OAuth
+authorization-code + PKCE flow against the platform, then keeps its own session cookie
+(`__Host-cxp_session`) over a platform token pair held server-side in `console_sessions`
+(tokens sealed with `CXP_ENCRYPTION_KEY`; the cookie is stored only as its SHA-256). Design:
+`docs/specs/2026-10-14-console-sign-in-design.md`.
+
+It is **off until `CXP_CONSOLE_CLIENT_ID` is set**: the server boots and serves everything else,
+`/auth/login` answers `503 console_login_disabled`, and the console shows that sign-in is not
+configured. Bearer tokens and `/mcp` do not depend on it. Turning it on is human-only (Rob), in
+this order, because a client id without the key fails the boot (naming the key):
+
+```bash
+# 1. Register the console as a public, first-party client (no secret, no consent screen)
+#    whose only redirect URI is {CXP_PUBLIC_URL}/auth/callback. Run on the platform's machine.
+fly ssh console -a otto-platform -C 'otto-platform-server client register \
+  --name "otto-cxp console" \
+  --redirect-uri https://otto-cxp.savvagent.com/auth/callback --first-party'
+#    -> prints the client_id
+
+# 2. The encryption key, staged so it applies with the next release.
+fly secrets set -a otto-cxp --stage CXP_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+
+# 3. Set the client id in fly.toml [env] (it is not a secret: a public client has nothing else
+#    to authenticate with, and PKCE binds each code to the browser that asked for it):
+#      CXP_CONSOLE_CLIENT_ID = "<client_id from step 1>"
+#    and merge that commit; the deploy turns sign-in on.
+```
+
+The redirect URI is registered **exactly**: a deployment that moves to another hostname registers
+a new client. Then open `https://otto-cxp.savvagent.com/`, sign in, and check that the dashboard
+loads; `GET /auth/session` answers `{"signedIn": true, ...}` from that browser.
+
+**Rotating `CXP_ENCRYPTION_KEY` signs every console user out** (sessions that no longer open are
+deleted on their next use). The platform rotates a refresh token on every use and revokes the
+whole sign-in if a spent one is replayed, so the service refreshes under the session's row lock
+and each refresh happens once, across machines. Sessions are deleted on sign-out, by the
+`org.deleted` and `member.removed` webhooks, and by the hourly sweep once expired (30 days
+without a refresh).
+
 ## Verify
 
 ```bash
@@ -143,7 +186,10 @@ reflects only that boot check, so a credential the platform starts refusing afte
 credential`), not as a failing `/readyz`.
 
 Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
-sign in, and `whoami` answers with the platform's records.
+sign in, and `whoami` answers with the platform's records. `curl -s -H 'accept: text/html'
+https://otto-cxp.savvagent.com/` returns the console's `index.html`, and
+`curl -s https://otto-cxp.savvagent.com/auth/session` answers `loginEnabled` true once
+`CXP_CONSOLE_CLIENT_ID` is set (false before).
 
 Usage backlog (should drain to 0 within seconds of activity). Connect with
 `fly postgres connect -a otto-db -d otto_cxp` and run SELECTs only; production diagnostics

@@ -249,8 +249,9 @@ async fn exec(tx: &mut otto_tenant::Tx<'_>, sql: &str, binds: &[Uuid]) {
     q.execute(tx.conn()).await.unwrap();
 }
 
-/// One row in every domain table, plus one unshipped usage event, for `org`,
-/// written as `otto_app` pinned to it. Catalog entities belong to `team`.
+/// One row in every domain table, plus one unshipped usage event and one
+/// console session, for `org`, written as `otto_app` pinned to it. Catalog
+/// entities belong to `team`.
 async fn seed(db: &Db, org: OrgId, team: Uuid) {
     let o = org.as_uuid();
     let [exp, app, page, comp, cust, seg, session, survey] = [(); 8].map(|_| Uuid::new_v4());
@@ -361,6 +362,15 @@ async fn seed(db: &Db, org: OrgId, team: Uuid) {
         &[o],
     )
     .await;
+    exec(
+        &mut tx,
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES (sha256($1::text::bytea), $2, $1, '\\x00', '\\x00', now(), \
+         now() + interval '1 day')",
+        &[Uuid::new_v4(), o],
+    )
+    .await;
     tx.commit().await.unwrap();
 }
 
@@ -376,7 +386,7 @@ async fn count(pool: &PgPool, table: &str, org: OrgId) -> i64 {
 /// Every table holding one of an org's domain rows or unshipped usage. Spelled
 /// out rather than taken from `PURGED_TABLES`, so dropping a table from the
 /// purge fails this test.
-const TENANT_TABLES: [&str; 16] = [
+const TENANT_TABLES: [&str; 17] = [
     "experiences",
     "applications",
     "pages",
@@ -393,6 +403,7 @@ const TENANT_TABLES: [&str; 16] = [
     "surveys",
     "survey_responses",
     "usage_outbox",
+    "console_sessions",
 ];
 
 // ---------------------------------------------------------------- begin_live

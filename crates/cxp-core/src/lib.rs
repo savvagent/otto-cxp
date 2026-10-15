@@ -2,7 +2,7 @@
 //! segments, support tickets, the knowledge base and chat, feedback and
 //! surveys, the experience catalog, the dashboard metrics, and the plumbing a
 //! resource server of the otto platform needs (authentication, usage
-//! metering, lifecycle events).
+//! metering, lifecycle events, the web console's sign-in sessions).
 //!
 //! This is otto-cxp's own database, separate from the platform's. Tenant
 //! isolation comes from `otto_tenant::{Db, Tx}`: every tenant query is a
@@ -19,6 +19,7 @@ pub mod analysis;
 pub mod auth;
 pub mod catalog;
 pub mod chat;
+pub mod console_sessions;
 pub mod customers;
 pub mod dashboard;
 pub mod error;

@@ -22,3 +22,5 @@ tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true, features = ["util"] }
 sqlx.workspace = true
 chrono.workspace = true
+url.workspace = true
+futures.workspace = true

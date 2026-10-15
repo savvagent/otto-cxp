@@ -32,17 +32,23 @@ Per-package: `cd sdk/typescript && pnpm build`.
 ## Architecture
 
 One binary, `cxp-server`, on `:8080`: `/mcp` (streamable HTTP, stateless), `/api/v1/...`,
-`POST /platform/webhooks`, `/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`.
+`/auth/...` (the web console's sign-in), `POST /platform/webhooks`,
+`/.well-known/oauth-protected-resource`, `/healthz`, `/readyz`, and the built web console
+(`CXP_CONSOLE_DIR`) for any other `GET`, with `index.html` for browser navigations; everything
+else is a JSON 404.
 
 **Crates (`crates/`):**
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
   (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
-  `begin_live`), `usage` (metering, outbox shipper), `maintenance` (the only cross-org access).
+  `begin_live`), `usage` (metering, outbox shipper), `console_sessions` (the web console's sign-in
+  sessions, tokens sealed with `CXP_ENCRYPTION_KEY`), `maintenance` (the only cross-org access).
 - `cxp-http` - the axum side of auth, shared by `/mcp` and `/api/v1`: `Authenticator`, `require_bearer`,
-  `refuse`, and the `/.well-known/oauth-protected-resource` router. Holds no SQL. A new credential
-  source (the console session cookie) is opt-in per surface: `/api` only, same-origin check on
-  writes; `/mcp` stays bearer-only.
+  `refuse`, and the `/.well-known/oauth-protected-resource` router; `console` (the PKCE sign-in
+  against the platform, `/auth/*`, the session cookie, single-flight token refresh). Holds no SQL.
+  The console session cookie is opt-in per surface (`Authenticator::with_console`): `/api` only,
+  a bearer wins over it, and a cookie write must carry this origin (`Origin`, else
+  `Sec-Fetch-Site: same-origin`) or is `403 cross_site_request`; `/mcp` stays bearer-only.
 - `cxp-mcp` - the `rmcp` 2.0.0 server: tools, resources, prompts, and the `/mcp` route behind
   `cxp_http::require_bearer`. Holds no SQL.
 - `cxp-api` - REST `/api/v1` and `/platform/webhooks`. Holds no SQL.
@@ -74,7 +80,9 @@ Domain operations are methods on extension traits implemented for `otto_tenant::
 `impl CustomersExt for Tx<'_>`), binding `self.org()` and executing on `self.conn()`. Request paths open
 the transaction with `platform_events::begin_live` (it also refuses revoked orgs and members), never
 `Db::begin`. Cross-org access exists only in `cxp_core::maintenance`. Never take an org id from
-anywhere but the verified token.
+anywhere but the verified token. The one pre-org lookup is a console cookie's session:
+`console_sessions::org_of` calls the `SECURITY DEFINER` function `console_session_org`, which
+returns only the org of the one row whose hash it is given; the row is then read pinned.
 
 ### PostgreSQL enum handling
 The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_channel`, `feedback_type`,
@@ -115,6 +123,9 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
 | `CXP_ENFORCE_QUOTAS` | `false` | fails open |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
+| `CXP_CONSOLE_CLIENT_ID` | unset | the web console's first-party client at the platform (redirect `{public}/auth/callback`); unset turns console sign-in off |
+| `CXP_ENCRYPTION_KEY` | unset (secret) | base64 of 32 bytes; seals console sessions; required only with `CXP_CONSOLE_CLIENT_ID`, validated whenever set |
+| `CXP_CONSOLE_DIR` | `apps/web/dist` | the built console; the image sets `/srv/console`; no `index.html` there means no SPA |
 | `RUST_LOG` | `info` | |
 
 ## Conventions
@@ -225,7 +236,7 @@ Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-d
 - **Append-only migrations.** A schema change is a new `crates/cxp-core/migrations/NNNN_<name>.sql`; never modify, rename, or delete one that is on `main` (a migration still only on an unmerged branch may be edited; recreate local databases that ran it). `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema: migrations are additive only. A `SECURITY DEFINER` function pins its `search_path` and is `REVOKE ALL … FROM PUBLIC` before being granted to `otto_app`.
 - **Tenant isolation is RLS, proven.** Every tenant table has `org_id`, enables and forces RLS with a policy named `<table>_tenant_isolation`, grants to `otto_app`, and is covered by the tenant-isolation test; `cxp-server` refuses to start if isolation fails at boot. Tenant transactions run as `otto_app` (`SET LOCAL ROLE`); background maintenance and the `org.deleted` tombstone run as the connecting role, which the policies bind only while that role is subject to RLS (neither superuser nor `BYPASSRLS`). In production it is still a superuser until #16 gives it a least-privilege login role.
 - **Composite `(org_id, id)` foreign keys** between tenant tables (FK checks bypass RLS).
-- **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events` and on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`) admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker.
+- **Request paths open transactions with `platform_events::begin_live`**, never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events`, on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`), and on `console_sessions` admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker. The one exception is `console_sessions_lookup`, a `SELECT`-only policy that admits the `console_session_org` function (via `app.console_session_lookup`, which only that function's own `SET` clause sets).
 - **No SQL outside `cxp-core`**, and only runtime `sqlx::query`/`query_as`, never the `query!` macros.
 - **Auth.** `/mcp` and `/api` require a platform token whose audience equals `CXP_RESOURCE_URI` exactly; every route, and every tool except `whoami` and `usage` (no scope), checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
 - **Metering:** exactly the tools `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage event each, in the tool's own transaction, into `usage_outbox`; the only route that records one is `POST /api/v1/surveys` (charged as `create_survey`); nothing else records one.

@@ -5,8 +5,11 @@
 //!   /.well-known/oauth-protected-resource
 //!                                     cxp-http  open; every 401 points at it
 //!   /mcp                              cxp-mcp   agents: bearer tokens from the platform
-//!   /api/v1/…                         cxp-api   the console: bearer tokens from the platform
+//!   /api/v1/…                         cxp-api   bearer tokens, or the console's session cookie
+//!   /auth/…                           cxp-http  the console's sign-in through the platform
 //!   /platform/webhooks                cxp-api   the platform's signed lifecycle events
+//!   GET/HEAD, anything else           the built console (CXP_CONSOLE_DIR): a file, or
+//!                                     index.html for a browser navigation
 //!   everything else                   JSON 404
 //! ```
 //!
@@ -27,16 +30,22 @@ pub mod boot;
 pub mod config;
 pub mod health;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use axum::body::Body;
+use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use axum::{middleware, Router};
 use cxp_core::usage::Meter;
-use http::{StatusCode, Uri};
+use cxp_http::console::{Console, ConsoleSettings};
+use http::{header, HeaderValue, Method, StatusCode};
 use otto_resource::{ClientConfig, PlatformClient};
 use otto_tenant::Db;
+use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub use boot::{run, run_with, Boot, PlatformCheck};
@@ -86,7 +95,8 @@ pub fn router(
         mcp_config(config),
     )
     .map_err(|e| anyhow!("{e}: CXP_PUBLIC_URL must have a host"))?;
-    let api = cxp_api::router(cxp_api::AppState::new(
+    let console = console(db.clone(), platform.clone(), config)?;
+    let mut state = cxp_api::AppState::new(
         db.clone(),
         platform,
         meter,
@@ -94,7 +104,13 @@ pub fn router(
             public_url: config.public_url.clone(),
             webhook_secret: config.platform_webhook_secret.clone(),
         },
-    ));
+    );
+    // The session cookie is a credential on /api only; /mcp never sees it.
+    if let Some(console) = &console {
+        state = state.with_console(console.clone());
+    }
+    let api = cxp_api::router(state);
+    let assets = ConsoleAssets::find(&config.console_dir);
     Ok(health::router(db, platform_check)
         // Open, and not part of either surface: every `401` points at it.
         .merge(cxp_http::protected_resource_router(
@@ -103,7 +119,9 @@ pub fn router(
         ))
         .merge(mcp)
         .merge(api)
-        .fallback(not_found)
+        // Mounted with the console off too, so /auth is never the SPA.
+        .merge(cxp_http::console::router(console))
+        .fallback(move |req: Request| console_or_not_found(assets.clone(), req))
         .layer(RequestBodyLimitLayer::new(cxp_api::MAX_BODY_BYTES))
         // Outside the limit: its own 413 is plain text, rewritten here to the
         // `{error, code}` shape every other error has.
@@ -116,6 +134,133 @@ pub fn router(
                 tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
             },
         )))
+}
+
+/// The web console's sign-in, when `CXP_CONSOLE_CLIENT_ID` is set.
+fn console(db: Db, platform: Arc<PlatformClient>, config: &Config) -> Result<Option<Console>> {
+    let Some(c) = &config.console else {
+        tracing::info!("console sign-in is off (CXP_CONSOLE_CLIENT_ID is unset)");
+        return Ok(None);
+    };
+    let cipher = otto_tenant::crypto::Cipher::from_base64_key(&c.encryption_key)
+        .map_err(|_| anyhow!("CXP_ENCRYPTION_KEY must be base64 of exactly 32 bytes"))?;
+    Ok(Some(Console::new(
+        db,
+        platform,
+        ConsoleSettings {
+            client_id: c.client_id.clone(),
+            cipher,
+            public_url: config.public_url.clone(),
+            platform_url: config.platform_url.clone(),
+            resource_uri: config.resource_uri.clone(),
+        },
+    )))
+}
+
+/// The built console: its files, and `index.html` for client-side routes.
+#[derive(Clone)]
+struct ConsoleAssets {
+    files: ServeDir,
+    index: ServeFile,
+}
+
+impl ConsoleAssets {
+    /// The console in `dir`, or `None` (logged) when there is no
+    /// `index.html` there to serve.
+    fn find(dir: &Path) -> Option<Self> {
+        let index = dir.join("index.html");
+        if !index.is_file() {
+            tracing::warn!(dir = %dir.display(),
+                "no built console at CXP_CONSOLE_DIR (no index.html); unknown paths answer 404");
+            return None;
+        }
+        Some(Self {
+            files: ServeDir::new(dir),
+            index: ServeFile::new(index),
+        })
+    }
+}
+
+/// Path prefixes that are never the console: an unknown path under one is
+/// the JSON `404`, whatever the request accepts.
+const RESERVED: &[&str] = &[
+    "/api",
+    "/mcp",
+    "/auth",
+    "/.well-known",
+    "/platform",
+    "/healthz",
+    "/readyz",
+];
+
+fn is_reserved(path: &str) -> bool {
+    RESERVED.iter().any(|p| {
+        path.strip_prefix(p)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+/// Whether the request is a browser navigation: it accepts HTML.
+fn wants_html(req: &Request) -> bool {
+    req.headers()
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.contains("text/html"))
+}
+
+/// Everything no route serves: a file of the built console for a `GET` or
+/// `HEAD` outside the reserved prefixes, `index.html` for a browser
+/// navigation the console routes itself, and otherwise the JSON `404`, so an
+/// agent or script that guessed a path still gets a machine-readable answer.
+async fn console_or_not_found(assets: Option<ConsoleAssets>, req: Request) -> Response {
+    let path = req.uri().path().to_string();
+    let Some(assets) = assets else {
+        return not_found(&path);
+    };
+    if !matches!(*req.method(), Method::GET | Method::HEAD) || is_reserved(&path) {
+        return not_found(&path);
+    }
+    let html = wants_html(&req);
+    let (parts, _) = req.into_parts();
+    let file = assets
+        .files
+        .oneshot(Request::from_parts(parts.clone(), Body::empty()))
+        .await
+        .map(|res| res.map(Body::new));
+    let mut res = match file {
+        Ok(res) if res.status() != StatusCode::NOT_FOUND => res,
+        _ if html => match assets
+            .index
+            .oneshot(Request::from_parts(parts, Body::empty()))
+            .await
+        {
+            Ok(res) => res.map(Body::new),
+            Err(e) => match e {},
+        },
+        _ => return not_found(&path),
+    };
+    let headers = res.headers_mut();
+    // Hashed build output never changes under its name; everything else
+    // (index.html, the service worker, the manifest) must be revalidated, or
+    // a deploy is invisible until a cache expires.
+    let cache = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // The console acts with an ambient session cookie: never inside a frame.
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
 }
 
 /// The MCP surface's settings, from the server's.
@@ -143,14 +288,13 @@ async fn json_payload_too_large(res: Response) -> Response {
 }
 
 /// The same `{error, code}` shape as every `/api/v1` error.
-async fn not_found(uri: Uri) -> Response {
+fn not_found(path: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         axum::Json(serde_json::json!({
             "error": format!(
-                "no route serves {}. Agents: the MCP endpoint is /mcp (see \
-                 /.well-known/oauth-protected-resource). The REST API is under /api/v1.",
-                uri.path()
+                "no route serves {path}. Agents: the MCP endpoint is /mcp (see \
+                 /.well-known/oauth-protected-resource). The REST API is under /api/v1."
             ),
             "code": "not_found",
         })),
@@ -173,7 +317,11 @@ mod tests {
 
     /// [`app`] as if boot's platform check had found `check`.
     fn app_with(check: PlatformCheck) -> Router {
-        let mut config = Config::for_test();
+        app_from(Config::for_test(), check)
+    }
+
+    /// [`app`] built from `config`.
+    fn app_from(mut config: Config, check: PlatformCheck) -> Router {
         // Nothing listens on port 1: a probe is refused at once.
         config.database_url = "postgres://cxp:cxp@127.0.0.1:1/none".into();
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -336,6 +484,151 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "not_found");
         assert!(body["error"].as_str().unwrap().contains("/nope"), "{body}");
+    }
+
+    /// A built console in a fresh directory: `index.html`, one hashed asset,
+    /// and the service worker.
+    fn console_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cxp-console-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html><title>CXP</title>").unwrap();
+        std::fs::write(dir.join("assets/app-abc123.js"), "console.log(1)").unwrap();
+        std::fs::write(dir.join("sw.js"), "self.x = 1").unwrap();
+        dir
+    }
+
+    async fn get_with(
+        app: Router,
+        path: &str,
+        accept: Option<&str>,
+    ) -> (StatusCode, http::HeaderMap, String) {
+        let mut req = Request::get(path).header("host", "cxp.example.com");
+        if let Some(a) = accept {
+            req = req.header("accept", a);
+        }
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    const NAVIGATION: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+
+    #[tokio::test]
+    async fn the_built_console_is_served_with_an_index_fallback_for_navigations() {
+        let dir = console_dir();
+        let mut config = Config::for_test();
+        config.console_dir = dir.clone();
+        let app = app_from(config, PlatformCheck::Accepted);
+
+        // A client-side route, navigated to: the console.
+        for path in ["/", "/tickets", "/customers/123"] {
+            let (status, headers, body) = get_with(app.clone(), path, Some(NAVIGATION)).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(body.contains("<title>CXP</title>"), "{path}: {body}");
+            assert_eq!(headers["cache-control"], "no-cache", "{path}");
+            assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+        }
+        // Its files, to anyone.
+        let (status, headers, body) = get_with(app.clone(), "/assets/app-abc123.js", None).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "console.log(1)"));
+        assert!(headers["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable"));
+        let (status, headers, _) = get_with(app.clone(), "/sw.js", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-cache");
+
+        // Not a navigation, or under a reserved prefix: the JSON 404, never
+        // the console's HTML.
+        for (path, accept) in [
+            ("/nope", None),
+            ("/nope", Some("application/json")),
+            ("/assets/missing.js", None),
+            ("/auth/nope", Some(NAVIGATION)),
+            ("/.well-known/nope", Some(NAVIGATION)),
+            ("/platform/nope", Some(NAVIGATION)),
+            ("/mcp/nope", Some(NAVIGATION)),
+            ("/healthz/nope", Some(NAVIGATION)),
+        ] {
+            let (status, headers, body) = get_with(app.clone(), path, accept).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path} {accept:?}");
+            assert!(
+                headers["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"),
+                "{path}"
+            );
+            assert!(body.contains("not_found"), "{path}: {body}");
+        }
+        // /api answers for itself: authentication first, in JSON.
+        let (status, _, body) = get_with(app.clone(), "/api/v1/nope", Some(NAVIGATION)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!body.contains("<title>"), "{body}");
+        // A write is never the console.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/tickets")
+                    .header("accept", NAVIGATION)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reserved_prefixes_match_whole_segments() {
+        for p in ["/api", "/api/v1/x", "/auth/login", "/.well-known/x", "/mcp"] {
+            assert!(is_reserved(p), "{p}");
+        }
+        for p in ["/", "/apis", "/authors", "/tickets", "/mcpx"] {
+            assert!(!is_reserved(p), "{p}");
+        }
+    }
+
+    /// Merging with no console configured deploys safely: sign-in says it is
+    /// off, rather than the console's HTML or a redirect that cannot work.
+    #[tokio::test]
+    async fn console_sign_in_is_off_by_default() {
+        let (status, _, body) = call("GET", "/auth/login").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "console_login_disabled");
+        let (status, _, body) = call("GET", "/auth/session").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["loginEnabled"], false);
+    }
+
+    #[tokio::test]
+    async fn console_sign_in_is_on_with_a_client_id_and_key() {
+        let mut config = Config::for_test();
+        config.console = Some(config::ConsoleConfig {
+            client_id: "cxp-console".into(),
+            encryption_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".into(),
+        });
+        let app = app_from(config, PlatformCheck::Accepted);
+        let res = app
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let to = res.headers()["location"].to_str().unwrap();
+        assert!(
+            to.starts_with("https://platform.example.com/oauth/authorize?"),
+            "{to}"
+        );
+        assert!(to.contains("client_id=cxp-console"), "{to}");
     }
 
     #[test]

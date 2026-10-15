@@ -33,7 +33,12 @@ const DOMAIN_TABLES: [&str; 15] = [
 ];
 
 /// Bookkeeping tables carrying a `<table>_tenant_isolation` policy.
-const BOOKKEEPING_TABLES: [&str; 3] = ["platform_events", "usage_outbox", "usage_outbox_rejected"];
+const BOOKKEEPING_TABLES: [&str; 4] = [
+    "platform_events",
+    "usage_outbox",
+    "usage_outbox_rejected",
+    "console_sessions",
+];
 
 /// Ids of one row in every tenant table, all in one org.
 struct Seeded {
@@ -112,6 +117,11 @@ async fn seed(db: &Db, org: OrgId) -> Seeded {
             .to_string(),
         "INSERT INTO usage_outbox_rejected (event_id, org_id, tool, billable, occurred_at, reason) \
          VALUES (gen_random_uuid(), $1, 'submit_feedback', true, now(), 'test')"
+            .to_string(),
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), $1, gen_random_uuid(), '\\x00', \
+         '\\x00', now(), now() + interval '1 day')"
             .to_string(),
     ];
     let mut tx = db.begin(org).await.unwrap();
@@ -437,6 +447,135 @@ async fn the_usage_outbox_is_drained_across_orgs_only_under_the_marker(pool: PgP
         assert_eq!(deleted, 2, "the marked shipper deletes from {table}");
         tx.rollback().await.unwrap();
     }
+}
+
+/// A console session is the one row a request reads before it knows the org:
+/// the cookie is how the org is learned. An unpinned transaction (a request
+/// path that forgot to pin) still sees, changes, and deletes nothing; the
+/// org comes only from `console_session_org`, which answers with the org of
+/// the one unexpired row whose hash it is given, and never a token.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_console_session_is_found_before_its_org_only_through_the_lookup_function(pool: PgPool) {
+    let admin = db(pool.clone());
+    let (a, b) = (org(), org());
+    seed(&admin, a).await;
+    seed(&admin, b).await;
+    let live: Vec<u8> = (0..32).collect();
+    let expired: Vec<u8> = (100..132).collect();
+    for (hash, expires) in [(&live, "now() + interval '1 day'"), (&expired, "now()")] {
+        let mut tx = admin.begin(a).await.unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+             refresh_token_enc, access_expires_at, expires_at) \
+             VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), {expires})"
+        ))
+        .bind(hash)
+        .bind(a)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Unpinned, without the function: nothing, whatever the statement.
+    let mut tx = as_app_unpinned(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "console_sessions is readable unpinned");
+    for sql in [
+        "UPDATE console_sessions SET expires_at = now()",
+        "DELETE FROM console_sessions",
+    ] {
+        let changed = sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(changed, 0, "unpinned: {sql}");
+    }
+    let err = sqlx::query(
+        "INSERT INTO console_sessions (id_hash, org_id, user_id, access_token_enc, \
+         refresh_token_enc, access_expires_at, expires_at) \
+         VALUES ($1, $2, gen_random_uuid(), '\\x00', '\\x00', now(), now())",
+    )
+    .bind(vec![7u8; 32])
+    .bind(a)
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "unpinned INSERT");
+    tx.rollback().await.unwrap();
+
+    // The marked sweep may delete across orgs, but cannot write one.
+    let mut tx = as_app_maintenance(&pool).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 4, "the marked sweep reads across orgs");
+    let err = sqlx::query("UPDATE console_sessions SET org_id = $1")
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate(&err), "42501", "the marked sweep moved a session");
+    tx.rollback().await.unwrap();
+
+    // The function, called as otto_app with no org pinned.
+    let lookup = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = as_app_unpinned(&pool).await;
+            let org: Option<Uuid> = sqlx::query_scalar("SELECT console_session_org($1)")
+                .bind(hash)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            // The setting it reads under ends with the call.
+            let after: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('app.console_session_lookup', true)")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_ne!(after.as_deref(), Some("on"), "the lookup setting leaked");
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "the table is readable after the call");
+            tx.rollback().await.unwrap();
+            org
+        }
+    };
+    assert_eq!(lookup(live.clone()).await, Some(a.as_uuid()));
+    assert_eq!(lookup(expired).await, None, "an expired session");
+    assert_eq!(lookup(vec![9u8; 32]).await, None, "an unknown hash");
+
+    // Its shape: SECURITY DEFINER with a pinned search_path, executable by
+    // otto_app and not by PUBLIC.
+    let (definer, config): (bool, Vec<String>) = sqlx::query_as(
+        "SELECT prosecdef, coalesce(proconfig, '{}') FROM pg_proc \
+         WHERE proname = 'console_session_org'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(definer);
+    assert!(
+        config.iter().any(|c| c.starts_with("search_path=")),
+        "{config:?}"
+    );
+    let grants: (bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE'), \
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) acl \
+                        WHERE p.proname = 'console_session_org' AND acl.grantee = 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, (true, false), "(otto_app may, PUBLIC may not)");
 }
 
 /// Foreign-key checks bypass row-level security, so only the composite

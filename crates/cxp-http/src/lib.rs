@@ -17,15 +17,24 @@
 //!   misconfiguration no retry can fix, logged at `error`.
 //!
 //! The one place a request's credential becomes a [`Principal`] is
-//! [`Authenticator::authenticate`]. A further credential source (a session
-//! cookie for the console) is opt-in per surface, like
-//! [`Authenticator::challenge_handler_401`]: only `/api` enables it, with a
-//! same-origin check on writes. `/mcp` stays bearer-only, so a cookie a
-//! browser attaches on its own can never authenticate an MCP call.
+//! [`Authenticator::authenticate_request`]. A further credential source (the
+//! web console's session cookie, [`console`]) is opt-in per surface, like
+//! [`Authenticator::challenge_handler_401`]: only `/api` enables it
+//! ([`Authenticator::with_console`]), and there a cookie-authenticated write
+//! must come from this origin ([`console::same_origin`]) or is `403
+//! cross_site_request`. `/mcp` stays bearer-only, so a cookie a browser
+//! attaches on its own can never authenticate an MCP call.
+//!
+//! **A bearer token, when present, decides the request**, valid or not: it is
+//! never "fixed" by falling back to a cookie, so a script's behaviour does not
+//! depend on what a browser left lying around. Only a request with no bearer
+//! looks at the cookie.
 //!
 //! The protected-resource metadata document (RFC 9728) is served by
 //! [`protected_resource_router`], which the binary mounts: the `401`s of every
 //! surface point at it, so it belongs to none of them.
+
+pub mod console;
 
 use std::sync::Arc;
 
@@ -50,6 +59,17 @@ pub struct Authenticator {
     platform: Arc<PlatformClient>,
     public_url: String,
     challenge_handler_401: bool,
+    console: Option<console::Console>,
+}
+
+/// Which credential authenticated a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `Authorization: Bearer ...`.
+    Bearer,
+    /// The web console's session cookie: ambient, so writes must prove their
+    /// origin.
+    Cookie,
 }
 
 impl Authenticator {
@@ -59,7 +79,15 @@ impl Authenticator {
             platform,
             public_url: public_url.into(),
             challenge_handler_401: false,
+            console: None,
         }
+    }
+
+    /// Accept the web console's session cookie on this surface, for a request
+    /// that carries no bearer token. `/api` only; never `/mcp`.
+    pub fn with_console(mut self, console: console::Console) -> Self {
+        self.console = Some(console);
+        self
     }
 
     /// Give a handler's own `401` without a `WWW-Authenticate` the challenge a
@@ -71,27 +99,74 @@ impl Authenticator {
         self
     }
 
-    /// The credential in `headers`, checked. Today that is the bearer token
-    /// in `Authorization`; any further source must be switched on per surface
-    /// (see the crate docs), never for every caller of this method.
+    /// The credential in `headers`, checked: [`Self::authenticate_request`]
+    /// without saying which credential it was.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthFailure> {
+        self.authenticate_request(headers).await.map(|(p, _)| p)
+    }
+
+    /// The credential in `headers`, checked, and which one it was: the bearer
+    /// token in `Authorization` if there is one (valid or not), otherwise the
+    /// console's session cookie where this surface accepts it
+    /// ([`Self::with_console`]), otherwise [`AuthFailure::Missing`].
+    pub async fn authenticate_request(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(Principal, Source), AuthFailure> {
         let authorization = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        auth::authenticate(&self.db, &self.platform, authorization).await
+        if auth::bearer(authorization).is_some() {
+            return auth::authenticate(&self.db, &self.platform, authorization)
+                .await
+                .map(|p| (p, Source::Bearer));
+        }
+        if let Some(console) = &self.console {
+            if let Some(cookie) = console.session_cookie(headers) {
+                return console
+                    .authenticate(cookie)
+                    .await
+                    .map(|p| (p, Source::Cookie));
+            }
+        }
+        Err(AuthFailure::Missing)
+    }
+
+    /// Whether this request would authenticate with the console's session
+    /// cookie (no bearer, a cookie this surface accepts) and is a write that
+    /// did not come from this origin ([`console::same_origin`]).
+    fn is_cross_site_cookie_write(&self, method: &http::Method, headers: &HeaderMap) -> bool {
+        let Some(console) = &self.console else {
+            return false;
+        };
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        auth::bearer(authorization).is_none()
+            && console.session_cookie(headers).is_some()
+            && !console.same_origin(method, headers)
     }
 }
 
 /// Reject the request unless it carries a live credential audienced for us;
 /// otherwise put the [`Principal`] in the request's extensions for handlers
-/// (the MCP transport carries it through as `http::request::Parts`).
+/// (the MCP transport carries it through as `http::request::Parts`). A
+/// cookie-authenticated write that did not come from this origin is refused
+/// with `403 cross_site_request` before the handler runs.
 pub async fn require_bearer(
     State(auth): State<Authenticator>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    match auth.authenticate(req.headers()).await {
-        Ok(principal) => {
+    // Before anything is looked up: a forged cross-site write must not even
+    // cause a token refresh or a session deletion.
+    if auth.is_cross_site_cookie_write(req.method(), req.headers()) {
+        tracing::warn!(method = %req.method(), path = %req.uri().path(),
+            "refused a cookie-authenticated write from another origin");
+        return console::cross_site();
+    }
+    match auth.authenticate_request(req.headers()).await {
+        Ok((principal, _)) => {
             req.extensions_mut().insert::<Principal>(principal);
             let mut res = next.run(req).await;
             if auth.challenge_handler_401

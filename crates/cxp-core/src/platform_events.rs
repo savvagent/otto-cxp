@@ -15,7 +15,7 @@
 //! | Event | Effect |
 //! |---|---|
 //! | `org.deleted` | Its tokens are refused (tombstone first), then every row this database holds for the org is deleted, in short transactions of at most [`PURGE_BATCH`] rows per table. Only the dedupe marker (written after the last batch), the tombstone, and usage the platform already refused (`usage_outbox_rejected`, swept after [`REJECTED_USAGE_KEEP_DAYS`]) survive. |
-//! | `member.removed` | The user's cached token is refused for a few minutes, until the platform's own introspection stops vouching for it. What they created stays. |
+//! | `member.removed` | The user's cached token is refused for a few minutes, until the platform's own introspection stops vouching for it, and their console sessions in the org are deleted. What they created stays. |
 //! | `team.deleted` | Catalog entities (experiences, applications, pages, components) owned by the team keep existing with `team_id` nulled. |
 //!
 //! # Why requests take a lock
@@ -56,13 +56,13 @@ pub const REMOVED_MEMBER_TTL_SECS: i64 = 300;
 /// The advisory-lock namespace for an org's lifecycle lock ("cxlc").
 const LIFECYCLE_LOCK: i32 = 0x6378_6c63;
 
-/// Every table holding an org's domain rows or unshipped usage, children
-/// before parents, as `org.deleted` purges them. `platform_events` is kept
-/// (a replay must still find its dedupe marker) and so is
-/// `usage_outbox_rejected`: it is the only record of usage that was charged
-/// to the org but never counted by the platform, which billing questions
-/// about the deleted org may still need, and the sweep forgets it after
-/// [`REJECTED_USAGE_KEEP_DAYS`] anyway.
+/// Every table holding an org's domain rows, unshipped usage, or console
+/// sessions, children before parents, as `org.deleted` purges them.
+/// `platform_events` is kept (a replay must still find its dedupe marker) and
+/// so is `usage_outbox_rejected`: it is the only record of usage that was
+/// charged to the org but never counted by the platform, which billing
+/// questions about the deleted org may still need, and the sweep forgets it
+/// after [`REJECTED_USAGE_KEEP_DAYS`] anyway.
 pub const PURGED_TABLES: &[&str] = &[
     "survey_responses",
     "surveys",
@@ -80,6 +80,7 @@ pub const PURGED_TABLES: &[&str] = &[
     "applications",
     "experiences",
     "usage_outbox",
+    "console_sessions",
 ];
 
 /// The most rows one `org.deleted` purge transaction deletes from any one
@@ -148,18 +149,25 @@ async fn exclude_requests(tx: &mut Tx<'_>, org: OrgId) -> Result<()> {
 }
 
 /// Housekeeping: forget dedupe markers older than `keep_days`, removed-member
-/// tombstones past twice their [`REMOVED_MEMBER_TTL_SECS`] window, and refused
-/// usage older than [`REJECTED_USAGE_KEEP_DAYS`]. Unpinned, in maintenance
-/// transactions (`crate::maintenance`), which the unpinned policies on
-/// `platform_events` and `usage_outbox_rejected` require.
+/// tombstones past twice their [`REMOVED_MEMBER_TTL_SECS`] window, refused
+/// usage older than [`REJECTED_USAGE_KEEP_DAYS`], and expired console
+/// sessions. Unpinned, in maintenance transactions (`crate::maintenance`),
+/// which the unpinned policies on `platform_events`, `usage_outbox_rejected`,
+/// and `console_sessions` require.
 ///
-/// Each of the three is its own transaction, so one failing neither rolls
-/// back nor stops the others. Returns how many rows were deleted, or the
-/// first failure (each is also logged) once all three have been tried.
+/// Each step is its own transaction (the console sessions, several bounded
+/// ones), so one failing neither rolls back nor stops the others. Returns how
+/// many rows were deleted, or the first failure (each is also logged) once
+/// every step has been tried.
 pub async fn sweep(db: &Db, keep_days: i32) -> Result<u64> {
     let mut swept = 0;
     let mut failure = None;
-    for step in [Sweep::Events, Sweep::Tombstones, Sweep::RejectedUsage] {
+    for step in [
+        Sweep::Events,
+        Sweep::Tombstones,
+        Sweep::RejectedUsage,
+        Sweep::ConsoleSessions,
+    ] {
         match sweep_one(db, step, keep_days).await {
             Ok(n) => swept += n,
             Err(e) => {
@@ -179,11 +187,17 @@ enum Sweep {
     Events,
     Tombstones,
     RejectedUsage,
+    ConsoleSessions,
 }
 
 async fn sweep_one(db: &Db, step: Sweep, keep_days: i32) -> Result<u64> {
+    // Its own bounded batches, each a maintenance transaction.
+    if let Sweep::ConsoleSessions = step {
+        return crate::console_sessions::sweep_expired(db).await;
+    }
     let mut tx = crate::maintenance::begin(db).await?;
     let n = match step {
+        Sweep::ConsoleSessions => 0,
         Sweep::Events => sqlx::query(
             "DELETE FROM platform_events WHERE received_at < now() - make_interval(days => $1)",
         )
@@ -334,9 +348,11 @@ async fn member_removed(
     let mut tx = db.begin(org).await?;
     exclude_requests(&mut tx, org).await?;
     let first = first_delivery(&mut tx, event, "member.removed").await?;
+    let mut sessions = 0;
     if first {
         // Only on the first delivery: a late redelivery must not restart the
-        // refusal window of a member who has since been re-invited.
+        // refusal window of a member who has since been re-invited, nor sign
+        // them out of the console again.
         sqlx::query(
             "INSERT INTO removed_members (org_id, user_id) VALUES ($1, $2) \
              ON CONFLICT (org_id, user_id) DO UPDATE SET removed_at = now()",
@@ -345,13 +361,15 @@ async fn member_removed(
         .bind(user)
         .execute(tx.conn())
         .await?;
+        sessions = crate::console_sessions::delete_for_user(&mut tx, user).await?;
     }
     tx.commit().await?;
 
-    tracing::info!(org = %org, user = %user, first, "member removed; their tokens are refused");
+    tracing::info!(org = %org, user = %user, first, sessions,
+        "member removed; their tokens are refused and their console sessions deleted");
     Ok(if first {
         Outcome::Applied {
-            detail: serde_json::json!({}),
+            detail: serde_json::json!({ "console_sessions": sessions }),
         }
     } else {
         Outcome::Duplicate
