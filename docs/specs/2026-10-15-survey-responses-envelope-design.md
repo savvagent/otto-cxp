@@ -1,6 +1,6 @@
 # Survey responses in the `/api/v1` list envelope
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#43)
 **Ticket:** #36
 
 ## Brief

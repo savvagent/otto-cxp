@@ -48,7 +48,7 @@ API client, hook, and survey detail page read `data`/`total`.
 - Modify: `crates/cxp-api/tests/api.rs` (new test)
 - Modify: `docs/specs/2026-10-14-otto-resource-server-design.md` (convention sentence)
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - In `wire_fixture::payloads()` add, after `"surveyList"`,
     `"surveyResponseList": Paginated::new((vec![survey_response()], 1), page),`.
   - In `crates/cxp-api/tests/api.rs` add
@@ -65,11 +65,11 @@ API client, hook, and survey detail page read `data`/`total`.
     `total` 3, `offset` 10; the empty survey → `{data: [], total: 0, limit: 50, offset: 0}`;
     another org's caller (`h.caller(RO)`) on the first survey → 404 with `code` `not_found`.
     Update the module doc's list at the top of `api.rs` only if it enumerates route shapes.
-- [ ] **Step 2: Run and watch them fail.**
+- [x] **Step 2: Run and watch them fail.**
   `DATABASE_URL=postgres://cxp:cxp@localhost:15465/otto_cxp cargo test -p cxp-api --locked`
   (the fixture test fails on the missing key; the new api test fails because the body is an
   array).
-- [ ] **Step 3: Implement.** In `routes/surveys.rs`, `responses` returns
+- [x] **Step 3: Implement.** In `routes/surveys.rs`, `responses` returns
   `ApiResult<Json<Paginated<SurveyResponse>>>`:
   `let page = q.page(); ... let found = tx.list_survey_responses(id, page).await?; tx.commit().await?; Ok(Json(Paginated::new(found, page)))`.
   Rewrite its whole doc comment: one page of the survey's responses, newest first, in the
@@ -84,10 +84,10 @@ API client, hook, and survey detail page read `data`/`total`.
   Regenerate the fixture:
   `UPDATE_WIRE_FIXTURES=1 cargo test -p cxp-api --lib wire_fixture` (it panics by design after
   writing), then re-run without the variable.
-- [ ] **Step 4: Run the gates and watch them pass:** test, lint, format, extra (Global
+- [x] **Step 4: Run the gates and watch them pass:** test, lint, format, extra (Global
   Constraints). The web gate will still pass at this point because nothing in `apps/web` reads
   `surveyResponseList` yet.
-- [ ] **Step 5: Commit**: `feat(api): answer survey responses in the list envelope`, body: the
+- [x] **Step 5: Commit**: `feat(api): answer survey responses in the list envelope`, body: the
   route was the last list answering a bare array and dropped the total cxp-core computes; ends
   `Fixes #36`.
 
@@ -102,7 +102,7 @@ API client, hook, and survey detail page read `data`/`total`.
 - Modify: `apps/web/src/lib/types.test.ts`
 - Create: `apps/web/src/pages/surveys/survey-detail.test.ts`
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `types.test.ts`: add `surveyResponseList: wire.surveyResponseList satisfies PaginatedResponse<SurveyResponse>,`
     to `typed`; add `[typed.surveyResponseList, keys.surveyResponse]` to the envelope test's
     `lists`; import `surveysApi` from `./api/surveys` and add to "api calls decode the server's
@@ -114,9 +114,9 @@ API client, hook, and survey detail page read `data`/`total`.
   - `survey-detail.test.ts`: `import { responsesCount } from "./survey-detail";` and expect
     `responsesCount(3, 3)` → `"3"`, `responsesCount(50, 120)` → `"50 of 120"`,
     `responsesCount(0, 0)` → `"0"`.
-- [ ] **Step 2: Run and watch them fail.** `cd apps/web && pnpm build` (type errors:
+- [x] **Step 2: Run and watch them fail.** `cd apps/web && pnpm build` (type errors:
   `getResponses` returns an array) and `pnpm test` (after a build, for `dist/sw.js`).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - `surveys.ts`: `getResponses: (id: string, params?: { limit?: number; offset?: number }) => { const searchParams = new URLSearchParams(); searchParams.set("limit", String(params?.limit ?? 50)); searchParams.set("offset", String(params?.offset ?? 0)); return apiFetch<PaginatedResponse<SurveyResponse>>(`/surveys/${id}/responses?${searchParams.toString()}`); }`.
   - `use-surveys.ts`: `responses: (id: string, params: Record<string, unknown> = {}) => [...surveyKeys.detail(id), "responses", params] as const`;
     `useSurveyResponses(id, params?: { limit?: number; offset?: number })` keys on
@@ -128,9 +128,9 @@ API client, hook, and survey detail page read `data`/`total`.
     loaded (plain `Responses` while loading); replace the inline
     `import("@/lib/types").SurveyResponse` annotation in `.map` with nothing (inferred) or a
     top-level type import.
-- [ ] **Step 4: Run the gates and watch them pass:** web
+- [x] **Step 4: Run the gates and watch them pass:** web
   (`pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test` from the repo root),
   plus test, lint, format, extra, and the container build.
-- [ ] **Step 5: Commit**: `feat(web): read survey responses from the list envelope`, body: the
+- [x] **Step 5: Commit**: `feat(web): read survey responses from the list envelope`, body: the
   route now answers `{data, total, limit, offset}`; the detail page shows the total; ends
   `Fixes #36`.
