@@ -599,3 +599,27 @@ mod casing {
         assert_eq!(b.team_id, None);
     }
 }
+
+#[cfg(test)]
+mod capped {
+    use super::CappedPaginated;
+    use serde_json::json;
+
+    /// A capped search keeps `totalCapped: true` and the page it served.
+    #[test]
+    fn a_capped_search_says_so_on_the_wire() {
+        let found = cxp_core::search::SearchPage {
+            items: Vec::<u8>::new(),
+            total: cxp_core::search::TOTAL_CAP,
+            total_capped: true,
+        };
+        let page = cxp_core::Page::new(Some(20), Some(1000));
+        assert_eq!(
+            serde_json::to_value(CappedPaginated::new(found, page)).unwrap(),
+            json!({
+                "data": [], "total": cxp_core::search::TOTAL_CAP, "totalCapped": true,
+                "limit": 20, "offset": 1000,
+            })
+        );
+    }
+}
