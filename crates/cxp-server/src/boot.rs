@@ -1,7 +1,7 @@
 //! The process lifecycle, as a library function so a test can run it whole:
 //! connect, check the database role (a deployment refuses a privileged one,
-//! one that reaches another service's database, or one that owns anything
-//! or may `TRUNCATE` a table), migrate (locally only: a deployment migrates
+//! one that reaches another service's database, or one that owns anything,
+//! may `TRUNCATE` a table, or may create objects or temporary tables), migrate (locally only: a deployment migrates
 //! as the database owner through [`migrate`], Fly's release command), prove
 //! tenant isolation (or refuse to serve), check the platform credential,
 //! start the background tasks (the sweeper re-checks the role hourly,
@@ -133,9 +133,11 @@ pub enum Verdict {
 /// row-level policy, or on the shared `otto-db` reaches the other services'
 /// data. One that owns anything here, or may `TRUNCATE` or add a `TRIGGER`
 /// to a table, can switch row-level security off (`NO FORCE`, `DROP
-/// POLICY`) or empty a table past it, with no privilege at all: the serving
-/// role must own nothing, and migrations run as the owner through
-/// [`migrate`].
+/// POLICY`) or empty a table past it, with no privilege at all; one that may
+/// create in the database or a schema, or create temporary tables, can
+/// shadow a tenant table or a function a `SECURITY DEFINER` function calls:
+/// the serving role must own nothing and create nothing, and migrations run
+/// as the owner through [`migrate`].
 ///
 /// A deployment is [`Config::is_deployment`], or an instance that also hosts
 /// another otto service's database ([`DbRole::shares_the_instance`]): a
@@ -197,16 +199,17 @@ pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
                 fly_app_name = config.fly_app_name.as_deref().unwrap_or(""),
                 "{summary}: refusing to serve. A deployment must log in as a dedicated runtime \
                  role that holds no superuser-equivalent privilege, can connect to no other \
-                 service's database, and owns nothing in this database; migrations run as the \
-                 database owner through `cxp-server migrate` (docs/deploy/fly.md)");
+                 service's database, owns nothing in this database, and can create nothing in \
+                 it; migrations run as the database owner through `cxp-server migrate` \
+                 (docs/deploy/fly.md)");
             Err(anyhow!(
                 "refusing to serve: {summary}; a deployment must log in as a role that is not a \
                  superuser, holds no BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or \
                  cross-service predefined role, directly or through membership, can connect to \
-                 no other service's database, and owns nothing in this database and may \
-                 TRUNCATE or add a TRIGGER to no table: the runtime role must own nothing, and \
-                 migrations run as the database owner through `cxp-server migrate` \
-                 (docs/deploy/fly.md)"
+                 no other service's database, owns nothing in this database, may TRUNCATE or \
+                 add a TRIGGER to no table, and may create no schema, object, or temporary \
+                 table in it: the runtime role must own nothing, and migrations run as the \
+                 database owner through `cxp-server migrate` (docs/deploy/fly.md)"
             ))
         }
     }
@@ -301,19 +304,33 @@ async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
     Ok(role.summary())
 }
 
+/// How long one catalog read of the role re-check may take before it counts
+/// as a failure.
+pub const RECHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// From this many failed re-checks in a row on, each is logged at `error`
+/// rather than `warn`: one is a blip, three hours of them mean the role is
+/// no longer being watched.
+pub const RECHECK_ESCALATE_AFTER: u32 = 3;
+
 /// Re-run the serving check ([`role_verdict`]) on the live database and
 /// raise or lower `alarm`, which holds `/readyz` back while raised
 /// ([`crate::health`]). Called by the sweeper after each pass, so a grant
-/// made after boot is noticed within the hour. A failed read leaves the
-/// alarm as it was: `/readyz` reports an unreachable database itself.
+/// made after boot is noticed within the hour. In a deployment it also
+/// re-runs the runtime-grant check ([`cxp_core::db_role::missing_runtime_grants`]),
+/// logged at `error` when something is missing (no alarm: requests still
+/// work; the `org.deleted` webhook or the background tasks do not).
+///
+/// A read that fails or takes longer than [`RECHECK_TIMEOUT`] leaves the
+/// alarm as it was (`/readyz` reports an unreachable database itself) and is
+/// counted ([`RoleAlarm::consecutive_failures`]): logged at `warn`, and at
+/// `error` from the [`RECHECK_ESCALATE_AFTER`]th in a row on. A re-check
+/// that reads everything resets the count.
 pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
-    let role = match cxp_core::db_role::inspect(db).await {
-        Ok(role) => role,
-        Err(e) => {
-            tracing::warn!(error = %e.log_detail(), source = ?std::error::Error::source(&e),
-                "could not re-check the database role; the readiness alarm is unchanged");
-            return;
-        }
+    let role = match tokio::time::timeout(RECHECK_TIMEOUT, cxp_core::db_role::inspect(db)).await {
+        Ok(Ok(role)) => role,
+        Ok(Err(e)) => return recheck_failed(alarm, "the database role", &e),
+        Err(_) => return recheck_timed_out(alarm, "the database role"),
     };
     match role_verdict(&role, config) {
         Verdict::Refused => {
@@ -332,6 +349,80 @@ pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
             }
         }
     }
+    if is_deployment(&role, config) {
+        let missing = match tokio::time::timeout(
+            RECHECK_TIMEOUT,
+            cxp_core::db_role::missing_runtime_grants(db),
+        )
+        .await
+        {
+            Ok(Ok(missing)) => missing,
+            Ok(Err(e)) => return recheck_failed(alarm, "the runtime role's grants", &e),
+            Err(_) => return recheck_timed_out(alarm, "the runtime role's grants"),
+        };
+        if !missing.is_empty() {
+            tracing::error!(
+                "the database role changed after boot: {}",
+                missing_grants(&missing, &role.current_user)
+            );
+        }
+    }
+    alarm.record_success();
+}
+
+/// Count a re-check that could not read `what`, and log it.
+fn recheck_failed(alarm: &RoleAlarm, what: &str, e: &cxp_core::Error) {
+    log_recheck_failure(
+        alarm.record_failure(),
+        what,
+        &format!(
+            "{} (source: {:?})",
+            e.log_detail(),
+            std::error::Error::source(e)
+        ),
+    );
+}
+
+/// Count a re-check whose read of `what` ran past [`RECHECK_TIMEOUT`], and
+/// log it.
+fn recheck_timed_out(alarm: &RoleAlarm, what: &str) {
+    log_recheck_failure(
+        alarm.record_failure(),
+        what,
+        &format!("no answer within {RECHECK_TIMEOUT:?}"),
+    );
+}
+
+fn log_recheck_failure(failures: u32, what: &str, why: &str) {
+    if failures >= RECHECK_ESCALATE_AFTER {
+        tracing::error!(consecutive_failures = failures, error = %why,
+            "could not re-check {what}, {failures} times in a row: the role is not being \
+             watched; the readiness alarm is unchanged");
+    } else {
+        tracing::warn!(consecutive_failures = failures, error = %why,
+            "could not re-check {what}; the readiness alarm is unchanged");
+    }
+}
+
+/// What a missing [`cxp_core::db_role::RUNTIME_GRANTS`] entry means, and the
+/// statements that fix each, for `role` (the runtime login).
+fn missing_grants(missing: &[&str], role: &str) -> String {
+    let role = sql_identifier(role);
+    let mut fixes = Vec::new();
+    if missing.contains(&"INSERT on deleted_orgs") {
+        fixes.push(format!(
+            "GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO {role}"
+        ));
+    }
+    if missing.contains(&"inheriting otto_app") {
+        fixes.push(format!("GRANT otto_app TO {role} WITH INHERIT TRUE"));
+    }
+    format!(
+        "the runtime role {role} lacks {} (the org.deleted tombstone and the background tasks \
+         need them); fix with: {}",
+        missing.join(", "),
+        fixes.join("; ")
+    )
 }
 
 /// Run the server on `listener` until `shutdown` completes, then drain
@@ -414,11 +505,7 @@ where
         .await
         .context("could not read the database role's grants")?;
     if !missing.is_empty() {
-        let why = format!(
-            "the runtime role cannot write the org.deleted tombstone ({}): GRANT cxp_runtime TO {}",
-            missing.join(", "),
-            sql_identifier(&role.current_user)
-        );
+        let why = missing_grants(&missing, &role.current_user);
         if deployment {
             tracing::error!("{why}: refusing to serve");
             return Err(anyhow!("refusing to serve: {why}"));
@@ -919,6 +1006,31 @@ mod tests {
         assert_eq!(sql_identifier("Cxp"), r#""Cxp""#);
         assert_eq!(sql_identifier("cxp-runtime"), r#""cxp-runtime""#);
         assert_eq!(sql_identifier(r#"a"b"#), r#""a""b""#);
+    }
+
+    /// The hint names every statement that fixes what is missing, and only
+    /// those, for the quoted role.
+    #[test]
+    fn the_missing_grants_hint_names_both_fixes() {
+        assert_eq!(
+            missing_grants(&["INSERT on deleted_orgs"], "cxp_server"),
+            "the runtime role \"cxp_server\" lacks INSERT on deleted_orgs (the org.deleted \
+             tombstone and the background tasks need them); fix with: GRANT INSERT ON \
+             deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO \"cxp_server\""
+        );
+        assert_eq!(
+            missing_grants(&["inheriting otto_app"], "Cxp"),
+            "the runtime role \"Cxp\" lacks inheriting otto_app (the org.deleted tombstone \
+             and the background tasks need them); fix with: GRANT otto_app TO \"Cxp\" WITH \
+             INHERIT TRUE"
+        );
+        let both = missing_grants(&cxp_core::db_role::RUNTIME_GRANTS, "r");
+        assert!(
+            both.ends_with(
+                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; GRANT otto_app TO "r" WITH INHERIT TRUE"#
+            ),
+            "{both}"
+        );
     }
 
     #[test]

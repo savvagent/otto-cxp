@@ -31,12 +31,17 @@
 //! next restart. The sweeper re-runs the check after each pass
 //! (`boot::recheck_db_role`) and raises a [`RoleAlarm`] when it would now
 //! refuse; while raised, the replica is unready with the fixed reason
-//! `database role refused` (the role summary is logged, never sent: catalog
-//! text stays out of responses). This fails closed, as boot does: with one
-//! machine, a raised alarm takes the service out of rotation until the role
-//! is fixed. The next pass after the fix clears it, as does a restart, which
-//! re-runs the boot check.
+//! `database role refused`. The role summary goes to the re-check's own
+//! `error` line each pass; a probe logs only the fixed reason at `warn` (and
+//! the stored summary at `debug`), and never sends it: catalog text stays out
+//! of responses. This fails closed, as boot does: with one machine, a raised
+//! alarm takes the service out of rotation until the role is fixed, which
+//! lasts until the next pass after the fix clears it, or a restart, which
+//! re-runs the boot check. The alarm also counts the re-checks that could
+//! not read the role in a row ([`RoleAlarm::consecutive_failures`]), which
+//! the re-check logs at `error` from the third on.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -61,22 +66,25 @@ const READY_TIMEOUT: Duration = Duration::from_secs(2);
 const ROLE_REFUSED: &str = "database role refused";
 
 /// Raised while the database-role re-check would refuse the role this
-/// process serves as; holds the role summary for the log. Cheap to clone:
-/// clones share one flag, so boot hands one to the sweeper and one to the
-/// router.
+/// process serves as; holds the role summary for the log, and how many
+/// re-checks in a row could not read the role. Cheap to clone: clones share
+/// one state, so boot hands one to the sweeper and one to the router.
 #[derive(Clone, Default)]
-pub struct RoleAlarm(Arc<RwLock<Option<String>>>);
+pub struct RoleAlarm {
+    summary: Arc<RwLock<Option<String>>>,
+    failures: Arc<AtomicU32>,
+}
 
 impl RoleAlarm {
     /// Raise (or keep raised) with the role `summary`.
     pub fn raise(&self, summary: String) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Some(summary);
+        *self.summary.write().unwrap_or_else(PoisonError::into_inner) = Some(summary);
     }
 
     /// Lower it; `true` when it was raised, so the caller logs the change
     /// once.
     pub fn clear(&self) -> bool {
-        self.0
+        self.summary
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
@@ -86,17 +94,35 @@ impl RoleAlarm {
     /// The role summary it was raised with, if raised: for the log only,
     /// never a response.
     pub fn summary(&self) -> Option<String> {
-        self.0
+        self.summary
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     pub fn is_raised(&self) -> bool {
-        self.0
+        self.summary
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .is_some()
+    }
+
+    /// How many re-checks in a row could not read the role (a database
+    /// error or a timeout); zero after one that could.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
+    /// Count a re-check that could not read the role; returns the new count.
+    pub fn record_failure(&self) -> u32 {
+        self.failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Reset the count after a re-check that read the role.
+    pub fn record_success(&self) {
+        self.failures.store(0, Ordering::Relaxed);
     }
 }
 
@@ -178,12 +204,14 @@ async fn readyz(State(ready): State<Ready>) -> Response {
         return unready(reason);
     }
     if let Some(summary) = ready.role.summary() {
-        // Logged, never sent: catalog text stays out of responses.
+        // The re-check logs the summary at error each pass; a probe repeats
+        // only the fixed reason, the summary at debug. Never sent: catalog
+        // text stays out of responses.
         tracing::warn!(
             reason = ROLE_REFUSED,
-            role = %summary,
             "readiness check failed: the database role re-check would refuse this role"
         );
+        tracing::debug!(role = %summary, "the refused database role");
         return unready(ROLE_REFUSED);
     }
     // `cxp_core::ping` touches no tenant table, so it needs no org: it asks
@@ -292,6 +320,14 @@ mod tests {
 
         assert!(alarm.clear(), "it was raised");
         assert!(!alarm.clear(), "already clear");
+        // Failures in a row are counted and reset by a success, in every
+        // clone.
+        assert_eq!(alarm.consecutive_failures(), 0);
+        assert_eq!(alarm.clone().record_failure(), 1);
+        assert_eq!(alarm.record_failure(), 2);
+        assert_eq!(alarm.consecutive_failures(), 2);
+        alarm.clone().record_success();
+        assert_eq!(alarm.consecutive_failures(), 0);
         assert!(!alarm.is_raised());
         let (status, body) = probe(readiness()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

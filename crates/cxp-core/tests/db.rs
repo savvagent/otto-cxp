@@ -2004,7 +2004,19 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
 
-    // A member of otto_app only: nothing owned, nothing to truncate.
+    // A member of otto_app only: nothing owned, nothing to truncate, and,
+    // once PUBLIC's default TEMPORARY on the database is revoked (as the
+    // runbook does), nowhere to create.
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "REVOKE TEMPORARY ON DATABASE \"{database}\" FROM PUBLIC"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     let role = inspect(&plain_db).await.unwrap();
     assert!(role.owned.is_empty(), "{}", role.summary());
     assert_eq!(role.owned_total, 0);
@@ -2013,7 +2025,8 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
     assert!(!role.can_alter_tables());
     assert!(
         role.summary().ends_with(
-            "; it owns nothing in this database and can TRUNCATE or add a TRIGGER to no table"
+            "; it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, \
+             and can create no schema, object, or temporary table in it"
         ),
         "{}",
         role.summary()
@@ -2130,10 +2143,6 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
 
     // The database's owner: the database, and schema public through
     // pg_database_owner, which every database owner is implicitly in.
-    let database: String = sqlx::query_scalar("SELECT current_database()::text")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
     sqlx::query(&format!(
         "ALTER DATABASE \"{database}\" OWNER TO {db_owner}"
     ))
@@ -2159,7 +2168,149 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         "{}",
         role.summary()
     );
+    // What it owns is not reported again as somewhere it may create.
+    assert!(role.create_privileges.is_empty(), "{}", role.summary());
     db_owner_db.pool().close().await;
+}
+
+/// `(user, object, privileges)` of each place `inspect` found the role may
+/// create in.
+fn creatable(role: &cxp_core::db_role::DbRole) -> Vec<(String, String, Vec<&'static str>)> {
+    role.create_privileges
+        .iter()
+        .map(|c| (c.user.clone(), c.object(), c.privileges.clone()))
+        .collect()
+}
+
+/// Where the runtime role may create (#27): `TEMPORARY` on the database (a
+/// temporary table shadows a tenant table through `pg_temp`), `CREATE` on a
+/// schema (an overload a SECURITY DEFINER function resolves), and `CREATE`
+/// on the database (new schemas), held directly, through `PUBLIC`, or one
+/// `SET ROLE` away through a NOINHERIT membership.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_where_a_role_may_create(pool: PgPool) {
+    use cxp_core::db_role::inspect;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let db_object = format!("database {database:?}");
+
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (schema_create, schema_create_db) = roles.login(&pool, "cxp_t_sch_create", base).await;
+    let (db_create, db_create_db) = roles.login(&pool, "cxp_t_db_create", base).await;
+    let create_group = roles.nologin(&pool, "cxp_t_create_grp", base).await;
+    let (noinherit, noinherit_db) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    for stmt in [
+        format!("GRANT otto_app TO {plain}, {schema_create}, {db_create}, {noinherit}"),
+        format!("GRANT {create_group} TO {noinherit}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    // A fresh database: PUBLIC holds TEMPORARY, so every login may create a
+    // temporary table, and is flagged.
+    let role = inspect(&plain_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(plain.clone(), db_object.clone(), vec!["TEMPORARY"])],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(!role.is_refused_in_a_deployment());
+    assert!(
+        role.summary()
+            .contains(&format!("can TEMPORARY in {db_object}")),
+        "{}",
+        role.summary()
+    );
+
+    // Revoked from PUBLIC (the runbook's S3): nowhere to create.
+    sqlx::query(&format!(
+        "REVOKE TEMPORARY ON DATABASE \"{database}\" FROM PUBLIC"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&plain_db).await.unwrap();
+    assert!(role.create_privileges.is_empty(), "{}", role.summary());
+    assert!(!role.can_alter_tables(), "{}", role.summary());
+    plain_db.pool().close().await;
+
+    // CREATE on schema public, granted to the login.
+    sqlx::query(&format!("GRANT CREATE ON SCHEMA public TO {schema_create}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role = inspect(&schema_create_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(
+            schema_create.clone(),
+            r#"schema "public""#.to_string(),
+            vec!["CREATE"]
+        )],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"can CREATE in schema "public""#),
+        "{}",
+        role.summary()
+    );
+    schema_create_db.pool().close().await;
+
+    // CREATE on the database, granted to the login.
+    sqlx::query(&format!(
+        "GRANT CREATE ON DATABASE \"{database}\" TO {db_create}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&db_create_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(db_create.clone(), db_object.clone(), vec!["CREATE"])],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    db_create_db.pool().close().await;
+
+    // CREATE and TEMPORARY held by a group a NOINHERIT login can SET ROLE
+    // to but does not inherit from: one SET ROLE away still counts.
+    for stmt in [
+        format!("GRANT CREATE, TEMPORARY ON DATABASE \"{database}\" TO {create_group}"),
+        format!("GRANT CREATE ON SCHEMA public TO {create_group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect(&noinherit_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [
+            (
+                noinherit.clone(),
+                db_object.clone(),
+                vec!["CREATE", "TEMPORARY"]
+            ),
+            (
+                noinherit.clone(),
+                r#"schema "public""#.to_string(),
+                vec!["CREATE"]
+            ),
+        ],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    noinherit_db.pool().close().await;
 }
 
 /// The runtime role needs, beyond `otto_app`, only `INSERT` on
@@ -2199,6 +2350,33 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
     }
     assert!(missing_runtime_grants(&as_login).await.unwrap().is_empty());
     as_login.pool().close().await;
+
+    // A NOINHERIT login that is a member of otto_app holds none of its
+    // privileges without SET ROLE: reported, with the insert it inherits
+    // nothing of either.
+    let (noinherit, as_noinherit) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    for stmt in [
+        format!("GRANT otto_app TO {noinherit}"),
+        format!("GRANT cxp_runtime TO {noinherit}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert_eq!(
+        missing_runtime_grants(&as_noinherit).await.unwrap(),
+        ["INSERT on deleted_orgs", "inheriting otto_app"]
+    );
+    // A grant directly to the login fixes the insert, not the inheritance.
+    sqlx::query(&format!("GRANT INSERT ON deleted_orgs TO {noinherit}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_runtime_grants(&as_noinherit).await.unwrap(),
+        ["inheriting otto_app"]
+    );
+    as_noinherit.pool().close().await;
 }
 
 /// Before migrations there is no `deleted_orgs` to need a grant on.

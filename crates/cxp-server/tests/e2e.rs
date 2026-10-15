@@ -2146,15 +2146,18 @@ async fn with_parameter_acl_lock(
             break;
         }
     }
-    // Closing the session releases the lock.
-    lock.close().await?;
-    result
+    // Closing the session releases the lock; a statement's error comes
+    // first, the close's only when every statement succeeded.
+    let closed = lock.close().await;
+    result.and(closed)
 }
 
 /// The migration owner docs/deploy/fly.md sets up on `otto-db`, on this
 /// test's (empty) database: a login role that is not privileged, may set the
 /// console lookup's parameter, and owns the database, which only the roles
-/// granted `CONNECT` may connect to. Returns its connection URL.
+/// granted `CONNECT` may connect to and in which only the owner may create
+/// temporary tables (PUBLIC's default `TEMPORARY` revoked, as the runbook
+/// does). Returns its connection URL.
 async fn owner_role(pool: &PgPool, role: &str) -> String {
     let database = pool.connect_options().get_database().unwrap().to_string();
     let password = plain_login(pool, role).await;
@@ -2172,6 +2175,7 @@ async fn owner_role(pool: &PgPool, role: &str) -> String {
     for stmt in [
         format!("ALTER DATABASE \"{database}\" OWNER TO {role}"),
         format!("REVOKE CONNECT ON DATABASE \"{database}\" FROM PUBLIC"),
+        format!("REVOKE TEMPORARY ON DATABASE \"{database}\" FROM PUBLIC"),
         format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
     ] {
         sqlx::query(&stmt).execute(pool).await.unwrap();
@@ -2180,21 +2184,24 @@ async fn owner_role(pool: &PgPool, role: &str) -> String {
 }
 
 /// The runtime role the service serves as: a login role that is not
-/// privileged, owns nothing, and is a member of `otto_app` (the tenant role)
-/// and `cxp_runtime` (the tombstone grant). Returns its connection URL.
-async fn runtime_role(pool: &PgPool, role: &str) -> String {
+/// privileged, owns nothing, and is a member of `groups` (normally
+/// [`RUNTIME_GROUPS`]). Returns its connection URL.
+async fn runtime_role(pool: &PgPool, role: &str, groups: &[&str]) -> String {
     let database = pool.connect_options().get_database().unwrap().to_string();
     shared_roles(pool).await;
     let password = plain_login(pool, role).await;
-    for stmt in [
-        format!("GRANT otto_app TO {role}"),
-        format!("GRANT cxp_runtime TO {role}"),
-        format!("GRANT CONNECT ON DATABASE \"{database}\" TO {role}"),
-    ] {
+    let grants = groups.iter().map(|g| format!("GRANT {g} TO {role}"));
+    for stmt in grants.chain([format!(
+        "GRANT CONNECT ON DATABASE \"{database}\" TO {role}"
+    )]) {
         sqlx::query(&stmt).execute(pool).await.unwrap();
     }
     database_url_as(pool, Some((role, &password)))
 }
+
+/// What the runtime role is a member of: `otto_app` (the tenant role) and
+/// `cxp_runtime` (the tombstone grant).
+const RUNTIME_GROUPS: [&str; 2] = ["otto_app", "cxp_runtime"];
 
 /// Production's shape on the test database: an owner and a runtime role
 /// (each dropped when the guard is), created before anything migrates, since
@@ -2208,6 +2215,11 @@ struct Split {
 }
 
 async fn split(pool: &PgPool) -> Split {
+    split_with(pool, &RUNTIME_GROUPS).await
+}
+
+/// [`split`] with a runtime role that is a member of `groups` only.
+async fn split_with(pool: &PgPool, groups: &[&str]) -> Split {
     let id = Uuid::new_v4().simple();
     let (owner, runtime) = (format!("cxp_ow_{id}"), format!("cxp_rt_{id}"));
     let drop = (
@@ -2216,7 +2228,7 @@ async fn split(pool: &PgPool) -> Split {
     );
     shared_roles(pool).await;
     let owner_url = owner_role(pool, &owner).await;
-    let runtime_url = runtime_role(pool, &runtime).await;
+    let runtime_url = runtime_role(pool, &runtime, groups).await;
     Split {
         owner,
         owner_url,
@@ -2516,8 +2528,10 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         boot.database_role
     );
     assert!(
-        boot.database_role
-            .contains("it owns nothing in this database"),
+        boot.database_role.ends_with(
+            "it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, and \
+             can create no schema, object, or temporary table in it"
+        ),
         "{}",
         boot.database_role
     );
@@ -2632,13 +2646,18 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         assert_eq!(n, 0, "{table} as the unpinned runtime role");
     }
 
-    // Nor can it switch row-level security off, or empty a table past it:
-    // each needs ownership or a privilege it does not hold.
+    // Nor can it switch row-level security off, empty a table past it,
+    // shadow a tenant table with a temporary one (pg_temp is searched first
+    // and outlives the transaction on a pooled connection), or plant a
+    // function a SECURITY DEFINER function could resolve: each needs
+    // ownership or a privilege it does not hold.
     for stmt in [
         "ALTER TABLE customers NO FORCE ROW LEVEL SECURITY",
         "ALTER TABLE customers DISABLE ROW LEVEL SECURITY",
         "DROP POLICY customers_tenant_isolation ON customers",
         "TRUNCATE customers",
+        "CREATE TEMP TABLE customers (x int)",
+        "CREATE FUNCTION public.f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
     ] {
         let err = sqlx::query(stmt)
             .execute(as_role.pool())
@@ -2836,7 +2855,9 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
 }
 
 /// A re-check that cannot read the role leaves a raised alarm raised: an
-/// unreachable database is no evidence the role was fixed.
+/// unreachable database is no evidence the role was fixed. Failures in a
+/// row are counted (logged at `error` from the third on), and a re-check
+/// that reads the role resets the count.
 #[sqlx::test(migrations = false)]
 async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: PgPool) {
     let _guard = discard_logs();
@@ -2844,8 +2865,118 @@ async fn the_role_recheck_keeps_the_alarm_when_the_database_cannot_answer(pool: 
     let alarm = cxp_server::health::RoleAlarm::default();
     alarm.raise("database role refused at the last pass".into());
     db.pool().close().await;
-    cxp_server::boot::recheck_db_role(&db, &Config::for_test(), &alarm).await;
-    assert!(alarm.is_raised());
+    for n in 1..=cxp_server::boot::RECHECK_ESCALATE_AFTER + 1 {
+        cxp_server::boot::recheck_db_role(&db, &Config::for_test(), &alarm).await;
+        assert!(alarm.is_raised());
+        assert_eq!(alarm.consecutive_failures(), n);
+    }
+
+    // A re-check that reads the role (the superuser test pool, on a
+    // developer's machine: allowed) resets the count and lowers the alarm.
+    let mut local = Config::for_test();
+    local.public_url = "http://localhost:8080".into();
+    local.resource_uri = "http://localhost:8080/mcp".into();
+    let db = Db::connect(&database_url_as(&pool, None)).await.unwrap();
+    cxp_server::boot::recheck_db_role(&db, &local, &alarm).await;
+    assert_eq!(alarm.consecutive_failures(), 0);
+    assert!(!alarm.is_raised());
+    db.pool().close().await;
+}
+
+/// A deployment refuses a runtime role that cannot write the `org.deleted`
+/// tombstone (a member of `otto_app` but not `cxp_runtime`): every such
+/// webhook would fail. The error names what is missing and the role, quoted,
+/// in the statements that fix it; nothing listens.
+#[sqlx::test(migrations = false)]
+async fn a_deployment_refuses_a_runtime_role_without_the_tombstone_grant(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split_with(&pool, &["otto_app"]).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.runtime_url, None);
+    config.run_migrations = false;
+    config.bind = addr;
+    config.platform_url = base;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cxp_server::run(config, listener, std::future::pending()),
+    )
+    .await
+    .expect("a refused boot returns rather than serving");
+    let err = format!("{:#}", result.expect_err("boot refused"));
+    assert!(err.contains("refusing to serve"), "{err}");
+    assert!(err.contains("INSERT on deleted_orgs"), "{err}");
+    assert!(
+        err.contains(&format!(r#"GRANT cxp_runtime TO "{}""#, roles.runtime)),
+        "{err}"
+    );
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+}
+
+/// The same role on a developer's machine (loopback URLs, no `FLY_APP_NAME`,
+/// no other service's database on the instance) boots, with a warning, and
+/// serves until stopped.
+#[sqlx::test(migrations = false)]
+async fn a_local_run_warns_about_a_runtime_role_without_the_tombstone_grant(pool: PgPool) {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    let roles = split_with(&pool, &["otto_app"]).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+
+    let (base, _) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = deployed(&roles.runtime_url, None);
+    config.public_url = "http://localhost:8080".into();
+    config.resource_uri = "http://localhost:8080/mcp".into();
+    config.fly_app_name = None;
+    config.run_migrations = false;
+    config.bind = addr;
+    config.platform_url = base;
+    assert!(!config.is_deployment());
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run(config, listener, async move {
+        let _ = stopped.await;
+    });
+    let client = async move {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(res) = reqwest::get(format!("http://{addr}/healthz")).await {
+                assert_eq!(res.status().as_u16(), 200);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the local run did not serve"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        stop.send(()).unwrap();
+    };
+    let (boot, ()) = tokio::join!(server, client);
+    boot.expect("a local run boots and stops cleanly");
+    let text = logs.text();
+    assert!(
+        text.contains("INSERT on deleted_orgs")
+            && text.contains("allowed only because this is not a deployment"),
+        "{text}"
+    );
 }
 
 /// A deployment refuses a superuser connection before running anything as
