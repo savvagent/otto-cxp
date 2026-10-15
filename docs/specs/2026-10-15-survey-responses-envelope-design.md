@@ -44,8 +44,10 @@ From #36 (verbatim):
   "autoUpdate"`), which runs until the worker updates; see Risks.
 - **No compatibility alias.** Content negotiation or a query flag to keep the array was rejected:
   #24 changed other list shapes without one, and the console is the known reader.
-- **The console shows the total.** The detail page heading becomes `Responses (<total>)`, and
-  when `total` exceeds the rows shown it says how many of the total are shown. It still fetches
+- **The console shows the total.** The detail page heading becomes `Responses (<total>)`, or
+  `Responses (<shown> of <total>)` when `total` exceeds the rows shown, computed by an exported
+  pure function `responsesCount(shown, total)` in `survey-detail.tsx` so it is unit-tested
+  (the console has no component-render tests). It still fetches
   the first page only (limit 50, as today); paging through responses is out of scope.
 - **`getResponses` takes optional `{limit, offset}`** with the same defaults (50, 0) as
   `surveysApi.list`, so a later pager needs no API change; the hook keys on them.
@@ -81,7 +83,8 @@ total).
 
 ## Architecture
 
-- `crates/cxp-api/src/routes/surveys.rs:144-155` `responses`: return
+- `crates/cxp-api/src/routes/surveys.rs:140-155` `responses` (its whole doc comment is rewritten,
+  dropping the #36 note): return
   `ApiResult<Json<Paginated<SurveyResponse>>>`; build it as
   `let page = q.page(); Paginated::new(tx.list_survey_responses(id, page).await?, page)`, the
   pattern every other list handler uses. Doc comment drops "plain JSON array" and states the
@@ -109,13 +112,14 @@ total).
   `only_creating_a_survey_charges_and_it_charges_once`).
 - Small shared DB: the query was already bounded (`Page` clamps limit to 200) and already counted
   the total; no new query.
-- No SQL outside `cxp-core`: no new SQL in `cxp-api` source. The api test seeds rows with SQL as
-  the test superuser, as `Harness::outbox` already reads with SQL.
+- No SQL outside `cxp-core`: no new SQL anywhere. The api test seeds responses through
+  `cxp_core::feedback::FeedbackExt::submit_survey_response` on an org-pinned `Db::begin(org)`
+  transaction (as `crates/cxp-core/tests` do), so seeding runs under RLS.
 - Migrations: none.
 
 ## Out-of-band
 
-None. No config, secret, scope, migration, or role change.
+None. No config, secret, scope, migration, or role change, and no recurring-cost impact.
 
 ## Error Handling & Edge Cases
 
@@ -132,7 +136,8 @@ None. No config, secret, scope, migration, or role change.
 - Rust unit (`cxp-api` lib, `wire_fixture`): the fixture test fails until `wire.json` is
   regenerated with the new `surveyResponseList` key.
 - Rust integration (`crates/cxp-api/tests/api.rs`): a new `#[sqlx::test]` creates a survey and two
-  customers over the API, seeds three responses with SQL as the test superuser, and asserts:
+  customers over the API, seeds three responses through `FeedbackExt::submit_survey_response` on
+  an org-pinned transaction, and asserts:
   exactly the four envelope keys; `total` 3, default `limit` 50, `offset` 0; `?limit=2&offset=0`
   serves two rows with `total` 3; `?offset=10` serves `[]` with `total` 3; a response row carries
   `surveyId`/`customerId`/`completedAt` (camelCase); an empty survey answers `total` 0; another
@@ -140,7 +145,8 @@ None. No config, secret, scope, migration, or role change.
 - Web (`apps/web/src/lib/types.test.ts`): `surveyResponseList` satisfies
   `PaginatedResponse<SurveyResponse>` and joins the envelope test; an api-call test stubs fetch
   with it and checks `surveysApi.getResponses` returns `data`/`total` and requests
-  `limit=50&offset=0`.
+  `limit=50&offset=0`. `apps/web/src/pages/surveys/survey-detail.test.ts` covers
+  `responsesCount` (`3`/`3` → `"3"`, `50`/`120` → `"50 of 120"`, `0`/`0` → `"0"`).
 - Gates: test, lint, format, extra (migrations), the pnpm gate (`apps/web/**` changed), and the
   container build (`crates/**`, `apps/web/**` changed).
 
