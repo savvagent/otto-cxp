@@ -46,8 +46,9 @@ use crate::Result;
 
 /// At most this many privileged roles, reachable databases, owned objects,
 /// or tables it may `TRUNCATE` or add a `TRIGGER` to are read per user: one
-/// is enough to refuse.
-const MAX_REPORTED: i64 = 8;
+/// is enough to refuse. Public only so tests can follow it.
+#[doc(hidden)]
+pub const MAX_REPORTED: i64 = 8;
 
 /// The predefined roles whose members reach past this service: server files
 /// and programs, every table in every database they can open, other
@@ -120,8 +121,9 @@ pub struct DbRole {
     /// How many objects the users own in all (each user's count, summed),
     /// of which [`DbRole::owned`] lists the first few.
     pub owned_total: i64,
-    /// Tables, views, and foreign tables either user may `TRUNCATE` or add
-    /// a `TRIGGER` to without owning them, at most `MAX_REPORTED` per
+    /// Tables, views, and foreign tables either user, or a role it can `SET
+    /// ROLE` to (inherited or not), may `TRUNCATE` or add a `TRIGGER` to
+    /// without owning them, at most `MAX_REPORTED` per
     /// user. Not read for a superuser user.
     pub table_privileges: Vec<TablePrivilege>,
 }
@@ -548,8 +550,14 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
             through,
         }));
 
-        // Every object here owned by a role the user is or can SET ROLE to,
-        // the first few by kind then name, and how many in all.
+        // The objects here owned by a role the user is or can SET ROLE to,
+        // the first few by kind then name, and how many in all. Each kind is
+        // a way around RLS for its owner: the database and its schemas (drop
+        // or replace what is in them), extensions (dropped with every object
+        // in them), tables and the rest of pg_class (NO FORCE RLS, drop a
+        // policy, ALTER or drop the relation), and functions and types
+        // (replace the code and types the triggers, policies, and the
+        // console lookup run).
         let rows: Vec<(String, String, String, i64)> = sqlx::query_as(&format!(
             "WITH schemas AS ({SCHEMAS}), \
              objects AS ( \
@@ -594,12 +602,14 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
         .await?;
         owned_total += rows.first().map_or(0, |r| r.3);
         owned.extend(rows.into_iter().map(|(kind, name, owner, _)| {
+            let known = OWNED_KINDS.into_iter().find(|k| *k == kind);
+            // Unreachable: the query only produces OWNED_KINDS. Should the
+            // two drift, the object is still reported, as "object", rather
+            // than dropped from a list that decides whether to refuse.
+            debug_assert!(known.is_some(), "kind {kind:?} is not in OWNED_KINDS");
             OwnedObject {
                 user: user.clone(),
-                kind: OWNED_KINDS
-                    .into_iter()
-                    .find(|k| *k == kind)
-                    .unwrap_or("object"),
+                kind: known.unwrap_or("object"),
                 name,
                 owner,
             }
@@ -607,16 +617,30 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
 
         // Relations it may TRUNCATE (which ignores RLS) or add a TRIGGER to
         // (code that runs as whoever writes next) without owning them.
+        // has_table_privilege(user, ...) counts only what the user inherits;
+        // a NOINHERIT login, or a grant WITH INHERIT FALSE, SET TRUE, still
+        // reaches a role's privileges by SET ROLE, so each role the user is a
+        // member of (itself included) is asked in turn.
         let rows: Vec<(String, bool, bool)> = sqlx::query_as(&format!(
-            "WITH schemas AS ({SCHEMAS}) \
-             SELECT c.oid::pg_catalog.regclass::text, \
-                    pg_catalog.has_table_privilege($1::text::name, c.oid, 'TRUNCATE'), \
-                    pg_catalog.has_table_privilege($1::text::name, c.oid, 'TRIGGER') \
-             FROM pg_catalog.pg_class c JOIN schemas s ON s.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-               AND NOT pg_catalog.pg_has_role($1::text::name, c.relowner, 'MEMBER') \
-               AND (pg_catalog.has_table_privilege($1::text::name, c.oid, 'TRUNCATE') \
-                    OR pg_catalog.has_table_privilege($1::text::name, c.oid, 'TRIGGER')) \
+            "WITH schemas AS ({SCHEMAS}), \
+             roles AS ( \
+               SELECT r.oid FROM pg_catalog.pg_roles r \
+               WHERE pg_catalog.pg_has_role($1::text::name, r.oid, 'MEMBER') \
+             ), \
+             relations AS ( \
+               SELECT c.oid, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_table_privilege(r.oid, c.oid, 'TRUNCATE')) \
+                        AS can_truncate, \
+                      EXISTS (SELECT 1 FROM roles r WHERE \
+                              pg_catalog.has_table_privilege(r.oid, c.oid, 'TRIGGER')) \
+                        AS can_trigger \
+               FROM pg_catalog.pg_class c JOIN schemas s ON s.oid = c.relnamespace \
+               WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 AND NOT pg_catalog.pg_has_role($1::text::name, c.relowner, 'MEMBER') \
+             ) \
+             SELECT oid::pg_catalog.regclass::text, can_truncate, can_trigger \
+             FROM relations WHERE can_truncate OR can_trigger \
              ORDER BY 1 \
              LIMIT $2"
         ))

@@ -2050,6 +2050,13 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
     let (truncate, truncate_db) = roles.login(&pool, "cxp_t_truncate", base).await;
     let (trigger, trigger_db) = roles.login(&pool, "cxp_t_trigger", base).await;
     let (db_owner, db_owner_db) = roles.login(&pool, "cxp_t_db_owner", base).await;
+    // TRUNCATE held by a group the login can SET ROLE to but does not
+    // inherit from: NOINHERIT, or (Postgres 16) a grant WITH INHERIT FALSE.
+    let truncate_group = roles.nologin(&pool, "cxp_t_trunc_grp", base).await;
+    let (noinherit, noinherit_db) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    let (set_only, set_only_db) = roles.login(&pool, "cxp_t_set_only", base).await;
     for stmt in [
         format!("GRANT otto_app TO {plain}, {table_owner}, {member}, {truncate}, {trigger}"),
         format!("ALTER TABLE tickets OWNER TO {table_owner}"),
@@ -2057,6 +2064,9 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         format!("GRANT {group_owner} TO {member}"),
         format!("GRANT TRUNCATE ON customers TO {truncate}"),
         format!("GRANT TRIGGER ON feedback TO {trigger}"),
+        format!("GRANT TRUNCATE ON customers TO {truncate_group}"),
+        format!("GRANT {truncate_group} TO {noinherit}"),
+        format!("GRANT {truncate_group} TO {set_only} WITH INHERIT FALSE, SET TRUE"),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
@@ -2085,11 +2095,35 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         role.summary()
     );
     assert!(role.owned.iter().all(|o| o.user == table_owner));
-    // Its indexes come with it: more than are listed, all counted, the
-    // table first (kinds in order, indexes last).
-    assert_eq!(role.owned.len(), 8, "{}", role.summary());
-    assert!(role.owned_total > 8, "{}", role.summary());
-    assert!(role.owned.iter().skip(1).all(|o| o.kind == "index"));
+    // Its indexes and owned sequences come with it, counted from the
+    // catalog so the test follows the schema; the table is listed first
+    // (kinds in order) and the list stops at the cap.
+    let expected: i64 = sqlx::query_scalar(
+        "SELECT 1 \
+           + (SELECT count(*) FROM pg_index WHERE indrelid = 'tickets'::regclass) \
+           + (SELECT count(*) FROM pg_depend d \
+              JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+              WHERE d.refobjid = 'tickets'::regclass AND d.deptype IN ('a', 'i'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cap = cxp_core::db_role::MAX_REPORTED;
+    assert_eq!(role.owned_total, expected, "{}", role.summary());
+    assert_eq!(
+        role.owned.len() as i64,
+        expected.min(cap),
+        "{}",
+        role.summary()
+    );
+    assert_eq!(
+        owned(&role)[0],
+        ("table", "tickets", table_owner.as_str()),
+        "{}",
+        role.summary()
+    );
+    // Owned relations are not reported again as table privileges.
+    assert!(role.table_privileges.is_empty(), "{}", role.summary());
     assert!(role.owns_objects());
     assert!(role.can_alter_tables());
     assert!(
@@ -2130,6 +2164,7 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
     );
     truncate_db.pool().close().await;
     let role = inspect(&trigger_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
     let privileges: Vec<_> = role
         .table_privileges
         .iter()
@@ -2141,6 +2176,24 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
     );
     assert!(role.can_alter_tables());
     trigger_db.pool().close().await;
+
+    // TRUNCATE one SET ROLE away counts, inherited or not.
+    for (login, as_login) in [(&noinherit, noinherit_db), (&set_only, set_only_db)] {
+        let role = inspect(&as_login).await.unwrap();
+        let privileges: Vec<_> = role
+            .table_privileges
+            .iter()
+            .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+            .collect();
+        assert_eq!(
+            privileges,
+            [(login.as_str(), "customers", vec!["TRUNCATE"])],
+            "{}",
+            role.summary()
+        );
+        assert!(role.can_alter_tables());
+        as_login.pool().close().await;
+    }
 
     // The database's owner: the database, and schema public through
     // pg_database_owner, which every database owner is implicitly in.
