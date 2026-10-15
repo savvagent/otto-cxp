@@ -30,8 +30,8 @@ const TEMPLATE: &str = include_str!("install_page.html");
 /// nothing else: the page fetches nothing, submits nothing, and is never
 /// framed.
 pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
-     style-src 'sha256-BkQgInaa3iWX2Xuf68SM2cweJB6VPvma0ftoW9fc5Xg='; \
-     script-src 'sha256-92nC2BTT6TmRZ5qPmaPC1O/48G4lO5YPK+97QWumpW0='; \
+     style-src 'sha256-FczW5OVrT2mS0VV+4I1vUxN60McgpyXt7vmlNbtNfGc='; \
+     script-src 'sha256-sQXLBsN1XKHAA1ZR/dNSyr1AEQTQNOqkaW/4UUO/0xo='; \
      base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// The rendered page, shared by every request.

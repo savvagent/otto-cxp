@@ -1,0 +1,3 @@
+# The install page's style and script are pinned by hash in its CSP; a CRLF
+# checkout would change those bytes and break the page under its own policy.
+crates/cxp-server/src/install_page.html text eol=lf
