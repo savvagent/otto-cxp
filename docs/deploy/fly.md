@@ -127,7 +127,8 @@ unprivileged `cxp` user to root) can read the owner's credential, and so can any
 app's Fly deploy token (`fly ssh`, or a machine they start). Closing that means the owner's
 credential living outside this app: a separate Fly app (say `otto-cxp-migrate`) holding only
 `CXP_MIGRATION_DATABASE_URL` and running `cxp-server migrate` as a one-off machine from the
-deploy job before `fly deploy`. That is a follow-up, not done here: it adds an app, its own
+deploy job before `fly deploy`. That is a follow-up,
+[#45](https://github.com/savvagent/otto-cxp/issues/45), not done here: it adds an app, its own
 deploy token, and ordering in CI.
 
 The `SECURITY DEFINER` functions run as their owner, `cxp_owner`: `console_session_org` (the

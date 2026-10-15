@@ -425,7 +425,7 @@ revoked), after which the new binary serves as `cxp_server`.
   `cxp` user inside the serving process, and environment dumps of it do not find it. Root on a
   serving machine (Fly's init holds the secrets), and anyone holding the app's deploy token, still
   can. The stronger arrangement, a separate Fly app holding only the owner credential and running
-  `cxp-server migrate` from the deploy job, is a recorded follow-up (another app, token, and CI
+  `cxp-server migrate` from the deploy job, is the follow-up #45 (another app, token, and CI
   ordering).
 - **No schema-version check before serving.** If the release command were skipped, a newer binary
   would serve against an older schema and fail per query. Fly aborts the deploy when the release
