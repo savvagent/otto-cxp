@@ -1,6 +1,6 @@
 # One casing convention for the `/api/v1` wire format — design
 
-**Status:** DRAFT
+**Status:** IN PROGRESS
 **Issue:** #24
 
 ## Brief
@@ -234,7 +234,10 @@ instead of an array until it reloads, and its dashboard keeps working via the le
   `totalCapped: false` and no `x-total-*` headers; dashboard answers both key sets; a ticket
   created with `customerId` and one with `customer_id` both succeed; a list filtered with
   `?customerId=` and `?customer_id=` both filter; a catalog create with `teamId` still verifies.
-  Existing snake_case calls in the file stay as alias coverage.
+  Existing snake_case calls in the file stay as alias coverage. The cross-tenant e2e suite
+  (`crates/cxp-server/tests/e2e.rs`, the `CountsOnlyB` arm) asserts the dashboard body exactly
+  and gains the camelCase keys; its search case only checks the body for leaked text, which holds
+  for either shape.
 - **Web:** `pnpm build` (tsc over `src` and `test`) and `pnpm test` (`types.test.ts` against the
   fixture; any API-client test that asserts a URL or body updated to camelCase).
 - **Gates:** test, clippy, fmt, migrations-append-only, docker build, pnpm gate (all from the
@@ -246,4 +249,9 @@ instead of an array until it reloads, and its dashboard keeps working via the le
   body calls it out. Mitigated by the shape being one day old.
 - **#34 is changing `cxp-core` search internals in parallel.** If `SearchPage` changes, the
   `CappedPaginated` constructor adapts on rebase; the wire shape here does not depend on core's.
-- **A cached old console bundle** sees the search object until reload (command palette only).
+- **A cached old console bundle.** The console is a PWA (`vite-plugin-pwa`, `registerType:
+  "autoUpdate"`, precached app shell), so a browser can run the previous bundle for one session
+  after the deploy. In it, writes still work (aliases) and the dashboard still works (legacy
+  keys); only the command palette's customer results break: `customerResults.value.slice` throws
+  inside its `try`/`finally`, so the palette shows no customers (tickets still show) until the
+  new worker takes over. Accepted: no guard is added for a one-session, read-only degradation.
