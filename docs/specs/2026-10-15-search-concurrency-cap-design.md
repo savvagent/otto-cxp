@@ -217,7 +217,7 @@ Gate: `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test --wor
     renaming a customer writes `customer_search_grams` through migration 0004's triggers.) The test
     fires 8 concurrent `GET /api/v1/customers/search` requests, waits until the 2 permits are
     taken, then issues `POST /api/v1/tickets` for that customer (a ticket write touches no search
-    table) and asserts it succeeds (201) while the searches are still blocked. The pool's acquire
+    table) and asserts it succeeds (200) while the searches are still blocked. The pool's acquire
     timeout is well under the 2 s `statement_timeout` (for example 500 ms), so the write lands
     inside the window. The turned-away searches
     answer 503 with `Retry-After`, and the blocked ones `query_too_broad`.

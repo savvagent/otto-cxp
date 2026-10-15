@@ -287,12 +287,20 @@ async fn write_during_a_search_flood(
 ) -> (StatusCode, Vec<StatusCode>) { /* see below */ }
 ```
 
-`write_during_a_search_flood`: spawn `n` tasks each calling
-`h.call("GET", "/api/v1/customers/search?q=grace", Some(token), None)` (the Harness must be
-`Clone` or wrapped in `Arc`; make `Harness` derive `Clone` if all fields allow, else share via
-`Arc<Harness>`); poll `h.search.available() == 0` every 10 ms for up to 1 s; then send
-`POST /api/v1/tickets` with `{"customerId": customer, "subject": "flood"}` and record its status;
-then join the searches.
+`write_during_a_search_flood`: follow the pattern in `crates/cxp-api/tests/console.rs` (~776-835:
+its own `pool_of_five`, 8 requests via `futures::future::join_all`, and `drop(h); pool.close().await;`
+at the end). Run the `n` searches
+(`h.call("GET", "/api/v1/customers/search?q=grace", Some(token), None)`) with `join_all`,
+concurrently via `tokio::join!` with a second future that: polls every 10 ms (up to 1 s) until
+`h.search.available() == 0` **and** the app pool has as many busy connections as the searches
+can hold (`pool.size() - pool.num_idle() as u32 >= min(permits, 5)`; pass the expected count in),
+so the searches really hold their connections before the write; then sends `POST /api/v1/tickets`
+with `{"customerId": customer, "subject": "flood"}` and returns its status. Wrap the whole join in
+`tokio::time::timeout(Duration::from_secs(10), ...)` so a search that stops honouring its
+statement_timeout fails the test instead of hanging it. At the end of each flood test, roll back
+and close the locker connection, `drop(h)`, and `pool.close().await`. The ticket route answers 200
+(no route here answers 201). Imports: `sqlx::postgres::{PgConnectOptions, PgPoolOptions}`,
+`sqlx::Connection`, `cxp_core::search::SearchLimiter`.
 
 Tests:
 
@@ -312,7 +320,7 @@ async fn a_search_flood_cannot_starve_a_write(opts: PgPoolOptions, connect: PgCo
     sqlx::query("LOCK TABLE customer_search_grams IN ACCESS EXCLUSIVE MODE")
         .execute(&mut locker).await.unwrap();
     let (write, searches) = write_during_a_search_flood(&h, &t, &customer, 8).await;
-    assert_eq!(write, StatusCode::CREATED, "the write was starved");
+    assert_eq!(write, StatusCode::OK, "the write was starved");
     assert!(searches.iter().all(|s| *s == StatusCode::SERVICE_UNAVAILABLE
                                     || *s == StatusCode::UNPROCESSABLE_ENTITY), "{searches:?}");
     assert!(searches.contains(&StatusCode::SERVICE_UNAVAILABLE), "nothing was turned away");
@@ -337,7 +345,7 @@ async fn a_search_without_a_permit_is_unavailable(pool: PgPool) {
     let _held = limiter.acquire().await.unwrap();
     let r = h.call("GET", "/api/v1/customers/search?q=grace", Some(&t), None).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(r.body["error"], "unavailable", "{}", r.body);
+    assert_eq!(r.body["code"], "unavailable", "{}", r.body);
     assert!(r.headers.contains_key("retry-after"));
 }
 ```
@@ -346,6 +354,10 @@ Check the customer-create route's JSON field names (`email`, `name`) and the tic
 (`customerId`, `subject`) against `crates/cxp-api/src/routes` before writing them; the wire is
 camelCase. Adjust the error-body field (`error` vs `code`) to what `ApiError` serializes (read
 `crates/cxp-api/src/error.rs`).
+
+Other callers to update: `harness_opts(pool, SECRET, true)` at `api.rs` ~1197, and the direct
+`router(...)` call in `crates/cxp-mcp/tests/mcp.rs` ~887
+(`the_router_refuses_an_empty_allowed_host_list`).
 
 (b) `crates/cxp-mcp/tests/mcp.rs`: give the harness a limiter (default `SearchLimiter::for_pool(5)`;
 a `harness_search(pool, limiter)` variant) and add:
