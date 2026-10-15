@@ -85,6 +85,14 @@ pub(crate) const CUSTOMER_COLS: &str = "id, email, name, phone, company, metadat
 /// until [`TOTAL_CAP`] + 1 match, so the count stops at the cap. The count
 /// of the org's customers (up to [`NEWEST_READ`] + 1) runs only when the
 /// matches have not already capped the result.
+///
+/// Each per-candidate step is fenced so a generic plan keeps it per
+/// candidate (#41): `LIMIT 1` in `matches`' lateral (a primary-key lookup,
+/// so at most one row anyway) stops the planner flattening it into a join
+/// over all of the org's customers, and `OFFSET 0` in `sub_hits`' probe
+/// stops it hashing the probe into a read of all of the org's index rows
+/// (`LIMIT` alone would not: Postgres drops it from an `EXISTS`). Neither
+/// changes a result. `tests/search_plans.rs` checks the plans.
 pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
     let cap = TOTAL_CAP;
     format!(
@@ -106,7 +114,8 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
            SELECT r.customer_id FROM (SELECT DISTINCT customer_id FROM sub_read) AS r \
            WHERE NOT EXISTS (SELECT 1 FROM wr WHERE wr.rk IN (2, 3) AND NOT EXISTS ( \
                    SELECT 1 FROM customer_search_grams c \
-                   WHERE c.org_id = $1 AND c.gram = wr.gram AND c.customer_id = r.customer_id)) \
+                   WHERE c.org_id = $1 AND c.gram = wr.gram AND c.customer_id = r.customer_id \
+                   OFFSET 0)) \
          ), sub_new AS MATERIALIZED ( \
            SELECT r.id AS customer_id FROM ( \
              SELECT id, email, name FROM customers \
@@ -169,7 +178,8 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
              SELECT id, email ILIKE $2 AS em, similarity(name, $3) AS sim, created_at \
              FROM customers \
              WHERE org_id = $1 AND id = c.customer_id \
-               AND (email ILIKE $2 OR name ILIKE $2 OR name % $3)) AS m \
+               AND (email ILIKE $2 OR name ILIKE $2 OR name % $3) \
+             LIMIT 1) AS m \
            LIMIT {cap_read} \
          ) \
          SELECT least((SELECT count(*) FROM matches), {cap}) AS total, \
@@ -190,6 +200,13 @@ pub(crate) static SEARCH_CUSTOMERS_SQL: LazyLock<String> = LazyLock::new(|| {
         cap_read = cap + 1,
     )
 });
+
+/// [`SEARCH_CUSTOMERS_SQL`]'s text, for the generic-plan shape tests
+/// (`tests/search_plans.rs`, #41). Not an interface.
+#[doc(hidden)]
+pub fn search_customers_sql() -> &'static str {
+    &SEARCH_CUSTOMERS_SQL
+}
 
 /// How many recent rows each section of the 360 view carries.
 const RECENT: i64 = 10;
