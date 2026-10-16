@@ -1,6 +1,6 @@
 # Give otto-cxp its own tenant role instead of the shared `otto_app` — design
 
-**Status:** APPROVED
+**Status:** IMPLEMENTED (#49)
 **Issue:** #28
 **Plan:** `docs/plans/2026-10-15-per-service-tenant-role.md`
 **Stacked on:** PR #46 (#27, the migration-owner split); retargeted to `main` after it merges.

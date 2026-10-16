@@ -108,7 +108,7 @@ stay). The role creation in production is human-only (runbook T1, Task 4). Do no
 
 **Model:** sonnet — mechanical across many files, with one migration fully specified here.
 
-- [ ] **Step 1: Write the failing unit test** in `crates/cxp-core/src/lib.rs`'s `mod tests`:
+- [x] **Step 1: Write the failing unit test** in `crates/cxp-core/src/lib.rs`'s `mod tests`:
 
 ```rust
     #[test]
@@ -143,13 +143,13 @@ And in `crates/cxp-core/tests/db.rs`, change `tenant_isolation_is_enforced_on_ev
     );
 ```
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p cxp-core --lib --locked the_tenant_role` → compile error (`TENANT_ROLE` not
 found). Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test -p cxp-core --test db --locked tenant_isolation_is_enforced_on_every_tenant_table`
 → FAIL (role is `otto_app`), once `lib.rs` compiles.
 
-- [ ] **Step 3: Implement the helper** in `crates/cxp-core/src/lib.rs`, after `POOL_ACQUIRE_TIMEOUT`:
+- [x] **Step 3: Implement the helper** in `crates/cxp-core/src/lib.rs`, after `POOL_ACQUIRE_TIMEOUT`:
 
 ```rust
 /// The role every tenant transaction assumes (`SET LOCAL ROLE`): otto-cxp's own (#28), never
@@ -176,7 +176,7 @@ pub fn tenant_db(pool: sqlx::PgPool) -> otto_tenant::Db {
 Update the crate doc comment's "runs under row-level security as `otto_app`" to "as `cxp_app`
 ([`TENANT_ROLE`])".
 
-- [ ] **Step 4: Add `clippy.toml`** at the workspace root:
+- [x] **Step 4: Add `clippy.toml`** at the workspace root:
 
 ```toml
 # Every otto_tenant::Db is built by cxp_core::tenant_db, which pins otto-cxp's own tenant role
@@ -191,7 +191,7 @@ Then prove the rule bites before fixing the call sites: `cargo clippy --workspac
 --locked -- -D warnings 2>&1 | grep -c disallowed_methods` must be > 0 (one per site). If it is 0,
 the path is wrong: try `otto_tenant::Db::from_pool`, and record which path worked.
 
-- [ ] **Step 5: Write migration 0007** at `crates/cxp-core/migrations/0007_cxp_app_tenant_role.sql`,
+- [x] **Step 5: Write migration 0007** at `crates/cxp-core/migrations/0007_cxp_app_tenant_role.sql`,
 exactly:
 
 ```sql
@@ -244,7 +244,7 @@ REVOKE DELETE ON removed_members FROM cxp_app;
 REVOKE ALL ON public._sqlx_migrations FROM cxp_app;
 ```
 
-- [ ] **Step 6: Move every `Db` construction to the helper.** `Db::from_pool(x)` →
+- [x] **Step 6: Move every `Db` construction to the helper.** `Db::from_pool(x)` →
 `cxp_core::tenant_db(x)`; `Db::connect(url).await.unwrap()` →
 `cxp_core::tenant_db(sqlx::PgPool::connect(url).await.unwrap())` (e2e). In
 `crates/cxp-core/tests/common/mod.rs`: `db(pool)` returns `cxp_core::tenant_db(pool)`; rename
@@ -254,7 +254,7 @@ the closure needs an owned `String` or a `&'static str` const); `as_app_unpinned
 `SET LOCAL ROLE` + `TENANT_ROLE`. Update the module docs to say the tenant role (`cxp_app`).
 Remove now-unused `use otto_tenant::Db` imports.
 
-- [ ] **Step 7: Replace `otto_app` where it means "the tenant role"** in tests. Rule: if the test
+- [x] **Step 7: Replace `otto_app` where it means "the tenant role"** in tests. Rule: if the test
 is about what a tenant transaction or the runtime's inherited grants can do, use
 `cxp_core::TENANT_ROLE` (in SQL strings via `format!`). Keep `otto_app` only where the test is
 about the shared role itself: (a) `the_schema_keeps_its_structural_invariants` checks the grant
@@ -273,14 +273,14 @@ the tenant role but not `cxp_runtime`") become `&["otto_app", cxp_core::TENANT_R
 task, and if it fails here because the role check is still `otto_app`, it should not: the check is
 unchanged in Task 1).
 
-- [ ] **Step 8: Run the gates**
+- [x] **Step 8: Run the gates**
 
 `cargo clippy --workspace --all-targets --locked -- -D warnings` → clean (no
 `disallowed_methods`). `cargo fmt --all`. Then
 `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test --workspace --locked` → all
 pass, 0 skipped. The two Step 1 tests pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add clippy.toml crates/
@@ -309,7 +309,7 @@ responses (these are boot-only).
 
 **Model:** sonnet — small, specified catalog queries and tests.
 
-- [ ] **Step 1: Write the failing tests** in `crates/cxp-core/tests/db.rs`:
+- [x] **Step 1: Write the failing tests** in `crates/cxp-core/tests/db.rs`:
   - Change the existing runtime-grant test (~2316-2390,
     `missing_runtime_grants_names_the_tombstone_insert` or its current name): logins are granted
     `cxp_core::TENANT_ROLE` instead of `otto_app`; expected lists become
@@ -350,14 +350,14 @@ responses (these are boot-only).
     assert!(report.tenant_role_assumed);
 ```
 
-- [ ] **Step 2: Run them to see them fail**
+- [x] **Step 2: Run them to see them fail**
 
 `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test -p cxp-core --test db --locked`
 → the runtime-grant and `holds_shared_tenant_role` tests fail (compile error for the latter);
 the parity, tombstone, and previous-release tests should already pass on Task 1's migration (they
 pin behavior; note it in the report).
 
-- [ ] **Step 3: Implement** in `crates/cxp-core/src/db_role.rs`:
+- [x] **Step 3: Implement** in `crates/cxp-core/src/db_role.rs`:
 
 ```rust
 /// What the runtime role needs besides its own login:
@@ -428,14 +428,14 @@ now relies on `cxp_app` already existing in the cluster (a missing role counts a
 local cluster has it (Global Constraints); CI gets it in Task 4. A failure there before that is the
 missing role, not a bug.
 
-- [ ] **Step 4: Run to see them pass**
+- [x] **Step 4: Run to see them pass**
 
 `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test --workspace --locked` → all
 pass, 0 skipped (the whole workspace: the server crate's unit tests and e2e depend on this
 change). Run `cargo clippy --workspace --all-targets --locked -- -D warnings` and
 `cargo fmt --all -- --check`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/cxp-core
@@ -467,7 +467,7 @@ login: &str) -> anyhow::Result<()>`. It refuses on every machine, not only in a 
 
 **Model:** sonnet — specified logic; e2e follows existing patterns closely.
 
-- [ ] **Step 1: Write the failing unit tests** in `boot.rs` `mod tests`. Build reports with:
+- [x] **Step 1: Write the failing unit tests** in `boot.rs` `mod tests`. Build reports with:
 
 ```rust
     fn report(effective: &str, assumed: bool) -> otto_tenant::isolation::IsolationReport {
@@ -506,11 +506,11 @@ and `… a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally` → 
 warning yet; locally the runtime-grant check only warns, so nothing refuses yet). The deployment
 refusal test already passes through the runtime-grant check (Task 2); note that in the report.
 
-- [ ] **Step 2: Run to see them fail**
+- [x] **Step 2: Run to see them fail**
 
 `cargo test -p cxp-server --lib --locked check_tenant_role` → compile error.
 
-- [ ] **Step 3: Implement** in `boot.rs`:
+- [x] **Step 3: Implement** in `boot.rs`:
 
 ```rust
 /// Whether tenant transactions really run as otto-cxp's own tenant role. otto-tenant issues
@@ -578,7 +578,7 @@ After the runtime-grant block (before the isolation proof), in a deployment only
 
 Fix doc comments in `boot.rs` that say tenant transactions use `otto_app`.
 
-- [ ] **Step 4: The e2e tests (written in Step 1, before Step 3)** in `crates/cxp-server/tests/e2e.rs`, following the
+- [x] **Step 4: The e2e tests (written in Step 1, before Step 3)** in `crates/cxp-server/tests/e2e.rs`, following the
 patterns of `a_deployment_refuses_an_owner_as_its_runtime_role` and the runtime-role tests around
 it (deployment config, `split_with`, captured logs, "nothing listens"):
   - `a_deployment_refuses_a_runtime_role_that_cannot_assume_cxp_app`: `split_with(&pool,
@@ -598,12 +598,12 @@ it (deployment config, `split_with`, captured logs, "nothing listens"):
     pool, `SELECT pg_has_role($1, 'otto_app', 'MEMBER')` is false for the runtime login, and the
     log has no `is still a member of otto_app` line.
 
-- [ ] **Step 5: Run to see them pass**
+- [x] **Step 5: Run to see them pass**
 
 `DATABASE_URL=postgres://cxp:cxp@localhost:15467/otto_cxp cargo test -p cxp-server --locked` →
 all pass (lib, e2e, secret_env), 0 skipped. Then the whole workspace test gate, clippy, fmt.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/cxp-server
@@ -632,7 +632,7 @@ Refs #28"
 
 **Model:** sonnet — docs with exact text given; the runbook SQL is specified below.
 
-- [ ] **Step 1: CI.** Replace the step with:
+- [x] **Step 1: CI.** Replace the step with:
 
 ```yaml
       # 0001 creates otto_app and 0007 creates cxp_app, each tolerating a lost race, but many
@@ -646,7 +646,7 @@ Refs #28"
 
 and the services comment: "so the migrations can create and grant otto_app and cxp_app".
 
-- [ ] **Step 2: Small docs.**
+- [x] **Step 2: Small docs.**
   - `.env.example` line 20: `GRANT cxp_app, cxp_runtime TO cxp_dev;` and add before it
     `--   CREATE ROLE cxp_app NOLOGIN;       -- once per cluster (migration 0007 creates it only as a superuser)`.
   - `fly.toml`: "Isolation rests on `SET LOCAL ROLE cxp_app` (otto-cxp's own tenant role, #28)
@@ -665,7 +665,7 @@ and the services comment: "so the migrations can create and grant otto_app and c
     `verify:`: `tenant isolation enforced as role "cxp_app"`. Security focus: "RLS under
     `cxp_app`".
 
-- [ ] **Step 3: `docs/deploy/fly.md`.**
+- [x] **Step 3: `docs/deploy/fly.md`.**
   - "Database role": four roles now. Table rows: `cxp_server` "member of `cxp_app` and
     `cxp_runtime` (and of `otto_app` until T5)"; new row `cxp_app` | no | nothing | `otto_cxp`'s
     tenant grants, the same as `otto_app`'s there (migration 0007) | `SET LOCAL ROLE` in tenant
@@ -822,14 +822,14 @@ can come back. `otto_app` itself is shared; otto-cxp never drops it.
     secret", add "and this runbook's T1 (`cxp_app`, before the first release command runs 0007)".
   - "Verify": `tenant isolation enforced as role "cxp_app" (assumed via SET LOCAL ROLE cxp_app)`.
 
-- [ ] **Step 4: Check** `grep -rn 'otto_app' CLAUDE.md docs/deploy/fly.md README.md .env.example fly.toml .github`
+- [x] **Step 4: Check** `grep -rn 'otto_app' CLAUDE.md docs/deploy/fly.md README.md .env.example fly.toml .github`
 (including `docs/deploy/fly.md` ~40-47, ~95-97, and ~135, "which `cxp_server` may call through
 `otto_app`'s `EXECUTE`", all of which describe the tenant role) and confirm every remaining
 mention is about the shared role itself (the rule, T5, the previous
 release, R-runbook history), not the tenant role otto-cxp uses. Run `cargo fmt --all -- --check`
 (no Rust change expected).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add .github CLAUDE.md README.md .env.example fly.toml docs/deploy/fly.md
