@@ -15,8 +15,8 @@ use crate::error::{on_unique, Error, Result};
 use crate::interactions::{Interaction, INTERACTION_COLS};
 use crate::paging::Page;
 use crate::search::{
-    self, Hits, SearchPage, DF_PROBE, FUZZY_CHECKED, FUZZY_CHECKED_PAST_READ, FUZZY_READ,
-    MAX_QUERY_CHARS, NEWEST_READ, SUBSTRING_READ, TOTAL_CAP,
+    self, Hits, SearchPage, SearchPermit, DF_PROBE, FUZZY_CHECKED, FUZZY_CHECKED_PAST_READ,
+    FUZZY_READ, MAX_QUERY_CHARS, NEWEST_READ, SUBSTRING_READ, TOTAL_CAP,
 };
 
 /// Longest customer email, in characters (RFC 5321's 64 + 1 + 255, with
@@ -377,8 +377,12 @@ pub trait CustomersExt {
     /// under row-level security no index can serve them; candidates come
     /// from `customer_search_grams` by leakproof btree lookups instead
     /// (`SEARCH_CUSTOMERS_SQL`).
+    ///
+    /// `permit`: see [`crate::search::SearchLimiter`]; acquire it before opening this
+    /// transaction.
     fn search_customers(
         &mut self,
+        permit: &SearchPermit,
         query: &str,
         page: Page,
     ) -> impl Future<Output = Result<SearchPage<Customer>>> + Send;
@@ -510,7 +514,12 @@ impl CustomersExt for Tx<'_> {
         Ok((rows, total))
     }
 
-    async fn search_customers(&mut self, query: &str, page: Page) -> Result<SearchPage<Customer>> {
+    async fn search_customers(
+        &mut self,
+        _permit: &SearchPermit,
+        query: &str,
+        page: Page,
+    ) -> Result<SearchPage<Customer>> {
         let query = query.trim();
         if query.is_empty() {
             return Err(Error::Invalid(

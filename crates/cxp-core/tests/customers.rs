@@ -232,7 +232,7 @@ async fn search_matches_email_and_name_and_escapes_wildcards(pool: PgPool) {
         .unwrap();
 
     let by_email = tx
-        .search_customers("NAVY", Page::default())
+        .search_customers(&common::permit().await, "NAVY", Page::default())
         .await
         .unwrap()
         .items;
@@ -240,7 +240,7 @@ async fn search_matches_email_and_name_and_escapes_wildcards(pool: PgPool) {
     assert_eq!(by_email[0].email, "grace@navy.example");
 
     let by_name = tx
-        .search_customers("turing", Page::default())
+        .search_customers(&common::permit().await, "turing", Page::default())
         .await
         .unwrap()
         .items;
@@ -248,26 +248,26 @@ async fn search_matches_email_and_name_and_escapes_wildcards(pool: PgPool) {
 
     // `%` is a literal here, not "match everything".
     let pct = tx
-        .search_customers("100%", Page::default())
+        .search_customers(&common::permit().await, "100%", Page::default())
         .await
         .unwrap()
         .items;
     assert_eq!(pct.len(), 1);
     let none = tx
-        .search_customers("zzzz", Page::default())
+        .search_customers(&common::permit().await, "zzzz", Page::default())
         .await
         .unwrap()
         .items;
     assert!(none.is_empty());
 
     let e = tx
-        .search_customers("   ", Page::default())
+        .search_customers(&common::permit().await, "   ", Page::default())
         .await
         .unwrap_err();
     assert_eq!(e.code(), "invalid_argument");
 
     let one = tx
-        .search_customers("example", page(1, 0))
+        .search_customers(&common::permit().await, "example", page(1, 0))
         .await
         .unwrap()
         .items;
@@ -805,7 +805,7 @@ async fn one_org_cannot_see_or_touch_anothers_customer_data(pool: PgPool) {
     let (rows, total) = tx.list_customers(&all, Page::default()).await.unwrap();
     assert!(rows.is_empty() && total == 0);
     assert!(tx
-        .search_customers("alice", Page::default())
+        .search_customers(&common::permit().await, "alice", Page::default())
         .await
         .unwrap()
         .items
@@ -1091,7 +1091,7 @@ async fn indexed_search_returns_exactly_what_the_scan_returns(pool: PgPool) {
     assert_eq!(indexed, scanned);
     // Org B's identical customers never appear.
     let all: Vec<Uuid> = tx
-        .search_customers("e", Page::new(Some(200), None))
+        .search_customers(&common::permit().await, "e", Page::new(Some(200), None))
         .await
         .unwrap()
         .items
@@ -1143,7 +1143,7 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
     let ids = |found: Vec<Customer>| found.into_iter().map(|c| c.id).collect::<Vec<_>>();
     assert_eq!(
         ids(tx
-            .search_customers("rosalind", Page::default())
+            .search_customers(&common::permit().await, "rosalind", Page::default())
             .await
             .unwrap()
             .items),
@@ -1156,7 +1156,7 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
         .unwrap();
     assert_eq!(
         ids(tx
-            .search_customers("old.example", Page::default())
+            .search_customers(&common::permit().await, "old.example", Page::default())
             .await
             .unwrap()
             .items),
@@ -1174,20 +1174,20 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
     .await
     .unwrap();
     assert!(tx
-        .search_customers("rosalind", Page::default())
+        .search_customers(&common::permit().await, "rosalind", Page::default())
         .await
         .unwrap()
         .items
         .is_empty());
     assert!(tx
-        .search_customers("old.example", Page::default())
+        .search_customers(&common::permit().await, "old.example", Page::default())
         .await
         .unwrap()
         .items
         .is_empty());
     assert_eq!(
         ids(tx
-            .search_customers("mcclintock", Page::default())
+            .search_customers(&common::permit().await, "mcclintock", Page::default())
             .await
             .unwrap()
             .items),
@@ -1195,7 +1195,7 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
     );
     assert_eq!(
         ids(tx
-            .search_customers("Barbra McClintok", Page::default())
+            .search_customers(&common::permit().await, "Barbra McClintok", Page::default())
             .await
             .unwrap()
             .items),
@@ -1203,7 +1203,7 @@ async fn the_search_index_follows_customer_writes(pool: PgPool) {
     );
     assert_eq!(
         ids(tx
-            .search_customers("new.ex", Page::default())
+            .search_customers(&common::permit().await, "new.ex", Page::default())
             .await
             .unwrap()
             .items),
@@ -1233,7 +1233,7 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(
-        tx.search_customers("raw row", Page::default())
+        tx.search_customers(&common::permit().await, "raw row", Page::default())
             .await
             .unwrap()
             .items
@@ -1246,13 +1246,13 @@ async fn raw_sql_writes_are_indexed(pool: PgPool) {
         .await
         .unwrap();
     assert!(tx
-        .search_customers("raw row", Page::default())
+        .search_customers(&common::permit().await, "raw row", Page::default())
         .await
         .unwrap()
         .items
         .is_empty());
     assert_eq!(
-        tx.search_customers("cooked", Page::default())
+        tx.search_customers(&common::permit().await, "cooked", Page::default())
             .await
             .unwrap()
             .items
@@ -1301,7 +1301,10 @@ async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
         .await
         .unwrap();
     assert!(indexed, "the update's false was overridden");
-    let found = tx.search_customers("flag", Page::default()).await.unwrap();
+    let found = tx
+        .search_customers(&common::permit().await, "flag", Page::default())
+        .await
+        .unwrap();
     assert_eq!(
         (found.items.len(), found.total, found.total_capped),
         (1, 1, false)
@@ -1334,7 +1337,10 @@ async fn rows_are_indexed_whatever_the_insert_says(pool: PgPool) {
         .await
         .unwrap();
     assert!(terms > 0, "the article has index rows");
-    let found = tx.search_articles("flag").await.unwrap();
+    let found = tx
+        .search_articles(&common::permit().await, "flag")
+        .await
+        .unwrap();
     assert_eq!(
         (found.items.len(), found.total, found.total_capped),
         (1, 1, false)
@@ -1433,9 +1439,15 @@ async fn the_rebuild_runbook_restores_lost_index_rows(pool: PgPool) {
         (0, 0)
     );
     let mut tx = db.begin(org).await.unwrap();
-    let found = tx.search_customers("lost", Page::default()).await.unwrap();
+    let found = tx
+        .search_customers(&common::permit().await, "lost", Page::default())
+        .await
+        .unwrap();
     assert_eq!((found.total, found.total_capped), (1, false));
-    let found = tx.search_articles("lost").await.unwrap();
+    let found = tx
+        .search_articles(&common::permit().await, "lost")
+        .await
+        .unwrap();
     assert_eq!((found.total, found.total_capped), (1, false));
 }
 
@@ -1468,7 +1480,7 @@ async fn a_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
     // instead of waiting on the lock for good.
     let e = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tx.search_customers("anything", Page::default()),
+        tx.search_customers(&common::permit().await, "anything", Page::default()),
     )
     .await
     .expect("the search waited past its own timeout")
@@ -1589,7 +1601,10 @@ async fn search_counts_up_to_the_cap(pool: PgPool) {
         .unwrap();
 
     for q in ["navy", "navy.example", "na"] {
-        let found = tx.search_customers(q, Page::default()).await.unwrap();
+        let found = tx
+            .search_customers(&common::permit().await, q, Page::default())
+            .await
+            .unwrap();
         assert_eq!((found.total, found.total_capped), (1000, true), "{q:?}");
         let ids: Vec<Uuid> = found.items.iter().map(|c| c.id).collect();
         assert_eq!(ids.len(), 50, "{q:?}");
@@ -1606,12 +1621,18 @@ async fn search_counts_up_to_the_cap(pool: PgPool) {
         );
     }
     // The page past the cap's edge is cut at it, and past it is empty.
-    let edge = tx.search_customers("navy", page(50, 990)).await.unwrap();
+    let edge = tx
+        .search_customers(&common::permit().await, "navy", page(50, 990))
+        .await
+        .unwrap();
     assert_eq!(
         (edge.items.len(), edge.total, edge.total_capped),
         (10, 1000, true)
     );
-    let past = tx.search_customers("navy", page(50, 1000)).await.unwrap();
+    let past = tx
+        .search_customers(&common::permit().await, "navy", page(50, 1000))
+        .await
+        .unwrap();
     assert_eq!(
         (past.items.len(), past.total, past.total_capped),
         (0, 1000, true)
@@ -1654,12 +1675,20 @@ async fn search_and_searchable_fields_are_length_limited(pool: PgPool) {
     let mut tx = db.begin(org()).await.unwrap();
 
     let e = tx
-        .search_customers(&"q".repeat(MAX_QUERY_CHARS + 1), Page::default())
+        .search_customers(
+            &common::permit().await,
+            &"q".repeat(MAX_QUERY_CHARS + 1),
+            Page::default(),
+        )
         .await
         .unwrap_err();
     assert_eq!(e.code(), "invalid_argument");
     let found = tx
-        .search_customers(&"q".repeat(MAX_QUERY_CHARS), Page::default())
+        .search_customers(
+            &common::permit().await,
+            &"q".repeat(MAX_QUERY_CHARS),
+            Page::default(),
+        )
         .await
         .unwrap();
     assert_eq!((found.total, found.total_capped), (0, false));

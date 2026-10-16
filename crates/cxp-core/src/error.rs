@@ -57,7 +57,8 @@ pub enum Error {
     /// same call may succeed later. Raised for a platform lifecycle event this
     /// build parses but has no handler for (so the platform redelivers it
     /// until a release that handles it is deployed); platform failures are
-    /// [`Error::Platform`].
+    /// [`Error::Platform`]. Also raised when a search finds every search
+    /// permit taken for longer than `search::SEARCH_WAIT` (#42).
     #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 

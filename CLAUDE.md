@@ -126,7 +126,9 @@ rebuilds the affected rows; extend the equivalence corpora in `crates/cxp-core/t
 `totalCapped: false` promises results identical to a full scan. Per-candidate probes keep their
 fences (`LIMIT 1` in the customer `matches` lateral, `OFFSET 0` in each correlated `EXISTS` probe
 of a search table, #41); `crates/cxp-core/tests/search_plans.rs` checks them and
-`scripts/bench-search/plans.py` checks a seeded database's generic plans.
+`scripts/bench-search/plans.py` checks a seeded database's generic plans. A search needs a
+`SearchPermit` from the process's one `SearchLimiter` (half the pool), taken before its
+transaction opens (#42).
 
 ## Configuration
 

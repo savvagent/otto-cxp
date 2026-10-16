@@ -86,8 +86,8 @@ pub async fn search(
 ) -> ApiResult<Json<CappedPaginated<Customer>>> {
     caller.require_read()?;
     let page = cxp_core::Page::new(q.limit, q.offset);
-    let mut tx = state.begin(&caller).await?;
-    let found = tx.search_customers(&q.q, page).await?;
+    let (permit, mut tx) = state.begin_search(&caller).await?;
+    let found = tx.search_customers(&permit, &q.q, page).await?;
     tx.commit().await?;
     Ok(Json(CappedPaginated::new(found, page)))
 }

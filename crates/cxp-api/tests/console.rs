@@ -213,6 +213,7 @@ async fn harness_with(pool: PgPool, console: bool) -> Harness {
         db.clone(),
         platform.clone(),
         meter,
+        cxp_core::search::SearchLimiter::for_pool(5),
         Config {
             public_url: PUBLIC_URL.into(),
             webhook_secret: "otto_whsec_test".into(),

@@ -11,8 +11,8 @@ use crate::contains_pattern;
 use crate::error::{Error, Result};
 use crate::paging::Page;
 use crate::search::{
-    self, Hits, SearchPage, DF_PROBE, FULL_TEXT_READ, MAX_QUERY_CHARS, RANKED_PAST_CAP,
-    SUBSTRING_READ, TOTAL_CAP,
+    self, Hits, SearchPage, SearchPermit, DF_PROBE, FULL_TEXT_READ, MAX_QUERY_CHARS,
+    RANKED_PAST_CAP, SUBSTRING_READ, TOTAL_CAP,
 };
 
 /// Most articles a search returns.
@@ -251,8 +251,12 @@ pub trait KnowledgeExt {
     /// leakproof, so under row-level security no index can serve them;
     /// candidates come from `knowledge_search_terms` by leakproof btree
     /// lookups instead (`SEARCH_ARTICLES_SQL`).
+    ///
+    /// `permit`: see [`crate::search::SearchLimiter`]; acquire it before opening this
+    /// transaction.
     fn search_articles(
         &mut self,
+        permit: &SearchPermit,
         query: &str,
     ) -> impl std::future::Future<Output = Result<SearchPage<KnowledgeArticle>>> + Send;
 
@@ -323,7 +327,11 @@ impl KnowledgeExt for Tx<'_> {
         .ok_or(Error::NotFound { kind: "article" })
     }
 
-    async fn search_articles(&mut self, query: &str) -> Result<SearchPage<KnowledgeArticle>> {
+    async fn search_articles(
+        &mut self,
+        _permit: &SearchPermit,
+        query: &str,
+    ) -> Result<SearchPage<KnowledgeArticle>> {
         let query = query.trim();
         if query.is_empty() {
             return Err(Error::Invalid("query must not be empty".into()));

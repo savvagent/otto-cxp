@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use cxp_core::auth::{MissingScope, Principal};
+use cxp_core::search::{SearchLimiter, SearchPermit};
 use cxp_core::usage::Meter;
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
@@ -64,15 +65,23 @@ pub struct Cxp {
     db: Db,
     platform: Arc<PlatformClient>,
     meter: Arc<Meter>,
+    /// The process-wide search cap, shared with `/api` (#42).
+    search: SearchLimiter,
     tool_router: ToolRouter<Self>,
 }
 
 impl Cxp {
-    pub fn new(db: Db, platform: Arc<PlatformClient>, meter: Arc<Meter>) -> Self {
+    pub fn new(
+        db: Db,
+        platform: Arc<PlatformClient>,
+        meter: Arc<Meter>,
+        search: SearchLimiter,
+    ) -> Self {
         Self {
             db,
             platform,
             meter,
+            search,
             tool_router: crate::tools::router(),
         }
     }
@@ -109,6 +118,18 @@ impl Cxp {
         cxp_core::platform_events::begin_live(&self.db, caller.org_id, Some(caller.user_id))
             .await
             .mcp()
+    }
+
+    /// A search permit, then the caller's transaction, in that order (#42):
+    /// waiting for the permit must not hold a pooled connection. Bind the
+    /// pair as `let (permit, mut tx)` so the transaction drops first.
+    pub(crate) async fn search_tx(
+        &self,
+        caller: &Principal,
+    ) -> Result<(SearchPermit, Tx<'static>), ErrorData> {
+        let permit = self.search.acquire().await.mcp()?;
+        let tx = self.tx(caller).await?;
+        Ok((permit, tx))
     }
 
     /// Look the org's quota standing up at the platform, before a billable

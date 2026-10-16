@@ -18,7 +18,7 @@
 //! | `payload_too_large` | 413 |
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
-//! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]): only a failure that can pass |
+//! | `unavailable` | 503, with `Retry-After` ([`cxp_core::auth::RETRY_AFTER_SECONDS`]): only a failure that can pass, or a search finding every search permit taken (#42) |
 //! | `query_too_broad` | 422, no `Retry-After`: a search ran past its time limit; narrow the query (repeating it unchanged cannot help) |
 //! | `internal` | 500, never with `Retry-After` (including a platform failure a retry cannot fix, such as this service's credential being refused) |
 

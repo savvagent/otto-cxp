@@ -252,8 +252,8 @@ impl Cxp {
     ) -> Result<Json<List<KnowledgeArticle>>, ErrorData> {
         let caller = self.caller(&parts)?;
         caller.require_read().mcp()?;
-        let mut tx = self.tx(&caller).await?;
-        let found = tx.search_articles(&p.query).await.mcp()?;
+        let (permit, mut tx) = self.search_tx(&caller).await?;
+        let found = tx.search_articles(&permit, &p.query).await.mcp()?;
         tx.commit().await.mcp()?;
         Ok(Json(List::searched(found)))
     }

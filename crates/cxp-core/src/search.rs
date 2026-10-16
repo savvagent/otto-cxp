@@ -25,8 +25,12 @@
 //! `tests/support.rs`, against the oracle in `tests/common/mod.rs`
 //! (`customers_both_ways`, `articles_both_ways`).
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use otto_tenant::Tx;
 use serde::Serialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Error, Result};
 
@@ -154,6 +158,76 @@ pub(crate) fn in_order<T>(
     out
 }
 
+/// How long a search waits for a [`SearchPermit`] before it is
+/// [`Error::Unavailable`]. A search takes tens of milliseconds, so two
+/// permits serve many in this time; the wait holds no connection.
+pub const SEARCH_WAIT: Duration = Duration::from_millis(500);
+
+/// The process-wide cap on concurrent searches (#42). A search holds one of
+/// the small shared pool's connections for up to its `statement_timeout`
+/// twice over, so without a cap a handful of broad searches from one
+/// `cxp:read` token could hold every connection while writes, platform
+/// webhooks and the usage shipper wait. `cxp-server` builds one per process
+/// ([`SearchLimiter::for_pool`]) and gives clones to `/api` and `/mcp`.
+///
+/// Acquire the permit **before** opening the search's transaction, and hold
+/// it until the transaction ends: opening the transaction takes a pooled
+/// connection, so a search waiting for a permit inside its transaction
+/// would hold that connection while it waits, and the cap would protect
+/// nothing.
+#[derive(Clone, Debug)]
+pub struct SearchLimiter(Arc<Semaphore>);
+
+/// Leave to run one search: what `search_customers` and `search_articles`
+/// require. Only [`SearchLimiter::acquire`] makes one; dropping it frees the
+/// permit. It proves a permit from *a* limiter, not which one: the server's
+/// one limiter is the only one outside tests (tests build their own so they
+/// never compete).
+#[derive(Debug)]
+pub struct SearchPermit {
+    /// Held only for its `Drop`, which frees the permit.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl SearchLimiter {
+    /// A limiter with `permits` concurrent searches. Panics on 0.
+    pub fn new(permits: usize) -> Self {
+        assert!(permits > 0, "a search limiter needs at least one permit");
+        Self(Arc::new(Semaphore::new(permits)))
+    }
+
+    /// Half the pool, at least one: always fewer than `max_connections`
+    /// for a pool of two or more (`CXP_DB_MAX_CONNECTIONS` is 2 to 20), so
+    /// searches can never hold every connection.
+    pub fn for_pool(max_connections: u32) -> Self {
+        Self::new((max_connections as usize / 2).max(1))
+    }
+
+    /// A permit, waiting up to [`SEARCH_WAIT`] for one; past that,
+    /// [`Error::Unavailable`] (retriable: REST 503 with `Retry-After`).
+    pub async fn acquire(&self) -> Result<SearchPermit> {
+        match tokio::time::timeout(SEARCH_WAIT, self.0.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(SearchPermit { _permit: permit }),
+            // Nothing closes the semaphore, so this arm is unreachable
+            // today; if it ever runs it is a bug, not a busy server, and
+            // must not read as retriable load.
+            Ok(Err(_)) => {
+                tracing::error!("the search limiter's semaphore was closed");
+                Err(Error::Internal("search limiter closed".into()))
+            }
+            Err(_) => {
+                tracing::warn!("a search found every search permit taken and was turned away");
+                Err(Error::Unavailable)
+            }
+        }
+    }
+
+    /// Permits free right now.
+    pub fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +247,55 @@ mod tests {
         }
         let e = on_timeout("search_articles")(sqlx::Error::PoolTimedOut);
         assert!(matches!(e, Error::Database(_)), "{e:?}");
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn for_pool_leaves_at_least_half_the_pool_free() {
+        for (pool, permits) in [(2, 1), (3, 1), (5, 2), (20, 10)] {
+            assert_eq!(
+                SearchLimiter::for_pool(pool).available(),
+                permits,
+                "pool {pool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_permit_is_held_until_dropped() {
+        let limiter = SearchLimiter::new(2);
+        let a = limiter.acquire().await.unwrap();
+        let _b = limiter.acquire().await.unwrap();
+        assert_eq!(limiter.available(), 0);
+        drop(a);
+        assert_eq!(limiter.available(), 1);
+        limiter.acquire().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_limiter_turns_a_search_away_after_the_wait() {
+        let limiter = SearchLimiter::new(1);
+        let _held = limiter.acquire().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let err = limiter.acquire().await.unwrap_err();
+        assert!(matches!(err, Error::Unavailable), "{err:?}");
+        assert!(err.retriable());
+        let waited = started.elapsed();
+        assert!(
+            waited >= SEARCH_WAIT && waited < SEARCH_WAIT * 2,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clones_share_one_set_of_permits() {
+        let limiter = SearchLimiter::new(1);
+        let other = limiter.clone();
+        let _held = limiter.acquire().await.unwrap();
+        assert_eq!(other.available(), 0);
     }
 }

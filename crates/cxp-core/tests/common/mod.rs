@@ -243,7 +243,7 @@ pub async fn customers_both_ways(
     page: Page,
 ) -> Option<(Searched, Searched)> {
     let org = tx.org();
-    let found = match tx.search_customers(q, page).await {
+    let found = match tx.search_customers(&permit().await, q, page).await {
         Ok(found) => found,
         Err(Error::Invalid(_)) => return None,
         Err(e) => panic!("{q:?}: {e:?}"),
@@ -281,7 +281,7 @@ pub async fn articles_both_ways(
     q: &str,
 ) -> Option<(Searched, Searched)> {
     let org = tx.org();
-    let found = match tx.search_articles(q).await {
+    let found = match tx.search_articles(&permit().await, q).await {
         Ok(found) => found,
         Err(Error::Invalid(_)) => return None,
         Err(e) => panic!("{q:?}: {e:?}"),
@@ -373,4 +373,13 @@ pub async fn customer_matches(tx: &mut otto_tenant::Tx<'_>, q: &str) -> Vec<Uuid
     .fetch_all(tx.conn())
     .await
     .unwrap()
+}
+
+/// A search permit from a limiter of this test's own (the server shares
+/// one per process; tests run in parallel and must not compete).
+pub async fn permit() -> cxp_core::search::SearchPermit {
+    cxp_core::search::SearchLimiter::new(1)
+        .acquire()
+        .await
+        .unwrap()
 }

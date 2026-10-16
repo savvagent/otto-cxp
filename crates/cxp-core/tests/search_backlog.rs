@@ -213,12 +213,17 @@ async fn build_under(pool: PgPool, role: String) {
     // found yet.
     let mut tx = db.begin(a).await.unwrap();
     assert!(tx
-        .search_customers("grace", Page::default())
+        .search_customers(&common::permit().await, "grace", Page::default())
         .await
         .unwrap()
         .items
         .is_empty());
-    assert!(tx.search_articles("gadget").await.unwrap().items.is_empty());
+    assert!(tx
+        .search_articles(&common::permit().await, "gadget")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     tx.commit().await.unwrap();
 
     // An ordinary write indexes them: the triggers write the index rows.

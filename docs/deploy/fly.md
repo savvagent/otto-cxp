@@ -56,6 +56,9 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   indexes grown a row at a time run 25-30% larger. When to act on that size, and the query that
   watches it, are in [Search index storage](#search-index-storage-34). The pool is
   capped at 5 connections (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.
+  Searches hold at most half of it (two of five) at once, process-wide; a search that cannot
+  start within 500 ms answers `unavailable` (503 with `Retry-After`)
+  ([#42](https://github.com/savvagent/otto-cxp/issues/42)).
   Split onto a dedicated instance before real customers.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`) and run at boot under an
   advisory lock. Never run the platform's migrations here.

@@ -423,7 +423,11 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
         ids.insert(title, a.id);
     }
 
-    let found = tx.search_articles("password").await.unwrap().items;
+    let found = tx
+        .search_articles(&common::permit().await, "password")
+        .await
+        .unwrap()
+        .items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles.len(), 2, "{titles:?}");
     assert!(
@@ -433,17 +437,42 @@ async fn knowledge_search_is_full_text_published_only_and_ranked(pool: PgPool) {
     assert!(!titles.contains(&"Shipping"));
 
     // Stemming: "ships" matches "ship"; a title substring matches too.
-    assert_eq!(tx.search_articles("ships").await.unwrap().items.len(), 1);
     assert_eq!(
-        tx.search_articles("Account sec").await.unwrap().items.len(),
+        tx.search_articles(&common::permit().await, "ships")
+            .await
+            .unwrap()
+            .items
+            .len(),
         1
     );
-    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
+    assert_eq!(
+        tx.search_articles(&common::permit().await, "Account sec")
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(tx
+        .search_articles(&common::permit().await, "zebra")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     // LIKE wildcards are literal.
-    let pct = tx.search_articles("%").await.unwrap().items;
+    let pct = tx
+        .search_articles(&common::permit().await, "%")
+        .await
+        .unwrap()
+        .items;
     assert_eq!(pct.len(), 1);
     assert_eq!(pct[0].id, ids["100% off"]);
-    assert!(tx.search_articles("_").await.unwrap().items.is_empty());
+    assert!(tx
+        .search_articles(&common::permit().await, "_")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -475,17 +504,24 @@ async fn knowledge_search_ranks_best_match_first_and_validates_the_query(pool: P
         .await
         .unwrap();
     }
-    let found = tx.search_articles("refund").await.unwrap().items;
+    let found = tx
+        .search_articles(&common::permit().await, "refund")
+        .await
+        .unwrap()
+        .items;
     let titles: Vec<_> = found.iter().map(|a| a.title.as_str()).collect();
     assert_eq!(titles, ["Refund policy", "Billing"]);
 
     let longest = cxp_core::search::MAX_QUERY_CHARS;
     for bad in ["", "   ".to_string().as_str(), &"x".repeat(longest + 1)] {
-        let e = tx.search_articles(bad).await.unwrap_err();
+        let e = tx
+            .search_articles(&common::permit().await, bad)
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Invalid(_)), "{e:?}");
     }
     assert!(tx
-        .search_articles(&"x".repeat(longest))
+        .search_articles(&common::permit().await, &"x".repeat(longest))
         .await
         .unwrap()
         .items
@@ -505,7 +541,14 @@ async fn knowledge_search_is_capped(pool: PgPool) {
     .execute(tx.conn())
     .await
     .unwrap();
-    assert_eq!(tx.search_articles("gadget").await.unwrap().items.len(), 20);
+    assert_eq!(
+        tx.search_articles(&common::permit().await, "gadget")
+            .await
+            .unwrap()
+            .items
+            .len(),
+        20
+    );
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -662,7 +705,12 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
     not_found(tx.delete_ticket(ticket.id).await, "ticket");
     // Articles.
     not_found(tx.get_article(article.id).await, "article");
-    assert!(tx.search_articles("zebra").await.unwrap().items.is_empty());
+    assert!(tx
+        .search_articles(&common::permit().await, "zebra")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     assert_eq!(tx.list_articles(None, Page::default()).await.unwrap().1, 0);
     not_found(
         tx.update_article(
@@ -909,7 +957,11 @@ async fn indexed_article_search_returns_exactly_what_the_scan_returns(pool: PgPo
         .fetch_all(tx.conn())
         .await
         .unwrap();
-    let found = tx.search_articles("password").await.unwrap().items;
+    let found = tx
+        .search_articles(&common::permit().await, "password")
+        .await
+        .unwrap()
+        .items;
     assert!(!found.is_empty());
     assert!(
         found.iter().all(|x| mine.contains(&x.id)),
@@ -932,7 +984,12 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
         .await
         .unwrap();
     // Unpublished: indexed, but search still hides it.
-    assert!(tx.search_articles("gift").await.unwrap().items.is_empty());
+    assert!(tx
+        .search_articles(&common::permit().await, "gift")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     tx.update_article(
         art.id,
         &ArticleUpdate {
@@ -942,7 +999,14 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert_eq!(tx.search_articles("expire").await.unwrap().items.len(), 1);
+    assert_eq!(
+        tx.search_articles(&common::permit().await, "expire")
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
 
     tx.update_article(
         art.id,
@@ -954,10 +1018,34 @@ async fn the_search_index_follows_article_writes(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert!(tx.search_articles("expire").await.unwrap().items.is_empty());
-    assert!(tx.search_articles("Gift c").await.unwrap().items.is_empty());
-    assert_eq!(tx.search_articles("lasts").await.unwrap().items.len(), 1);
-    assert_eq!(tx.search_articles("re cr").await.unwrap().items.len(), 1);
+    assert!(tx
+        .search_articles(&common::permit().await, "expire")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert!(tx
+        .search_articles(&common::permit().await, "Gift c")
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert_eq!(
+        tx.search_articles(&common::permit().await, "lasts")
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        tx.search_articles(&common::permit().await, "re cr")
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
 
     tx.delete_article(art.id).await.unwrap();
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM knowledge_search_terms")
@@ -1000,7 +1088,10 @@ async fn article_search_counts_up_to_the_cap(pool: PgPool) {
     assert_eq!((indexed.total, indexed.capped), (1000, true));
     assert_eq!(indexed.ids, scanned.ids, "one word: the scan's best");
 
-    let found = tx.search_articles("gadget widget").await.unwrap();
+    let found = tx
+        .search_articles(&common::permit().await, "gadget widget")
+        .await
+        .unwrap();
     assert_eq!((found.total, found.total_capped), (1000, true));
     let ids: Vec<Uuid> = found.items.iter().map(|a| a.id).collect();
     assert_eq!(ids.len(), 20);
@@ -1154,7 +1245,7 @@ async fn an_article_search_past_its_timeout_is_query_too_broad(pool: PgPool) {
     let started = std::time::Instant::now();
     let e = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tx.search_articles("anything"),
+        tx.search_articles(&common::permit().await, "anything"),
     )
     .await
     .expect("the search waited past its own timeout")
