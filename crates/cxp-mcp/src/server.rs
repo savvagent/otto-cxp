@@ -123,7 +123,7 @@ impl Cxp {
     /// A search permit, then the caller's transaction, in that order (#42):
     /// waiting for the permit must not hold a pooled connection. Bind the
     /// pair as `let (permit, mut tx)` so the transaction drops first.
-    pub async fn search_tx(
+    pub(crate) async fn search_tx(
         &self,
         caller: &Principal,
     ) -> Result<(SearchPermit, Tx<'static>), ErrorData> {

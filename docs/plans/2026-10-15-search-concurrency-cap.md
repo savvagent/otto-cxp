@@ -81,7 +81,7 @@ Task 2.
 
 **Model:** sonnet
 
-- [ ] **Step 1: Write the failing unit tests** at the end of `search.rs` (add a
+- [x] **Step 1: Write the failing unit tests** at the end of `search.rs` (add a
   `#[cfg(test)] mod tests` if there is none; if there is, add to it):
 
 ```rust
@@ -129,12 +129,12 @@ mod limiter_tests {
 }
 ```
 
-- [ ] **Step 2: Run, see them fail (do not compile)**
+- [x] **Step 2: Run, see them fail (do not compile)**
 
 Run: `cargo test -p cxp-core --lib --locked limiter_tests`
 Expected: compile errors: `SearchLimiter` not found.
 
-- [ ] **Step 3: Implement** in `search.rs` (imports: `std::sync::Arc`, `std::time::Duration`,
+- [x] **Step 3: Implement** in `search.rs` (imports: `std::sync::Arc`, `std::time::Duration`,
   `tokio::sync::{OwnedSemaphorePermit, Semaphore}`):
 
 ```rust
@@ -204,14 +204,14 @@ braced struct instead (`pub struct SearchPermit { _permit: OwnedSemaphorePermit 
 Then extend the `Error::Unavailable` doc comment in `error.rs` with: "Also raised when a search
 finds every search permit taken for longer than `search::SEARCH_WAIT` (#42)."
 
-- [ ] **Step 4: Run, see them pass**
+- [x] **Step 4: Run, see them pass**
 
 Run: `cargo test -p cxp-core --lib --locked limiter_tests` — expected 4 passed.
 
-- [ ] **Step 5: Gates** (all four from Global Constraints; the workspace test needs
+- [x] **Step 5: Gates** (all four from Global Constraints; the workspace test needs
   `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp`).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/cxp-core/src/search.rs crates/cxp-core/src/error.rs crates/cxp-core/Cargo.toml Cargo.lock
@@ -261,7 +261,7 @@ SQL outside `cxp-core`.
 
 **Model:** sonnet
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 (a) `crates/cxp-api/tests/api.rs`: give `harness_opts` a `search: SearchLimiter` parameter (keep
 `harness`/`harness_with` passing `SearchLimiter::for_pool(5)`), add `search: SearchLimiter` to
@@ -382,12 +382,12 @@ async fn a_search_tool_without_a_permit_is_unavailable(pool: PgPool) {
 
 (Check how existing tests read `retriable` from a tool error and match that shape.)
 
-- [ ] **Step 2: Run, see them fail (do not compile)**
+- [x] **Step 2: Run, see them fail (do not compile)**
 
 Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test -p cxp-api --test api --locked search`
 Expected: compile errors (`harness_opts` arity, `SearchLimiter` unused by `AppState`).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 1. `cxp-core`: add `permit: &SearchPermit` as the first parameter after `self` to
    `search_customers` and `search_articles` (trait declarations, doc comments: "`permit`: see
@@ -419,7 +419,7 @@ Expected: compile errors (`harness_opts` arity, `SearchLimiter` unused by `AppSt
    pass `search.clone()` to `cxp_mcp::router` and `search` to `AppState::new`, with a comment:
    one limiter for the whole process, so `/api` and `/mcp` together hold at most half the pool.
 
-- [ ] **Step 4: Run, see them pass**
+- [x] **Step 4: Run, see them pass**
 
 Run:
 - `DATABASE_URL=postgres://cxp:cxp@localhost:15466/otto_cxp cargo test -p cxp-api --test api --locked search`
@@ -429,9 +429,9 @@ Run:
 If `without_the_cap_a_search_flood_starves_a_write` does not fail the write (the write got
 through), report DONE_WITH_CONCERNS with what happened: the flood test would not prove anything.
 
-- [ ] **Step 5: Gates** (all four).
+- [x] **Step 5: Gates** (all four).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A crates
@@ -455,14 +455,14 @@ Refs #42"
 
 **Model:** haiku
 
-- [ ] **Step 1:** In `docs/deploy/fly.md`, after "The pool is capped at 5 connections
+- [x] **Step 1:** In `docs/deploy/fly.md`, after "The pool is capped at 5 connections
   (`CXP_DB_MAX_CONNECTIONS`) because the instance is small and shared.", add: "Searches hold at
   most half of it (two of five) at once, process-wide; a search that cannot start within 500 ms
   answers `unavailable` (503 with `Retry-After`) ([#42](https://github.com/savvagent/otto-cxp/issues/42))."
-- [ ] **Step 2:** In CLAUDE.md's "### Search index (#17)" paragraph, append: "A search needs a
+- [x] **Step 2:** In CLAUDE.md's "### Search index (#17)" paragraph, append: "A search needs a
   `SearchPermit` from the process's one `SearchLimiter` (half the pool), taken before its
   transaction opens (#42)."
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/deploy/fly.md CLAUDE.md

@@ -1,6 +1,6 @@
 # Search concurrency cap — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#48)
 **Issue:** #42 "Cap concurrent searches below the database pool size"
 **Plan:** `docs/plans/2026-10-15-search-concurrency-cap.md`
 **Builds on:** `docs/specs/2026-10-15-search-index-upkeep-design.md` (#34),
@@ -156,6 +156,12 @@ drop(permit); // implicit at scope end, after the transaction is done
 MCP's `search_customers` and `search_knowledge_base` follow the same order, with `.mcp()?` on the
 acquire. The scope check (`require_read`) stays first, so an unauthorized caller never takes a
 permit.
+
+As built (after review), each surface opens a search through one helper that does both steps in
+order, `AppState::begin_search` and `Cxp::search_tx`, returning `(SearchPermit, Tx)`;
+`cxp_server::router` takes the limiter as a parameter (`boot.rs` builds it beside the pool), so
+the e2e suite can hold its permits and prove both surfaces share it. A closed semaphore (never
+closed today) is `Error::Internal`, not `Unavailable`.
 
 The trait methods take `permit: &SearchPermit` and don't use it beyond its existence. The
 parameter documents and enforces that a caller holds one. The doc on `SearchLimiter::acquire`
