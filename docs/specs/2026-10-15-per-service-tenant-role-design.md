@@ -424,6 +424,27 @@ changes. Plus a manual check: a direct `otto_tenant::Db::from_pool` in a test ma
     warning.
 - CI: `Pre-create the tenant roles` creates `otto_app` and `cxp_app`.
 
+## Review round 1 (PR #49)
+
+- **0007 refuses a `cxp_app` that is not a plain group role.** The role is cluster-wide, so one
+  created by someone else first could carry LOGIN, an attribute, membership in another role, or a
+  member WITH ADMIN OPTION (on Postgres 16 a non-superuser creator gets ADMIN on its roles); any
+  of these would hand every tenant grant past otto-cxp. The migration's second block refuses each,
+  naming what it found; a test runs that block, as written, against stand-in roles. It also guards
+  the `_sqlx_migrations` revoke as 0001 does.
+- **Losing `cxp_app` after boot raises the readiness alarm.** The `Db` resolved at boot that it
+  may `SET LOCAL ROLE cxp_app`, so a later revoke makes every tenant transaction fail; the hourly
+  re-check now raises the alarm when the runtime role no longer inherits `cxp_app` (a missing
+  tombstone grant still only logs).
+- **Boot logs the isolation line only after `check_tenant_role` passes,** and the refusal names the
+  effective role with SQL quoting. The missing-grant hint names `CREATE ROLE` for an absent role.
+- **Runbook:** T2 lists `cxp_app`'s members and their ADMIN option; T4 adds schema and default
+  privilege parity; T0 shows the grantor of `cxp_server`'s `otto_app` membership, and T5 covers
+  Postgres 16's `GRANTED BY` when the plain `REVOKE` leaves it.
+- **Tests added:** `cxp_app` is independent of `otto_app` (a table granted to `otto_app` is refused
+  to a tenant transaction), default privileges reach `cxp_app`, the alarm on a lost tenant role,
+  and the order-independence of the before-migrations runtime-grant test.
+
 ## Risks & open questions
 
 - **`cxp_app` keeps `EXECUTE` on `expire_removed_members` and `console_session_org`** (parity with

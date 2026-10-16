@@ -982,6 +982,10 @@ that owns and holds nothing: no restart.
 SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
 FROM pg_roles WHERE rolname = 'cxp_app';
 SELECT roleid::regrole FROM pg_auth_members WHERE member = 'cxp_app'::regrole;
+-- Its members: cxp_server only, with admin_option f (migration 0007 refuses a cxp_app that
+-- anyone holds WITH ADMIN OPTION, since that holder could grant it, and every tenant grant).
+SELECT member::regrole, admin_option, grantor::regrole FROM pg_auth_members
+WHERE roleid = 'cxp_app'::regrole;
 -- t, t: cxp_server holds it (MEMBER) and inherits its grants (USAGE).
 SELECT pg_has_role('cxp_server', 'cxp_app', 'MEMBER') AS member,
        pg_has_role('cxp_server', 'cxp_app', 'USAGE') AS inherits;
