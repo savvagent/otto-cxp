@@ -3102,6 +3102,49 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
     db.pool().close().await;
 }
 
+/// Losing `cxp_app` after boot makes every tenant transaction fail (the `Db` resolved at boot
+/// that it may assume the role), so the re-check raises the alarm and `/readyz` says so;
+/// granting it back clears the alarm.
+#[sqlx::test(migrations = false)]
+async fn the_role_recheck_raises_the_alarm_when_the_runtime_role_loses_cxp_app(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+    let config = deployed(&roles.runtime_url, None);
+    let db = cxp_core::tenant_db(sqlx::PgPool::connect(&roles.runtime_url).await.unwrap());
+    let alarm = cxp_server::health::RoleAlarm::default();
+
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(!alarm.is_raised(), "a clean runtime role");
+
+    sqlx::query(&format!("REVOKE cxp_app FROM {}", roles.runtime))
+        .execute(&pool)
+        .await
+        .unwrap();
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(alarm.is_raised(), "the tenant role was lost after boot");
+    let summary = alarm.summary().expect("raised with a summary");
+    assert!(summary.contains("inheriting cxp_app"), "{summary}");
+    let (status, body) = readyz(db.clone(), alarm.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({ "status": "unready", "reason": "database role refused" })
+    );
+
+    sqlx::query(&format!("GRANT cxp_app TO {}", roles.runtime))
+        .execute(&pool)
+        .await
+        .unwrap();
+    cxp_server::boot::recheck_db_role(&db, &config, &alarm).await;
+    assert!(!alarm.is_raised(), "fixed");
+    let (status, _) = readyz(db.clone(), alarm).await;
+    assert_eq!(status, StatusCode::OK);
+    db.pool().close().await;
+}
+
 /// A re-check that cannot read the role leaves a raised alarm raised: an
 /// unreachable database is no evidence the role was fixed. Failures in a
 /// row are counted (logged at `error` from the third on), and a re-check
@@ -3282,6 +3325,8 @@ async fn a_deployment_refuses_a_runtime_role_that_cannot_assume_cxp_app(pool: Pg
     let err = boot_without_cxp_app(&pool, false).await;
     assert!(err.contains("refusing to serve"), "{err}");
     assert!(err.contains("cxp_app"), "{err}");
+    assert!(err.contains("lacks inheriting cxp_app"), "{err}");
+    assert!(!err.contains("tenant transactions run as"), "{err}");
 }
 
 /// Locally too: the runtime-grant check only warns there, and otto-tenant

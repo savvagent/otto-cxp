@@ -318,8 +318,11 @@ pub const RECHECK_ESCALATE_AFTER: u32 = 3;
 /// ([`crate::health`]). Called by the sweeper after each pass, so a grant
 /// made after boot is noticed within the hour. In a deployment it also
 /// re-runs the runtime-grant check ([`cxp_core::db_role::missing_runtime_grants`]),
-/// logged at `error` when something is missing (no alarm: requests still
-/// work; the `org.deleted` webhook or the background tasks do not).
+/// logged at `error` when something is missing. Losing the tenant role
+/// (`inheriting cxp_app`) raises the alarm too: the `Db` resolved at boot that
+/// it may `SET LOCAL ROLE cxp_app`, so every tenant transaction now fails, and
+/// readiness should say so. A missing tombstone grant raises nothing (requests
+/// still work; the `org.deleted` webhook does not, and the platform retries it).
 ///
 /// A read that fails or takes longer than [`RECHECK_TIMEOUT`] leaves the
 /// alarm as it was (`/readyz` reports an unreachable database itself) and is
@@ -332,25 +335,8 @@ pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
         Ok(Err(e)) => return recheck_failed(alarm, "the database role", &e),
         Err(_) => return recheck_timed_out(alarm, "the database role"),
     };
-    match role_verdict(&role, config) {
-        Verdict::Refused => {
-            let summary = role.summary();
-            tracing::error!(
-                "the database role changed after boot: {summary}; /readyz answers 503 until it \
-                 is fixed"
-            );
-            alarm.raise(summary);
-        }
-        Verdict::Clean | Verdict::AllowedLocally => {
-            if alarm.clear() {
-                tracing::info!(
-                    "the database role re-check passes again; /readyz no longer holds back"
-                );
-            }
-        }
-    }
-    if is_deployment(&role, config) {
-        let missing = match tokio::time::timeout(
+    let missing = if is_deployment(&role, config) {
+        match tokio::time::timeout(
             RECHECK_TIMEOUT,
             cxp_core::db_role::missing_runtime_grants(db),
         )
@@ -359,12 +345,33 @@ pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
             Ok(Ok(missing)) => missing,
             Ok(Err(e)) => return recheck_failed(alarm, "the runtime role's grants", &e),
             Err(_) => return recheck_timed_out(alarm, "the runtime role's grants"),
-        };
-        if !missing.is_empty() {
+        }
+    } else {
+        Vec::new()
+    };
+    let grants = (!missing.is_empty()).then(|| missing_grants(&missing, &role.current_user));
+    if let Some(grants) = &grants {
+        tracing::error!("the database role changed after boot: {grants}");
+    }
+    let [_, tenant] = cxp_core::db_role::RUNTIME_GRANTS;
+    let refused = match role_verdict(&role, config) {
+        Verdict::Refused => Some(role.summary()),
+        Verdict::Clean | Verdict::AllowedLocally => grants.filter(|_| missing.contains(&tenant)),
+    };
+    match refused {
+        Some(summary) => {
             tracing::error!(
-                "the database role changed after boot: {}",
-                missing_grants(&missing, &role.current_user)
+                "the database role changed after boot: {summary}; /readyz answers 503 until it \
+                 is fixed"
             );
+            alarm.raise(summary);
+        }
+        None => {
+            if alarm.clear() {
+                tracing::info!(
+                    "the database role re-check passes again; /readyz no longer holds back"
+                );
+            }
         }
     }
     alarm.record_success();
@@ -417,9 +424,10 @@ fn missing_grants(missing: &[&str], role: &str) -> String {
         ));
     }
     if missing.contains(&tenant) {
+        let tenant_role = cxp_core::TENANT_ROLE;
         fixes.push(format!(
-            "GRANT {} TO {role} WITH INHERIT TRUE",
-            cxp_core::TENANT_ROLE
+            "CREATE ROLE {tenant_role} NOLOGIN (if it does not exist); GRANT {tenant_role} TO \
+             {role} WITH INHERIT TRUE"
         ));
     }
     format!(
@@ -548,8 +556,8 @@ where
         .await
         .context("refusing to serve: tenant isolation is not enforced by this database")?;
     let isolation = report.summary();
-    tracing::info!("{isolation}");
     check_tenant_role(&report, &role.current_user)?;
+    tracing::info!("{isolation}");
 
     let platform = platform_client(&config)?;
     let check = check_platform(&platform, &config).await;
@@ -698,10 +706,10 @@ pub fn check_tenant_role(
     }
     let role = cxp_core::TENANT_ROLE;
     let why = format!(
-        "tenant transactions run as {:?}, not otto-cxp's own tenant role {role} (it does not \
+        "tenant transactions run as {}, not otto-cxp's own tenant role {role} (it does not \
          exist, or {} cannot assume it): as a superuser, CREATE ROLE {role} NOLOGIN; GRANT \
          {role} TO {} WITH INHERIT TRUE; then migrate (docs/deploy/fly.md, runbook T1)",
-        report.effective_role,
+        sql_identifier(&report.effective_role),
         sql_identifier(login),
         sql_identifier(login),
     );
@@ -1108,13 +1116,13 @@ mod tests {
         assert_eq!(
             missing_grants(&["inheriting cxp_app"], "Cxp"),
             "the runtime role \"Cxp\" lacks inheriting cxp_app (the org.deleted tombstone \
-             and the background tasks need them); fix with: GRANT cxp_app TO \"Cxp\" WITH \
-             INHERIT TRUE"
+             and the background tasks need them); fix with: CREATE ROLE cxp_app NOLOGIN (if it \
+             does not exist); GRANT cxp_app TO \"Cxp\" WITH INHERIT TRUE"
         );
         let both = missing_grants(&cxp_core::db_role::RUNTIME_GRANTS, "r");
         assert!(
             both.ends_with(
-                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; GRANT cxp_app TO "r" WITH INHERIT TRUE"#
+                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; CREATE ROLE cxp_app NOLOGIN (if it does not exist); GRANT cxp_app TO "r" WITH INHERIT TRUE"#
             ),
             "{both}"
         );
