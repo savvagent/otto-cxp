@@ -5,7 +5,9 @@
 -- Roles are cluster-wide. Create it where the migrating role may (tests, a local superuser),
 -- tolerating a concurrent creator. Where it may not (production's cxp_owner has no CREATEROLE)
 -- it must already exist (docs/deploy/fly.md, runbook T1); otherwise this migration fails, so the
--- release command aborts the deploy instead of recording 0007 with no grants made.
+-- release command aborts the deploy instead of recording 0007 with no grants made. The DO block
+-- exists so the failure names the fix (without it the GRANTs below would fail on a missing role
+-- anyway).
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_app') THEN
@@ -24,16 +26,43 @@ BEGIN
   END IF;
 END $$;
 
+-- A cxp_app that already existed was not made here: refuse it unless it is a plain group role,
+-- since it is the role every tenant transaction runs as. Checked after the create block so it
+-- also covers a role created concurrently.
+DO $$
+DECLARE
+  r pg_roles%ROWTYPE;
+  found text[] := ARRAY[]::text[];
+BEGIN
+  SELECT * INTO r FROM pg_roles WHERE rolname = 'cxp_app';
+  IF r.rolcanlogin THEN found := found || 'LOGIN'; END IF;
+  IF r.rolsuper THEN found := found || 'SUPERUSER'; END IF;
+  IF r.rolbypassrls THEN found := found || 'BYPASSRLS'; END IF;
+  IF r.rolcreaterole THEN found := found || 'CREATEROLE'; END IF;
+  IF r.rolcreatedb THEN found := found || 'CREATEDB'; END IF;
+  IF r.rolreplication THEN found := found || 'REPLICATION'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = 'cxp_app'::regrole) THEN
+    found := found || 'membership in another role';
+  END IF;
+  IF cardinality(found) > 0 THEN
+    RAISE EXCEPTION 'role cxp_app has %: otto-cxp''s tenant role must be NOLOGIN, hold no '
+                    'attribute, and be a member of nothing (docs/deploy/fly.md, runbook T1/T2)',
+                    array_to_string(found, ', ');
+  END IF;
+END $$;
+
 -- The same grants 0001, 0003, and 0004 gave otto_app, one statement each over every table,
 -- sequence, and function in public, then 0001's three narrowings. otto_app keeps its own: the
 -- previous release runs tenant transactions as otto_app until this one replaces it, and again
--- after a rollback. A later migration revokes them.
+-- after a rollback. A later migration should revoke them (docs/deploy/fly.md, the tenant-role
+-- runbook's Later).
 GRANT USAGE ON SCHEMA public TO cxp_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cxp_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO cxp_app;
 -- Includes the two SECURITY DEFINER functions, expire_removed_members() and
--- console_session_org(bytea): both are REVOKE ALL ... FROM PUBLIC and granted to the tenant role
--- by name, as 0001 and 0003 did for otto_app.
+-- console_session_org(bytea): covered by this blanket EXECUTE, as 0001's blanket grant covered
+-- expire_removed_members (0003 granted console_session_org by name); both stay
+-- REVOKE ALL ... FROM PUBLIC.
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO cxp_app;
 -- Tables and sequences a later migration creates as the migrating role (cxp_owner in
 -- production) get the same.
@@ -46,4 +75,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- expire_removed_members(); the migrator's ledger is not the app's.
 REVOKE INSERT, UPDATE, DELETE ON deleted_orgs FROM cxp_app;
 REVOKE DELETE ON removed_members FROM cxp_app;
-REVOKE ALL ON public._sqlx_migrations FROM cxp_app;
+DO $$
+BEGIN
+  IF to_regclass('public._sqlx_migrations') IS NOT NULL THEN
+    REVOKE ALL ON public._sqlx_migrations FROM cxp_app;
+  END IF;
+END $$;

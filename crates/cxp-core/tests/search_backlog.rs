@@ -33,7 +33,7 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> PgPool {
              NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
         ),
         // The database starts as the previous release left it, whose tenant role was otto_app
-        // (0001 to 0003 grant to it; cxp_app arrives with 0007).
+        // (0001 to 0004 grant to it; cxp_app arrives with 0007).
         "DO $$ BEGIN CREATE ROLE otto_app NOLOGIN; \
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
             .to_string(),
