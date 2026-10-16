@@ -557,7 +557,7 @@ unset PW
 is proven apart from the code change (that release runs every database path the same way; the
 e2e test `the_service_runs_whole_as_a_least_privilege_database_owner` proves them as such a
 role). Then `curl -s https://otto-cxp.savvagent.com/readyz` answers ready, `fly logs -a otto-cxp
---no-tail` shows `tenant isolation enforced as role "otto_app"`, and in `fly postgres connect -a
+--no-tail` shows `tenant isolation enforced as role "otto_app"` (the release running then, before #28), and in `fly postgres connect -a
 otto-db`:
 
 ```sql
@@ -852,7 +852,7 @@ queries (now `t` for `otto_cxp` and `postgres` only), plus `SELECT has_schema_pr
 ```bash
 fly apps restart otto-cxp
 curl -s https://otto-cxp.savvagent.com/readyz      # ready
-fly logs -a otto-cxp --no-tail                     # CXP_RUN_MIGRATIONS is off; tenant isolation enforced as role "otto_app"
+fly logs -a otto-cxp --no-tail                     # CXP_RUN_MIGRATIONS is off; tenant isolation enforced as role "otto_app" (the release running then, before #28)
 ```
 
 **S5. Undo, only before S6.** S3 alone, back to `cxp_server` owning everything (as postgres; the
@@ -914,7 +914,7 @@ holds no superuser-equivalent privilege ...`, `applying migrations`, `migrations
 machine's shows `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment ...`,
 `database role "cxp_server" ... it owns nothing in this database, can TRUNCATE or add a TRIGGER
 to no table, and can create no schema, object, or temporary table in it ...`, `not migrating`,
-`tenant isolation enforced as role "otto_app"`.
+`tenant isolation enforced as role "otto_app"` (releases before #28; from #28 on, `"cxp_app"`).
 
 Rolling back after S6 means rolling back the code, and the release command is the catch: an image
 from before #27 does not know `migrate` and would start serving inside the release machine until
@@ -952,8 +952,8 @@ ORDER BY 1;
 -- cxp_owner owns otto_cxp; PUBLIC has no CONNECT (no "=c" entry) on any service database.
 SELECT datname, pg_get_userbyid(datdba) AS owner, datacl FROM pg_database
 WHERE datname IN ('otto_cxp', 'otto_platform', 'otto_factory', 'otto_flags') ORDER BY 1;
--- What cxp_server is a member of: otto_app and cxp_runtime.
-SELECT r.rolname FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
+-- What cxp_server is a member of: otto_app and cxp_runtime (and who granted each: T5 needs it).
+SELECT r.rolname, m.grantor::regrole FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
 WHERE m.member = 'cxp_server'::regrole ORDER BY 1;
 \c otto_cxp
 -- 6: #27 is deployed.
@@ -1032,7 +1032,15 @@ WHERE n.nspname = 'public' AND c.relkind = 'S'
 UNION ALL
 SELECT f.oid::regprocedure::text, 'EXECUTE' FROM pg_proc f JOIN pg_namespace n ON n.oid = f.pronamespace
 WHERE n.nspname = 'public'
-  AND has_function_privilege('cxp_app', f.oid, 'EXECUTE') <> has_function_privilege('otto_app', f.oid, 'EXECUTE');
+  AND has_function_privilege('cxp_app', f.oid, 'EXECUTE') <> has_function_privilege('otto_app', f.oid, 'EXECUTE')
+UNION ALL
+SELECT 'schema public', p.priv FROM unnest(ARRAY['USAGE','CREATE']) AS p(priv)
+WHERE has_schema_privilege('cxp_app', 'public', p.priv) <> has_schema_privilege('otto_app', 'public', p.priv);
+-- r: cxp_app=arwd/cxp_owner; S: cxp_app=rU/cxp_owner (tables and sequences a later
+-- migration creates as cxp_owner reach cxp_app).
+SELECT d.defaclobjtype, d.defaclacl FROM pg_default_acl d
+JOIN pg_namespace n ON n.oid = d.defaclnamespace
+WHERE d.defaclrole = 'cxp_owner'::regrole AND n.nspname = 'public';
 -- f, t: a tenant transaction may not write a tombstone; cxp_server may (through cxp_runtime).
 SELECT has_table_privilege('cxp_app', 'public.deleted_orgs', 'INSERT') AS tenant_tombstone,
        has_table_privilege('cxp_server', 'public.deleted_orgs', 'INSERT') AS runtime_tombstone;
@@ -1040,7 +1048,8 @@ SELECT has_table_privilege('cxp_app', 'public.deleted_orgs', 'INSERT') AS tenant
 
 If the parity query returns rows (production's `otto_app` grants can differ from a fresh
 migration's), stop here: do not run T5, keep `cxp_server` in `otto_app`, and report the rows. The
-release still serves, as `cxp_app`.
+release serves as `cxp_app`, but requests that need a privilege it lacks fail; re-run the
+missing GRANT as `cxp_owner` (in `otto_cxp`) and report the difference.
 
 **T5. Leave `otto_app`.** Once T3 and T4 pass, as postgres:
 
@@ -1048,6 +1057,9 @@ release still serves, as `cxp_app`.
 REVOKE otto_app FROM cxp_server;
 -- f
 SELECT pg_has_role('cxp_server', 'otto_app', 'MEMBER');
+-- If that still says t (Postgres 16 revokes only the grants the revoking role made), revoke the
+-- grant by its grantor, from T0's second query:
+-- REVOKE otto_app FROM cxp_server GRANTED BY <grantor>;
 ```
 
 ```bash
