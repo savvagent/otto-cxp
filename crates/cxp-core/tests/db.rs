@@ -2648,6 +2648,15 @@ async fn the_previous_release_still_isolates_as_otto_app(pool: PgPool) {
 /// Before migrations there is no `deleted_orgs` to need a grant on.
 #[sqlx::test(migrations = false)]
 async fn missing_runtime_grants_is_empty_before_migrations(pool: PgPool) {
+    // A missing cxp_app now counts as a missing grant, so the role must exist for the list to
+    // be empty. Roles are cluster-wide and tests run concurrently: tolerate a concurrent creator.
+    sqlx::query(
+        "DO $$ BEGIN CREATE ROLE cxp_app NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     assert!(cxp_core::db_role::missing_runtime_grants(&db(pool))
         .await
         .unwrap()
@@ -2737,4 +2746,95 @@ async fn migration_0007_pins_the_security_definer_functions(pool: PgPool) {
         "{}",
         expire.3
     );
+}
+
+/// `cxp_app` shares nothing with `otto_app`: a privilege granted to `otto_app` after migrating
+/// does not reach a tenant transaction, and the roles are not members of each other.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_is_independent_of_otto_app(pool: PgPool) {
+    sqlx::query("CREATE TABLE t_shared (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 0007's default privileges gave cxp_app this table; take them back so only otto_app holds it.
+    sqlx::query("REVOKE ALL ON t_shared FROM cxp_app")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT ON t_shared TO otto_app")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = db(pool.clone()).begin(org()).await.unwrap();
+    let err = sqlx::query("SELECT count(*) FROM t_shared")
+        .fetch_one(&mut *tx.conn())
+        .await
+        .expect_err("cxp_app was never granted t_shared");
+    assert_eq!(sqlstate(&err), "42501");
+    drop(tx);
+    let member: bool = sqlx::query_scalar("SELECT pg_has_role('cxp_app', 'otto_app', 'MEMBER')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!member, "cxp_app is a member of otto_app");
+}
+
+/// Migration 0007 refuses a pre-existing `cxp_app` that is not a plain group role. A negative
+/// test would mutate the cluster-wide role other tests share, so this runs the check against
+/// the test cluster's real `cxp_app` (which migrating just accepted) and asserts the catalog
+/// facts the check reads.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_is_a_plain_group_role(pool: PgPool) {
+    let flags: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication \
+         FROM pg_roles WHERE rolname = 'cxp_app'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flags, (false, false, false, false, false, false));
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_auth_members WHERE member = 'cxp_app'::regrole",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(memberships, 0, "cxp_app is a member of another role");
+}
+
+/// Tables and sequences a later migration creates as the migrating role reach `cxp_app`
+/// through 0007's default privileges, minus `TRUNCATE`.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0007_sets_default_privileges_for_the_migrating_role(pool: PgPool) {
+    sqlx::query("CREATE TABLE later_t (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE SEQUENCE later_s")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (privilege, expected) in [
+        ("SELECT", true),
+        ("INSERT", true),
+        ("UPDATE", true),
+        ("DELETE", true),
+        ("TRUNCATE", false),
+    ] {
+        let has: bool = sqlx::query_scalar("SELECT has_table_privilege('cxp_app', 'later_t', $1)")
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(has, expected, "{privilege} on a later table");
+    }
+    for privilege in ["USAGE", "SELECT"] {
+        let has: bool =
+            sqlx::query_scalar("SELECT has_sequence_privilege('cxp_app', 'later_s', $1)")
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(has, "{privilege} on a later sequence");
+    }
 }

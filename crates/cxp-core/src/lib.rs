@@ -8,8 +8,8 @@
 //! isolation comes from `otto_tenant::{Db, Tx}`: every tenant query is a
 //! method on an [`otto_tenant::Tx`], which cannot exist without an org, and
 //! runs under row-level security as `cxp_app` ([`TENANT_ROLE`]). Query
-//! methods are extension traits (`customers::CustomersExt`, `tickets::TicketsExt`, ...) because `Tx`
-//! is defined in otto-tenant. Request paths open their transactions with
+//! methods are extension traits (`customers::CustomersExt`,
+//! `tickets::TicketsExt`, ...) because `Tx` is defined in otto-tenant. Request paths open their transactions with
 //! `platform_events::begin_live`, never `Db::begin` directly, so a deleted org
 //! or removed member is refused.
 //!
@@ -49,13 +49,15 @@ pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// The role every tenant transaction assumes (`SET LOCAL ROLE`): otto-cxp's own (#28), never
 /// the `otto_app` the otto services on a shared instance may share, so a privilege another
 /// service grants `otto_app` never reaches a tenant transaction here. A NOLOGIN role holding
-/// `otto_cxp`'s tenant grants and nothing else (migration 0007); the runtime login is a member
-/// of it (and inherits its grants for the background work it does as itself).
+/// `otto_cxp`'s tenant grants and nothing else (migration 0007); the runtime login is made a member
+/// of it (runbook T1; 0007 grants it to no one), and inherits its grants for the background
+/// work it does as itself.
 pub const TENANT_ROLE: &str = "cxp_app";
 
 /// The only way to make an [`otto_tenant::Db`] in this workspace: `Db::from_pool` and
-/// `Db::connect` default to the shared `otto_app` and are forbidden elsewhere (`clippy.toml`),
-/// so production and every test pin [`TENANT_ROLE`] alike.
+/// `Db::connect` default to the shared `otto_app` and are forbidden elsewhere (`clippy.toml`;
+/// two tests that deliberately model the previous release allow it), so production and the tests
+/// pin [`TENANT_ROLE`] alike.
 ///
 /// otto-tenant skips `SET LOCAL ROLE` when the role is missing or not assumable rather than
 /// failing; `cxp-server`'s boot refuses that on every machine (`boot::check_tenant_role`).
