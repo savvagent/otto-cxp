@@ -35,19 +35,25 @@ DECLARE
   found text[] := ARRAY[]::text[];
 BEGIN
   SELECT * INTO r FROM pg_roles WHERE rolname = 'cxp_app';
-  IF r.rolcanlogin THEN found := found || 'LOGIN'; END IF;
-  IF r.rolsuper THEN found := found || 'SUPERUSER'; END IF;
-  IF r.rolbypassrls THEN found := found || 'BYPASSRLS'; END IF;
-  IF r.rolcreaterole THEN found := found || 'CREATEROLE'; END IF;
-  IF r.rolcreatedb THEN found := found || 'CREATEDB'; END IF;
-  IF r.rolreplication THEN found := found || 'REPLICATION'; END IF;
+  IF r.rolcanlogin THEN found := array_append(found, 'LOGIN'); END IF;
+  IF r.rolsuper THEN found := array_append(found, 'SUPERUSER'); END IF;
+  IF r.rolbypassrls THEN found := array_append(found, 'BYPASSRLS'); END IF;
+  IF r.rolcreaterole THEN found := array_append(found, 'CREATEROLE'); END IF;
+  IF r.rolcreatedb THEN found := array_append(found, 'CREATEDB'); END IF;
+  IF r.rolreplication THEN found := array_append(found, 'REPLICATION'); END IF;
   IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = 'cxp_app'::regrole) THEN
-    found := found || 'membership in another role';
+    found := array_append(found, 'membership in another role');
+  END IF;
+  -- Whoever holds ADMIN on it may grant it, and with it every tenant grant, to anyone. On
+  -- Postgres 16 a non-superuser that creates a role gets ADMIN on it; one a superuser creates
+  -- (runbook T1) has no such row.
+  IF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = 'cxp_app'::regrole AND admin_option) THEN
+    found := array_append(found, 'a member WITH ADMIN OPTION');
   END IF;
   IF cardinality(found) > 0 THEN
     RAISE EXCEPTION 'role cxp_app has %: otto-cxp''s tenant role must be NOLOGIN, hold no '
-                    'attribute, and be a member of nothing (docs/deploy/fly.md, runbook T1/T2)',
-                    array_to_string(found, ', ');
+                    'attribute, be a member of nothing, and have no member WITH ADMIN OPTION '
+                    '(docs/deploy/fly.md, runbook T1/T2)', array_to_string(found, ', ');
   END IF;
 END $$;
 

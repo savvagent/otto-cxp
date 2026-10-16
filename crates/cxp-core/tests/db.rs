@@ -2735,6 +2735,51 @@ async fn cxp_app_is_a_plain_group_role(pool: PgPool) {
     assert_eq!(memberships, 0, "cxp_app is a member of another role");
 }
 
+/// 0007's check of an existing `cxp_app` refuses one that is not a plain group role. The real
+/// role is cluster-wide and shared by concurrent tests, so the check's block runs, as written in
+/// the migration, against a stand-in role of its own.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0007_refuses_a_cxp_app_that_is_not_a_plain_group_role(pool: PgPool) {
+    let migration = include_str!("../migrations/0007_cxp_app_tenant_role.sql");
+    let start = migration
+        .find("DO $$\nDECLARE")
+        .expect("0007's plain-group-role check");
+    let end = start + migration[start..].find("END $$;").expect("its end") + "END $$;".len();
+    let check = &migration[start..end];
+    let mut roles = TestRoles::new(&pool);
+    let run = |role: &str| {
+        let sql = check.replace("cxp_app", role);
+        let pool = pool.clone();
+        async move { sqlx::query(&sql).execute(&pool).await }
+    };
+
+    let plain = roles.nologin(&pool, "cxp_app_plain", "").await;
+    run(&plain).await.expect("a plain group role passes");
+
+    let (login, db) = roles.login(&pool, "cxp_app_login", "").await;
+    db.pool().close().await;
+    let err = run(&login).await.unwrap_err().to_string();
+    assert!(err.contains(&format!("role {login} has LOGIN")), "{err}");
+
+    let member = roles.nologin(&pool, "cxp_app_member", "").await;
+    let group = roles.nologin(&pool, "cxp_app_group", "").await;
+    sqlx::query(&format!("GRANT {group} TO {member}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = run(&member).await.unwrap_err().to_string();
+    assert!(err.contains("membership in another role"), "{err}");
+
+    let admin = roles.nologin(&pool, "cxp_app_admin", "").await;
+    let holder = roles.nologin(&pool, "cxp_app_holder", "").await;
+    sqlx::query(&format!("GRANT {admin} TO {holder} WITH ADMIN OPTION"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = run(&admin).await.unwrap_err().to_string();
+    assert!(err.contains("a member WITH ADMIN OPTION"), "{err}");
+}
+
 /// Tables and sequences a later migration creates as the migrating role reach `cxp_app`
 /// through 0007's default privileges, minus `TRUNCATE`.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
