@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 30
     services:
       # `#[sqlx::test]` runs against a real Postgres, no mocks. A superuser, as
-      # in compose.yaml, so the baseline migration can create and grant otto_app.
+      # in compose.yaml, so the migrations can create and grant otto_app and cxp_app.
       postgres:
         image: postgres:16
         env:
@@ -57,11 +57,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # The baseline creates otto_app itself and tolerates losing the race, but
-      # many test databases migrate in parallel against one cluster-scoped role;
-      # creating it first takes the race out.
-      - name: Pre-create the otto_app role
-        run: psql "$DATABASE_URL" -c "CREATE ROLE otto_app NOLOGIN;"
+      # 0001 creates otto_app and 0007 creates cxp_app, each tolerating a lost race, but
+      # many test databases migrate in parallel against these cluster-scoped roles; creating
+      # them first takes the race out.
+      - name: Pre-create the tenant roles
+        run: |
+          psql "$DATABASE_URL" -c "CREATE ROLE otto_app NOLOGIN;"
+          psql "$DATABASE_URL" -c "CREATE ROLE cxp_app NOLOGIN;"
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check

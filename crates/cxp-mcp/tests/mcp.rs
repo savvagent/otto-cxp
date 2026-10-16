@@ -22,7 +22,6 @@ use otto_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, OrgInfo, PlatformClient, Role, TokenKind,
     UserInfo,
 };
-use otto_tenant::Db;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -173,7 +172,7 @@ async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
         format!("{base}/settings/billing"),
     ));
     let app = router(
-        Db::from_pool(pool.clone()),
+        cxp_core::tenant_db(pool.clone()),
         client,
         meter,
         Config {
@@ -301,7 +300,7 @@ async fn a_live_console_session_cookie_is_not_a_credential_on_mcp(pool: PgPool) 
     let access = token(&h.platform, org, WRITE);
     let cookie = "A".repeat(43);
     console_sessions::create(
-        &Db::from_pool(h.pool.clone()),
+        &cxp_core::tenant_db(h.pool.clone()),
         &otto_tenant::crypto::Cipher::from_base64_key(
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         )
@@ -739,7 +738,7 @@ async fn knowledge_articles_and_unknown_uris(pool: PgPool) {
 
     // No tool writes articles; seed one through cxp-core in org's own
     // transaction, as the REST surface does.
-    let db = Db::from_pool(pool);
+    let db = cxp_core::tenant_db(pool);
     let mut tx = db.begin(org.into()).await.unwrap();
     let article = tx
         .create_article(&NewArticle {
@@ -885,7 +884,7 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
     for hosts in [vec![], vec![" ".to_string(), String::new()]] {
         let meter = Arc::new(Meter::new(client.clone(), false, "https://x"));
         let built = router(
-            Db::from_pool(pool.clone()),
+            cxp_core::tenant_db(pool.clone()),
             client.clone(),
             meter,
             Config {

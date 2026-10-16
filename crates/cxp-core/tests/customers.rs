@@ -1,5 +1,5 @@
 //! The customer-data domain (customers, interactions, segments) against a real
-//! Postgres, as a request runs it: through `Db::begin` as `otto_app`.
+//! Postgres, as a request runs it: through `Db::begin` as `cxp_app`.
 
 mod common;
 

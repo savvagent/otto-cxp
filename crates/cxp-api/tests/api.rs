@@ -20,7 +20,6 @@ use otto_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role,
     TeamInfo, TokenKind, UsageBatch, UsageReceipt, UserInfo,
 };
-use otto_tenant::Db;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -231,7 +230,7 @@ async fn harness_opts(pool: PgPool, webhook_secret: &str, enforce: bool) -> Harn
         "https://otto.example.com",
     ));
     let state = AppState::new(
-        Db::from_pool(pool.clone()),
+        cxp_core::tenant_db(pool.clone()),
         platform,
         meter,
         Config {
@@ -1267,7 +1266,7 @@ async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
     // No REST route submits a response (that is MCP only), so seed through the
     // domain API on an org-pinned transaction, under RLS like a request. Test
     // setup only: request paths open with `begin_live`.
-    let db = Db::from_pool(h.pool.clone());
+    let db = cxp_core::tenant_db(h.pool.clone());
     let mut tx = db.begin(otto_tenant::ids::OrgId::from(org)).await.unwrap();
     for customer in [customers[0], customers[1], customers[0]] {
         tx.submit_survey_response(survey, customer, &json!({"q1": 9}))

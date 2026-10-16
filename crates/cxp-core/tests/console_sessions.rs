@@ -6,7 +6,7 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use common::{db, org, otto_app_db, user};
+use common::{db, org, tenant_role_db, user};
 use cxp_core::console_sessions::{self, Claim, Lease, NewSession, Refreshed};
 use cxp_core::platform_events::{self, Outcome};
 use cxp_core::Error;
@@ -657,7 +657,7 @@ async fn a_store_behind_the_lifecycle_lock_times_out(pool: PgPool) {
 /// query on it inherits them.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_store_timeouts_do_not_outlive_its_transaction(pool: PgPool) {
-    let one = Db::from_pool(
+    let one = cxp_core::tenant_db(
         PgPoolOptions::new()
             .max_connections(1)
             .connect_with(pool.connect_options().as_ref().clone())
@@ -825,7 +825,7 @@ async fn member_removed_deletes_that_members_sessions_once(pool: PgPool) {
 }
 
 /// The sweep deletes only expired sessions, across orgs, in batches, as
-/// `otto_app` (the policies admit it only under the maintenance marker).
+/// `cxp_app` (the policies admit it only under the maintenance marker).
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_sweep_deletes_expired_sessions_in_batches(pool: PgPool) {
     let admin = db(pool.clone());
@@ -847,7 +847,7 @@ async fn the_sweep_deletes_expired_sessions_in_batches(pool: PgPool) {
         .unwrap();
     }
 
-    let app_db = otto_app_db(&pool).await;
+    let app_db = tenant_role_db(&pool).await;
     let swept = console_sessions::sweep_expired(&app_db).await.unwrap();
     assert_eq!(swept, 2 * expired as u64);
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM console_sessions")

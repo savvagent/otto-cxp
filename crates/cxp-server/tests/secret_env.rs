@@ -77,6 +77,14 @@ fn a_serving_process_reexecutes_without_the_migration_secret() {
         "the rest is kept"
     );
 
+    // The log line is written after the re-exec, before boot connects; killing the child as
+    // soon as the marker shows can beat it there under load. Boot gives up on the silent
+    // database after the pool's acquire timeout and exits, with its output complete; only a
+    // child that outlives that by far is killed.
+    let exit_by = Instant::now() + cxp_core::POOL_ACQUIRE_TIMEOUT + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && Instant::now() < exit_by {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let _ = child.kill();
     let _ = child.wait();
     let out = output_of(&mut child);

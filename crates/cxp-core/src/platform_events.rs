@@ -270,7 +270,7 @@ async fn sweep_in_tx(db: &Db, step: TxSweep, keep_days: i32) -> Result<u64> {
         .execute(&mut *tx)
         .await?
         .rows_affected(),
-        // otto_app may not DELETE tombstones; this database function deletes
+        // the tenant role may not DELETE tombstones; this database function deletes
         // only expired ones (twice REMOVED_MEMBER_TTL_SECS, fixed in the
         // migration).
         TxSweep::Tombstones => {

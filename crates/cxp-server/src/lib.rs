@@ -449,7 +449,7 @@ mod tests {
             .unwrap();
         let platform = platform_client(&config).unwrap();
         router(
-            Db::from_pool(pool),
+            cxp_core::tenant_db(pool),
             platform.clone(),
             meter(platform, &config),
             &config,
@@ -1034,7 +1034,7 @@ mod tests {
             .unwrap();
         let platform = platform_client(&Config::for_test()).unwrap();
         let err = router(
-            Db::from_pool(pool),
+            cxp_core::tenant_db(pool),
             platform.clone(),
             meter(platform, &config),
             &config,
