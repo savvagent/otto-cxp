@@ -702,14 +702,38 @@ async fn try_reschedule(
 ///
 /// A failure that passes on its own is logged at `warn`; one that needs an
 /// operator at `error`.
+///
+/// `pause` reads `true` while the database-role check refuses the connecting
+/// role (the server's readiness alarm): the shipper runs as that role, so it
+/// pauses — up to and including the final flush on `shutdown` — until the
+/// alarm clears, rather than ship as a role that may now hold `BYPASSRLS`.
+/// Rows wait in the outbox; nothing is lost.
 pub async fn run(
     db: Db,
     platform: Arc<PlatformClient>,
     cfg: ShipperConfig,
+    mut pause: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ShipError> {
     let mut failures: u32 = 0;
     loop {
+        if *pause.borrow() {
+            tracing::warn!(
+                "usage shipping is paused: the database role the shipper runs as is refused; \
+                 rows stay in the outbox until it is fixed"
+            );
+            tokio::select! {
+                resumed = pause.wait_for(|paused| !*paused) => {
+                    // The sender is shared with the process's lifetime; a
+                    // closed channel means the process is winding down.
+                    if resumed.is_err() {
+                        return Ok(());
+                    }
+                }
+                _ = shutdown.changed() => return Ok(()),
+            }
+            continue;
+        }
         let wait = match ship_once(&db, &platform, &cfg).await {
             Ok(n) => {
                 failures = 0;
