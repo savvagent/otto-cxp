@@ -2854,6 +2854,61 @@ async fn the_role_recheck_raises_and_clears_the_readiness_alarm(pool: PgPool) {
     db.pool().close().await;
 }
 
+/// The retention sweep runs as the runtime role, so while the role alarm is
+/// raised it pauses: a pass re-checks (raising the alarm) and sweeps nothing,
+/// and a pass that clears the alarm sweeps again (#47).
+#[sqlx::test(migrations = false)]
+async fn the_retention_sweep_pauses_while_the_role_alarm_is_raised(pool: PgPool) {
+    let _guard = discard_logs();
+    let roles = split(&pool).await;
+    cxp_server::boot::migrate(&deployed(&roles.runtime_url, Some(&roles.owner_url)))
+        .await
+        .expect("the owner migrates");
+    let config = deployed(&roles.runtime_url, None);
+    let db = Db::connect(&roles.runtime_url).await.unwrap();
+    let alarm = cxp_server::health::RoleAlarm::default();
+
+    // An old platform-event marker the sweep would remove.
+    let org = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO platform_events (event_id, org_id, kind, received_at) \
+         VALUES ($1, $2, 'member.removed', now() - interval '90 days')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let count = |pool: PgPool| async move {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM platform_events WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        n
+    };
+
+    // A privilege granted after boot: the pass's re-check raises the alarm,
+    // and the sweep is skipped even though the row is old enough.
+    sqlx::query(&format!("GRANT pg_read_all_data TO {}", roles.runtime))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cxp_server::boot::sweep_pass(&db, &config, &alarm).await, 0);
+    assert!(alarm.is_raised(), "the re-check raised the alarm");
+    assert_eq!(count(pool.clone()).await, 1, "paused: nothing swept");
+
+    // Fixed: the same pass clears the alarm and sweeps the row.
+    sqlx::query(&format!("REVOKE pg_read_all_data FROM {}", roles.runtime))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cxp_server::boot::sweep_pass(&db, &config, &alarm).await, 1);
+    assert!(!alarm.is_raised(), "cleared");
+    assert_eq!(count(pool.clone()).await, 0, "resumed: swept");
+    db.pool().close().await;
+}
+
 /// A re-check that cannot read the role leaves a raised alarm raised: an
 /// unreachable database is no evidence the role was fixed. Failures in a
 /// row are counted (logged at `error` from the third on), and a re-check
