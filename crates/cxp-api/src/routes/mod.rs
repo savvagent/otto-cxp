@@ -11,9 +11,7 @@
 //! (`metadata`, `questions`, `answers`) passes through untouched.
 //!
 //! Lists answer [`Paginated`] `{data, total, limit, offset}`; search answers
-//! [`CappedPaginated`], which adds `totalCapped`. One exception remains,
-//! tracked: `GET /dashboard/metrics` also sends its deprecated snake_case keys
-//! (`total_customers`, ...) beside the camelCase ones (#35). Errors are
+//! [`CappedPaginated`], which adds `totalCapped`. Errors are
 //! `{"error", "code"}`; the auth layer's `401`/`403` use the RFC 6750 names
 //! `error` and `error_description`. The web console's types follow this, and
 //! the `wire_fixture` tests below pin the shapes it reads.

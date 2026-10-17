@@ -97,12 +97,9 @@ describe("types match the server's JSON", () => {
     sameKeys(typed.team, keys.team);
   });
 
-  it("answers dashboard metrics in camelCase, with the legacy snake_case keys alongside", () => {
-    const snake = (k: string) => k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  it("answers dashboard metrics in camelCase only (#35)", () => {
     const camel = Object.keys(keys.dashboardMetrics);
-    sameKeys(wire.dashboardMetrics, Object.fromEntries([...camel, ...camel.map(snake)].map((k) => [k, true])));
-    const m = wire.dashboardMetrics as Record<string, number>;
-    for (const k of camel) expect(m[snake(k)]).toBe(m[k]);
+    sameKeys(wire.dashboardMetrics, Object.fromEntries(camel.map((k) => [k, true])));
   });
 
   it("answers search in the list envelope with totalCapped", () => {

@@ -626,15 +626,12 @@ async fn routes_answer_in_the_shapes_the_console_reads(pool: PgPool) {
     let metrics = h
         .call("GET", "/api/v1/dashboard/metrics", Some(&t), None)
         .await;
-    // camelCase, plus the snake_case keys this route answered with before
-    // #24, kept for existing consumers.
+    // camelCase only (#35).
     assert_eq!(
         metrics.body,
         json!({
             "totalCustomers": 1, "totalTickets": 2, "openTickets": 2,
             "totalFeedback": 0, "totalSurveys": 0, "totalExperiences": 0,
-            "total_customers": 1, "total_tickets": 2, "open_tickets": 2,
-            "total_feedback": 0, "total_surveys": 0, "total_experiences": 0,
         })
     );
 
