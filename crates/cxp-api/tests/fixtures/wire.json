@@ -200,17 +200,11 @@
   },
   "dashboardMetrics": {
     "openTickets": 1,
-    "open_tickets": 1,
     "totalCustomers": 1,
     "totalExperiences": 1,
     "totalFeedback": 3,
     "totalSurveys": 1,
-    "totalTickets": 2,
-    "total_customers": 1,
-    "total_experiences": 1,
-    "total_feedback": 3,
-    "total_surveys": 1,
-    "total_tickets": 2
+    "totalTickets": 2
   },
   "experience": {
     "createdAt": "2026-10-10T12:30:00Z",
