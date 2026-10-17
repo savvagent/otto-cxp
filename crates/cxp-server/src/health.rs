@@ -39,7 +39,10 @@
 //! lasts until the next pass after the fix clears it, or a restart, which
 //! re-runs the boot check. The alarm also counts the re-checks that could
 //! not read the role in a row ([`RoleAlarm::consecutive_failures`]), which
-//! the re-check logs at `error` from the third on.
+//! the re-check logs at `error` from the third on. While it is raised it also
+//! pauses the background maintenance ([`RoleAlarm::pause_signal`]): the sweep
+//! and the usage shipper run as the connecting role, so a role that gained
+//! `BYPASSRLS` after boot must not keep running them.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -51,6 +54,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use otto_tenant::Db;
+use tokio::sync::watch;
 
 use crate::PlatformCheck;
 
@@ -69,26 +73,60 @@ const ROLE_REFUSED: &str = "database role refused";
 /// process serves as; holds the role summary for the log, and how many
 /// re-checks in a row could not read the role. Cheap to clone: clones share
 /// one state, so boot hands one to the sweeper and one to the router.
-#[derive(Clone, Default)]
+///
+/// Raising it also tells the background maintenance to pause
+/// ([`RoleAlarm::pause_signal`]): the sweep and the usage shipper run as the
+/// connecting role, so while the check refuses that role they must not run at
+/// all — a role that gained `BYPASSRLS` after boot would apply to them until
+/// the next pass cleared the alarm.
+#[derive(Clone)]
 pub struct RoleAlarm {
     summary: Arc<RwLock<Option<String>>>,
     failures: Arc<AtomicU32>,
+    /// `true` while raised, so a `watch`er wakes the moment it changes.
+    /// `send_replace` never fails, so it works before anyone subscribes.
+    paused: watch::Sender<bool>,
+}
+
+impl Default for RoleAlarm {
+    fn default() -> Self {
+        Self {
+            summary: Arc::new(RwLock::new(None)),
+            failures: Arc::new(AtomicU32::new(0)),
+            paused: watch::channel(false).0,
+        }
+    }
 }
 
 impl RoleAlarm {
-    /// Raise (or keep raised) with the role `summary`.
+    /// Raise (or keep raised) with the role `summary`, and pause the
+    /// background maintenance until it clears.
     pub fn raise(&self, summary: String) {
         *self.summary.write().unwrap_or_else(PoisonError::into_inner) = Some(summary);
+        self.paused.send_replace(true);
     }
 
     /// Lower it; `true` when it was raised, so the caller logs the change
-    /// once.
+    /// once. Resumes the background maintenance.
     pub fn clear(&self) -> bool {
-        self.summary
+        let was = self
+            .summary
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-            .is_some()
+            .is_some();
+        if was {
+            self.paused.send_replace(false);
+        }
+        was
+    }
+
+    /// A receiver that reads `true` while the alarm is raised and wakes
+    /// whoever waits on it when it changes: the background maintenance
+    /// (the sweep and the usage shipper) pauses on it and resumes once it
+    /// clears.
+    pub fn pause_signal(&self) -> watch::Receiver<bool> {
+        self.paused.subscribe()
     }
 
     /// The role summary it was raised with, if raised: for the log only,
@@ -345,5 +383,26 @@ mod tests {
         // A bare platform check converts, with no alarm.
         let (_, body) = probe(PlatformCheck::Accepted.into()).await;
         assert_ne!(body["reason"], "database role refused");
+    }
+
+    /// Raising the alarm pauses the background maintenance and clearing it
+    /// resumes, in every clone, and a subscriber taken before or after the
+    /// change reads the current state.
+    #[tokio::test]
+    async fn the_role_alarm_pauses_and_resumes_the_background_maintenance() {
+        let alarm = RoleAlarm::default();
+        let mut pause = alarm.pause_signal();
+        assert!(!*pause.borrow(), "lowered at boot");
+
+        alarm.raise("refused".into());
+        assert!(*pause.borrow(), "raised: the maintenance pauses");
+        pause.changed().await.unwrap();
+        // A signal taken after the raise still reads it.
+        assert!(*alarm.clone().pause_signal().borrow());
+
+        assert!(alarm.clear(), "it was raised");
+        assert!(!*pause.borrow(), "cleared: the maintenance resumes");
+        pause.changed().await.unwrap();
+        assert!(!*alarm.pause_signal().borrow());
     }
 }

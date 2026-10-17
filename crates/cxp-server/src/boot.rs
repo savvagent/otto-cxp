@@ -267,6 +267,12 @@ pub fn migration_url(config: &Config) -> Result<&str> {
 ///
 /// The serving process never migrates in a deployment (its role owns
 /// nothing, so it cannot), and never reads the owner's credential.
+///
+/// After migrating, a deployment verifies what it must have left in place:
+/// migration 0005 grants the tombstone `INSERT` to `cxp_runtime` only when the
+/// role already exists ([`cxp_core::db_role::missing_cxp_runtime_install`]),
+/// so a missing role or grant fails the release rather than boot a fleet that
+/// refuses to serve.
 pub async fn migrate(config: &Config) -> Result<String> {
     let url = migration_url(config)?;
     // Two connections: the migrator and sqlx's advisory lock, on a database
@@ -301,6 +307,19 @@ async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
     tracing::info!("applying migrations");
     cxp_core::migrate(db).await.context("migrations failed")?;
     tracing::info!("migrations applied");
+    if is_deployment(&role, config) {
+        // 0005 grants the tombstone INSERT to `cxp_runtime` only when the role
+        // already exists, and a migration never runs twice. Without it every
+        // serving machine refuses to boot, so abort the release here instead.
+        let missing = cxp_core::db_role::missing_cxp_runtime_install(db)
+            .await
+            .context("could not read cxp_runtime's grants")?;
+        if !missing.is_empty() {
+            let why = missing_cxp_runtime(&missing);
+            tracing::error!("{why}: aborting the release");
+            return Err(anyhow!("refusing to finish the release: {why}"));
+        }
+    }
     Ok(role.summary())
 }
 
@@ -434,6 +453,34 @@ fn missing_grants(missing: &[&str], role: &str) -> String {
         "the runtime role {role} lacks {} (the org.deleted tombstone and the background tasks \
          need them); fix with: {}",
         missing.join(", "),
+        fixes.join("; ")
+    )
+}
+
+/// What a missing [`cxp_core::db_role::missing_cxp_runtime_install`] entry
+/// means, and the statements that fix each, for the release command to log
+/// before it aborts. Migration 0005 grants the tombstone `INSERT` to
+/// `cxp_runtime` only when the role already exists, and a migration never
+/// runs twice, so a deployment that reaches serving without this refuses to
+/// boot.
+fn missing_cxp_runtime(missing: &[&str]) -> String {
+    use cxp_core::db_role::{CXP_RUNTIME_MISSING_GRANT, CXP_RUNTIME_MISSING_ROLE};
+    let mut fixes = Vec::new();
+    if missing.contains(&CXP_RUNTIME_MISSING_ROLE) {
+        fixes.push(
+            "CREATE ROLE cxp_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE \
+             NOREPLICATION; GRANT cxp_runtime TO <this service's runtime login>"
+                .to_string(),
+        );
+    }
+    if missing.contains(&CXP_RUNTIME_MISSING_GRANT) {
+        fixes.push("GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string());
+    }
+    format!(
+        "the release cannot finish without {}: migration 0005 grants the org.deleted tombstone \
+         to cxp_runtime only when the role already exists, so every serving machine would \
+         refuse to boot; fix with: {}",
+        missing.join(" and "),
         fixes.join("; ")
     )
 }
@@ -576,6 +623,7 @@ where
         db.clone(),
         platform,
         shipper_config,
+        alarm.pause_signal(),
         stopped.clone(),
     ));
     let mut sweeper = tokio::spawn(sweep_loop(db, config.clone(), alarm, stopped));
@@ -738,20 +786,44 @@ fn ended(what: &str, result: std::result::Result<Result<()>, JoinError>) -> anyh
     anyhow!("{what} ended while serving: {why}")
 }
 
-/// Hourly retention ([`cxp_core::platform_events::sweep`]): old
-/// platform-event markers, expired removed-member tombstones, and rejected
-/// usage past `REJECTED_USAGE_KEEP_DAYS`; then the database-role re-check
-/// ([`recheck_db_role`]). The first pass runs at boot, right after the boot
+/// One pass, as [`sweep_loop`] runs it every hour: the database-role
+/// re-check ([`recheck_db_role`]) first, so a role that changed after the
+/// last pass is caught before this pass sweeps as it; then, only while the
+/// alarm is clear, the retention sweep ([`cxp_core::platform_events::sweep`]:
+/// old platform-event markers, expired removed-member tombstones, and
+/// rejected usage past `REJECTED_USAGE_KEEP_DAYS`). While the alarm is raised
+/// the sweep is paused — the shipper pauses through [`RoleAlarm::pause_signal`]
+/// — and it resumes once a pass clears the alarm. Returns the rows swept
+/// (zero while paused). The first pass runs at boot, right after the boot
 /// check, and so finds nothing new.
+#[doc(hidden)]
+pub async fn sweep_pass(db: &Db, config: &Config, alarm: &RoleAlarm) -> u64 {
+    recheck_db_role(db, config, alarm).await;
+    if alarm.is_raised() {
+        tracing::warn!(
+            "the retention sweep is paused: the database role re-check is holding /readyz back"
+        );
+        return 0;
+    }
+    match cxp_core::platform_events::sweep(db, PLATFORM_EVENT_RETENTION_DAYS).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(rows = n, "swept old platform-event records");
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!(error = %e.log_detail(),
+                source = ?std::error::Error::source(&e), "retention sweep failed");
+            0
+        }
+    }
+}
+
+/// The hourly loop: [`sweep_pass`], then sleep, until shutdown.
 async fn sweep_loop(db: Db, config: Config, alarm: RoleAlarm, mut shutdown: watch::Receiver<bool>) {
     loop {
-        match cxp_core::platform_events::sweep(&db, PLATFORM_EVENT_RETENTION_DAYS).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(rows = n, "swept old platform-event records"),
-            Err(e) => tracing::warn!(error = %e.log_detail(),
-                source = ?std::error::Error::source(&e), "retention sweep failed"),
-        }
-        recheck_db_role(&db, &config, &alarm).await;
+        sweep_pass(&db, &config, &alarm).await;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
             _ = shutdown.changed() => return,
@@ -1124,6 +1196,32 @@ mod tests {
             both.ends_with(
                 r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; CREATE ROLE cxp_app NOLOGIN (if it does not exist); GRANT cxp_app TO "r" WITH INHERIT TRUE"#
             ),
+            "{both}"
+        );
+    }
+
+    /// The release-abort message names what is missing and the statement that
+    /// fixes each, and only those.
+    #[test]
+    fn the_missing_cxp_runtime_hint_names_the_fix() {
+        use cxp_core::db_role::{CXP_RUNTIME_MISSING_GRANT, CXP_RUNTIME_MISSING_ROLE};
+        let role_only = missing_cxp_runtime(&[CXP_RUNTIME_MISSING_ROLE]);
+        assert!(role_only.contains("the cxp_runtime role"), "{role_only}");
+        assert!(
+            role_only.contains("CREATE ROLE cxp_runtime NOLOGIN"),
+            "{role_only}"
+        );
+        assert!(
+            !role_only.contains("GRANT INSERT ON deleted_orgs"),
+            "a missing role has no grant to fix: {role_only}"
+        );
+        let both = missing_cxp_runtime(&[CXP_RUNTIME_MISSING_ROLE, CXP_RUNTIME_MISSING_GRANT]);
+        assert!(
+            both.contains("and INSERT on deleted_orgs for cxp_runtime"),
+            "{both}"
+        );
+        assert!(
+            both.contains("GRANT INSERT ON deleted_orgs TO cxp_runtime"),
             "{both}"
         );
     }

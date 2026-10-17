@@ -1338,7 +1338,14 @@ async fn run_ships_then_flushes_on_shutdown(pool: PgPool) {
         ..ShipperConfig::default()
     };
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let shipper = tokio::spawn(usage::run(db.clone(), platform.clone(), cfg, shutdown));
+    let (_resume, pause) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(
+        db.clone(),
+        platform.clone(),
+        cfg,
+        pause,
+        shutdown,
+    ));
 
     // The first pass: shipped, answered, and deleted.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1718,6 +1725,87 @@ async fn rows_that_all_have_an_invalid_quantity_send_no_request(pool: PgPool) {
         .map(|r| r.1)
         .collect();
     assert_eq!(reasons, vec!["invalid_quantity"; 2]);
+}
+
+/// While the pause signal reads `true` (the server's role alarm is raised)
+/// the shipper runs as a role the check refuses, so it ships nothing; clearing
+/// it resumes, and the rows wait in the outbox untouched meanwhile (#47).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_pauses_while_the_role_is_refused(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    let o = org();
+    charge_n(&db, &meter, o, 1).await;
+
+    let cfg = ShipperConfig {
+        poll: Duration::from_millis(20),
+        ..ShipperConfig::default()
+    };
+    // Start raised, as a role that changed after boot would.
+    let (pause_tx, pause) = tokio::sync::watch::channel(true);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(
+        db.clone(),
+        platform.clone(),
+        cfg,
+        pause,
+        shutdown,
+    ));
+
+    // Several polls pass with the signal raised: nothing ships.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(outbox(&pool).await.len(), 1, "paused: nothing shipped");
+    assert_eq!(stub.lock().unwrap().received.len(), 0);
+
+    // Cleared: the next pass ships.
+    pause_tx.send(false).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !outbox(&pool).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("clearing the pause resumes shipping");
+    assert_eq!(stub.lock().unwrap().received.len(), 1);
+
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns on shutdown")
+        .unwrap()
+        .expect("the final flush succeeds");
+}
+
+/// Shutting down while the pause is raised returns without shipping: the
+/// final flush does not run as a role the check refuses. The rows stay in the
+/// outbox for the next start.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_paused_does_not_flush_on_shutdown(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), false, "https://x");
+    charge_n(&db, &meter, org(), 1).await;
+
+    let (_pause_tx, pause) = tokio::sync::watch::channel(true);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(
+        db.clone(),
+        platform,
+        ShipperConfig::default(),
+        pause,
+        shutdown,
+    ));
+    // Let it reach the pause.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns on shutdown")
+        .unwrap()
+        .expect("a paused shutdown is clean");
+    assert_eq!(outbox(&pool).await.len(), 1, "nothing shipped while paused");
+    assert_eq!(stub.lock().unwrap().received.len(), 0);
 }
 
 // ---------------------------------------------------------------------- auth
