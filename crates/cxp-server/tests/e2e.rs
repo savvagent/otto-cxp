@@ -2212,6 +2212,13 @@ async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
 
     let p = mock.lock().unwrap();
     assert_eq!(p.declared.len(), 1, "declared once");
+    let mut keys = p.declared[0].clone();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["otto-cxp/responses_collected", "otto-cxp/surveys_sent"],
+        "both meters declared"
+    );
     assert_eq!(
         p.declared_before_first_event,
         Some(true),

@@ -903,12 +903,13 @@ the shipper declares to the platform (`PUT /internal/meters`) before it ships an
 that arrives during the declaration warns and skips the final flush; the next start ships the
 rows. Enforcement is always on: a billable call is refused (`budget_exceeded` or
 `payment_required`; REST 402) while the org's billing is blocked, and fails open, so a billing
-lookup that fails or times out lets the call through. `CXP_ENFORCE_QUOTAS` is retired: it is
+lookup that fails or times out lets the call through (and that org's billable calls go through
+unchecked for 5 s before the next lookup). `CXP_ENFORCE_QUOTAS` is retired: it is
 ignored and logs a startup warning if set.
 
 - Rollout overlap: while the previous release still runs beside this one, its shipper sends
-  metered rows without a meter or quantity, so the platform counts them unmetered. The overlap
-  ends when the old machines stop.
+  metered rows without a meter or quantity, so the platform counts them unmetered; it also still
+  records `create_survey` calls, which ship unmetered too. The overlap ends when the old machines stop.
 - Every billable call now looks the org's billing up (cached 60 s, 2 s timeout). After this
   ships, watch billable-tool latency and the rate of `could not read usage` warnings: a rise
   means calls are failing open.
