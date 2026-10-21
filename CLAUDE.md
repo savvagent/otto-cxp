@@ -106,9 +106,10 @@ The DB has 6 custom enum types (`ticket_status`, `ticket_priority`, `ticket_chan
 Model structs store enum columns as `String`, not Rust enums.
 
 ### Metering
-Exactly `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage
-event each (`Meter::charge`, in the tool's own transaction, into `usage_outbox`); the only route that
-records one is `POST /api/v1/surveys` (charged as `create_survey`). Nothing else meters.
+Exactly `send_survey` (meter `otto-cxp/surveys_sent`) and `submit_feedback` and
+`submit_survey_response` (`otto-cxp/responses_collected`) record one usage event each, quantity 1
+(`Meter::charge`, in the tool's own transaction, into `usage_outbox`). `create_survey` is free. No
+REST route records usage. Nothing else meters.
 
 ### Migrations
 Append-only: add `crates/cxp-core/migrations/NNNN_<name>.sql`, never edit an applied one. New tenant
@@ -267,7 +268,7 @@ Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-d
 - **Request paths open transactions with `platform_events::begin_live`** (or `begin_live_bounded`, the same with transaction-local timeouts), never `Db::begin`; unpinned cross-org access goes only through `cxp_core::maintenance`. The database enforces it: the unpinned policies on `platform_events`, on the usage outbox tables (`usage_outbox`, `usage_outbox_rejected`), and on `console_sessions` admit a transaction only when no org is pinned **and** it carries the maintenance marker (`app.maintenance = 'on'`); an unpinned transaction without the marker sees nothing. Only `cxp_core::maintenance::begin` sets the marker. The one exception is `console_sessions_lookup`, a `SELECT`-only policy that admits the `console_session_org` function (via `app.console_session_lookup`, which only that function's own `SET` clause sets).
 - **No SQL outside `cxp-core`**, and only runtime `sqlx::query`/`query_as`, never the `query!` macros.
 - **Auth.** `/mcp` requires a bearer platform token whose audience equals `CXP_RESOURCE_URI` exactly, and nothing else. `/api` takes that bearer or, with no `Authorization` header, the web console's session cookie (whose stored platform token is introspected exactly as a bearer is, and must be the session's own org and user); a bearer, when present, decides the request, and a cookie-authenticated write must come from this origin or is `403 cross_site_request`. `/auth/*` is unauthenticated by design (it is the sign-in). Every route, and every tool except `whoami` and `usage` (no scope), checks `cxp:read` or `cxp:write`. Unauthenticated requests get 401 with `WWW-Authenticate` naming `/.well-known/oauth-protected-resource`.
-- **Metering:** exactly the tools `submit_feedback`, `create_survey`, `send_survey`, `submit_survey_response` record one usage event each, in the tool's own transaction, into `usage_outbox`; the only route that records one is `POST /api/v1/surveys` (charged as `create_survey`); nothing else records one.
+- **Metering:** exactly `send_survey` (`otto-cxp/surveys_sent`), `submit_feedback` and `submit_survey_response` (`otto-cxp/responses_collected`) record one usage event each (quantity 1), in the tool's own transaction, into `usage_outbox`; no REST route records one; nothing else does.
 - **Teams belong to the platform.** Catalog `team_id` is an opaque platform team id, verified at the platform on write; there is no local teams table.
 - **Platform webhooks** (`org.deleted`, `member.removed`, `team.deleted`) are signature-verified, fail closed, and apply idempotently.
 - **Untrusted text:** customer-supplied text returned by a tool is data, and database error text never reaches a response.

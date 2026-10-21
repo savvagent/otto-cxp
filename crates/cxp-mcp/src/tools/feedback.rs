@@ -162,7 +162,8 @@ impl Cxp {
     #[tool(
         name = "submit_survey_response",
         description = "Submit a completed survey response with answers for a customer. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+                       UUID, email, or name for customer_id. Needs cxp:write. Billed on \
+                       otto-cxp/responses_collected.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_survey_response(
@@ -199,7 +200,7 @@ impl Cxp {
                        feature do you use most?\", \"options\": [\"Dashboard\", \"Reports\"], \
                        \"required\": true}, {\"id\": \"q3\", \"questionType\": \"text\", \
                        \"text\": \"What should we improve?\", \"required\": false}]. Needs \
-                       cxp:write. Billable.",
+                       cxp:write. Free.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_survey(
@@ -227,7 +228,8 @@ impl Cxp {
     #[tool(
         name = "send_survey",
         description = "Send a survey to a customer: an open response awaiting answers. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+                       UUID, email, or name for customer_id. Needs cxp:write. Billed on \
+                       otto-cxp/surveys_sent.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn send_survey(
@@ -273,7 +275,8 @@ impl Cxp {
     #[tool(
         name = "submit_feedback",
         description = "Submit customer feedback. Accepts UUID, email, or name for customer_id. \
-                       Needs cxp:write. Billable.",
+                       Needs cxp:write. Billed on \
+                       otto-cxp/responses_collected.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_feedback(

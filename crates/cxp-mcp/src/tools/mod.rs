@@ -168,6 +168,44 @@ mod tests {
         }
     }
 
+    /// What the tool descriptions promise about billing matches `BILLABLE`
+    /// and the meters, and `create_survey` is free.
+    #[test]
+    fn the_descriptions_say_what_is_billed_and_on_which_meter() {
+        let tools = router().list_all();
+        let desc = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not routed"))
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string()
+        };
+        for tool in cxp_core::usage::BILLABLE {
+            let meter = cxp_core::usage::meter_for(tool).expect("billable tools have a meter");
+            assert!(
+                desc(tool).contains(&format!("Billed on {meter}.")),
+                "{tool}: {}",
+                desc(tool)
+            );
+        }
+        let create = desc("create_survey");
+        assert!(create.ends_with("Needs cxp:write. Free."), "{create}");
+        assert!(!create.contains("Billable"), "{create}");
+        let usage = desc("usage");
+        for meter in [
+            cxp_core::usage::SURVEYS_SENT,
+            cxp_core::usage::RESPONSES_COLLECTED,
+        ] {
+            assert!(usage.contains(meter), "usage lacks {meter}: {usage}");
+        }
+        assert!(usage.contains("blockedReason"), "{usage}");
+        assert!(!usage.contains("create_survey"), "{usage}");
+        assert!(desc("whoami").contains("meters"), "{}", desc("whoami"));
+    }
+
     #[test]
     fn the_team_tools_are_gone() {
         for t in [

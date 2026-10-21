@@ -16,7 +16,6 @@ use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
 use cxp_core::search::SearchLimiter;
-use cxp_core::usage::Meter;
 use otto_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role,
     TeamInfo, TokenKind, UsageBatch, UsageReceipt, UserInfo,
@@ -234,11 +233,9 @@ async fn harness_opts(pool: PgPool, webhook_secret: &str, search: SearchLimiter)
     let (base, stub) = start_platform().await;
     let platform =
         Arc::new(PlatformClient::new(ClientConfig::new(base, RESOURCE, "otto_rs_test")).unwrap());
-    let meter = Arc::new(Meter::new(platform.clone(), "https://otto.example.com"));
     let state = AppState::new(
         Db::from_pool(pool.clone()),
         platform,
-        meter,
         search.clone(),
         Config {
             public_url: PUBLIC_URL.into(),

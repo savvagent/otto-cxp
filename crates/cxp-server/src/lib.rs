@@ -104,7 +104,6 @@ pub fn router(
     let mut state = cxp_api::AppState::new(
         db.clone(),
         platform,
-        meter,
         search,
         cxp_api::Config {
             public_url: config.public_url.clone(),
