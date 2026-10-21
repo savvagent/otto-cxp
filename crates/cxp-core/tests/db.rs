@@ -1992,8 +1992,14 @@ async fn the_outbox_tables_carry_a_meter_quantity_pair_kept_together_by_a_check(
                 .await
                 .unwrap_err();
             assert_eq!(
-                sqlstate(&err),
-                "23514",
+                (
+                    sqlstate(&err),
+                    err.as_database_error().and_then(|e| e.constraint())
+                ),
+                (
+                    "23514".to_string(),
+                    Some(format!("{table}_meter_quantity").as_str())
+                ),
                 "{table}: meter {meter}, quantity {quantity} must violate the CHECK"
             );
         }
