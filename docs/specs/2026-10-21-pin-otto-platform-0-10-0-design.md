@@ -1,6 +1,6 @@
 # Pin otto-platform 0.10.0 — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#53)
 **Issue:** #52 "Meter surveys sent and responses collected; make create_survey free" (PR 1 of 2)
 **Plan:** `docs/plans/2026-10-21-pin-otto-platform-0-10-0.md`
 
