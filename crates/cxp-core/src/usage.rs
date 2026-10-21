@@ -430,6 +430,9 @@ pub async fn ship_once(
             tool: r.tool.clone(),
             billable: r.billable,
             occurred_at: r.occurred_at,
+            service: None,
+            meter: None,
+            quantity: None,
         })
         .collect();
 
@@ -807,6 +810,10 @@ mod tests {
             included_ops: included,
             hard_stop: false,
             features: Default::default(),
+            service: None,
+            meters: Vec::new(),
+            budget: None,
+            blocked_reason: None,
         }
     }
 

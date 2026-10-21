@@ -54,7 +54,8 @@ stubs; scopes finer than `cxp:read` / `cxp:write`; new CXP domain features; otto
 - The Development Workflow section in `CLAUDE.md` was written by this epic, modeled on otto-flags
   (the repo had none). Every value in it is an assumption for a human to confirm.
 - otto-platform pin: the same rev otto-flags pins, `fa1ae08c8d5760c1df9752281a078192032e7d24`
-  (v0.5.0). Both crates are unchanged through v0.6.0.
+  (v0.5.0). Both crates are unchanged through v0.6.0. (As of this epic; #53 moved the pin to
+  v0.10.0, rev `bfda55e`.)
 - Local Postgres: `postgres:16` on port **15435**, user/password `cxp`/`cxp`, database
   `otto_cxp` (15433 is otto-factory's, 15434 otto-flags').
 - Write scope implies read: a read checks for `cxp:read` **or** `cxp:write`; a write checks for
