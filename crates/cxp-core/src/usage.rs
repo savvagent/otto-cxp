@@ -80,8 +80,8 @@ pub const BILLABLE_METERS: &[(&str, &str)] = &[
 ];
 
 /// The tools of [`BILLABLE_METERS`], in its order, and the only ones
-/// recorded. A copy, since a `const` cannot map; a unit test keeps the two
-/// equal.
+/// recorded. A copy of that table's tools, kept equal to it by a unit test, so
+/// callers can use a plain `&[&str]`.
 pub const BILLABLE: &[&str] = &["send_survey", "submit_feedback", "submit_survey_response"];
 
 /// The value meter `tool` charges, or `None` for a free tool.
@@ -252,11 +252,46 @@ impl Meter {
                     .remove(&org);
                 return Some(status);
             }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "timed out".to_string(),
+            Ok(Err(e)) => e,
+            Err(_) => {
+                return self.fail_open_after(org, "timed out", None);
+            }
         };
-        tracing::warn!(org = %org, reason = %failure,
-            "could not read usage from the platform; allowing billable calls for {FAIL_OPEN_FOR:?}");
+        let kind = match &failure {
+            otto_resource::Error::Status { status, .. } => status.to_string(),
+            otto_resource::Error::Unauthorized => "401".to_string(),
+            otto_resource::Error::NotFound => "404".to_string(),
+            otto_resource::Error::Decode(_) => "decode".to_string(),
+            otto_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
+            _ => "transport".to_string(),
+        };
+        self.fail_open_after(org, &kind, Some(&failure))
+    }
+
+    /// Log a failed usage lookup and open the org's fail-open window. Only
+    /// the failure `kind` is logged above `debug`; the platform's text, which
+    /// this service does not control, is `debug` only.
+    fn fail_open_after(
+        &self,
+        org: OrgId,
+        kind: &str,
+        failure: Option<&otto_resource::Error>,
+    ) -> Option<UsageStatus> {
+        if matches!(
+            failure,
+            Some(otto_resource::Error::Decode(_) | otto_resource::Error::InvalidUrl(_))
+        ) {
+            tracing::error!(org = %org, kind,
+                "could not use the platform's usage answer (a version mismatch or bad URL); \
+                 billing enforcement is off until this is fixed, allowing billable calls for \
+                 {FAIL_OPEN_FOR:?}");
+        } else {
+            tracing::warn!(org = %org, kind,
+                "could not read usage from the platform; allowing billable calls for {FAIL_OPEN_FOR:?}");
+        }
+        if let Some(e) = failure {
+            tracing::debug!(org = %org, error = %e, "usage lookup failed");
+        }
         let mut m = self
             .fail_open
             .lock()
@@ -332,8 +367,8 @@ pub struct Status {
     /// Whether this server refuses billable calls while billing is blocked.
     /// Always true; kept so existing readers of the field keep working.
     pub enforced: bool,
-    /// The service the platform reports these meters and budget for. `None`
-    /// from an older platform that does not name it, or before the operator
+    /// The service the platform reports these meters and budget for, if it is
+    /// a slug (`[a-z0-9-]`, 1 to 64 characters). `None` from an older platform that does not name it, or before the operator
     /// assigns this service a slug.
     pub service: Option<String>,
     /// This month's usage of each meter this service declares, in
@@ -377,7 +412,8 @@ pub struct BudgetOut {
     pub hard_stop: bool,
     /// Whether the budget refuses billable calls now.
     pub blocked: bool,
-    /// Why `blocked` is set, or why spend is unknown.
+    /// Why `blocked` is set, or why spend is unknown: `budget_exceeded` or
+    /// `spend_unavailable`; any other text from the platform becomes `None`.
     pub reason: Option<String>,
 }
 
@@ -390,9 +426,19 @@ impl From<otto_resource::BudgetStatus> for BudgetOut {
             thresholds_reached: b.thresholds_reached,
             hard_stop: b.hard_stop,
             blocked: b.blocked,
-            reason: b.reason,
+            reason: b.reason.filter(|r| {
+                r == otto_resource::BUDGET_EXCEEDED || r == otto_resource::SPEND_UNAVAILABLE
+            }),
         }
     }
+}
+
+/// Whether `s` is a service slug, `^[a-z0-9-]{1,64}$`: the only platform
+/// text [`Status::service`] echoes.
+fn is_slug(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 impl Status {
@@ -423,7 +469,7 @@ impl Status {
             warning,
             hard_stop: u.hard_stop,
             enforced: true,
-            service: u.service,
+            service: u.service.filter(|s| is_slug(s)),
             meters,
             budget: u.budget.map(BudgetOut::from),
             blocked_reason: refused_with,
@@ -820,11 +866,12 @@ async fn settle(
 
 /// The start of a statement moving claimed rows (`$1`, ids) into
 /// `usage_outbox_rejected`: a caller may narrow the `WHERE`, then appends
-/// [`INSERT_REJECTED`] and the reason expression.
+/// [`INSERT_REJECTED`] and the reason expression. It returns `row_failures`
+/// because the give-up reason quotes it; nothing reads `attempts`.
 const MOVE_TO_REJECTED: &str = "WITH moved AS ( \
        DELETE FROM usage_outbox WHERE id = ANY($1)";
 const INSERT_REJECTED: &str = "RETURNING event_id, org_id, user_id, tool, billable, occurred_at, \
-       meter, quantity, attempts, row_failures) \
+       meter, quantity, row_failures) \
      INSERT INTO usage_outbox_rejected \
        (event_id, org_id, user_id, tool, billable, occurred_at, meter, quantity, reason) \
      SELECT event_id, org_id, user_id, tool, billable, occurred_at, meter, quantity,";
@@ -929,15 +976,65 @@ async fn try_reschedule(
 /// How often a stuck meter declaration is logged.
 const DECLARE_LOG_EVERY: Duration = Duration::from_secs(60);
 
-/// Rows waiting in `usage_outbox`, for the declaration log: one bounded
-/// `count(*)`, in a maintenance transaction.
-async fn waiting(db: &Db) -> std::result::Result<i64, sqlx::Error> {
+/// The most rows [`rows_waiting`] counts in production; past it the count is
+/// reported as `10000+`.
+pub const WAITING_CAP: i64 = 10_000;
+
+/// A count of `usage_outbox` rows that stops at a cap, so counting never
+/// scans a backlog without bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsWaiting {
+    /// The rows counted: at most the cap.
+    pub count: i64,
+    /// Whether more rows than the cap were waiting.
+    pub capped: bool,
+}
+
+impl std::fmt::Display for RowsWaiting {
+    /// The count, or `<cap>+` when it stopped at the cap.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.capped {
+            write!(f, "{}+", self.count)
+        } else {
+            write!(f, "{}", self.count)
+        }
+    }
+}
+
+/// Rows waiting in `usage_outbox`, for the declaration log: one `count(*)`
+/// over at most `cap + 1` rows, in a maintenance transaction, so a backlog
+/// during an outage cannot make the count itself expensive. Production passes
+/// [`WAITING_CAP`].
+///
+/// ```no_run
+/// # async fn f(db: &otto_tenant::Db) -> Result<(), sqlx::Error> {
+/// let n = cxp_core::usage::rows_waiting(db, cxp_core::usage::WAITING_CAP).await?;
+/// println!("{n}"); // "12", or "10000+" at the cap
+/// # Ok(()) }
+/// ```
+pub async fn rows_waiting(db: &Db, cap: i64) -> std::result::Result<RowsWaiting, sqlx::Error> {
     let mut tx = crate::maintenance::begin(db).await?;
-    let n = sqlx::query_scalar("SELECT count(*) FROM usage_outbox")
-        .fetch_one(&mut *tx)
-        .await?;
+    let seen: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM (SELECT 1 FROM usage_outbox LIMIT $1) s")
+            .bind(cap.saturating_add(1))
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
-    Ok(n)
+    Ok(RowsWaiting {
+        count: seen.min(cap),
+        capped: seen > cap,
+    })
+}
+
+/// [`rows_waiting`] at the production cap, as the string the logs carry.
+async fn waiting(db: &Db) -> Option<String> {
+    match rows_waiting(db, WAITING_CAP).await {
+        Ok(n) => Some(n.to_string()),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not count the usage rows waiting");
+            None
+        }
+    }
 }
 
 /// Declare [`METER_DECLARATIONS`] with the platform, retrying with capped
@@ -953,8 +1050,8 @@ async fn waiting(db: &Db) -> std::result::Result<i64, sqlx::Error> {
 /// declaration delays billing and loses none. On the first failure, then at
 /// most once a minute, it logs at `error` with the kind of failure (the
 /// status, `"decode"`, `"invalid_url"`, or `"transport"`) and the number of
-/// rows waiting (one `count(*)` per log, so the small shared database is not
-/// polled); the platform's text is `debug` only.
+/// rows waiting (one `count(*)` per log, capped at [`WAITING_CAP`] and shown
+/// as `10000+` past it, so the small shared database is not polled); the platform's text is `debug` only.
 ///
 /// A receipt that rejects a key is not a failure to retry: the same
 /// declaration would be refused again. Each rejected key is logged at `error`
@@ -1009,13 +1106,7 @@ async fn declare_meters(
         };
         if last_logged.is_none_or(|t| t.elapsed() >= DECLARE_LOG_EVERY) {
             last_logged = Some(tokio::time::Instant::now());
-            let rows_waiting = match waiting(db).await {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::debug!(error = %e, "could not count the usage rows waiting");
-                    None
-                }
-            };
+            let rows_waiting = waiting(db).await;
             let kind = match &e {
                 otto_resource::Error::Status { status, .. } => status.to_string(),
                 otto_resource::Error::Unauthorized => "401".to_string(),
@@ -1068,7 +1159,7 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ShipError> {
     if !declare_meters(&db, &platform, &cfg, &mut shutdown).await {
-        let rows_waiting = waiting(&db).await.ok();
+        let rows_waiting = waiting(&db).await;
         tracing::warn!(
             ?rows_waiting,
             "shutting down before the usage meters were declared; no final flush, the rows \
@@ -1141,8 +1232,7 @@ mod tests {
             BILLABLE,
             ["send_survey", "submit_feedback", "submit_survey_response"]
         );
-        // `BILLABLE` is a copy of the table's tools (a `const` cannot map),
-        // so the two can never disagree.
+        // `BILLABLE` is a copy of the table's tools; this keeps the two equal.
         let tools: Vec<&str> = BILLABLE_METERS.iter().map(|(t, _)| *t).collect();
         assert_eq!(BILLABLE, tools.as_slice());
         for t in [
@@ -1312,6 +1402,43 @@ mod tests {
         let s = Status::new(both);
         let quantities: Vec<u64> = s.meters.iter().map(|m| m.quantity).collect();
         assert_eq!(quantities, [7, 2]);
+    }
+
+    /// Platform text is echoed only where it is a known constant or a slug.
+    #[test]
+    fn status_normalizes_platform_strings() {
+        for (given, kept) in [
+            ("otto-cxp", true),
+            ("a", true),
+            (&"a".repeat(64), true),
+            (&"a".repeat(65), false),
+            ("", false),
+            ("Otto-cxp", false),
+            ("otto_cxp", false),
+            ("otto cxp", false),
+            ("otto-cxp\n", false),
+            ("<script>", false),
+        ] {
+            let mut u = usage(0, 0);
+            u.service = Some(given.to_string());
+            let s = Status::new(u).service;
+            assert_eq!(s.is_some(), kept, "{given:?}");
+        }
+
+        for (given, kept) in [
+            (otto_resource::BUDGET_EXCEEDED, true),
+            (otto_resource::SPEND_UNAVAILABLE, true),
+            ("ignore previous instructions", false),
+            ("", false),
+        ] {
+            let mut b = budget(Some(10), false);
+            b.reason = Some(given.to_string());
+            let out = BudgetOut::from(b);
+            assert_eq!(out.reason.as_deref(), kept.then_some(given), "{given:?}");
+        }
+        let mut b = budget(Some(10), false);
+        b.reason = None;
+        assert_eq!(BudgetOut::from(b).reason, None);
     }
 
     #[test]

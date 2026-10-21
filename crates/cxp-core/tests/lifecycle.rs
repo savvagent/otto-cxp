@@ -2309,3 +2309,40 @@ async fn member_removed_in_one_org_leaves_the_user_working_in_another(pool: PgPo
     tx.commit().await.unwrap();
     assert!(!platform_events::revoked(&db, b, u).await.unwrap());
 }
+
+/// The declaration log's rows-waiting count stops at its cap and says so,
+/// instead of counting a whole backlog.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn rows_waiting_stops_at_the_cap(pool: PgPool) {
+    let db = db(pool.clone());
+    let o = org();
+    let w = usage::rows_waiting(&db, 5).await.unwrap();
+    assert_eq!((w.count, w.capped, w.to_string()), (0, false, "0".into()));
+
+    let seed = |n: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO usage_outbox (org_id, tool, billable) \
+                 SELECT $1, 'submit_feedback', true FROM generate_series(1, $2)",
+            )
+            .bind(o.as_uuid())
+            .bind(n)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    seed(5).await;
+    let w = usage::rows_waiting(&db, 5).await.unwrap();
+    assert_eq!((w.count, w.capped, w.to_string()), (5, false, "5".into()));
+
+    seed(1).await;
+    let w = usage::rows_waiting(&db, 5).await.unwrap();
+    assert_eq!((w.count, w.capped, w.to_string()), (5, true, "5+".into()));
+
+    seed(20).await;
+    let w = usage::rows_waiting(&db, 5).await.unwrap();
+    assert_eq!((w.count, w.capped, w.to_string()), (5, true, "5+".into()));
+    assert_eq!(usage::WAITING_CAP, 10_000);
+}
