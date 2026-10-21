@@ -159,20 +159,21 @@ Modeled on otto-flags' `0007_usage_outbox_meter.sql`:
 
 ```sql
 SET LOCAL lock_timeout = '3s';
--- usage_outbox_rejected first, the order the shipper locks them.
-ALTER TABLE usage_outbox_rejected
-  ADD COLUMN meter text,
-  ADD COLUMN quantity bigint,
-  ADD CONSTRAINT usage_outbox_rejected_meter_quantity
-    CHECK ((meter IS NULL) = (quantity IS NULL) AND (quantity IS NULL OR quantity > 0)) NOT VALID;
+-- usage_outbox first: the shipper's move to rejected deletes from usage_outbox, then
+-- inserts into usage_outbox_rejected (MOVE_TO_REJECTED), so take the locks in that order.
 ALTER TABLE usage_outbox
   ADD COLUMN meter text,
   ADD COLUMN quantity bigint,
   ADD CONSTRAINT usage_outbox_meter_quantity
     CHECK ((meter IS NULL) = (quantity IS NULL) AND (quantity IS NULL OR quantity > 0)) NOT VALID;
+ALTER TABLE usage_outbox_rejected
+  ADD COLUMN meter text,
+  ADD COLUMN quantity bigint,
+  ADD CONSTRAINT usage_outbox_rejected_meter_quantity
+    CHECK ((meter IS NULL) = (quantity IS NULL) AND (quantity IS NULL OR quantity > 0)) NOT VALID;
 ```
 
-The plan confirms which order the shipper locks the two tables in. The comment block explains
+The order follows otto-cxp's own shipper, not otto-flags'. The comment block explains
 the rollout, the `NOT VALID` and the lock timeout, as the flags file does. No new table, policy
 or grant: the existing RLS policies and grants cover new columns.
 
@@ -270,7 +271,7 @@ The legacy fields (`plan`, `includedOps`, `billableUsed`, `remaining`, `totalCal
 
 - `enforced` is always `true`.
 - `warning` changes meaning: true when billable calls are blocked, or when the budget's
-  `percentUsed` is at least 80. It no longer reflects the deprecated family-wide bucket, whose
+  `percentUsed` is at least 80. When `percentUsed` is unknown (`None`), only the blocked state sets it. It no longer reflects the deprecated family-wide bucket, whose
   "always warn on a plan that includes none" would now be noise.
 
 The `usage` tool's description says what it reports and that only the three tools add to the
