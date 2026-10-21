@@ -82,7 +82,7 @@ v0.10.0.
 
 Model: sonnet
 
-- [ ] **Step 1:** Write a failing test in `crates/cxp-core/tests/db.rs`, or extend the existing
+- [x] **Step 1:** Write a failing test in `crates/cxp-core/tests/db.rs`, or extend the existing
   outbox schema test if one exists. It asserts:
   - `usage_outbox` and `usage_outbox_rejected` each have nullable `meter text` and
     `quantity bigint`;
@@ -91,9 +91,9 @@ Model: sonnet
   - rows with both NULL, or `('otto-cxp/surveys_sent', 1)`, are accepted.
   `cxp_core::maintenance` is private, so follow the existing patterns in `db.rs` (~125 and
   ~432-470) for writing outbox rows.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-core --test db --locked`. Expected: the new test fails.
-- [ ] **Step 3:** Create `crates/cxp-core/migrations/0005_usage_outbox_meter.sql`.
+- [x] **Step 3:** Create `crates/cxp-core/migrations/0005_usage_outbox_meter.sql`.
   - Header comment: what it adds and why (#52), that it is additive and rollback-compatible (the
     previous release writes both columns NULL, and its shipper ignores them, shipping rows
     unmetered), why `NOT VALID`, and why `lock_timeout`.
@@ -115,9 +115,9 @@ Model: sonnet
     ```
   - No policy or grant changes: existing table-level grants and RLS cover new columns. Confirm
     that 0001's grants on these tables are table-level, not column lists.
-- [ ] **Step 4:** Re-run the step 2 command. Expected: it passes. Then run the full test gate,
+- [x] **Step 4:** Re-run the step 2 command. Expected: it passes. Then run the full test gate,
   clippy, fmt and the migrations check. Expected: all pass, and the check prints nothing.
-- [ ] **Step 5:** Commit `feat(core): add meter and quantity to the usage outbox`.
+- [x] **Step 5:** Commit `feat(core): add meter and quantity to the usage outbox`.
 
 ### Task 2: Metered charge, budget enforcement, and the BillingBlocked error
 
@@ -127,7 +127,7 @@ The core change. The workspace must compile and pass at the end of the task, so 
 updates every caller of what it changes: `Meter::new` and `Error::QuotaExceeded` users in cxp-mcp,
 cxp-api and cxp-server, and their tests. Tool descriptions, routes and docs are later tasks.
 
-- [ ] **Step 1:** Write failing tests.
+- [x] **Step 1:** Write failing tests.
   - In `crates/cxp-core/src/usage.rs` `mod tests`:
     - `BILLABLE` is exactly `send_survey`, `submit_feedback`, `submit_survey_response`.
     - `meter_for` maps them to `SURVEYS_SENT`/`RESPONSES_COLLECTED`.
@@ -166,9 +166,9 @@ cxp-api and cxp-server, and their tests. Tool descriptions, routes and docs are 
   - In `crates/cxp-mcp/src/error.rs` tests: both codes map to `INVALID_REQUEST` with `data.code`
     and `data.retriable: false`.
   - In `crates/cxp-api/src/error.rs` tests: both codes are `402` with body `{error, code}`.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-core --locked`. Expected: it fails to compile or the new tests fail.
-- [ ] **Step 3:** Implement in `crates/cxp-core/src/usage.rs`.
+- [x] **Step 3:** Implement in `crates/cxp-core/src/usage.rs`.
   - Add `pub const SURVEYS_SENT`, `pub const RESPONSES_COLLECTED`, and
     `pub const METER_DECLARATIONS: &[(&str, &str, &str)]`:
     `(SURVEYS_SENT, "Surveys sent", "survey")` and
@@ -203,23 +203,23 @@ cxp-api and cxp-server, and their tests. Tool descriptions, routes and docs are 
     - Doc comments mark the legacy fields deprecated (the family-wide bucket).
     - `Status::new(u)` drops the `enforced` argument and sets `enforced: true`.
     - Update the module docs: billable tools, meters, always-on enforcement that fails open.
-- [ ] **Step 4:** Implement in `crates/cxp-core/src/error.rs`. Replace `QuotaExceeded` with
+- [x] **Step 4:** Implement in `crates/cxp-core/src/error.rs`. Replace `QuotaExceeded` with
   `BillingBlocked { reason: BlockedReason, tool: String, url: String }`. `code()` is
   `reason.code()`, and it is not retriable. `Display` per reason, worded as the spec gives it:
   name the tool, say reads and free tools still work, who can fix it, at `{url}`, and that a
   change takes up to a minute.
-- [ ] **Step 5:** Map the error in the other crates:
+- [x] **Step 5:** Map the error in the other crates:
   - `crates/cxp-mcp/src/error.rs`: `"access_revoked" | "budget_exceeded" | "payment_required" =>
     INVALID_REQUEST`. Update the module's code list.
   - `crates/cxp-api/src/error.rs`: `BillingBlocked` gives `StatusCode::PAYMENT_REQUIRED`. Update
     the module's code table: `budget_exceeded`/`payment_required` are 402, and `quota_exceeded`
     is removed.
-- [ ] **Step 6:** Stop charging `create_survey` everywhere in this task. Once it leaves
+- [x] **Step 6:** Stop charging `create_survey` everywhere in this task. Once it leaves
   `BILLABLE`, a remaining charge site would fail every `create_survey` as `internal`.
   - MCP `crates/cxp-mcp/src/tools/feedback.rs`: `create_survey` drops `warm_quota` and `charge`.
   - REST `crates/cxp-api/src/routes/surveys.rs`: `create` drops `warm` and `charge`; delete
     `CHARGED_AS`.
-- [ ] **Step 7:** Fix every `Meter::new` caller and every test the change breaks, so the
+- [x] **Step 7:** Fix every `Meter::new` caller and every test the change breaks, so the
   workspace compiles and every gate passes. Change behavior only as Steps 3–6 define it.
   - `Meter::new` callers: `crates/cxp-server/src/lib.rs:75` (`meter()`), `crates/cxp-api/src/lib.rs`
     tests (~322), `crates/cxp-api/tests/api.rs` (~237), `crates/cxp-api/tests/console.rs` (~211),
@@ -241,15 +241,15 @@ cxp-api and cxp-server, and their tests. Tool descriptions, routes and docs are 
     the assertion that `POST /api/v1/surveys` ships `create_survey` (~1630), and the expected
     `create_survey` events in `received` (~1644-1651). Change them to "REST ships nothing" and the
     new meters' events.
-- [ ] **Step 8:** Re-run step 2's command, then every gate. Expected: all pass.
-- [ ] **Step 9:** Commit `feat(core): charge value meters and refuse billable calls when billing is
+- [x] **Step 8:** Re-run step 2's command, then every gate. Expected: all pass.
+- [x] **Step 9:** Commit `feat(core): charge value meters and refuse billable calls when billing is
   blocked`.
 
 ### Task 3: Ship meter and quantity, and declare the meters first
 
 Model: sonnet
 
-- [ ] **Step 1:** Write failing tests in `crates/cxp-core/tests/lifecycle.rs`.
+- [x] **Step 1:** Write failing tests in `crates/cxp-core/tests/lifecycle.rs`.
   - The fake platform records each shipped event's `meter`/`quantity`, as JSON fields (extend
     `ship` at `lifecycle.rs:115`). It also serves `PUT /internal/meters`, recording the declared
     keys. A `Shared` switch makes it answer 503 or 409 `service_not_set`, or reject one key in the
@@ -267,9 +267,9 @@ Model: sonnet
     - A shutdown while declaring returns promptly, without shipping.
     - A receipt rejecting one key still lets shipping proceed, and the other meter's rows ship.
     - Adapt `run_ships_then_flushes_on_shutdown`.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-core --test lifecycle --locked`. Expected: the new tests fail.
-- [ ] **Step 3:** Implement in `crates/cxp-core/src/usage.rs`.
+- [x] **Step 3:** Implement in `crates/cxp-core/src/usage.rs`.
   - `Row` gains `meter: Option<String>` and `quantity: Option<i64>`. The claim's `RETURNING`
     gains them.
   - The `UsageEvent` gets `meter: r.meter.clone()` and `quantity`. Convert with
@@ -291,18 +291,18 @@ Model: sonnet
       body text goes at `debug` only.
   - `run` calls it first and returns `Ok(())` without the final pass if it returns `false`.
     Update `run`'s and the module's docs.
-- [ ] **Step 4:** Re-run step 2's command, then every gate. Expected: all pass. The
+- [x] **Step 4:** Re-run step 2's command, then every gate. Expected: all pass. The
   `cxp-server` e2e may now need its fake platform to serve `PUT /internal/meters`. If e2e fails
   for that: `the_server_boots_serves_and_flushes_usage_on_shutdown` declares before its final
   flush, and a shutdown during declaration skips the flush. So in this task, unconditionally add `PUT /internal/meters` to the e2e fake platform, answering in the receipt's
   v0.10.0 shape.
-- [ ] **Step 5:** Commit `feat(core): ship usage meters and declare them before shipping`.
+- [x] **Step 5:** Commit `feat(core): ship usage meters and declare them before shipping`.
 
 ### Task 4: MCP and REST surfaces
 
 Model: sonnet
 
-- [ ] **Step 1:** Write failing tests.
+- [x] **Step 1:** Write failing tests.
   - `crates/cxp-mcp/tests/mcp.rs` (some of these may already exist from Task 2; add what is missing):
     - `create_survey` succeeds for an org whose platform status is `budget_exceeded`, and writes
       no `usage_outbox` row.
@@ -316,10 +316,10 @@ Model: sonnet
     no `usage_outbox` row. Task 2 already made this a 200. No route in
     `cxp_api::routes()` writes a usage row: extend whatever route-coverage test exists, or
     assert it for the write routes.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-mcp -p cxp-api --locked`. Expected: the instructions and description assertions fail.
   Behavior tests already passing after Task 2 are fine.
-- [ ] **Step 3:** Implement the MCP side. Task 2 already removed the `create_survey` charge.
+- [x] **Step 3:** Implement the MCP side. Task 2 already removed the `create_survey` charge.
   - `crates/cxp-mcp/src/tools/feedback.rs`:
     - `create_survey`'s description ends "Needs cxp:write. Free."
     - `send_survey`'s description says "Billed on otto-cxp/surveys_sent."
@@ -337,27 +337,27 @@ Model: sonnet
     update the module doc ("how much budget is left").
   - `crates/cxp-mcp/src/tools/mod.rs`: keep the source-scan tests green over the new `BILLABLE`,
     and update the doc comment at line 12.
-- [ ] **Step 4:** Implement the REST side.
+- [x] **Step 4:** Implement the REST side.
   - `crates/cxp-api/src/lib.rs` (Task 2 already removed the charge in `routes/surveys.rs`): if nothing in `cxp-api` uses `AppState.meter` any more (check
     `routes/me.rs` and every handler), remove the field and the constructor parameter, and fix
     the callers in `cxp-server` and the tests. Update the crate doc (`lib.rs:27`): no route
     records usage, and a REST route added for a billable operation must charge the same meter.
-- [ ] **Step 5:** Re-run step 2's command, then every gate. Expected: all pass.
-- [ ] **Step 6:** Commit `feat(mcp): make create_survey free and report meters and budget`.
+- [x] **Step 5:** Re-run step 2's command, then every gate. Expected: all pass.
+- [x] **Step 6:** Commit `feat(mcp): make create_survey free and report meters and budget`.
 
 ### Task 5: Retire CXP_ENFORCE_QUOTAS and point refusals at the platform
 
 Model: haiku
 
-- [ ] **Step 1:** Write failing tests in `crates/cxp-server/src/config.rs` `mod tests`.
+- [x] **Step 1:** Write failing tests in `crates/cxp-server/src/config.rs` `mod tests`.
   - Config parses with `CXP_ENFORCE_QUOTAS` set to `yes`, to `yes-please` (formerly a parse
     error, test at `config.rs:718`), or unset.
   - There is no `enforce_quotas` field. A function `retired_vars(&vars) -> Vec<&'static str>` (or
     similar) reports `CXP_ENFORCE_QUOTAS` when it is set, so startup can warn.
   - `upgrade_url()` returns the platform URL with no trailing `/`.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-server --lib --locked`. Expected: the new tests fail.
-- [ ] **Step 3:** Implement.
+- [x] **Step 3:** Implement.
   - Remove `enforce_quotas` from `Config`, its `Debug`, the boot log field (`boot.rs:252`) and the
     tests.
   - At startup, after logging is initialized, log one `warn!` per retired variable that is set:
@@ -366,14 +366,14 @@ Model: haiku
     startup warnings are logged.
   - `upgrade_url()` becomes `self.platform_url.trim_end_matches('/').to_string()`, with its doc
     updated: v0.10.0 has no `/settings/billing`.
-- [ ] **Step 4:** Re-run step 2's command, then every gate. Expected: all pass.
-- [ ] **Step 5:** Commit `feat(server): retire CXP_ENFORCE_QUOTAS`.
+- [x] **Step 4:** Re-run step 2's command, then every gate. Expected: all pass.
+- [x] **Step 5:** Commit `feat(server): retire CXP_ENFORCE_QUOTAS`.
 
 ### Task 6: End-to-end metering and docs
 
 Model: sonnet
 
-- [ ] **Step 1:** Write a failing e2e test in `crates/cxp-server/tests/e2e.rs`. It must go through
+- [x] **Step 1:** Write a failing e2e test in `crates/cxp-server/tests/e2e.rs`. It must go through
   `cxp_server::run_with`, as `the_server_boots_serves_and_flushes_usage_on_shutdown` (~1945)
   does: the harness's `s.ship()` calls `ship_once` directly and never declares.
   - Through the real router and a real shipper, against the fake platform, call `send_survey`,
@@ -383,11 +383,11 @@ Model: sonnet
     none for `create_survey`.
   - The `BILLABLE` coverage check at `e2e.rs:1603` was already updated in Task 2; extend it if
     needed.
-- [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
+- [x] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
   cxp-server --test e2e --locked`. Expected: the new test fails, or fails to compile.
-- [ ] **Step 3:** Make it pass. Only test-harness changes should be needed, since Tasks 2–4 built
+- [x] **Step 3:** Make it pass. Only test-harness changes should be needed, since Tasks 2–4 built
   the behavior. If production code must change, report DONE_WITH_CONCERNS saying what and why.
-- [ ] **Step 4:** Update the docs.
+- [x] **Step 4:** Update the docs.
   - `CLAUDE.md`:
     - Rewrite the "### Metering" pattern and the **Metering** invariant to the rule in Global
       Constraints: meters declared at shipper start; no REST route records usage; a REST route
@@ -404,5 +404,5 @@ Model: sonnet
       that fails open.
     - Note the rollout overlap: the previous release ships metered rows unmetered while both run.
     - Add `declared usage meters` to the list of boot markers (around line 856).
-- [ ] **Step 5:** Run every gate. Expected: all pass.
-- [ ] **Step 6:** Commit `docs: describe value metering and the retired quota flag`.
+- [x] **Step 5:** Run every gate. Expected: all pass.
+- [x] **Step 6:** Commit `docs: describe value metering and the retired quota flag`.

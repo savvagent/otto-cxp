@@ -1,6 +1,6 @@
 # Meter surveys sent and responses collected — design
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED (#54)
 **Issue:** #52 "Meter surveys sent and responses collected; make create_survey free" (PR 2 of 2)
 **Plan:** `docs/plans/2026-10-21-meter-surveys-and-responses.md`
 **Builds on:** `docs/specs/2026-10-21-pin-otto-platform-0-10-0-design.md` (PR 1, the pin to
