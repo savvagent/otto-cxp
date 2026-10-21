@@ -41,16 +41,15 @@ pub enum Error {
     #[error("access to this organization has been revoked; sign in again")]
     AccessRevoked,
 
-    #[error(
-        "this organization has used all {included} operations its {plan} plan includes this \
-         month ({used} so far), so {tool} was refused. Reads still work. Upgrade at {upgrade_url}"
-    )]
-    QuotaExceeded {
+    /// The platform says this organization's billable otto-cxp calls must be
+    /// refused now ([`BlockedReason`]), so `tool`, a billable tool, was
+    /// refused and nothing was recorded. Not retriable: the same call fails
+    /// until someone acts at `url`. Reads and free tools are never refused.
+    #[error("{}", billing_message(*.reason, .tool, .url))]
+    BillingBlocked {
+        reason: BlockedReason,
         tool: String,
-        used: i64,
-        included: i64,
-        plan: String,
-        upgrade_url: String,
+        url: String,
     },
 
     /// This could not be completed right now; nothing was changed, and the
@@ -104,6 +103,48 @@ pub enum Error {
     /// `internal`.
     #[error("{}", database_message(.0))]
     Database(#[from] sqlx::Error),
+}
+
+/// Why the platform says billable calls must be refused, as
+/// [`Error::BillingBlocked`] carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedReason {
+    /// This service's budget for the month is spent and its hard stop is on.
+    /// Also any blocked state this build does not recognize (an unknown
+    /// future `blocked_reason`, or a blocked budget with no reason), since
+    /// the console is where an owner finds out more either way.
+    BudgetExceeded,
+    /// The org is not in good standing to be billed (no card on file, an
+    /// unpaid subscription, a failed payment past its grace period).
+    PaymentRequired,
+}
+
+impl BlockedReason {
+    /// The stable wire code, as the platform names the reason.
+    pub fn code(&self) -> &'static str {
+        match self {
+            BlockedReason::BudgetExceeded => otto_resource::BUDGET_EXCEEDED,
+            BlockedReason::PaymentRequired => otto_resource::PAYMENT_REQUIRED,
+        }
+    }
+}
+
+/// Only constants, the tool's name and the configured URL: nothing the
+/// platform or the database said.
+fn billing_message(reason: BlockedReason, tool: &str, url: &str) -> String {
+    match reason {
+        BlockedReason::BudgetExceeded => format!(
+            "this organization's otto-cxp budget for this month is spent and its hard stop is \
+             on, so {tool} was refused. Reads and free tools still work. An owner or admin can \
+             raise the budget or turn the hard stop off at {url}; a change takes up to a minute \
+             to apply."
+        ),
+        BlockedReason::PaymentRequired => format!(
+            "this organization's billing needs a payment method in good standing, so {tool} was \
+             refused. Reads and free tools still work. An owner can fix it at {url}; a change \
+             takes up to a minute to apply."
+        ),
+    }
 }
 
 /// What a caller is told of any server-side failure. Shared by every surface
@@ -190,7 +231,7 @@ impl Error {
             Error::Conflict(_) => "conflict",
             Error::UnknownTeam => "unknown_team",
             Error::AccessRevoked => "access_revoked",
-            Error::QuotaExceeded { .. } => "quota_exceeded",
+            Error::BillingBlocked { reason, .. } => reason.code(),
             Error::Unavailable => "unavailable",
             Error::QueryTooBroad => "query_too_broad",
             Error::Platform(p) if p.is_retriable() => "unavailable",
@@ -356,13 +397,46 @@ mod tests {
     use super::fake::db;
     use super::*;
 
-    fn quota() -> Error {
-        Error::QuotaExceeded {
-            tool: "submit_feedback".into(),
-            used: 10,
-            included: 10,
-            plan: "free".into(),
-            upgrade_url: "https://otto.savvagent.com/billing".into(),
+    const BILLING_URL: &str = "https://otto.savvagent.com";
+
+    fn blocked(reason: BlockedReason) -> Error {
+        Error::BillingBlocked {
+            reason,
+            tool: "send_survey".into(),
+            url: BILLING_URL.into(),
+        }
+    }
+
+    /// A billing refusal codes as its reason, is not retriable (the same
+    /// call fails until someone changes the budget or the payment method),
+    /// and says which tool was refused, that reads and free tools still work,
+    /// who can fix it and where. It carries no database or platform text.
+    #[test]
+    fn a_billing_refusal_names_the_tool_and_where_to_fix_it() {
+        for (reason, code, who) in [
+            (
+                BlockedReason::BudgetExceeded,
+                "budget_exceeded",
+                "An owner or admin",
+            ),
+            (
+                BlockedReason::PaymentRequired,
+                "payment_required",
+                "An owner",
+            ),
+        ] {
+            let e = blocked(reason);
+            assert_eq!(e.code(), code);
+            assert!(!e.retriable(), "{code}");
+            assert!(!e.is_internal(), "{code}");
+            let text = e.to_string();
+            assert!(text.contains("send_survey"), "{text}");
+            assert!(text.contains(BILLING_URL), "{text}");
+            assert!(text.contains("Reads and free tools still work"), "{text}");
+            assert!(text.contains(who), "{text}");
+            assert!(text.contains("up to a minute"), "{text}");
+            assert!(!text.contains(super::fake::DB_TEXT), "{text}");
+            assert!(!text.contains("constraint"), "{text}");
         }
     }
 
@@ -399,7 +473,8 @@ mod tests {
             (Error::Conflict("dup".into()), "conflict"),
             (Error::UnknownTeam, "unknown_team"),
             (Error::AccessRevoked, "access_revoked"),
-            (quota(), "quota_exceeded"),
+            (blocked(BlockedReason::BudgetExceeded), "budget_exceeded"),
+            (blocked(BlockedReason::PaymentRequired), "payment_required"),
             (Error::Unavailable, "unavailable"),
             (Error::QueryTooBroad, "query_too_broad"),
             (
@@ -495,7 +570,8 @@ mod tests {
             Error::Conflict("dup".into()),
             Error::UnknownTeam,
             Error::AccessRevoked,
-            quota(),
+            blocked(BlockedReason::BudgetExceeded),
+            blocked(BlockedReason::PaymentRequired),
             Error::Platform(otto_resource::Error::Unauthorized),
             Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
         ] {

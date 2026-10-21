@@ -856,6 +856,10 @@ The logs must show, in order:
 - `tenant isolation enforced as role "otto_app"`
 - `the otto platform accepted this service's credential`
 
+`declared usage meters` is logged by the shipper, which starts alongside the server, so it is not
+part of that order: it usually appears just after `cxp-server listening`, and only once the
+platform has answered the declaration. See "Usage metering" below.
+
 If the platform REJECTED the credential, or `CXP_PLATFORM_URL` is not the platform, `/readyz`
 answers 503 with `"reason": "platform credential rejected"` (or `"platform misconfigured"`), so a
 deploy with a bad secret fails its health check. The check runs once at boot: after fixing the
@@ -891,9 +895,29 @@ it against the rows` at `error` and keeps the whole batch, uncounted, until that
 Splitting stops after half the claim lease (60 s) or 64 requests in one pass; the pieces not
 yet sent wait for the next pass, uncounted. Anything else (the platform down, rate limiting,
 the credential refused) never gives a row up: it stays in `usage_outbox`, retried with backoff
-up to every 15 minutes and still counted toward its period's quota, until it ships. A final
+up to every 15 minutes, until it ships. A final
 flush on shutdown that cannot reach the platform is logged at `warn` and does not fail the
 exit; the next start ships those rows.
+
+Usage metering (#52). Three tools are billed, one event of quantity 1 per call, on two meters
+the shipper declares to the platform (`PUT /internal/meters`) before it ships anything, logging
+`declared usage meters`: `send_survey` on `otto-cxp/surveys_sent`, and `submit_feedback` and
+`submit_survey_response` on `otto-cxp/responses_collected`. `create_survey` is free. A shutdown
+that arrives during the declaration warns and skips the final flush; the next start ships the
+rows. Enforcement is always on: a billable call is refused (`budget_exceeded` or
+`payment_required`; REST 402) while the org's billing is blocked, and fails open, so a billing
+lookup that fails or times out lets the call through (and that org's billable calls go through
+unchecked for 5 s before the next lookup). `CXP_ENFORCE_QUOTAS` is retired: it is
+ignored and logs a startup warning if set.
+
+- Rollout overlap: while the previous release still runs beside this one, its shipper sends
+  metered rows without a meter or quantity, so the platform counts them unmetered; it also still
+  records `create_survey` calls, which ship unmetered too. The overlap ends when the old machines stop.
+- Every billable call now looks the org's billing up (cached 60 s, 2 s timeout). After this
+  ships, watch billable-tool latency and the rate of `could not read usage` warnings: a rise
+  means calls are failing open.
+- For Rob, optional: if `fly secrets list -a otto-cxp` shows `CXP_ENFORCE_QUOTAS`, it can be
+  removed with `fly secrets unset -a otto-cxp CXP_ENFORCE_QUOTAS`. It does nothing now.
 
 ## Deploys
 

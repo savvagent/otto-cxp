@@ -1,4 +1,4 @@
-//! Who am I, and how much budget is left. Both check no scope and record no
+//! Who am I, and where this service's meters and budget stand. Both check no scope and record no
 //! usage: a caller must never have to spend an operation, or hold a
 //! particular grant, to find out where it stands.
 
@@ -19,9 +19,9 @@ impl Cxp {
     #[tool(
         name = "whoami",
         description = "Who this token says you are: your user, the one organization it opens, your \
-                       role there, the scopes it carries, and how much of this month's allowance is \
-                       left (null if the platform cannot say right now; call usage later). Call \
-                       this first in a session. Free.",
+                       role there, the scopes it carries, and this service's meters and the org's \
+                       otto-cxp budget (null if the platform cannot say right now; call usage \
+                       later). Call this first in a session. Free.",
         annotations(read_only_hint = true)
     )]
     pub async fn whoami(
@@ -83,10 +83,12 @@ impl Cxp {
 
     #[tool(
         name = "usage",
-        description = "How much of this organization's monthly allowance (shared across every otto \
-                       service it uses) has been used and how much is left. Only submit_feedback, \
-                       create_survey, send_survey, and submit_survey_response consume it. Free. If \
-                       `warning` is true, tell the person you are working for.",
+        description = "This service's own meters this month (otto-cxp/surveys_sent and \
+                       otto-cxp/responses_collected), the organization's otto-cxp budget, and \
+                       `blockedReason` (budget_exceeded or payment_required while billed calls \
+                       are refused, else null). Only send_survey, submit_feedback, and \
+                       submit_survey_response add to them. Free. If `warning` is true, tell the \
+                       person you are working for.",
         annotations(read_only_hint = true)
     )]
     pub async fn usage(

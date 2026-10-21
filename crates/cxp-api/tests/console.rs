@@ -17,7 +17,6 @@ use axum::routing::post;
 use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
-use cxp_core::usage::Meter;
 use cxp_http::console::{pkce_challenge, Console, ConsoleKeys, ConsoleSettings};
 use otto_resource::{ClientConfig, IntrospectionResponse, PlatformClient, Role, TokenKind};
 use otto_tenant::crypto::Cipher;
@@ -208,11 +207,9 @@ async fn harness_with(pool: PgPool, console: bool) -> Harness {
         PlatformClient::new(ClientConfig::new(base.clone(), RESOURCE, "otto_rs_test")).unwrap(),
     );
     let db = Db::from_pool(pool.clone());
-    let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
     let mut state = AppState::new(
         db.clone(),
         platform.clone(),
-        meter,
         cxp_core::search::SearchLimiter::for_pool(5),
         Config {
             public_url: PUBLIC_URL.into(),

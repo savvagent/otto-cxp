@@ -32,7 +32,6 @@ pub struct Config {
     /// `Host` headers `/mcp` accepts besides the public URL's own host.
     pub extra_allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
-    pub enforce_quotas: bool,
     pub log_format: LogFormat,
     /// `FLY_APP_NAME`, which Fly sets on every machine: its presence alone
     /// makes this process a deployment ([`Self::is_deployment`]).
@@ -83,7 +82,6 @@ impl std::fmt::Debug for Config {
             .field("platform_webhook_secret", &"<redacted>")
             .field("extra_allowed_hosts", &self.extra_allowed_hosts)
             .field("allowed_origins", &self.allowed_origins)
-            .field("enforce_quotas", &self.enforce_quotas)
             .field("log_format", &self.log_format)
             .field("fly_app_name", &self.fly_app_name)
             .field(
@@ -98,6 +96,26 @@ impl std::fmt::Debug for Config {
             // The database URL carries a password.
             .finish_non_exhaustive()
     }
+}
+
+/// Variables that are no longer read. Setting one never fails a boot; the
+/// server warns once per variable so the operator can unset it.
+const RETIRED_VARS: [&str; 1] = ["CXP_ENFORCE_QUOTAS"];
+
+/// The [`RETIRED_VARS`] that `get` reports as set (and not blank), for the
+/// startup warning.
+///
+/// ```
+/// let set = |n: &str| (n == "CXP_ENFORCE_QUOTAS").then(|| "yes".to_string());
+/// assert_eq!(cxp_server::config::retired_vars(set), ["CXP_ENFORCE_QUOTAS"]);
+/// assert!(cxp_server::config::retired_vars(|_| None).is_empty());
+/// ```
+pub fn retired_vars(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    let vars = Vars(&get);
+    RETIRED_VARS
+        .into_iter()
+        .filter(|name| vars.optional(name).is_some())
+        .collect()
 }
 
 impl Config {
@@ -158,7 +176,6 @@ impl Config {
                 .iter()
                 .map(|o| origin_entry("CXP_ALLOWED_ORIGINS", o))
                 .collect::<Result<_>>()?,
-            enforce_quotas: vars.parse("CXP_ENFORCE_QUOTAS", "false", bool_value)?,
             log_format: vars.parse("CXP_LOG_FORMAT", "text", |s| match s {
                 "text" => Ok(LogFormat::Text),
                 "json" => Ok(LogFormat::Json),
@@ -175,13 +192,11 @@ impl Config {
         })
     }
 
-    /// Where an org upgrades its plan, named in quota errors: the platform's
-    /// billing settings.
+    /// Where a refused caller is sent to fix billing: the platform itself,
+    /// without a trailing `/`. otto-platform v0.10.0 has no
+    /// `/settings/billing` page, so naming one would send them to a 404.
     pub fn upgrade_url(&self) -> String {
-        format!(
-            "{}/settings/billing",
-            self.platform_url.trim_end_matches('/')
-        )
+        self.platform_url.trim_end_matches('/').to_string()
     }
 
     /// Whether this is a deployment rather than a developer's machine. It is
@@ -250,7 +265,6 @@ impl Config {
             platform_webhook_secret: "otto_whsec_test".into(),
             extra_allowed_hosts: vec![],
             allowed_origins: vec![],
-            enforce_quotas: false,
             log_format: LogFormat::Text,
             fly_app_name: None,
             console: None,
@@ -495,12 +509,8 @@ mod tests {
         assert!(c.run_migrations);
         assert_eq!(c.bind, "0.0.0.0:8080".parse().unwrap());
         assert!(c.extra_allowed_hosts.is_empty() && c.allowed_origins.is_empty());
-        assert!(!c.enforce_quotas);
         assert_eq!(c.log_format, LogFormat::Text);
-        assert_eq!(
-            c.upgrade_url(),
-            "https://otto.savvagent.com/settings/billing"
-        );
+        assert_eq!(c.upgrade_url(), "https://otto.savvagent.com");
         assert_eq!(c.allowed_hosts(), ["otto-cxp.savvagent.com"]);
     }
 
@@ -517,7 +527,6 @@ mod tests {
                 "CXP_ALLOWED_ORIGINS",
                 "https://Console.example:443/, http://localhost:5173",
             ),
-            ("CXP_ENFORCE_QUOTAS", "yes"),
             ("CXP_LOG_FORMAT", "json"),
             ("CXP_INTROSPECTION_SECRET", "  otto_rs_padded \n"),
         ]))
@@ -533,7 +542,6 @@ mod tests {
             c.allowed_origins,
             ["https://console.example", "http://localhost:5173"]
         );
-        assert!(c.enforce_quotas);
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(
             c.introspection_secret, "otto_rs_padded",
@@ -715,7 +723,6 @@ mod tests {
             ("CXP_DB_MAX_CONNECTIONS", "many"),
             ("CXP_RUN_MIGRATIONS", "maybe"),
             ("CXP_BIND", "8080"),
-            ("CXP_ENFORCE_QUOTAS", "yes-please"),
             ("CXP_LOG_FORMAT", "xml"),
         ] {
             let msg = error(&env(&[(name, bad)]));
@@ -724,6 +731,31 @@ mod tests {
         let mut vars = env(&[]);
         vars.remove("DATABASE_URL");
         assert!(error(&vars).contains("CXP_DATABASE_URL (or DATABASE_URL)"));
+    }
+
+    #[test]
+    fn a_retired_variable_never_fails_a_boot_and_is_reported_when_set() {
+        for value in ["yes", "yes-please", "true", ""] {
+            let vars = env(&[("CXP_ENFORCE_QUOTAS", value)]);
+            assert!(load(&vars).is_ok(), "CXP_ENFORCE_QUOTAS={value:?}");
+        }
+        assert!(load(&env(&[])).is_ok());
+
+        let set = env(&[("CXP_ENFORCE_QUOTAS", "yes-please")]);
+        assert_eq!(
+            retired_vars(|n| set.get(n).cloned()),
+            ["CXP_ENFORCE_QUOTAS"]
+        );
+        let blank = env(&[("CXP_ENFORCE_QUOTAS", "  ")]);
+        assert!(retired_vars(|n| blank.get(n).cloned()).is_empty());
+        let unset = env(&[]);
+        assert!(retired_vars(|n| unset.get(n).cloned()).is_empty());
+    }
+
+    #[test]
+    fn the_upgrade_url_is_the_platform_url_without_a_trailing_slash() {
+        let c = load(&env(&[("CXP_PLATFORM_URL", "https://otto.example.com//")])).unwrap();
+        assert_eq!(c.upgrade_url(), "https://otto.example.com");
     }
 
     const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";

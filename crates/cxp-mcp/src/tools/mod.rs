@@ -168,6 +168,44 @@ mod tests {
         }
     }
 
+    /// What the tool descriptions promise about billing matches `BILLABLE`
+    /// and the meters, and `create_survey` is free.
+    #[test]
+    fn the_descriptions_say_what_is_billed_and_on_which_meter() {
+        let tools = router().list_all();
+        let desc = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not routed"))
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string()
+        };
+        for tool in cxp_core::usage::BILLABLE {
+            let meter = cxp_core::usage::meter_for(tool).expect("billable tools have a meter");
+            assert!(
+                desc(tool).contains(&format!("Billed on {meter}.")),
+                "{tool}: {}",
+                desc(tool)
+            );
+        }
+        let create = desc("create_survey");
+        assert!(create.ends_with("Needs cxp:write. Free."), "{create}");
+        assert!(!create.contains("Billable"), "{create}");
+        let usage = desc("usage");
+        for meter in [
+            cxp_core::usage::SURVEYS_SENT,
+            cxp_core::usage::RESPONSES_COLLECTED,
+        ] {
+            assert!(usage.contains(meter), "usage lacks {meter}: {usage}");
+        }
+        assert!(usage.contains("blockedReason"), "{usage}");
+        assert!(!usage.contains("create_survey"), "{usage}");
+        assert!(desc("whoami").contains("meters"), "{}", desc("whoami"));
+    }
+
     #[test]
     fn the_team_tools_are_gone() {
         for t in [
@@ -190,8 +228,9 @@ mod tests {
         while let Some(at) = rest.find(".charge(") {
             rest = &rest[at + ".charge(".len()..];
             let call = &rest[..rest.find(')').unwrap_or(rest.len())];
-            // `self.charge(&mut tx, &caller, "name")`: the last argument.
-            let last = call.rsplit(',').next().unwrap_or("").trim();
+            // `self.charge(&mut tx, &caller, "name", &warmed)`: the third
+            // argument, the tool's name.
+            let last = call.split(',').nth(2).unwrap_or("").trim();
             let name = last
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
@@ -203,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_four_billable_tools_charge_once_each() {
+    fn exactly_the_three_billable_tools_charge_once_each() {
         let mut charged: Vec<String> = SOURCES
             .iter()
             .flat_map(|(file, src)| {
@@ -225,7 +264,7 @@ mod tests {
             .collect();
         billable.sort();
         assert_eq!(charged, billable);
-        // And only they look the quota up at the platform.
+        // And only they look up at the platform whether billing is blocked.
         let warmed: usize = SOURCES
             .iter()
             .map(|(_, src)| src.matches("self.warm_quota(").count())
@@ -246,7 +285,7 @@ mod tests {
                 .map_or(body.len(), |i| i + 1);
             let body = &body[..end];
             let charge = body
-                .find(&format!(".charge(&mut tx, &caller, \"{tool}\")"))
+                .find(&format!(".charge(&mut tx, &caller, \"{tool}\", &warmed)"))
                 .unwrap_or_else(|| panic!("{tool} does not charge itself"));
             let tx = body.find("self.tx(&caller)").expect("opens a transaction");
             let commit = body.find("tx.commit()").expect("commits");
@@ -254,12 +293,12 @@ mod tests {
                 tx < charge && charge < commit,
                 "{tool} charges outside its transaction"
             );
-            // The quota lookup is a network call: made before the
+            // The billing lookup is a network call: made before the
             // transaction holds a pooled connection.
             let warm = body
-                .find("self.warm_quota(&caller)")
-                .unwrap_or_else(|| panic!("{tool} does not warm the quota"));
-            assert!(warm < tx, "{tool} warms the quota inside its transaction");
+                .find("let warmed = self.warm_quota(&caller)")
+                .unwrap_or_else(|| panic!("{tool} does not look billing up"));
+            assert!(warm < tx, "{tool} looks billing up inside its transaction");
             // Before its write: the domain call of the same name follows the
             // charge, and does not precede it.
             assert!(

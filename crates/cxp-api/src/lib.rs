@@ -18,15 +18,15 @@
 //!
 //! Every `/api/v1` handler does the same five things in order: take the
 //! [`Principal`](cxp_core::auth::Principal) the bearer middleware attached,
-//! check its scope, do any platform lookup it needs (a catalog team id, the
-//! usage quota) *before* opening a transaction so no pooled connection waits
+//! check its scope, do any platform lookup it needs (a catalog team id)
+//! *before* opening a transaction so no pooled connection waits
 //! on the network, open the transaction with
 //! [`platform_events::begin_live`](cxp_core::platform_events::begin_live), and
 //! commit after the one domain call.
 //!
-//! **Metering:** the only route that records usage is `POST /api/v1/surveys`,
-//! charged as `create_survey` in the same transaction as the insert, because
-//! it is the same operation as the MCP tool. Nothing else here charges.
+//! **Metering:** no route records usage. `POST /api/v1/surveys` is free, as
+//! the MCP `create_survey` tool is; a route added for one of the billable
+//! operations must charge the same meter its tool does.
 //!
 //! Errors are JSON `{"error": text, "code": code}` (see [`ApiError`]); an
 //! authentication failure is the OAuth-shaped `{"error", "error_description"}`
@@ -46,7 +46,6 @@ use axum::routing::{get, post, MethodRouter};
 use axum::{middleware, Router};
 use cxp_core::auth::Principal;
 use cxp_core::search::{SearchLimiter, SearchPermit};
-use cxp_core::usage::Meter;
 use http::Method;
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
@@ -85,8 +84,6 @@ pub struct AppState {
     pub db: Db,
     /// Token introspection, the caller's teams, and catalog team checks.
     pub platform: Arc<PlatformClient>,
-    /// Records `create_survey` usage for `POST /api/v1/surveys`.
-    pub meter: Arc<Meter>,
     /// The process-wide cap on concurrent searches, shared with `/mcp`
     /// (#42). A search takes its permit before opening its transaction.
     pub search: SearchLimiter,
@@ -100,14 +97,12 @@ impl AppState {
     pub fn new(
         db: Db,
         platform: Arc<PlatformClient>,
-        meter: Arc<Meter>,
         search: SearchLimiter,
         config: Config,
     ) -> Self {
         Self {
             db,
             platform,
-            meter,
             search,
             config: Arc::new(config),
             console: None,
@@ -319,11 +314,9 @@ mod tests {
             ))
             .unwrap(),
         );
-        let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
         let state = AppState::new(
             Db::from_pool(pool),
             platform,
-            meter,
             SearchLimiter::for_pool(5),
             Config {
                 public_url: "https://cxp.example.com".into(),

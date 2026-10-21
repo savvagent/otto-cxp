@@ -1,6 +1,5 @@
-//! `/api/v1/surveys`. `POST` is the one metered route: it is the same
-//! operation as the `create_survey` tool and charges the same usage event, in
-//! the same transaction as the insert.
+//! `/api/v1/surveys`. Free, like the `create_survey` tool: no route here
+//! records usage.
 
 use axum::extract::State;
 use axum::{Extension, Json};
@@ -14,9 +13,6 @@ use uuid::Uuid;
 use super::{deleted, PageParams, Paginated};
 use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::{ApiResult, AppState};
-
-/// The usage event `POST /api/v1/surveys` records.
-pub const CHARGED_AS: &str = "create_survey";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,14 +89,7 @@ pub async fn create(
         questions: body.questions,
         ..Default::default()
     };
-    // The quota lookup is a platform call: before the transaction, so no
-    // pooled connection waits on it.
-    state.meter.warm(caller.org_id).await;
     let mut tx = state.begin(&caller).await?;
-    state
-        .meter
-        .charge(&mut tx, caller.user_id, CHARGED_AS)
-        .await?;
     let survey = tx.create_survey(&new).await?;
     tx.commit().await?;
     Ok(Json(survey))

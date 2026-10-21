@@ -10,9 +10,9 @@
 //!    pointer; discovery and health are open;
 //! 2. org B cannot read or write org A's rows through any tool or route, and
 //!    the boot-time isolation proof passes;
-//! 3. `whoami`/`usage` work, exactly the four billable tools (and
-//!    `POST /api/v1/surveys`) ship one usage event each, and a replayed
-//!    shipment is accepted;
+//! 3. `whoami`/`usage` work, exactly the three billable tools ship one
+//!    usage event each (REST ships nothing), and a replayed shipment is
+//!    accepted;
 //! 4. lifecycle webhooks are verified and applied once.
 //!
 //! And for #16: the whole service runs as a least-privilege database owner,
@@ -65,6 +65,13 @@ struct Platform {
     received: Vec<UsageEvent>,
     /// The event ids counted once, as the platform dedupes them.
     counted: HashSet<Uuid>,
+    /// The keys of every meter declaration the platform accepted, in order.
+    declared: Vec<Vec<String>>,
+    /// Every usage event as sent on the wire, with its `meter` and `quantity`
+    /// (which `UsageEvent` does not carry).
+    raw_events: Vec<Value>,
+    /// Whether a declaration had been accepted when the first event arrived.
+    declared_before_first_event: Option<bool>,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -160,8 +167,14 @@ async fn usage_status(Path(org): Path<Uuid>) -> Json<Value> {
 
 /// Records every event; an event id seen before is a duplicate, as the
 /// platform reports it.
-async fn ship(State(p): State<Shared>, Json(b): Json<UsageBatch>) -> Json<UsageReceipt> {
+async fn ship(State(p): State<Shared>, Json(raw): Json<Value>) -> Json<UsageReceipt> {
+    let b: UsageBatch = serde_json::from_value(raw.clone()).expect("a usage batch");
     let mut p = p.lock().unwrap();
+    if p.declared_before_first_event.is_none() {
+        p.declared_before_first_event = Some(!p.declared.is_empty());
+    }
+    p.raw_events
+        .extend(raw["events"].as_array().cloned().unwrap_or_default());
     let (mut accepted, mut duplicates) = (0, 0);
     for e in b.events {
         if p.counted.insert(e.event_id) {
@@ -178,6 +191,21 @@ async fn ship(State(p): State<Shared>, Json(b): Json<UsageBatch>) -> Json<UsageR
     })
 }
 
+/// Declares every meter sent, as the platform does: the shipper declares
+/// before it ships, and a shutdown during declaration skips the final flush.
+async fn declare_meters(State(p): State<Shared>, Json(b): Json<Value>) -> Json<Value> {
+    let keys: Vec<String> = b["meters"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter_map(|m| m["key"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    p.lock().unwrap().declared.push(keys.clone());
+    Json(json!({"declared": keys, "rejected": []}))
+}
+
 async fn start_platform() -> (String, Shared) {
     let shared: Shared = Arc::default();
     let app = Router::new()
@@ -190,6 +218,7 @@ async fn start_platform() -> (String, Shared) {
         .route("/internal/orgs/{org}/teams/{team}", get(team))
         .route("/internal/orgs/{org}/usage-status", get(usage_status))
         .route("/internal/usage", post(ship))
+        .route("/internal/meters", axum::routing::put(declare_meters))
         .with_state(shared.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1608,9 +1637,9 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
         }
     }
 
-    // Every route in cxp-api's table, once each: only POST /api/v1/surveys
-    // ships, as create_survey. Deletes go last (each on a row made for it),
-    // so every other route has something to act on.
+    // Every route in cxp-api's table, once each: none ships anything (POST
+    // /api/v1/surveys is free, as create_survey is). Deletes go last (each
+    // on a row made for it), so every other route has something to act on.
     let mut routes = cxp_api::route_table();
     routes.sort_by_key(|(m, _)| *m == Method::DELETE);
     let mut catalog: HashMap<&str, String> = HashMap::new();
@@ -1627,29 +1656,18 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
         }
         s.ship().await;
         let new: Vec<String> = s.shipped()[before..].to_vec();
-        if method == Method::POST && path == "/api/v1/surveys" {
-            assert_eq!(new, ["create_survey"], "{method} {path}");
-        } else {
-            assert!(new.is_empty(), "{method} {path} shipped {new:?}");
-        }
+        assert!(new.is_empty(), "{method} {path} shipped {new:?}");
     }
     assert_eq!(s.ship().await, 0, "free routes shipped something");
 
-    // One event per billable call (the second survey was made so DELETE
-    // had one to delete), each with its own event id, for this org and user.
+    // One event per billable tool call, each with its own event id, for this
+    // org and user.
     let received = s.mock.lock().unwrap().received.clone();
     let mut tools: Vec<&str> = received.iter().map(|e| e.tool.as_str()).collect();
     tools.sort_unstable();
     assert_eq!(
         tools,
-        [
-            "create_survey",
-            "create_survey",
-            "create_survey",
-            "send_survey",
-            "submit_feedback",
-            "submit_survey_response"
-        ]
+        ["send_survey", "submit_feedback", "submit_survey_response"]
     );
     let ids: HashSet<Uuid> = received.iter().map(|e| e.event_id).collect();
     assert_eq!(ids.len(), received.len(), "event ids are unique");
@@ -1935,6 +1953,33 @@ impl Logs {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
+
+    /// Capture this test's own task's `info`-and-above logs until the
+    /// returned guard drops.
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Wait until the shipper has logged `declared usage meters`. That line
+    /// comes after the platform's reply, so a stop after it cannot skip the
+    /// final flush; the fake platform's own record is written before it
+    /// replies and proves nothing of the kind.
+    async fn wait_until_declared(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !self.text().contains("declared usage meters") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shipper logged that it declared its usage meters");
+    }
 }
 
 /// `run`, as `main` calls it, on a real socket: it boots against the test
@@ -1943,14 +1988,7 @@ impl Logs {
 /// the platform before returning.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Logs::capture();
 
     let (base, mock) = start_platform().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1987,6 +2025,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
             ..Default::default()
         },
     );
+    let client_logs = logs.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2020,6 +2059,10 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         // The shipper's poll is an hour here; nothing has shipped it yet, so
         // what arrives below was sent by the flush on the way out.
         assert!(mock.lock().unwrap().received.is_empty());
+        // A stop that beat the declaration would skip the final flush, so
+        // wait for the shipper's `declared usage meters` line, which follows
+        // the platform's reply.
+        client_logs.wait_until_declared().await;
         stop.send(()).unwrap();
         mock
     };
@@ -2034,6 +2077,14 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         boot.isolation
     );
     let received = mock.lock().unwrap().received.clone();
+    let declared = mock.lock().unwrap().declared.clone();
+    assert_eq!(declared.len(), 1, "declared once, before the flush");
+    let mut keys = declared[0].clone();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["otto-cxp/responses_collected", "otto-cxp/surveys_sent"]
+    );
     assert_eq!(
         received.len(),
         1,
@@ -2059,6 +2110,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         r#"tenant isolation enforced as role "otto_app""#,
         "the otto platform accepted this service's credential",
         "cxp-server listening",
+        "declared usage meters",
         "flushing usage",
         "stopped",
     ] {
@@ -2067,6 +2119,150 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
             .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
         from += at + line.len();
     }
+}
+
+/// Value metering end to end, through `run_with` and the real shipper: the
+/// platform is told the two meters before it is sent anything, then receives
+/// one `surveys_sent` and two `responses_collected` event, each quantity 1 with
+/// its own event id, and none for the free `create_survey`.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
+    let (logs, _guard) = Logs::capture();
+    let (base, mock) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut database_url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    database_url.set_path(pool.connect_options().get_database().unwrap());
+    let mut config = Config::for_test();
+    config.database_url = database_url.to_string();
+    config.bind = addr;
+    config.public_url = format!("http://{addr}");
+    config.resource_uri = format!("http://{addr}/mcp");
+    config.platform_url = base;
+    let resource = config.resource_uri.clone();
+
+    let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
+    let token = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    mock.lock().unwrap().tokens.insert(
+        token.clone(),
+        (org, user, vec!["cxp:write".into()], resource),
+    );
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run_with(
+        config,
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        // Only the final flush ships.
+        cxp_core::usage::ShipperConfig {
+            poll: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    let client_logs = logs.clone();
+    let client = async move {
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status().as_u16(), 200);
+        let call = |name: &str, args: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}});
+            let http = http.clone();
+            let (url, token, name) = (format!("{base}/mcp"), token.clone(), name.to_owned());
+            async move {
+                let res = http
+                    .post(url)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status().as_u16(), 200, "{name}");
+                let v: Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+                assert!(
+                    v["result"]["isError"] != true && v.get("error").is_none(),
+                    "{name}: {v}"
+                );
+                v["result"]["structuredContent"].clone()
+            }
+        };
+        call("create_customer", json!({"email": "m@example.com"})).await;
+        let survey = call(
+            "create_survey",
+            json!({"title": "NPS", "questions": r#"[{"id": "q1", "type": "nps"}]"#}),
+        )
+        .await;
+        let survey_id = survey["id"].as_str().expect("survey id").to_owned();
+        call(
+            "send_survey",
+            json!({"survey_id": survey_id, "customer_id": "m@example.com"}),
+        )
+        .await;
+        call(
+            "submit_feedback",
+            json!({"customer_id": "m@example.com", "feedback_type": "praise"}),
+        )
+        .await;
+        call(
+            "submit_survey_response",
+            json!({"survey_id": survey_id, "customer_id": "m@example.com",
+                   "answers": r#"{"score": 10}"#}),
+        )
+        .await;
+        // A stop that beat the declaration would skip the final flush; wait
+        // for the `declared usage meters` line, which follows the reply.
+        client_logs.wait_until_declared().await;
+        stop.send(()).unwrap();
+        mock
+    };
+    let (boot, mock) = tokio::join!(server, client);
+    boot.expect("a clean stop");
+
+    let p = mock.lock().unwrap();
+    assert_eq!(p.declared.len(), 1, "declared once");
+    let mut keys = p.declared[0].clone();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["otto-cxp/responses_collected", "otto-cxp/surveys_sent"],
+        "both meters declared"
+    );
+    assert_eq!(
+        p.declared_before_first_event,
+        Some(true),
+        "the meters were declared before the first event"
+    );
+    let mut seen: Vec<(String, u64, String)> = p
+        .raw_events
+        .iter()
+        .map(|e| {
+            (
+                e["meter"].as_str().unwrap_or_default().to_owned(),
+                e["quantity"].as_u64().unwrap_or_default(),
+                e["tool"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let want = |m: &str, t: &str| (m.to_owned(), 1, t.to_owned());
+    assert_eq!(
+        seen,
+        [
+            want("otto-cxp/responses_collected", "submit_feedback"),
+            want("otto-cxp/responses_collected", "submit_survey_response"),
+            want("otto-cxp/surveys_sent", "send_survey"),
+        ],
+        "exactly three metered events, none for create_survey: {:?}",
+        p.raw_events
+    );
+    let ids: HashSet<_> = p.received.iter().map(|e| e.event_id).collect();
+    assert_eq!(ids.len(), 3, "distinct event ids");
 }
 
 /// A database where one tenant table no longer enforces row-level security
@@ -2229,14 +2425,7 @@ impl Drop for DropRoleOnExit {
 /// policies.
 #[sqlx::test(migrations = false)]
 async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool) {
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Logs::capture();
 
     let role = format!("cxp_lp_{}", Uuid::new_v4().simple());
     let _drop_role = DropRoleOnExit::new(&pool, &role);
@@ -2328,6 +2517,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
         },
     );
     let check_pool = pool.clone();
+    let client_logs = logs.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2391,6 +2581,10 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // A stop that beat the declaration would skip the final flush, so
+        // wait for the shipper's `declared usage meters` line, which follows
+        // the platform's reply.
+        client_logs.wait_until_declared().await;
         stop.send(()).unwrap();
     };
     let (boot, ()) = tokio::join!(server, client);

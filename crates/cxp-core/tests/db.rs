@@ -1944,3 +1944,70 @@ async fn the_database_role_check_sees_other_databases_and_a_shared_instance(pool
     );
     as_role.pool().close().await;
 }
+
+/// Migration 0005: both outbox tables carry a nullable `meter`/`quantity` pair
+/// that a CHECK keeps together (both NULL, or both set with quantity > 0). The
+/// previous release writes both NULL, so unmetered rows must stay valid.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_outbox_tables_carry_a_meter_quantity_pair_kept_together_by_a_check(pool: PgPool) {
+    for table in ["usage_outbox", "usage_outbox_rejected"] {
+        let cols: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 \
+             AND column_name IN ('meter', 'quantity') ORDER BY column_name",
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                ("meter".to_string(), "text".to_string(), "YES".to_string()),
+                (
+                    "quantity".to_string(),
+                    "bigint".to_string(),
+                    "YES".to_string()
+                ),
+            ],
+            "{table} columns"
+        );
+
+        let insert = |meter: &'static str, quantity: &'static str| {
+            let (extra_cols, extra_vals) = if table == "usage_outbox" {
+                ("", "")
+            } else {
+                (", occurred_at, reason", ", now(), 'x'")
+            };
+            format!(
+                "INSERT INTO {table} (event_id, org_id, tool, billable, meter, quantity{extra_cols}) \
+                 VALUES (gen_random_uuid(), gen_random_uuid(), 'send_survey', true, {meter}, \
+                 {quantity}{extra_vals})"
+            )
+        };
+
+        for (meter, quantity) in [("'m'", "NULL"), ("'m'", "0"), ("NULL", "1"), ("'m'", "-1")] {
+            let err = sqlx::query(&insert(meter, quantity))
+                .execute(&pool)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (
+                    sqlstate(&err),
+                    err.as_database_error().and_then(|e| e.constraint())
+                ),
+                (
+                    "23514".to_string(),
+                    Some(format!("{table}_meter_quantity").as_str())
+                ),
+                "{table}: meter {meter}, quantity {quantity} must violate the CHECK"
+            );
+        }
+        for (meter, quantity) in [("NULL", "NULL"), ("'otto-cxp/surveys_sent'", "1")] {
+            sqlx::query(&insert(meter, quantity))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{table}: meter {meter}, quantity {quantity}: {e}"));
+        }
+    }
+}

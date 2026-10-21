@@ -1,8 +1,8 @@
-//! Feedback and surveys, and the analytics over them. The four billable tools
-//! of this service live here: `submit_feedback`, `create_survey`,
-//! `send_survey`, and `submit_survey_response` each charge one usage event in
-//! their own transaction, before their write, so a failed call is never
-//! billed. No other tool charges.
+//! Feedback and surveys, and the analytics over them. The three billable tools
+//! of this service live here: `send_survey`, `submit_feedback`, and
+//! `submit_survey_response` each charge one usage event on their value meter
+//! in their own transaction, before their write, so a failed call is never
+//! billed. No other tool charges; `create_survey` is free.
 
 use cxp_core::analysis::sentiment::{analyze_sentiment, SentimentResult};
 use cxp_core::customers::CustomersExt;
@@ -162,7 +162,8 @@ impl Cxp {
     #[tool(
         name = "submit_survey_response",
         description = "Submit a completed survey response with answers for a customer. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+                       UUID, email, or name for customer_id. Needs cxp:write. Billed on \
+                       otto-cxp/responses_collected.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_survey_response(
@@ -174,9 +175,9 @@ impl Cxp {
         caller.require_write().mcp()?;
         let survey_id = uuid("survey_id", &p.survey_id)?;
         let answers = parse_json("answers", &p.answers).mcp()?;
-        self.warm_quota(&caller).await;
+        let warmed = self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
-        self.charge(&mut tx, &caller, "submit_survey_response")
+        self.charge(&mut tx, &caller, "submit_survey_response", &warmed)
             .await?;
         let customer_id = tx.resolve_customer(&p.customer_id).await.mcp()?;
         let response = tx
@@ -199,7 +200,7 @@ impl Cxp {
                        feature do you use most?\", \"options\": [\"Dashboard\", \"Reports\"], \
                        \"required\": true}, {\"id\": \"q3\", \"questionType\": \"text\", \
                        \"text\": \"What should we improve?\", \"required\": false}]. Needs \
-                       cxp:write. Billable.",
+                       cxp:write. Free.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn create_survey(
@@ -210,9 +211,7 @@ impl Cxp {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;
         let questions = parse_json("questions", &p.questions).mcp()?;
-        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
-        self.charge(&mut tx, &caller, "create_survey").await?;
         let survey = tx
             .create_survey(&NewSurvey {
                 title: p.title,
@@ -229,7 +228,8 @@ impl Cxp {
     #[tool(
         name = "send_survey",
         description = "Send a survey to a customer: an open response awaiting answers. Accepts \
-                       UUID, email, or name for customer_id. Needs cxp:write. Billable.",
+                       UUID, email, or name for customer_id. Needs cxp:write. Billed on \
+                       otto-cxp/surveys_sent.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn send_survey(
@@ -240,9 +240,10 @@ impl Cxp {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;
         let survey_id = uuid("survey_id", &p.survey_id)?;
-        self.warm_quota(&caller).await;
+        let warmed = self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
-        self.charge(&mut tx, &caller, "send_survey").await?;
+        self.charge(&mut tx, &caller, "send_survey", &warmed)
+            .await?;
         let customer_id = tx.resolve_customer(&p.customer_id).await.mcp()?;
         let response = tx.send_survey(survey_id, customer_id).await.mcp()?;
         tx.commit().await.mcp()?;
@@ -274,7 +275,8 @@ impl Cxp {
     #[tool(
         name = "submit_feedback",
         description = "Submit customer feedback. Accepts UUID, email, or name for customer_id. \
-                       Needs cxp:write. Billable.",
+                       Needs cxp:write. Billed on \
+                       otto-cxp/responses_collected.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     pub async fn submit_feedback(
@@ -288,9 +290,10 @@ impl Cxp {
         let application_id = optional_uuid("application_id", p.application_id.as_deref())?;
         let page_id = optional_uuid("page_id", p.page_id.as_deref())?;
         let component_id = optional_uuid("component_id", p.component_id.as_deref())?;
-        self.warm_quota(&caller).await;
+        let warmed = self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
-        self.charge(&mut tx, &caller, "submit_feedback").await?;
+        self.charge(&mut tx, &caller, "submit_feedback", &warmed)
+            .await?;
         let customer_id = tx.resolve_customer(&p.customer_id).await.mcp()?;
         let feedback = tx
             .submit_feedback(&NewFeedback {

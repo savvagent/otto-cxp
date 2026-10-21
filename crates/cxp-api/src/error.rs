@@ -14,7 +14,7 @@
 //! | `insufficient_scope` | 403, with `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"` (RFC 6750 §3.1) |
 //! | `access_revoked` | 401, with the `WWW-Authenticate` challenge |
 //! | `invalid_signature` | 401 (`/platform/webhooks` only) |
-//! | `quota_exceeded` | 429 (the org's plan allowance is used up; reads still work) |
+//! | `budget_exceeded`, `payment_required` | 402 (a billable call while billing is blocked: this service's budget hard stop, or a payment method needed; reads and free routes still work) |
 //! | `payload_too_large` | 413 |
 //! | `unsupported_media_type` | 415 (a JSON body without `Content-Type: application/json`) |
 //! | `method_not_allowed` | 405 (a known `/api/v1` path, another method) |
@@ -81,7 +81,7 @@ fn status_for(e: &cxp_core::Error) -> StatusCode {
         Error::Invalid(_) | Error::UnknownTeam => StatusCode::BAD_REQUEST,
         Error::Conflict(_) => StatusCode::CONFLICT,
         Error::AccessRevoked => StatusCode::UNAUTHORIZED,
-        Error::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+        Error::BillingBlocked { .. } => StatusCode::PAYMENT_REQUIRED,
         Error::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         // The caller's query, not the server, is the problem, and repeating
         // it unchanged cannot help: a 4xx, so no generic retry layer repeats
@@ -161,7 +161,40 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cxp_core::error::BlockedReason;
     use cxp_core::Error;
+
+    fn blocked(reason: BlockedReason) -> Error {
+        Error::BillingBlocked {
+            reason,
+            tool: "send_survey".into(),
+            url: "https://otto.example.com".into(),
+        }
+    }
+
+    /// A billable call refused while billing is blocked is a 402 with the
+    /// usual `{error, code}` body, and nothing tells the client to retry.
+    #[tokio::test]
+    async fn billing_refusals_are_payment_required() {
+        for code in ["budget_exceeded", "payment_required"] {
+            let reason = if code == "budget_exceeded" {
+                BlockedReason::BudgetExceeded
+            } else {
+                BlockedReason::PaymentRequired
+            };
+            let res = ApiError::from(blocked(reason)).into_response();
+            assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED, "{code}");
+            assert!(res.headers().get(header::RETRY_AFTER).is_none(), "{code}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], code);
+            let text = body["error"].as_str().unwrap();
+            assert!(text.contains("send_survey"), "{text}");
+            assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+        }
+    }
 
     #[test]
     fn every_domain_code_has_its_status() {
@@ -172,14 +205,12 @@ mod tests {
             (Error::Conflict("dup".into()), StatusCode::CONFLICT),
             (Error::AccessRevoked, StatusCode::UNAUTHORIZED),
             (
-                Error::QuotaExceeded {
-                    tool: "create_survey".into(),
-                    used: 10,
-                    included: 10,
-                    plan: "free".into(),
-                    upgrade_url: "https://otto.example.com".into(),
-                },
-                StatusCode::TOO_MANY_REQUESTS,
+                blocked(BlockedReason::BudgetExceeded),
+                StatusCode::PAYMENT_REQUIRED,
+            ),
+            (
+                blocked(BlockedReason::PaymentRequired),
+                StatusCode::PAYMENT_REQUIRED,
             ),
             (Error::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
             (Error::QueryTooBroad, StatusCode::UNPROCESSABLE_ENTITY),

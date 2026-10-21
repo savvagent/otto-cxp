@@ -46,7 +46,8 @@ struct Platform {
     down: bool,
     /// Answer every usage-status request with a 503.
     usage_down: bool,
-    /// Report every org as over its allowance on a hard-stop plan.
+    /// Report every org's billable calls as blocked: its otto-cxp budget is
+    /// spent with the hard stop on.
     blocked: bool,
     /// How many usage-status requests have arrived.
     usage_lookups: usize,
@@ -106,16 +107,36 @@ async fn usage_status(
     if p.usage_down {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let (used, hard_stop) = if p.blocked { (10, true) } else { (3, false) };
-    Ok(Json(json!({
+    // A v0.10.0 platform: the legacy bucket never blocks; the budget does.
+    let mut body = json!({
         "org_id": org,
         "plan": "team",
         "period_start": Utc::now().date_naive(),
-        "billable_count": used,
-        "total_count": used,
-        "included_ops": if p.blocked { 10 } else { 1000 },
-        "hard_stop": hard_stop,
-    })))
+        "billable_count": 3,
+        "total_count": 3,
+        "included_ops": 1000,
+        "hard_stop": false,
+        "service": "otto-cxp",
+        "meters": [{
+            "meter": cxp_core::usage::RESPONSES_COLLECTED,
+            "display_name": "Responses collected",
+            "unit": "response",
+            "quantity": 3,
+        }],
+    });
+    if p.blocked {
+        body["blocked_reason"] = json!("budget_exceeded");
+        body["budget"] = json!({
+            "monthly_budget_cents": 1000,
+            "spend_cents": 1000,
+            "percent_used": 100,
+            "thresholds_reached": [50, 80, 100],
+            "hard_stop": true,
+            "blocked": true,
+            "reason": "budget_exceeded",
+        });
+    }
+    Ok(Json(body))
 }
 
 async fn start_platform() -> (String, Shared) {
@@ -154,34 +175,23 @@ fn token(p: &Shared, org: Uuid, scopes: &[&str]) -> String {
 // ------------------------------------------------------------------ harness
 
 struct Harness {
+    /// The mock platform's base URL, which the upgrade URL starts with.
+    base: String,
     app: Router,
     pool: PgPool,
     platform: Shared,
 }
 
 async fn harness(pool: PgPool) -> Harness {
-    harness_with(pool, false).await
-}
-
-/// [`harness`], with the meter enforcing quotas when `enforce` is set.
-async fn harness_with(pool: PgPool, enforce: bool) -> Harness {
-    harness_opts(pool, enforce, SearchLimiter::for_pool(5)).await
+    harness_search(pool, SearchLimiter::for_pool(5)).await
 }
 
 /// [`harness`], with the given search limiter.
 async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
-    harness_opts(pool, false, search).await
-}
-
-async fn harness_opts(pool: PgPool, enforce: bool, search: SearchLimiter) -> Harness {
     let (base, platform) = start_platform().await;
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
-    let meter = Arc::new(Meter::new(
-        client.clone(),
-        enforce,
-        format!("{base}/settings/billing"),
-    ));
+    let meter = Arc::new(Meter::new(client.clone(), base.clone()));
     let app = router(
         Db::from_pool(pool.clone()),
         client,
@@ -195,6 +205,7 @@ async fn harness_opts(pool: PgPool, enforce: bool, search: SearchLimiter) -> Har
     )
     .unwrap();
     Harness {
+        base,
         app,
         pool,
         platform,
@@ -260,6 +271,18 @@ impl Harness {
             .fetch_all(&self.pool)
             .await
             .unwrap()
+    }
+
+    /// The (tool, meter, quantity) of every usage row `org` has recorded,
+    /// by tool.
+    async fn metered(&self, org: Uuid) -> Vec<(String, Option<String>, Option<i64>)> {
+        sqlx::query_as(
+            "SELECT tool, meter, quantity FROM usage_outbox WHERE org_id = $1 ORDER BY tool",
+        )
+        .bind(org)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
     }
 }
 
@@ -504,7 +527,7 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
         )
         .await
         .unwrap();
-    assert_eq!(h.charged(org).await, ["create_survey"]);
+    assert!(h.charged(org).await.is_empty(), "create_survey is free");
 
     h.tool(
         &writer,
@@ -513,7 +536,7 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
     )
     .await
     .unwrap();
-    assert_eq!(h.charged(org).await, ["create_survey", "send_survey"]);
+    assert_eq!(h.charged(org).await, ["send_survey"]);
 
     h.tool(
         &writer,
@@ -530,13 +553,16 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
     )
     .await
     .unwrap();
+    let row = |tool: &str, meter: &str| (tool.to_string(), Some(meter.to_string()), Some(1));
     assert_eq!(
-        h.charged(org).await,
+        h.metered(org).await,
         [
-            "create_survey",
-            "send_survey",
-            "submit_feedback",
-            "submit_survey_response"
+            row("send_survey", cxp_core::usage::SURVEYS_SENT),
+            row("submit_feedback", cxp_core::usage::RESPONSES_COLLECTED),
+            row(
+                "submit_survey_response",
+                cxp_core::usage::RESPONSES_COLLECTED
+            ),
         ]
     );
 
@@ -550,7 +576,7 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(code(&failed), "not_found", "{failed}");
-    assert_eq!(h.charged(org).await.len(), 4);
+    assert_eq!(h.charged(org).await.len(), 3);
 
     // The analytics over what was recorded.
     let nps = h
@@ -565,14 +591,15 @@ async fn each_billable_tool_records_exactly_one_usage_event(pool: PgPool) {
     assert_eq!(nps["promoters"], 1, "{nps}");
     let csat = h.tool(&writer, "calculate_csat", json!({})).await.unwrap();
     assert_eq!(csat["csat"], 100.0, "{csat}");
-    assert_eq!(h.charged(org).await.len(), 4);
+    assert_eq!(h.charged(org).await.len(), 3);
 }
 
-/// With quotas enforced, a read or a free write never calls the platform for
-/// the org's usage; only a billable tool looks it up, before its transaction.
+/// A read or a free write (`create_survey` among them) never calls the
+/// platform for the org's usage; only a billable tool looks it up, before its
+/// transaction.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn only_billable_tools_look_the_quota_up(pool: PgPool) {
-    let h = harness_with(pool, true).await;
+    let h = harness(pool).await;
     let org = Uuid::new_v4();
     let writer = token(&h.platform, org, WRITE);
     let lookups = || h.platform.lock().unwrap().usage_lookups;
@@ -585,6 +612,13 @@ async fn only_billable_tools_look_the_quota_up(pool: PgPool) {
     .await
     .unwrap();
     h.tool(&writer, "list_customers", json!({})).await.unwrap();
+    h.tool(
+        &writer,
+        "create_survey",
+        json!({"title": "NPS", "questions": "[]"}),
+    )
+    .await
+    .unwrap();
     h.rpc(
         &writer,
         "resources/read",
@@ -618,6 +652,18 @@ async fn whoami_and_usage_need_no_scope_and_record_nothing(pool: PgPool) {
     assert_eq!(me["token"]["canRead"], false);
     assert_eq!(me["usage"]["billableUsed"], 3);
     assert_eq!(me["usage"]["remaining"], 997);
+    assert_eq!(me["usage"]["enforced"], true, "{me}");
+    assert_eq!(me["usage"]["service"], "otto-cxp", "{me}");
+    assert_eq!(
+        me["usage"]["meters"],
+        json!([
+            {"meter": cxp_core::usage::SURVEYS_SENT, "displayName": "Surveys sent",
+             "unit": "survey", "quantity": 0},
+            {"meter": cxp_core::usage::RESPONSES_COLLECTED,
+             "displayName": "Responses collected", "unit": "response", "quantity": 3},
+        ]),
+        "{me}"
+    );
 
     let usage = h.tool(&bare, "usage", json!({})).await.unwrap();
     assert_eq!(usage["usage"]["plan"], "Team", "{usage}");
@@ -817,40 +863,61 @@ async fn knowledge_articles_and_unknown_uris(pool: PgPool) {
     assert_eq!(code(&refused), "invalid_argument", "{refused}");
 }
 
+/// While the org's otto-cxp budget is spent with the hard stop on, a
+/// billable tool is refused with `budget_exceeded`, records nothing, and
+/// names where to fix it; free tools, `create_survey` included, still work.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn an_org_over_its_allowance_is_refused_billable_calls(pool: PgPool) {
-    let h = harness_with(pool, true).await;
+async fn an_org_out_of_budget_is_refused_billable_calls(pool: PgPool) {
+    let h = harness(pool).await;
     let org = Uuid::new_v4();
     let writer = token(&h.platform, org, WRITE);
     h.platform.lock().unwrap().blocked = true;
 
-    let refused = h
+    h.tool(
+        &writer,
+        "create_customer",
+        json!({"email": "q@example.com", "name": "Q"}),
+    )
+    .await
+    .unwrap();
+    let survey = h
         .tool(
             &writer,
             "create_survey",
             json!({"title": "NPS", "questions": "[]"}),
         )
         .await
-        .unwrap_err();
-    assert_eq!(code(&refused), "quota_exceeded", "{refused}");
-    assert_eq!(refused["data"]["retriable"], false);
-    assert!(
-        refused["message"]
-            .as_str()
-            .unwrap()
-            .contains("settings/billing"),
-        "{refused}"
-    );
-    assert!(h.charged(org).await.is_empty());
+        .unwrap();
 
-    // Free calls still work.
-    h.tool(
-        &writer,
-        "create_customer",
-        json!({"email": "q@example.com"}),
-    )
-    .await
-    .unwrap();
+    let refused = h
+        .tool(
+            &writer,
+            "send_survey",
+            json!({"survey_id": survey["id"].clone(), "customer_id": "q@example.com"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&refused), "budget_exceeded", "{refused}");
+    assert_eq!(refused["data"]["retriable"], false);
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.contains("send_survey"), "{refused}");
+    assert!(message.contains(&h.base), "{refused}");
+    assert!(h.charged(org).await.is_empty());
+    let responses: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM survey_responses WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(responses, 0, "a refused send_survey wrote a response");
+
+    let usage = h.tool(&writer, "usage", json!({})).await.unwrap();
+    assert_eq!(
+        usage["usage"]["blockedReason"], "budget_exceeded",
+        "{usage}"
+    );
+    assert_eq!(usage["usage"]["warning"], true, "{usage}");
+    assert_eq!(usage["usage"]["budget"]["blocked"], true, "{usage}");
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -894,7 +961,7 @@ async fn the_router_refuses_an_empty_allowed_host_list(pool: PgPool) {
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
     for hosts in [vec![], vec![" ".to_string(), String::new()]] {
-        let meter = Arc::new(Meter::new(client.clone(), false, "https://x"));
+        let meter = Arc::new(Meter::new(client.clone(), "https://x"));
         let built = router(
             Db::from_pool(pool.clone()),
             client.clone(),
