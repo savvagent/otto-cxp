@@ -85,7 +85,8 @@ impl Cxp {
         name = "usage",
         description = "This service's own meters this month (otto-cxp/surveys_sent and \
                        otto-cxp/responses_collected), the organization's otto-cxp budget, and \
-                       `blockedReason`. Only send_survey, submit_feedback, and \
+                       `blockedReason` (budget_exceeded or payment_required while billed calls \
+                       are refused, else null). Only send_survey, submit_feedback, and \
                        submit_survey_response add to them. Free. If `warning` is true, tell the \
                        person you are working for.",
         annotations(read_only_hint = true)

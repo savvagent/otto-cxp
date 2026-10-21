@@ -58,7 +58,9 @@ follow.
 Reading needs the cxp:read scope (or cxp:write); changing anything needs \
 cxp:write. You are billed for send_survey (surveys sent) and for submit_feedback and \
 submit_survey_response (responses collected); create_survey and everything \
-else, including whoami and usage, is free. Call usage to see where you stand.";
+else, including whoami and usage, is free. While the organization's billing is \
+blocked, a billed call is refused with budget_exceeded or payment_required and \
+changes nothing; free calls still work. Call usage to see where you stand.";
 
 /// The service. Cheap to clone, because `rmcp` builds one per request.
 #[derive(Clone)]
