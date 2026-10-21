@@ -18,6 +18,11 @@
 -- were just added), so there is nothing to validate, and skipping the scan
 -- keeps tool calls from queueing behind it while the ACCESS EXCLUSIVE lock is
 -- held. New and updated rows are checked as usual.
+--
+-- Locks: the second ALTER can wait up to lock_timeout while the first table's
+-- lock is still held, so the worst case is about 2 x 3 s. The order stays as
+-- it is because it matches the shipper's, so the migration cannot deadlock
+-- with it.
 
 -- Fail fast rather than queue behind a long transaction. sqlx runs each
 -- migration in its own transaction, so SET LOCAL ends with it.
