@@ -120,9 +120,9 @@ pub struct Meter {
 }
 
 /// An org's billing standing, looked up by [`Meter::warm`] before a billable
-/// tool opens its transaction and spent by [`Meter::charge`] inside it. It
-/// is bound to the org it was looked up for (not `Clone`), so a charge
-/// cannot be made against another org's standing.
+/// tool opens its transaction and spent by [`Meter::charge`] in the
+/// transaction that follows. It carries the org it was looked up for, and
+/// `charge` refuses it in another org's transaction.
 #[derive(Debug)]
 #[must_use = "pass it to Meter::charge"]
 pub struct Warmed {
