@@ -178,6 +178,16 @@ async fn ship(State(p): State<Shared>, Json(b): Json<UsageBatch>) -> Json<UsageR
     })
 }
 
+/// Declares every meter sent, as the platform does: the shipper declares
+/// before it ships, and a shutdown during declaration skips the final flush.
+async fn declare_meters(Json(b): Json<Value>) -> Json<Value> {
+    let keys: Vec<Value> = b["meters"]
+        .as_array()
+        .map(|m| m.iter().map(|m| m["key"].clone()).collect())
+        .unwrap_or_default();
+    Json(json!({"declared": keys, "rejected": []}))
+}
+
 async fn start_platform() -> (String, Shared) {
     let shared: Shared = Arc::default();
     let app = Router::new()
@@ -190,6 +200,7 @@ async fn start_platform() -> (String, Shared) {
         .route("/internal/orgs/{org}/teams/{team}", get(team))
         .route("/internal/orgs/{org}/usage-status", get(usage_status))
         .route("/internal/usage", post(ship))
+        .route("/internal/meters", axum::routing::put(declare_meters))
         .with_state(shared.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
