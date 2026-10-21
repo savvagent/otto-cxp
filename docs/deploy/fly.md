@@ -855,7 +855,10 @@ The logs must show, in order:
 - `applying migrations`
 - `tenant isolation enforced as role "otto_app"`
 - `the otto platform accepted this service's credential`
-- `declared usage meters` (usually just after `cxp-server listening`, since the shipper starts alongside the server; see "Usage metering" below)
+
+`declared usage meters` is logged by the shipper, which starts alongside the server, so it is not
+part of that order: it usually appears just after `cxp-server listening`, and only once the
+platform has answered the declaration. See "Usage metering" below.
 
 If the platform REJECTED the credential, or `CXP_PLATFORM_URL` is not the platform, `/readyz`
 answers 503 with `"reason": "platform credential rejected"` (or `"platform misconfigured"`), so a

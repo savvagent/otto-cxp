@@ -23,6 +23,8 @@ Success criteria (verbatim from #1):
 3. `whoami` and `usage` work; `submit_feedback`, `create_survey`, `send_survey`, and
    `submit_survey_response` each ship exactly one usage event (deduplicated by `event_id`), and
    every other tool ships none.
+   (Superseded by #52, 2026-10-21: three tools are billed, `create_survey` is free; see the note
+   under "Metering".)
 4. `org.deleted`, `member.removed`, and `team.deleted` webhooks are signature-verified and applied
    idempotently, and catalog entities owned by a deleted team are handled.
 5. Production: the `otto-cxp` Fly app serves `/healthz` and `/readyz`, the boot log shows
@@ -62,10 +64,12 @@ stubs; scopes finer than `cxp:read` / `cxp:write`; new CXP domain features; otto
   `cxp:write`. `whoami` and `usage` check no scope (as in otto-flags).
 - Only the four billable tools write `usage_outbox` rows; `whoami`, `usage`, and every other
   tool record nothing (criterion 3; otto-flags records free calls as `billable: false`, this
-  service does not).
+  service does not). (Superseded by #52, 2026-10-21: three billable tools, not four;
+  `create_survey` is free.)
 - REST `POST /api/v1/surveys` is the same operation as `create_survey` and charges the same
   usage event (tool name `create_survey`); otherwise the console would be a billing bypass. No
-  other route charges.
+  other route charges. (Superseded by #52, 2026-10-21: `create_survey` is free, so
+  `POST /api/v1/surveys` charges nothing and no route records usage.)
 - A deleted team's catalog entities keep existing with `team_id = NULL` (unowned, visible to the
   org), rather than being deleted. Deleting customer-facing catalog rows on a team change would
   also null every feedback/ticket/customer reference to them.
@@ -134,7 +138,8 @@ error.rs            Error enum (NotFound { kind: &'static str }, Invalid(String)
                     `retriable() -> bool` (the codes MCP and REST put on the wire: not_found,
                     invalid_argument, conflict, unknown_team, access_revoked, quota_exceeded,
                     unavailable, query_too_broad (#34), internal); Display never includes
-                    database text; a
+                    database text (Superseded by #52, 2026-10-21: `QuotaExceeded` / `quota_exceeded` became
+                    `BillingBlocked`, code `budget_exceeded` or `payment_required`); a
                     database error reads the same through Tenant(Db(..)) as through Database;
                     pub(crate) map_fk(e, &[(constraint, kind)]) maps a composite-FK violation
                     to NotFound { kind }
@@ -315,7 +320,8 @@ then refuse with `Error::AccessRevoked` when the org is in `deleted_orgs` or the
 
 ### Metering (`cxp_core::usage`, S4)
 
-`BILLABLE = ["submit_feedback", "create_survey", "send_survey", "submit_survey_response"]`.
+`BILLABLE = ["submit_feedback", "create_survey", "send_survey", "submit_survey_response"]`
+(Superseded by #52, 2026-10-21: `create_survey` is no longer in it).
 `Meter::charge(&self, tx, user, tool)` returns `Error::Internal` (a programming error, code
 `internal`) if `tool` is not in `BILLABLE`, optionally enforces the quota (`CXP_ENFORCE_QUOTAS`,
 default off, fail open) and inserts one `usage_outbox` row in the caller's transaction.
@@ -356,6 +362,7 @@ with `#[tool_router(router = …)]` per file, combined in `tools/mod.rs`; `tools
 → commit → `Json(out)`. Errors: `ErrorData` with `data: {code, retriable}`; codes include
 `unauthenticated`, `insufficient_scope`, `not_found`, `invalid_argument`, `access_revoked`,
 `quota_exceeded`, `unavailable`, `query_too_broad` (#34), `internal` (no database text).
+(Superseded by #52, 2026-10-21: `quota_exceeded` is now `budget_exceeded` or `payment_required`.)
 Resources (3) and prompts (4)
 ported; resources need read scope; `metrics://dashboard` calls `DashboardExt` (S8). `lib.rs` exposes `Config { public_url, resource_uri,
 platform_url, allowed_hosts, allowed_origins }` and `router(db, platform, meter, config) -> Result<Router, NoAllowedHosts>`
@@ -376,7 +383,8 @@ their earlier snake_case spelling (`team_id`) as an alias, and both at once is a
 and caller-owned JSON (`metadata`) are untouched. Lists are `{data, total, limit, offset}`;
 `GET /api/v1/customers/search` adds `totalCapped`. The tracked exception is
 `GET /api/v1/dashboard/metrics`, which also sends its deprecated snake_case keys (#35).
-`POST /api/v1/surveys` charges `create_survey`.
+`POST /api/v1/surveys` charges `create_survey`. (Superseded by #52, 2026-10-21: it charges
+nothing; `create_survey` is free.)
 `POST /platform/webhooks`: verify `Otto-Signature` with `CXP_PLATFORM_WEBHOOK_SECRET` (bad
 signature 401, bad body 400), `platform_events::apply` (an event at fault, code `invalid_argument`, is 400
 `invalid_event`; any other failure, a bug here included, is 503 so the platform redelivers until
