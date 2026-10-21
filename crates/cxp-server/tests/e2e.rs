@@ -67,6 +67,11 @@ struct Platform {
     counted: HashSet<Uuid>,
     /// The keys of every meter declaration the platform accepted, in order.
     declared: Vec<Vec<String>>,
+    /// Every usage event as sent on the wire, with its `meter` and `quantity`
+    /// (which `UsageEvent` does not carry).
+    raw_events: Vec<Value>,
+    /// Whether a declaration had been accepted when the first event arrived.
+    declared_before_first_event: Option<bool>,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -162,8 +167,14 @@ async fn usage_status(Path(org): Path<Uuid>) -> Json<Value> {
 
 /// Records every event; an event id seen before is a duplicate, as the
 /// platform reports it.
-async fn ship(State(p): State<Shared>, Json(b): Json<UsageBatch>) -> Json<UsageReceipt> {
+async fn ship(State(p): State<Shared>, Json(raw): Json<Value>) -> Json<UsageReceipt> {
+    let b: UsageBatch = serde_json::from_value(raw.clone()).expect("a usage batch");
     let mut p = p.lock().unwrap();
+    if p.declared_before_first_event.is_none() {
+        p.declared_before_first_event = Some(!p.declared.is_empty());
+    }
+    p.raw_events
+        .extend(raw["events"].as_array().cloned().unwrap_or_default());
     let (mut accepted, mut duplicates) = (0, 0);
     for e in b.events {
         if p.counted.insert(e.event_id) {
@@ -2097,6 +2108,140 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
             .unwrap_or_else(|| panic!("{line:?} not logged after byte {from}:\n{text}"));
         from += at + line.len();
     }
+}
+
+/// Value metering end to end, through `run_with` and the real shipper: the
+/// platform is told the two meters before it is sent anything, then receives
+/// one `surveys_sent` and two `responses_collected` event, each quantity 1 with
+/// its own event id, and none for the free `create_survey`.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
+    let (base, mock) = start_platform().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut database_url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    database_url.set_path(pool.connect_options().get_database().unwrap());
+    let mut config = Config::for_test();
+    config.database_url = database_url.to_string();
+    config.bind = addr;
+    config.public_url = format!("http://{addr}");
+    config.resource_uri = format!("http://{addr}/mcp");
+    config.platform_url = base;
+    let resource = config.resource_uri.clone();
+
+    let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
+    let token = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    mock.lock().unwrap().tokens.insert(
+        token.clone(),
+        (org, user, vec!["cxp:write".into()], resource),
+    );
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = cxp_server::run_with(
+        config,
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        // Only the final flush ships.
+        cxp_core::usage::ShipperConfig {
+            poll: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        },
+    );
+    let client = async move {
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let ready = http.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status().as_u16(), 200);
+        let call = |name: &str, args: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}});
+            let http = http.clone();
+            let (url, token, name) = (format!("{base}/mcp"), token.clone(), name.to_owned());
+            async move {
+                let res = http
+                    .post(url)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status().as_u16(), 200, "{name}");
+                let v: Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+                assert!(
+                    v["result"]["isError"] != true && v.get("error").is_none(),
+                    "{name}: {v}"
+                );
+                v["result"]["structuredContent"].clone()
+            }
+        };
+        call("create_customer", json!({"email": "m@example.com"})).await;
+        let survey = call(
+            "create_survey",
+            json!({"title": "NPS", "questions": r#"[{"id": "q1", "type": "nps"}]"#}),
+        )
+        .await;
+        let survey_id = survey["id"].as_str().expect("survey id").to_owned();
+        call(
+            "send_survey",
+            json!({"survey_id": survey_id, "customer_id": "m@example.com"}),
+        )
+        .await;
+        call(
+            "submit_feedback",
+            json!({"customer_id": "m@example.com", "feedback_type": "praise"}),
+        )
+        .await;
+        call(
+            "submit_survey_response",
+            json!({"survey_id": survey_id, "customer_id": "m@example.com",
+                   "answers": r#"{"score": 10}"#}),
+        )
+        .await;
+        // A stop that beat the declaration would skip the final flush.
+        wait_until_declared(&mock).await;
+        stop.send(()).unwrap();
+        mock
+    };
+    let (boot, mock) = tokio::join!(server, client);
+    boot.expect("a clean stop");
+
+    let p = mock.lock().unwrap();
+    assert_eq!(p.declared.len(), 1, "declared once");
+    assert_eq!(
+        p.declared_before_first_event,
+        Some(true),
+        "the meters were declared before the first event"
+    );
+    let mut seen: Vec<(String, u64, String)> = p
+        .raw_events
+        .iter()
+        .map(|e| {
+            (
+                e["meter"].as_str().unwrap_or_default().to_owned(),
+                e["quantity"].as_u64().unwrap_or_default(),
+                e["tool"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let want = |m: &str, t: &str| (m.to_owned(), 1, t.to_owned());
+    assert_eq!(
+        seen,
+        [
+            want("otto-cxp/responses_collected", "submit_feedback"),
+            want("otto-cxp/responses_collected", "submit_survey_response"),
+            want("otto-cxp/surveys_sent", "send_survey"),
+        ],
+        "exactly three metered events, none for create_survey: {:?}",
+        p.raw_events
+    );
+    let ids: HashSet<_> = p.received.iter().map(|e| e.event_id).collect();
+    assert_eq!(ids.len(), 3, "distinct event ids");
 }
 
 /// A database where one tenant table no longer enforces row-level security
