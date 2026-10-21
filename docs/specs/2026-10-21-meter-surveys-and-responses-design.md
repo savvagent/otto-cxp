@@ -180,9 +180,9 @@ or grant: the existing RLS policies and grants cover new columns.
 
 - The claim's `RETURNING` and `Row` gain `meter: Option<String>` and `quantity: Option<i64>`.
   `UsageEvent` gets `meter: r.meter.clone()` and `quantity: r.quantity.map(|q| q as u64)`. The
-  CHECK keeps `quantity` positive; the plan uses a `u64::try_from` that fails closed: a row that
-  somehow fails it is sent unmetered? No: it is moved to `usage_outbox_rejected` with reason
-  `invalid_quantity`, never sent with a guessed value.
+  CHECK keeps `quantity` positive. The conversion is a `u64::try_from` that fails closed: a row
+  that somehow fails it is moved to `usage_outbox_rejected` with reason `invalid_quantity`. It is
+  never sent unmetered or with a guessed value.
 - The move to `usage_outbox_rejected` copies `meter` and `quantity`.
 - A legacy row (`meter IS NULL`, written by the previous release during rollout) ships unmetered,
   exactly as before.
