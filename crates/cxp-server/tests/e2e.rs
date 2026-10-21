@@ -206,17 +206,6 @@ async fn declare_meters(State(p): State<Shared>, Json(b): Json<Value>) -> Json<V
     Json(json!({"declared": keys, "rejected": []}))
 }
 
-/// Wait until the mock platform has accepted a meter declaration.
-async fn wait_until_declared(mock: &Shared) {
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while mock.lock().unwrap().declared.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the shipper declared its usage meters");
-}
-
 async fn start_platform() -> (String, Shared) {
     let shared: Shared = Arc::default();
     let app = Router::new()
@@ -1964,6 +1953,33 @@ impl Logs {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
+
+    /// Capture this test's own task's `info`-and-above logs until the
+    /// returned guard drops.
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Wait until the shipper has logged `declared usage meters`. That line
+    /// comes after the platform's reply, so a stop after it cannot skip the
+    /// final flush; the fake platform's own record is written before it
+    /// replies and proves nothing of the kind.
+    async fn wait_until_declared(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !self.text().contains("declared usage meters") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shipper logged that it declared its usage meters");
+    }
 }
 
 /// `run`, as `main` calls it, on a real socket: it boots against the test
@@ -1972,14 +1988,7 @@ impl Logs {
 /// the platform before returning.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Logs::capture();
 
     let (base, mock) = start_platform().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2016,6 +2025,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
             ..Default::default()
         },
     );
+    let client_logs = logs.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2050,8 +2060,9 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         // what arrives below was sent by the flush on the way out.
         assert!(mock.lock().unwrap().received.is_empty());
         // A stop that beat the declaration would skip the final flush, so
-        // wait for the platform to have accepted the declaration first.
-        wait_until_declared(&mock).await;
+        // wait for the shipper's `declared usage meters` line, which follows
+        // the platform's reply.
+        client_logs.wait_until_declared().await;
         stop.send(()).unwrap();
         mock
     };
@@ -2116,6 +2127,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
 /// its own event id, and none for the free `create_survey`.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
+    let (logs, _guard) = Logs::capture();
     let (base, mock) = start_platform().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2150,6 +2162,7 @@ async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
             ..Default::default()
         },
     );
+    let client_logs = logs.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2202,8 +2215,9 @@ async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
                    "answers": r#"{"score": 10}"#}),
         )
         .await;
-        // A stop that beat the declaration would skip the final flush.
-        wait_until_declared(&mock).await;
+        // A stop that beat the declaration would skip the final flush; wait
+        // for the `declared usage meters` line, which follows the reply.
+        client_logs.wait_until_declared().await;
         stop.send(()).unwrap();
         mock
     };
@@ -2411,14 +2425,7 @@ impl Drop for DropRoleOnExit {
 /// policies.
 #[sqlx::test(migrations = false)]
 async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool) {
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Logs::capture();
 
     let role = format!("cxp_lp_{}", Uuid::new_v4().simple());
     let _drop_role = DropRoleOnExit::new(&pool, &role);
@@ -2510,7 +2517,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
         },
     );
     let check_pool = pool.clone();
-    let declared_mock = mock.clone();
+    let client_logs = logs.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2575,8 +2582,9 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         // A stop that beat the declaration would skip the final flush, so
-        // wait for the platform to have accepted the declaration first.
-        wait_until_declared(&declared_mock).await;
+        // wait for the shipper's `declared usage meters` line, which follows
+        // the platform's reply.
+        client_logs.wait_until_declared().await;
         stop.send(()).unwrap();
     };
     let (boot, ()) = tokio::join!(server, client);
