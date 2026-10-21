@@ -322,6 +322,11 @@ default off, fail open) and inserts one `usage_outbox` row in the caller's trans
 `Meter::report(org)` returns the usage summary `whoami`/`usage` show (otto-flags' `Status`).
 `ship_once`/`run` ship batches to `POST /internal/usage` (event_id dedupe at the platform), as
 otto-flags, claiming due rows in `(next_attempt_at, id)` order, in maintenance transactions.
+
+> (Superseded by #52, 2026-10-21: only `send_survey`, `submit_feedback` and
+> `submit_survey_response` are billed, on two value meters; `create_survey` is free; enforcement is
+> always on and fails open. See `docs/specs/2026-10-21-meter-surveys-and-responses-design.md`.)
+
 Rows the platform refuses per event in its receipt move to `usage_outbox_rejected` with the
 reason, logged at error. A batch it refuses whole with a 4xx about the request, 413 included, is
 split in halves and resent recursively until the refused events stand alone; an event refused
@@ -397,6 +402,9 @@ with a 2 s timeout. A drain that fails, or a final flush that fails for a reason
 pass on its own, exits non-zero; a flush that cannot reach the platform logs at warn and leaves
 its rows for the next start. `tests/e2e.rs` with a mock platform proves criteria 1–4
 over HTTP.
+
+> (Superseded by #52, 2026-10-21: `CXP_ENFORCE_QUOTAS` is retired; it is ignored and warns at
+> startup if set.)
 
 ## Stories
 

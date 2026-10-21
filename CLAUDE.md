@@ -45,7 +45,7 @@ is a JSON 404.
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
   (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
-  `begin_live`), `usage` (metering, outbox shipper), `console_sessions` (the web console's sign-in
+  `begin_live`), `usage` (metering: value meters, declaration, outbox shipper), `console_sessions` (the web console's sign-in
   sessions; tokens sealed with an HKDF subkey of `CXP_ENCRYPTION_KEY`; refresh by lease +
   compare-and-swap), `sealed` (`nonce || ciphertext`), `search` (#17: the search index tables'
   bounds, a count capped at 1000 with `totalCapped`, and a search's 2 s `statement_timeout`, read as
@@ -149,7 +149,7 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 | `CXP_BIND` | `0.0.0.0:8080` | |
 | `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts, as `host` or `host:port`; the `CXP_PUBLIC_URL` host is always allowed |
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
-| `CXP_ENFORCE_QUOTAS` | `false` | fails open |
+| `CXP_ENFORCE_QUOTAS` | retired | ignored; warns at startup if set (enforcement is always on, fails open) |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
 | `CXP_CONSOLE_CLIENT_ID` | unset | the web console's first-party client at the platform (redirect `{public}/auth/callback`); unset turns console sign-in off |
 | `CXP_ENCRYPTION_KEY` | unset (secret) | base64 of 32 bytes; never used directly: HKDF-SHA256 derives the session-token and OAuth-flow subkeys; required only with `CXP_CONSOLE_CLIENT_ID`, validated whenever set; rotating it signs everyone out of the console |
