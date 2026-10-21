@@ -65,6 +65,8 @@ struct Platform {
     received: Vec<UsageEvent>,
     /// The event ids counted once, as the platform dedupes them.
     counted: HashSet<Uuid>,
+    /// The keys of every meter declaration the platform accepted, in order.
+    declared: Vec<Vec<String>>,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -180,12 +182,28 @@ async fn ship(State(p): State<Shared>, Json(b): Json<UsageBatch>) -> Json<UsageR
 
 /// Declares every meter sent, as the platform does: the shipper declares
 /// before it ships, and a shutdown during declaration skips the final flush.
-async fn declare_meters(Json(b): Json<Value>) -> Json<Value> {
-    let keys: Vec<Value> = b["meters"]
+async fn declare_meters(State(p): State<Shared>, Json(b): Json<Value>) -> Json<Value> {
+    let keys: Vec<String> = b["meters"]
         .as_array()
-        .map(|m| m.iter().map(|m| m["key"].clone()).collect())
+        .map(|m| {
+            m.iter()
+                .filter_map(|m| m["key"].as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
+    p.lock().unwrap().declared.push(keys.clone());
     Json(json!({"declared": keys, "rejected": []}))
+}
+
+/// Wait until the mock platform has accepted a meter declaration.
+async fn wait_until_declared(mock: &Shared) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while mock.lock().unwrap().declared.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the shipper declared its usage meters");
 }
 
 async fn start_platform() -> (String, Shared) {
@@ -2020,6 +2038,9 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         // The shipper's poll is an hour here; nothing has shipped it yet, so
         // what arrives below was sent by the flush on the way out.
         assert!(mock.lock().unwrap().received.is_empty());
+        // A stop that beat the declaration would skip the final flush, so
+        // wait for the platform to have accepted the declaration first.
+        wait_until_declared(&mock).await;
         stop.send(()).unwrap();
         mock
     };
@@ -2034,6 +2055,14 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         boot.isolation
     );
     let received = mock.lock().unwrap().received.clone();
+    let declared = mock.lock().unwrap().declared.clone();
+    assert_eq!(declared.len(), 1, "declared once, before the flush");
+    let mut keys = declared[0].clone();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["otto-cxp/responses_collected", "otto-cxp/surveys_sent"]
+    );
     assert_eq!(
         received.len(),
         1,
@@ -2059,6 +2088,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
         r#"tenant isolation enforced as role "otto_app""#,
         "the otto platform accepted this service's credential",
         "cxp-server listening",
+        "declared usage meters",
         "flushing usage",
         "stopped",
     ] {
@@ -2328,6 +2358,7 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
         },
     );
     let check_pool = pool.clone();
+    let declared_mock = mock.clone();
     let client = async move {
         let http = reqwest::Client::new();
         let base = format!("http://{addr}");
@@ -2391,6 +2422,9 @@ async fn the_service_runs_whole_as_a_least_privilege_database_owner(pool: PgPool
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // A stop that beat the declaration would skip the final flush, so
+        // wait for the platform to have accepted the declaration first.
+        wait_until_declared(&declared_mock).await;
         stop.send(()).unwrap();
     };
     let (boot, ()) = tokio::join!(server, client);

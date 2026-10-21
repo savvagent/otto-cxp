@@ -16,8 +16,8 @@
 //! - **Shipping is a background task** ([`run`]) that first declares the
 //!   meters, then posts rows (with their `meter` and `quantity`) to the
 //!   platform and deletes what it answered for. Nothing ships until the
-//!   declaration is answered; the rows wait in the outbox. The platform dedupes on the
-//!   row's `event_id`, so retries are free.
+//!   declaration is answered; the rows wait in the outbox. The platform
+//!   dedupes on the row's `event_id`, so retries are free.
 //! - **Only the rows' own faults give a row up.** A row the platform refuses
 //!   in its receipt moves to `usage_outbox_rejected` with the reason, logged
 //!   at `error`. A whole-batch 4xx refusal is split in halves and resent
@@ -571,6 +571,10 @@ impl ShipError {
 /// - Any other failure keeps the rows it covers, and every piece not yet
 ///   sent, for the next pass. Only failures about the rows themselves
 ///   ([`ShipError::faults_the_rows`]) count toward [`MAX_ROW_FAILURES`].
+/// - A metered row whose quantity the platform would refuse (above
+///   `MAX_METER_QUANTITY`) is never sent: it moves to `usage_outbox_rejected`
+///   with the reason `invalid_quantity`, and is counted in the returned
+///   number. If every claimed row is like that, no request is made.
 ///
 /// A receipt is trusted only if it accounts for every event exactly once:
 /// its counts add up to the batch, and its rejected ids are distinct and all
@@ -611,20 +615,24 @@ pub async fn ship_once(
     // (and never with a guessed quantity): it moves straight to
     // `usage_outbox_rejected`. The outbox CHECK makes a missing or
     // non-positive quantity unreachable; only one above the cap can get here.
-    let (rows, invalid): (Vec<Row>, Vec<Row>) = rows
-        .into_iter()
-        .partition(|r| r.shippable_quantity().is_some());
-    if !invalid.is_empty() {
-        let invalid_ids: Vec<i64> = invalid.iter().map(|r| r.id).collect();
+    let mut shippable: Vec<(Row, Option<u64>)> = Vec::with_capacity(claimed);
+    let mut invalid_ids: Vec<i64> = Vec::new();
+    for r in rows {
+        match r.shippable_quantity() {
+            Some(quantity) => shippable.push((r, quantity)),
+            None => invalid_ids.push(r.id),
+        }
+    }
+    if !invalid_ids.is_empty() {
         reject_invalid_quantity(db, &invalid_ids).await?;
     }
-    if rows.is_empty() {
+    if shippable.is_empty() {
         return Ok(claimed);
     }
-    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let events: Vec<UsageEvent> = rows
+    let ids: Vec<i64> = shippable.iter().map(|(r, _)| r.id).collect();
+    let events: Vec<UsageEvent> = shippable
         .iter()
-        .map(|r| UsageEvent {
+        .map(|(r, quantity)| UsageEvent {
             event_id: r.event_id,
             org_id: r.org_id,
             user_id: r.user_id,
@@ -633,7 +641,7 @@ pub async fn ship_once(
             occurred_at: r.occurred_at,
             service: None,
             meter: r.meter.clone(),
-            quantity: r.shippable_quantity().flatten(),
+            quantity: *quantity,
         })
         .collect();
 
@@ -937,12 +945,16 @@ async fn waiting(db: &Db) -> std::result::Result<i64, sqlx::Error> {
 /// [`ShipperConfig::max_backoff`]) until the platform answers. Returns `false`
 /// if `shutdown` came first.
 ///
-/// A transport error, a 5xx, or a `409 service_not_set` retries. Nothing ships
-/// meanwhile and the outbox keeps every row, so a platform that cannot take the
+/// Every failure retries: a transport error, any status (5xx, 401, 409
+/// `service_not_set`, any other 4xx), and an answer this client cannot decode.
+/// Nothing may ship until the platform accepts the declaration (a metered
+/// event for an undeclared meter would be refused and moved aside), and the
+/// outbox keeps every row meanwhile, so a platform that cannot take the
 /// declaration delays billing and loses none. On the first failure, then at
-/// most once a minute, it logs at `error` with the status (or "transport") and
-/// the number of rows waiting (one `count(*)` per log, so the small shared
-/// database is not polled); the platform's text is `debug` only.
+/// most once a minute, it logs at `error` with the kind of failure (the
+/// status, `"decode"`, `"invalid_url"`, or `"transport"`) and the number of
+/// rows waiting (one `count(*)` per log, so the small shared database is not
+/// polled); the platform's text is `debug` only.
 ///
 /// A receipt that rejects a key is not a failure to retry: the same
 /// declaration would be refused again. Each rejected key is logged at `error`
@@ -971,8 +983,19 @@ async fn declare_meters(
         let e = match result {
             Ok(receipt) => {
                 for r in &receipt.rejected {
-                    tracing::error!(key = %r.key, "the platform refused to declare a usage meter; \
-                         its usage will be refused until the declaration is fixed");
+                    // Only our own constant key is logged at `error`; what the
+                    // platform echoed back stays at `debug`.
+                    match METER_DECLARATIONS.iter().find(|(key, _, _)| *key == r.key) {
+                        Some((key, _, _)) => tracing::error!(
+                            key = *key,
+                            "the platform refused to declare a usage meter; its usage will be \
+                             refused until the declaration is fixed"
+                        ),
+                        None => tracing::error!(
+                            "the platform refused to declare an undeclared key; its usage will \
+                             be refused until the declaration is fixed"
+                        ),
+                    }
                     tracing::debug!(key = %r.key, platform_text = %r.reason, "usage meter refused");
                 }
                 tracing::info!(
@@ -993,17 +1016,24 @@ async fn declare_meters(
                     None
                 }
             };
-            let status = match &e {
-                otto_resource::Error::Status { status, .. } => Some(*status),
-                otto_resource::Error::Unauthorized => Some(401),
-                otto_resource::Error::NotFound => Some(404),
-                _ => None,
+            let kind = match &e {
+                otto_resource::Error::Status { status, .. } => status.to_string(),
+                otto_resource::Error::Unauthorized => "401".to_string(),
+                otto_resource::Error::NotFound => "404".to_string(),
+                otto_resource::Error::Decode(_) => "decode".to_string(),
+                otto_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
+                _ => "transport".to_string(),
+            };
+            let hint = if matches!(e, otto_resource::Error::Unauthorized) {
+                " Check CXP_INTROSPECTION_SECRET."
+            } else {
+                ""
             };
             tracing::error!(
-                status = status.map_or("transport".to_string(), |s| s.to_string()),
+                status = kind,
                 ?rows_waiting,
                 "could not declare the usage meters; no usage ships until they are declared \
-                 (rows stay queued and nothing is lost). Retrying"
+                 (rows stay queued and nothing is lost). Retrying.{hint}"
             );
             tracing::debug!(error = %e, "could not declare the usage meters");
         }
@@ -1038,6 +1068,12 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ShipError> {
     if !declare_meters(&db, &platform, &cfg, &mut shutdown).await {
+        let rows_waiting = waiting(&db).await.ok();
+        tracing::warn!(
+            ?rows_waiting,
+            "shutting down before the usage meters were declared; no final flush, the rows \
+             stay queued for the next start"
+        );
         return Ok(());
     }
     let mut failures: u32 = 0;

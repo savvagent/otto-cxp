@@ -79,8 +79,10 @@ struct Platform {
     /// Every usage event as it came over the wire, so a test can tell an
     /// absent `meter` from a null one.
     raw_events: Vec<Value>,
-    /// The keys of every `PUT /internal/meters` request, in order.
+    /// The keys of every declaration the platform accepted, in order.
     declared: Vec<Vec<String>>,
+    /// How many `PUT /internal/meters` requests arrived, answered or not.
+    declare_attempts: usize,
     /// Answer every declaration with this status instead.
     declare_status: Option<StatusCode>,
     /// Answer every declaration with 409 `service_not_set`.
@@ -136,7 +138,7 @@ async fn declare(
 ) -> Result<Json<MeterDeclarationReceipt>, (StatusCode, Json<Value>)> {
     let mut p = p.lock().unwrap();
     let keys: Vec<String> = b.meters.iter().map(|m| m.key.clone()).collect();
-    p.declared.push(keys.clone());
+    p.declare_attempts += 1;
     if let Some(status) = p.declare_status {
         return Err((status, Json(json!({"error": "unavailable"}))));
     }
@@ -147,7 +149,7 @@ async fn declare(
         ));
     }
     let mut receipt = MeterDeclarationReceipt::default();
-    for key in keys {
+    for key in keys.clone() {
         if p.declare_reject.contains(&key) {
             receipt.rejected.push(RejectedMeter {
                 key,
@@ -157,6 +159,7 @@ async fn declare(
             receipt.declared.push(key);
         }
     }
+    p.declared.push(keys);
     Ok(Json(receipt))
 }
 
@@ -1566,6 +1569,7 @@ async fn run_ships_nothing_while_declaring_fails_and_loses_nothing(pool: PgPool)
             p.declare_status = failure;
             p.declare_service_not_set = failure.is_none();
             p.declared.clear();
+            p.declare_attempts = 0;
             p.declared_before_ship.clear();
         }
 
@@ -1577,7 +1581,7 @@ async fn run_ships_nothing_while_declaring_fails_and_loses_nothing(pool: PgPool)
             shutdown,
         ));
         tokio::time::timeout(Duration::from_secs(10), async {
-            while stub.lock().unwrap().declared.len() < 3 {
+            while stub.lock().unwrap().declare_attempts < 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1585,6 +1589,7 @@ async fn run_ships_nothing_while_declaring_fails_and_loses_nothing(pool: PgPool)
         .expect("declaration is retried");
         {
             let p = stub.lock().unwrap();
+            assert!(p.declared.is_empty(), "never accepted");
             assert!(p.declared_before_ship.is_empty(), "nothing shipped");
         }
         assert_eq!(outbox(&pool).await.len(), 1, "the row stays");
@@ -1627,11 +1632,21 @@ async fn a_receipt_refusing_one_meter_still_lets_the_other_ship(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
     let meter = Meter::new(platform.clone(), "https://x");
-    charge_tool(&db, &meter, org(), "submit_feedback").await;
-    stub.lock()
-        .unwrap()
-        .declare_reject
-        .insert("otto-cxp/surveys_sent".into());
+    let o = org();
+    charge_tool(&db, &meter, o, "submit_feedback").await;
+    charge_tool(&db, &meter, o, "send_survey").await;
+    let survey_event: Uuid =
+        sqlx::query_scalar("SELECT event_id FROM usage_outbox WHERE tool = $1")
+            .bind("send_survey")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    {
+        let mut p = stub.lock().unwrap();
+        p.declare_reject.insert("otto-cxp/surveys_sent".into());
+        // The platform answers for the undeclared meter's event itself.
+        p.reject.insert(survey_event);
+    }
 
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let shipper = tokio::spawn(usage::run(
@@ -1644,10 +1659,64 @@ async fn a_receipt_refusing_one_meter_still_lets_the_other_ship(pool: PgPool) {
     stop.send(true).unwrap();
     shipper.await.unwrap().unwrap();
 
-    let p = stub.lock().unwrap();
-    assert_eq!(p.declared.len(), 1, "declared once, not retried");
-    assert_eq!(p.raw_events.len(), 1);
-    assert_eq!(p.raw_events[0]["meter"], "otto-cxp/responses_collected");
+    {
+        let p = stub.lock().unwrap();
+        assert_eq!(p.declare_attempts, 1, "declared once, not retried");
+        assert_eq!(p.declared.len(), 1);
+        assert_eq!(p.raw_events.len(), 2, "the refused meter's row is sent too");
+        let sent_meters: HashSet<&str> = p
+            .raw_events
+            .iter()
+            .map(|e| e["meter"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sent_meters,
+            HashSet::from(["otto-cxp/responses_collected", "otto-cxp/surveys_sent"])
+        );
+    }
+    // The platform's per-event answer decides it: refused, so moved aside.
+    assert_eq!(
+        rejected_rows(&pool).await,
+        vec![(survey_event, "unknown org".to_string())]
+    );
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn rows_that_all_have_an_invalid_quantity_send_no_request(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let o = org();
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO usage_outbox (org_id, tool, billable, meter, quantity) \
+             VALUES ($1, 'send_survey', true, 'otto-cxp/surveys_sent', $2)",
+        )
+        .bind(o.as_uuid())
+        .bind(otto_resource::MAX_METER_QUANTITY as i64 + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        usage::ship_once(&db, &platform, &ShipperConfig::default())
+            .await
+            .unwrap(),
+        2,
+        "the claimed count"
+    );
+    {
+        let p = stub.lock().unwrap();
+        assert!(p.batch_sizes.is_empty(), "no usage request was sent");
+        assert!(p.raw_events.is_empty());
+    }
+    assert!(outbox(&pool).await.is_empty());
+    let reasons: Vec<String> = rejected_rows(&pool)
+        .await
+        .into_iter()
+        .map(|r| r.1)
+        .collect();
+    assert_eq!(reasons, vec!["invalid_quantity"; 2]);
 }
 
 // ---------------------------------------------------------------------- auth
