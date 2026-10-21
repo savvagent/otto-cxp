@@ -249,7 +249,6 @@ where
         resource_uri = %config.resource_uri,
         platform_url = %config.platform_url,
         allowed_hosts = ?config.allowed_hosts(),
-        enforce_quotas = config.enforce_quotas,
         "cxp-server listening"
     );
 

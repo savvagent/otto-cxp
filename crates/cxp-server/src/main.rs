@@ -20,6 +20,12 @@ async fn main() -> Result<()> {
          variables named above in the deployment",
     )?;
     init_tracing(config.log_format);
+    for name in cxp_server::config::retired_vars(|n| std::env::var(n).ok()) {
+        tracing::warn!(
+            "{name} is retired and ignored: billable calls are refused whenever the platform \
+             reports the org blocked (budget_exceeded, payment_required)"
+        );
+    }
     if let Ok(path) = dotenv {
         tracing::debug!(path = %path.display(), "loaded .env");
     }

@@ -191,10 +191,7 @@ async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
     let (base, platform) = start_platform().await;
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
-    let meter = Arc::new(Meter::new(
-        client.clone(),
-        format!("{base}/settings/billing"),
-    ));
+    let meter = Arc::new(Meter::new(client.clone(), base.clone()));
     let app = router(
         Db::from_pool(pool.clone()),
         client,
