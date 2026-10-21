@@ -264,7 +264,7 @@ or grant: the existing RLS policies and grants cover new columns.
   agents.
 - `budget: Option<BudgetOut>`, mirroring `BudgetStatus`: `{monthlyBudgetCents, spendCents,
   percentUsed, thresholdsReached, hardStop, blocked, reason}`.
-- `blockedReason: Option<String>`, the platform's value as is.
+- `blockedReason: Option<String>`: the code a billable call would be refused with now (`budget_exceeded` or `payment_required`), else null. Implementation note: it was first specified as the platform's raw value; review changed it so the report always matches the refusal, including an unknown future reason or a blocked budget with no reason.
 
 The legacy fields (`plan`, `includedOps`, `billableUsed`, `remaining`, `totalCalls`,
 `periodStart`, `hardStop`) stay, so no consumer breaks, and are documented as deprecated.
