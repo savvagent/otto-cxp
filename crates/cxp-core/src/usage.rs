@@ -992,7 +992,7 @@ async fn declare_meters(
                              refused until the declaration is fixed"
                         ),
                         None => tracing::error!(
-                            "the platform refused to declare an undeclared key; its usage will \
+                            "the platform refused a meter key this service did not send (see debug); its usage will \
                              be refused until the declaration is fixed"
                         ),
                     }
