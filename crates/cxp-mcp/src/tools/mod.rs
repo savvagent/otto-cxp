@@ -190,8 +190,9 @@ mod tests {
         while let Some(at) = rest.find(".charge(") {
             rest = &rest[at + ".charge(".len()..];
             let call = &rest[..rest.find(')').unwrap_or(rest.len())];
-            // `self.charge(&mut tx, &caller, "name")`: the last argument.
-            let last = call.rsplit(',').next().unwrap_or("").trim();
+            // `self.charge(&mut tx, &caller, "name", &warmed)`: the third
+            // argument, the tool's name.
+            let last = call.split(',').nth(2).unwrap_or("").trim();
             let name = last
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
@@ -225,7 +226,7 @@ mod tests {
             .collect();
         billable.sort();
         assert_eq!(charged, billable);
-        // And only they look the quota up at the platform.
+        // And only they look up at the platform whether billing is blocked.
         let warmed: usize = SOURCES
             .iter()
             .map(|(_, src)| src.matches("self.warm_quota(").count())
@@ -246,7 +247,7 @@ mod tests {
                 .map_or(body.len(), |i| i + 1);
             let body = &body[..end];
             let charge = body
-                .find(&format!(".charge(&mut tx, &caller, \"{tool}\")"))
+                .find(&format!(".charge(&mut tx, &caller, \"{tool}\", &warmed)"))
                 .unwrap_or_else(|| panic!("{tool} does not charge itself"));
             let tx = body.find("self.tx(&caller)").expect("opens a transaction");
             let commit = body.find("tx.commit()").expect("commits");
@@ -254,12 +255,12 @@ mod tests {
                 tx < charge && charge < commit,
                 "{tool} charges outside its transaction"
             );
-            // The quota lookup is a network call: made before the
+            // The billing lookup is a network call: made before the
             // transaction holds a pooled connection.
             let warm = body
-                .find("self.warm_quota(&caller)")
-                .unwrap_or_else(|| panic!("{tool} does not warm the quota"));
-            assert!(warm < tx, "{tool} warms the quota inside its transaction");
+                .find("let warmed = self.warm_quota(&caller)")
+                .unwrap_or_else(|| panic!("{tool} does not look billing up"));
+            assert!(warm < tx, "{tool} looks billing up inside its transaction");
             // Before its write: the domain call of the same name follows the
             // charge, and does not precede it.
             assert!(

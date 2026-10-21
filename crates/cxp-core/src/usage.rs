@@ -119,6 +119,18 @@ pub struct Meter {
     pub upgrade_url: String,
 }
 
+/// An org's billing standing, looked up by [`Meter::warm`] before a billable
+/// tool opens its transaction and spent by [`Meter::charge`] inside it. It
+/// is bound to the org it was looked up for (not `Clone`), so a charge
+/// cannot be made against another org's standing.
+#[derive(Debug)]
+#[must_use = "pass it to Meter::charge"]
+pub struct Warmed {
+    org: OrgId,
+    /// `None` when the platform gave no answer: the charge fails open.
+    status: Option<UsageStatus>,
+}
+
 impl std::fmt::Debug for Meter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Meter")
@@ -136,11 +148,23 @@ impl Meter {
         }
     }
 
-    /// Look the org's standing up before a transaction opens, so a slow
-    /// platform never holds a pooled connection. [`Meter::charge`] then reads
-    /// the platform client's cached answer.
-    pub async fn warm(&self, org: OrgId) {
-        let _ = self.status_for(org).await;
+    /// Look up whether the org's billing is blocked, before the tool's
+    /// transaction opens, and hand the answer to [`Meter::charge`]. This is
+    /// the only place a billable call waits on the platform, so a slow
+    /// platform never holds a pooled connection: `charge` makes no platform
+    /// call of its own. With no answer from the platform the [`Warmed`]
+    /// carries none, and `charge` fails open.
+    ///
+    /// ```text
+    /// let warmed = meter.warm(org).await;
+    /// let mut tx = begin_live(&db, org, Some(user)).await?;
+    /// meter.charge(&mut tx, user, "send_survey", &warmed).await?;
+    /// ```
+    pub async fn warm(&self, org: OrgId) -> Warmed {
+        Warmed {
+            org,
+            status: self.status_for(org).await,
+        }
     }
 
     /// Record one call of a [`BILLABLE`] tool in `tx`, on its meter with
@@ -149,10 +173,22 @@ impl Meter {
     /// programming error in the caller, not the agent's request: it is
     /// refused with [`Error::Internal`] without recording anything.
     ///
+    /// Makes no platform call, so the transaction's connection never waits
+    /// on the platform: the standing is the one [`Meter::warm`] looked up
+    /// before the transaction opened. A `warmed` for another org than the
+    /// transaction's is a programming error ([`Error::Internal`]); nothing is
+    /// recorded.
+    ///
     /// Fails open: with no answer from the platform, the call is recorded.
     /// The refusal is soft at the boundary: concurrent calls can each pass a
-    /// cached status just before it turns blocked.
-    pub async fn charge(&self, tx: &mut Tx<'_>, user: UserId, tool: &str) -> Result<()> {
+    /// status looked up just before it turns blocked.
+    pub async fn charge(
+        &self,
+        tx: &mut Tx<'_>,
+        user: UserId,
+        tool: &str,
+        warmed: &Warmed,
+    ) -> Result<()> {
         let Some(meter) = meter_for(tool) else {
             tracing::error!(tool, "refusing to meter a tool that is not billable");
             return Err(Error::Internal(format!(
@@ -161,7 +197,13 @@ impl Meter {
             )));
         };
         let org = tx.org();
-        if let Some(reason) = self.status_for(org).await.as_ref().and_then(blocked_reason) {
+        if warmed.org != org {
+            tracing::error!(tool, "refusing to charge with another org's standing");
+            return Err(Error::Internal(format!(
+                "the standing looked up for one org was used to charge {tool} in another"
+            )));
+        }
+        if let Some(reason) = warmed.status.as_ref().and_then(blocked_reason) {
             return Err(Error::BillingBlocked {
                 reason,
                 tool: tool.to_string(),
@@ -286,18 +328,21 @@ pub struct Status {
     /// **Deprecated** (the family-wide bucket): never refuses anything.
     pub hard_stop: bool,
     /// Whether this server refuses billable calls while billing is blocked.
-    /// Always true.
+    /// Always true; kept so existing readers of the field keep working.
     pub enforced: bool,
-    /// The service the platform reports these meters and budget for.
+    /// The service the platform reports these meters and budget for. `None`
+    /// from an older platform that does not name it, or before the operator
+    /// assigns this service a slug.
     pub service: Option<String>,
     /// This month's usage of each meter this service declares, in
     /// [`METER_DECLARATIONS`] order; 0 for one with no usage yet.
     pub meters: Vec<MeterOut>,
     /// This service's monthly budget, if the org has set one.
     pub budget: Option<BudgetOut>,
-    /// Why billable calls are refused now (`budget_exceeded`,
-    /// `payment_required`), as the platform gives it; `None` while they are
-    /// not.
+    /// Why billable calls are refused now: `payment_required`, or
+    /// `budget_exceeded` for every other block (including a reason this
+    /// build does not know and a blocked budget with no reason), exactly as
+    /// [`Meter::charge`] refuses them; `None` while they are not.
     pub blocked_reason: Option<String>,
 }
 
@@ -356,6 +401,7 @@ impl Status {
                 .as_ref()
                 .and_then(|b| b.percent_used)
                 .is_some_and(|p| p >= WARN_AT_PERCENT);
+        let refused_with = blocked_reason(&u).map(|r| r.code().to_string());
         let meters = METER_DECLARATIONS
             .iter()
             .map(|(key, display_name, unit)| MeterOut {
@@ -378,7 +424,7 @@ impl Status {
             service: u.service,
             meters,
             budget: u.budget.map(BudgetOut::from),
-            blocked_reason: u.blocked_reason,
+            blocked_reason: refused_with,
         }
     }
 }
@@ -1087,6 +1133,26 @@ mod tests {
         );
         assert_eq!(s.blocked_reason.as_deref(), Some("budget_exceeded"));
         assert!(s.enforced);
+
+        // It reports what `Meter::charge` refuses with: a reason this build
+        // does not know, and a blocked budget with no reason, are both
+        // `budget_exceeded`; `payment_required` stays its own.
+        let reported = |reason: Option<&str>, budget_blocked: bool| {
+            let mut u = usage(0, 0);
+            u.blocked_reason = reason.map(str::to_string);
+            u.budget = budget_blocked.then(|| budget(Some(120), true));
+            Status::new(u).blocked_reason
+        };
+        assert_eq!(
+            reported(Some("something_new"), false).as_deref(),
+            Some("budget_exceeded")
+        );
+        assert_eq!(reported(None, true).as_deref(), Some("budget_exceeded"));
+        assert_eq!(
+            reported(Some("payment_required"), false).as_deref(),
+            Some("payment_required")
+        );
+        assert_eq!(reported(None, false), None);
 
         let s = Status::new(usage(0, 10));
         assert_eq!((s.budget, s.blocked_reason), (None, None));

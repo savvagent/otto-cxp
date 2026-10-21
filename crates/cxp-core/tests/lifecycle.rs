@@ -932,9 +932,10 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
     let meter = Meter::new(platform, "https://otto.example.com");
     let (o, u) = (org(), user());
 
+    let warmed = meter.warm(o).await;
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
     for tool in usage::BILLABLE {
-        meter.charge(&mut tx, u, tool).await.unwrap();
+        meter.charge(&mut tx, u, tool, &warmed).await.unwrap();
     }
     for free in [
         "create_survey",
@@ -945,7 +946,7 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
         "",
     ] {
         // Metering a free tool is the server's bug, not the agent's request.
-        let err = meter.charge(&mut tx, u, free).await.unwrap_err();
+        let err = meter.charge(&mut tx, u, free, &warmed).await.unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "{free}: {err:?}");
         assert_eq!(err.code(), "internal", "{free}: {err}");
         assert!(err.is_internal() && !err.retriable(), "{free}");
@@ -993,7 +994,10 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
 
     // A call whose transaction rolls back leaves no record.
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    meter.charge(&mut tx, u, "submit_feedback").await.unwrap();
+    meter
+        .charge(&mut tx, u, "submit_feedback", &warmed)
+        .await
+        .unwrap();
     tx.rollback().await.unwrap();
     assert_eq!(count(&pool, "usage_outbox", o).await, 3);
 }
@@ -1010,14 +1014,17 @@ async fn an_enforcing_meter_refuses_an_org_out_of_budget(pool: PgPool) {
         let (platform, stub) = start_platform().await;
         stub.lock().unwrap().blocked_reason = Some(reason.into());
         let meter = Meter::new(platform, "https://otto.example.com");
-        meter.warm(o).await;
+        let warmed = meter.warm(o).await;
 
         let report = meter.report(o).await.unwrap();
         assert_eq!(report.blocked_reason.as_deref(), Some(reason));
         assert!(report.warning && report.enforced, "{reason}");
 
         let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-        let err = meter.charge(&mut tx, u, "send_survey").await.unwrap_err();
+        let err = meter
+            .charge(&mut tx, u, "send_survey", &warmed)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), reason, "{err}");
         assert!(!err.retriable() && !err.is_internal(), "{reason}");
         assert!(err.to_string().contains("send_survey"), "{err}");
@@ -1059,10 +1066,38 @@ async fn an_enforcing_meter_refuses_an_org_out_of_budget(pool: PgPool) {
         meters,
         [(usage::SURVEYS_SENT, 0), (usage::RESPONSES_COLLECTED, 12)]
     );
+    let warmed = meter.warm(o).await;
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    meter.charge(&mut tx, u, "send_survey").await.unwrap();
+    meter
+        .charge(&mut tx, u, "send_survey", &warmed)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(count(&pool, "usage_outbox", o).await, 1);
+}
+
+/// A standing looked up for one org is not valid in another org's
+/// transaction: a programming error, refused with nothing recorded, even
+/// when the standing would have allowed the call.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn a_warmed_standing_is_refused_in_another_orgs_transaction(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, _) = start_platform().await;
+    let meter = Meter::new(platform, "https://x");
+    let (a, b, u) = (org(), org(), user());
+    let warmed_for_a = meter.warm(a).await;
+
+    let mut tx = begin_live(&db, b, Some(u)).await.unwrap();
+    let err = meter
+        .charge(&mut tx, u, "send_survey", &warmed_for_a)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(err.is_internal() && !err.retriable(), "{err}");
+    tx.commit().await.unwrap();
+    for o in [a, b] {
+        assert_eq!(count(&pool, "usage_outbox", o).await, 0);
+    }
 }
 
 /// If the platform cannot say whether billing is blocked, billable work is
@@ -1072,9 +1107,12 @@ async fn an_enforcing_meter_fails_open(pool: PgPool) {
     let db = db(pool.clone());
     let meter = Meter::new(client("http://127.0.0.1:1"), "https://x");
     let (o, u) = (org(), user());
-    meter.warm(o).await;
+    let warmed = meter.warm(o).await;
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    meter.charge(&mut tx, u, "submit_feedback").await.unwrap();
+    meter
+        .charge(&mut tx, u, "submit_feedback", &warmed)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(count(&pool, "usage_outbox", o).await, 1);
     assert_eq!(meter.report(o).await.unwrap_err().code(), "unavailable");
@@ -1082,10 +1120,11 @@ async fn an_enforcing_meter_fails_open(pool: PgPool) {
 
 async fn charge_n(db: &Db, meter: &Meter, o: OrgId, n: usize) {
     let u = user();
+    let warmed = meter.warm(o).await;
     let mut tx = begin_live(db, o, Some(u)).await.unwrap();
     for _ in 0..n {
         meter
-            .charge(&mut tx, u, "submit_survey_response")
+            .charge(&mut tx, u, "submit_survey_response", &warmed)
             .await
             .unwrap();
     }
@@ -1696,8 +1735,7 @@ async fn a_failed_settle_still_reschedules_the_failed_pieces(pool: PgPool) {
 }
 
 /// However long the platform stays unreachable, the rows stay in the outbox
-/// (and keep counting toward their period's quota): an outage is not the
-/// rows' fault.
+/// (unshipped, and only retried): an outage is not the rows' fault.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn an_unreachable_platform_never_gives_usage_up(pool: PgPool) {
     let db = db(pool.clone());

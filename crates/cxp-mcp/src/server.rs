@@ -9,18 +9,19 @@
 //! `platform_events::begin_live`, the only way a request reaches tenant data.
 //!
 //! **A tool body:** check the scope, open the transaction, do one thing,
-//! commit. The three billable tools also warm the quota
+//! commit. The three billable tools also look up whether billing is blocked
 //! ([`Cxp::warm_quota`]) before the transaction and charge inside it
-//! ([`Cxp::charge`]): a failed call is never billed. Besides the platform's
-//! token introspection (every request, in the auth middleware), only they
-//! (the quota) and the free `whoami` and `usage` (the caller's membership and
-//! the org's usage report) call the platform; no other tool does.
+//! ([`Cxp::charge`], with that answer): a failed call is never billed.
+//! Besides the platform's token introspection (every request, in the auth
+//! middleware), only they (the billing lookup) and the free `whoami` and
+//! `usage` (the caller's membership and the org's usage report) call the
+//! platform; no other tool does, and no charge does inside a transaction.
 
 use std::sync::Arc;
 
 use cxp_core::auth::{MissingScope, Principal};
 use cxp_core::search::{SearchLimiter, SearchPermit};
-use cxp_core::usage::Meter;
+use cxp_core::usage::{Meter, Warmed};
 use otto_resource::PlatformClient;
 use otto_tenant::{Db, Tx};
 use rmcp::handler::server::tool::ToolRouter;
@@ -132,25 +133,30 @@ impl Cxp {
         Ok((permit, tx))
     }
 
-    /// Look the org's quota standing up at the platform, before a billable
-    /// tool opens its transaction, so the network call never holds a pooled
-    /// connection. Only the three `cxp_core::usage::BILLABLE` tools call this;
-    /// of the rest, only `whoami` and `usage` call the platform (for the
-    /// caller's membership and the org's usage report).
-    pub async fn warm_quota(&self, caller: &Principal) {
-        self.meter.warm(caller.org_id).await;
+    /// Look up at the platform whether the org's billing is blocked, before
+    /// a billable tool opens its transaction, so the network call never
+    /// holds a pooled connection. Only the three `cxp_core::usage::BILLABLE`
+    /// tools call this; of the rest, only `whoami` and `usage` call the
+    /// platform (for the caller's membership and the org's usage report).
+    pub async fn warm_quota(&self, caller: &Principal) -> Warmed {
+        self.meter.warm(caller.org_id).await
     }
 
     /// Record one call of a billable tool (and refuse it while the org's
-    /// billing is blocked), inside the tool's own transaction and before its write. Only
-    /// the three `cxp_core::usage::BILLABLE` tools call this.
+    /// billing is blocked, per `warmed`), inside the tool's own transaction
+    /// and before its write. Makes no platform call. Only the three
+    /// `cxp_core::usage::BILLABLE` tools call this.
     pub async fn charge(
         &self,
         tx: &mut Tx<'_>,
         caller: &Principal,
         tool: &str,
+        warmed: &Warmed,
     ) -> Result<(), ErrorData> {
-        self.meter.charge(tx, caller.user_id, tool).await.mcp()
+        self.meter
+            .charge(tx, caller.user_id, tool, warmed)
+            .await
+            .mcp()
     }
 }
 

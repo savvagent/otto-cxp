@@ -175,6 +175,8 @@ fn token(p: &Shared, org: Uuid, scopes: &[&str]) -> String {
 // ------------------------------------------------------------------ harness
 
 struct Harness {
+    /// The mock platform's base URL, which the upgrade URL starts with.
+    base: String,
     app: Router,
     pool: PgPool,
     platform: Shared,
@@ -206,6 +208,7 @@ async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
     )
     .unwrap();
     Harness {
+        base,
         app,
         pool,
         platform,
@@ -901,8 +904,15 @@ async fn an_org_out_of_budget_is_refused_billable_calls(pool: PgPool) {
     assert_eq!(refused["data"]["retriable"], false);
     let message = refused["message"].as_str().unwrap();
     assert!(message.contains("send_survey"), "{refused}");
-    assert!(message.contains("settings/billing"), "{refused}");
+    assert!(message.contains(&h.base), "{refused}");
     assert!(h.charged(org).await.is_empty());
+    let responses: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM survey_responses WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(responses, 0, "a refused send_survey wrote a response");
 
     let usage = h.tool(&writer, "usage", json!({})).await.unwrap();
     assert_eq!(

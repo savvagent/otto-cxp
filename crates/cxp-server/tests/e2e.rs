@@ -10,9 +10,9 @@
 //!    pointer; discovery and health are open;
 //! 2. org B cannot read or write org A's rows through any tool or route, and
 //!    the boot-time isolation proof passes;
-//! 3. `whoami`/`usage` work, exactly the four billable tools (and
-//!    `POST /api/v1/surveys`) ship one usage event each, and a replayed
-//!    shipment is accepted;
+//! 3. `whoami`/`usage` work, exactly the three billable tools ship one
+//!    usage event each (REST ships nothing), and a replayed shipment is
+//!    accepted;
 //! 4. lifecycle webhooks are verified and applied once.
 //!
 //! And for #16: the whole service runs as a least-privilege database owner,
@@ -1609,8 +1609,8 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
     }
 
     // Every route in cxp-api's table, once each: none ships anything (POST
-    // /api/v1/surveys is free, as create_survey is). Deletes go last (each on a row made for it),
-    // so every other route has something to act on.
+    // /api/v1/surveys is free, as create_survey is). Deletes go last (each
+    // on a row made for it), so every other route has something to act on.
     let mut routes = cxp_api::route_table();
     routes.sort_by_key(|(m, _)| *m == Method::DELETE);
     let mut catalog: HashMap<&str, String> = HashMap::new();

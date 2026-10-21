@@ -4,9 +4,8 @@
 //! (`insufficient_scope`, `not_found`, `invalid_argument`, `conflict`,
 //! `unknown_team`, `access_revoked`, `budget_exceeded`, `payment_required`,
 //! `unavailable`, `query_too_broad`, `internal`, and `unauthenticated` for a
-//! surface mounted
-//! without its middleware) and `data.retriable` says whether repeating the call unchanged
-//! could succeed.
+//! surface mounted without its middleware) and `data.retriable` says whether
+//! repeating the call unchanged could succeed.
 //!
 //! `cxp_core::Error`'s `Display` never carries database or platform text, so
 //! the message is passed through as is; server-side failures are logged here
