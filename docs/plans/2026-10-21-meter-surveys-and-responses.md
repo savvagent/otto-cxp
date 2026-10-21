@@ -293,9 +293,8 @@ Model: sonnet
     Update `run`'s and the module's docs.
 - [ ] **Step 4:** Re-run step 2's command, then every gate. Expected: all pass. The
   `cxp-server` e2e may now need its fake platform to serve `PUT /internal/meters`. If e2e fails
-  for that, and it will (`the_server_boots_serves_and_flushes_usage_on_shutdown` declares
-  before its final flush, and a shutdown during declaration skips the flush). So in this task,
-  unconditionally add `PUT /internal/meters` to the e2e fake platform, answering in the receipt's
+  for that: `the_server_boots_serves_and_flushes_usage_on_shutdown` declares before its final
+  flush, and a shutdown during declaration skips the flush. So in this task, unconditionally add `PUT /internal/meters` to the e2e fake platform, answering in the receipt's
   v0.10.0 shape.
 - [ ] **Step 5:** Commit `feat(core): ship usage meters and declare them before shipping`.
 
@@ -314,11 +313,12 @@ Model: sonnet
     - The server instructions mention `send_survey`, `submit_feedback` and
       `submit_survey_response`, do not call `create_survey` billed, and name both meters.
   - `crates/cxp-api/tests/api.rs`: `POST /api/v1/surveys` for a blocked org returns 200 and writes
-    no `usage_outbox` row. This replaces Task 2's 402 expectation. No route in
+    no `usage_outbox` row. Task 2 already made this a 200. No route in
     `cxp_api::routes()` writes a usage row: extend whatever route-coverage test exists, or
     assert it for the write routes.
 - [ ] **Step 2:** Run `DATABASE_URL=postgres://cxp:cxp@localhost:15435/otto_cxp cargo test -p
-  cxp-mcp -p cxp-api --locked`. Expected: the new tests fail.
+  cxp-mcp -p cxp-api --locked`. Expected: the instructions and description assertions fail.
+  Behavior tests already passing after Task 2 are fine.
 - [ ] **Step 3:** Implement the MCP side. Task 2 already removed the `create_survey` charge.
   - `crates/cxp-mcp/src/tools/feedback.rs`:
     - `create_survey`'s description ends "Needs cxp:write. Free."
