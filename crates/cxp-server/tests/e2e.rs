@@ -1608,8 +1608,8 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
         }
     }
 
-    // Every route in cxp-api's table, once each: only POST /api/v1/surveys
-    // ships, as create_survey. Deletes go last (each on a row made for it),
+    // Every route in cxp-api's table, once each: none ships anything (POST
+    // /api/v1/surveys is free, as create_survey is). Deletes go last (each on a row made for it),
     // so every other route has something to act on.
     let mut routes = cxp_api::route_table();
     routes.sort_by_key(|(m, _)| *m == Method::DELETE);
@@ -1627,29 +1627,18 @@ async fn criterion_3_exactly_the_billable_calls_ship_one_usage_event_each(pool: 
         }
         s.ship().await;
         let new: Vec<String> = s.shipped()[before..].to_vec();
-        if method == Method::POST && path == "/api/v1/surveys" {
-            assert_eq!(new, ["create_survey"], "{method} {path}");
-        } else {
-            assert!(new.is_empty(), "{method} {path} shipped {new:?}");
-        }
+        assert!(new.is_empty(), "{method} {path} shipped {new:?}");
     }
     assert_eq!(s.ship().await, 0, "free routes shipped something");
 
-    // One event per billable call (the second survey was made so DELETE
-    // had one to delete), each with its own event id, for this org and user.
+    // One event per billable tool call, each with its own event id, for this
+    // org and user.
     let received = s.mock.lock().unwrap().received.clone();
     let mut tools: Vec<&str> = received.iter().map(|e| e.tool.as_str()).collect();
     tools.sort_unstable();
     assert_eq!(
         tools,
-        [
-            "create_survey",
-            "create_survey",
-            "create_survey",
-            "send_survey",
-            "submit_feedback",
-            "submit_survey_response"
-        ]
+        ["send_survey", "submit_feedback", "submit_survey_response"]
     );
     let ids: HashSet<Uuid> = received.iter().map(|e| e.event_id).collect();
     assert_eq!(ids.len(), received.len(), "event ids are unique");

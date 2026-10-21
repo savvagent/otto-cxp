@@ -1,8 +1,8 @@
-//! Feedback and surveys, and the analytics over them. The four billable tools
-//! of this service live here: `submit_feedback`, `create_survey`,
-//! `send_survey`, and `submit_survey_response` each charge one usage event in
-//! their own transaction, before their write, so a failed call is never
-//! billed. No other tool charges.
+//! Feedback and surveys, and the analytics over them. The three billable tools
+//! of this service live here: `send_survey`, `submit_feedback`, and
+//! `submit_survey_response` each charge one usage event on their value meter
+//! in their own transaction, before their write, so a failed call is never
+//! billed. No other tool charges; `create_survey` is free.
 
 use cxp_core::analysis::sentiment::{analyze_sentiment, SentimentResult};
 use cxp_core::customers::CustomersExt;
@@ -210,9 +210,7 @@ impl Cxp {
         let caller = self.caller(&parts)?;
         caller.require_write().mcp()?;
         let questions = parse_json("questions", &p.questions).mcp()?;
-        self.warm_quota(&caller).await;
         let mut tx = self.tx(&caller).await?;
-        self.charge(&mut tx, &caller, "create_survey").await?;
         let survey = tx
             .create_survey(&NewSurvey {
                 title: p.title,

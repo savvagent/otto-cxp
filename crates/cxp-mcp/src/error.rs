@@ -2,8 +2,9 @@
 //!
 //! The branch point is machine-readable: `data.code` is stable
 //! (`insufficient_scope`, `not_found`, `invalid_argument`, `conflict`,
-//! `unknown_team`, `access_revoked`, `quota_exceeded`, `unavailable`,
-//! `query_too_broad`, `internal`, and `unauthenticated` for a surface mounted
+//! `unknown_team`, `access_revoked`, `budget_exceeded`, `payment_required`,
+//! `unavailable`, `query_too_broad`, `internal`, and `unauthenticated` for a
+//! surface mounted
 //! without its middleware) and `data.retriable` says whether repeating the call unchanged
 //! could succeed.
 //!
@@ -40,8 +41,9 @@ pub fn from_core(e: &Error) -> ErrorData {
     }
     let rpc = match e.code() {
         // Well-formed calls the server declined (a platform that no longer
-        // knows the org reads as access_revoked too).
-        "access_revoked" | "quota_exceeded" => ErrorCode::INVALID_REQUEST,
+        // knows the org reads as access_revoked too; a billable call while
+        // billing is blocked).
+        "access_revoked" | "budget_exceeded" | "payment_required" => ErrorCode::INVALID_REQUEST,
         _ if e.is_internal() => ErrorCode::INTERNAL_ERROR,
         "unavailable" => ErrorCode::INTERNAL_ERROR,
         _ => ErrorCode::INVALID_PARAMS,
@@ -120,6 +122,7 @@ pub fn unauthenticated() -> ErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cxp_core::error::BlockedReason;
 
     fn pg_error() -> Error {
         Error::Database(sqlx_like())
@@ -127,6 +130,31 @@ mod tests {
 
     fn sqlx_like() -> sqlx::Error {
         sqlx::Error::Protocol("relation \"customers\" violates secret_constraint_name".into())
+    }
+
+    fn blocked(reason: BlockedReason) -> Error {
+        Error::BillingBlocked {
+            reason,
+            tool: "send_survey".into(),
+            url: "https://otto.example.com".into(),
+        }
+    }
+
+    /// A billable call refused while billing is blocked is a well-formed call
+    /// the server declined, and repeating it cannot help.
+    #[test]
+    fn billing_refusals_are_invalid_requests_that_are_not_retriable() {
+        for (reason, code) in [
+            (BlockedReason::BudgetExceeded, "budget_exceeded"),
+            (BlockedReason::PaymentRequired, "payment_required"),
+        ] {
+            let wire = from_core(&blocked(reason));
+            assert_eq!(wire.code, ErrorCode::INVALID_REQUEST, "{code}");
+            let d = wire.data.expect("data");
+            assert_eq!(d["code"], code);
+            assert_eq!(d["retriable"], false, "{code}");
+            assert!(wire.message.contains("send_survey"), "{}", wire.message);
+        }
     }
 
     #[test]
@@ -137,13 +165,8 @@ mod tests {
             Error::Conflict("dup".into()),
             Error::UnknownTeam,
             Error::AccessRevoked,
-            Error::QuotaExceeded {
-                tool: "create_survey".into(),
-                used: 10,
-                included: 10,
-                plan: "Free".into(),
-                upgrade_url: "https://otto.example.com/settings/billing".into(),
-            },
+            blocked(BlockedReason::BudgetExceeded),
+            blocked(BlockedReason::PaymentRequired),
             Error::Unavailable,
             Error::QueryTooBroad,
             pg_error(),

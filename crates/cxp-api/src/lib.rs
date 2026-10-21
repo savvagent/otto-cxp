@@ -18,15 +18,15 @@
 //!
 //! Every `/api/v1` handler does the same five things in order: take the
 //! [`Principal`](cxp_core::auth::Principal) the bearer middleware attached,
-//! check its scope, do any platform lookup it needs (a catalog team id, the
-//! usage quota) *before* opening a transaction so no pooled connection waits
+//! check its scope, do any platform lookup it needs (a catalog team id)
+//! *before* opening a transaction so no pooled connection waits
 //! on the network, open the transaction with
 //! [`platform_events::begin_live`](cxp_core::platform_events::begin_live), and
 //! commit after the one domain call.
 //!
-//! **Metering:** the only route that records usage is `POST /api/v1/surveys`,
-//! charged as `create_survey` in the same transaction as the insert, because
-//! it is the same operation as the MCP tool. Nothing else here charges.
+//! **Metering:** no route records usage. `POST /api/v1/surveys` is free, as
+//! the MCP `create_survey` tool is; a route added for one of the billable
+//! operations must charge the same meter its tool does.
 //!
 //! Errors are JSON `{"error": text, "code": code}` (see [`ApiError`]); an
 //! authentication failure is the OAuth-shaped `{"error", "error_description"}`
@@ -319,7 +319,7 @@ mod tests {
             ))
             .unwrap(),
         );
-        let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
+        let meter = Arc::new(Meter::new(platform.clone(), "https://x.example"));
         let state = AppState::new(
             Db::from_pool(pool),
             platform,

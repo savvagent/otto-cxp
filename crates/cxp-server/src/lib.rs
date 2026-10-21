@@ -70,13 +70,9 @@ pub fn platform_client(config: &Config) -> Result<Arc<PlatformClient>> {
     Ok(Arc::new(client))
 }
 
-/// The one meter the MCP tools and `POST /api/v1/surveys` charge through.
+/// The one meter the billable MCP tools charge through.
 pub fn meter(platform: Arc<PlatformClient>, config: &Config) -> Arc<Meter> {
-    Arc::new(Meter::new(
-        platform,
-        config.enforce_quotas,
-        config.upgrade_url(),
-    ))
+    Arc::new(Meter::new(platform, config.upgrade_url()))
 }
 
 /// Every surface on one router. `platform_check` is what boot's credential

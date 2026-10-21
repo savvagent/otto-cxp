@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_four_billable_tools_charge_once_each() {
+    fn exactly_the_three_billable_tools_charge_once_each() {
         let mut charged: Vec<String> = SOURCES
             .iter()
             .flat_map(|(file, src)| {

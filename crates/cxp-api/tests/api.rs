@@ -49,7 +49,8 @@ struct Platform {
     introspection_down: bool,
     /// Answer team and member-team lookups with a 503.
     teams_down: bool,
-    /// Report the org's allowance used up with a hard stop.
+    /// Report the org's billable calls blocked: its otto-cxp budget is spent
+    /// with the hard stop on.
     blocked: bool,
 }
 
@@ -144,15 +145,20 @@ async fn team(
 
 async fn usage_status(State(p): State<Shared>, Path(org): Path<Uuid>) -> Json<Value> {
     let blocked = p.lock().unwrap().blocked;
-    Json(json!({
+    // A v0.10.0 platform: the legacy bucket never blocks; the budget does.
+    let mut body = json!({
         "org_id": org,
         "plan": "team",
         "period_start": Utc::now().date_naive(),
-        "billable_count": if blocked { 1000 } else { 0 },
+        "billable_count": 0,
         "total_count": 0,
         "included_ops": 1000,
-        "hard_stop": blocked,
-    }))
+        "hard_stop": false,
+    });
+    if blocked {
+        body["blocked_reason"] = json!("budget_exceeded");
+    }
+    Json(body)
 }
 
 async fn ship(Json(b): Json<UsageBatch>) -> Json<UsageReceipt> {
@@ -220,25 +226,15 @@ struct Harness {
 }
 
 async fn harness_with(pool: PgPool, webhook_secret: &str) -> Harness {
-    harness_opts(pool, webhook_secret, false, SearchLimiter::for_pool(5)).await
+    harness_opts(pool, webhook_secret, SearchLimiter::for_pool(5)).await
 }
 
-/// [`harness_with`], with the meter enforcing quotas when `enforce` is set
-/// and the given search limiter.
-async fn harness_opts(
-    pool: PgPool,
-    webhook_secret: &str,
-    enforce: bool,
-    search: SearchLimiter,
-) -> Harness {
+/// [`harness_with`], with the given search limiter.
+async fn harness_opts(pool: PgPool, webhook_secret: &str, search: SearchLimiter) -> Harness {
     let (base, stub) = start_platform().await;
     let platform =
         Arc::new(PlatformClient::new(ClientConfig::new(base, RESOURCE, "otto_rs_test")).unwrap());
-    let meter = Arc::new(Meter::new(
-        platform.clone(),
-        enforce,
-        "https://otto.example.com",
-    ));
+    let meter = Arc::new(Meter::new(platform.clone(), "https://otto.example.com"));
     let state = AppState::new(
         Db::from_pool(pool.clone()),
         platform,
@@ -723,10 +719,12 @@ async fn unknown_routes_and_methods_answer_json_and_only_after_auth(pool: PgPool
 
 // ----------------------------------------------------------------- metering
 
+/// No route records usage: `POST /api/v1/surveys` is free, as the MCP
+/// `create_survey` tool is, and so is every other survey operation.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn only_creating_a_survey_charges_and_it_charges_once(pool: PgPool) {
+async fn no_route_records_usage(pool: PgPool) {
     let h = harness(pool).await;
-    let (org, user, t) = h.caller(RW);
+    let (_, _, t) = h.caller(RW);
 
     let c = h
         .call(
@@ -761,12 +759,8 @@ async fn only_creating_a_survey_charges_and_it_charges_once(pool: PgPool) {
         .await;
     assert_eq!(s.status, StatusCode::OK, "{}", s.body);
     let survey = s.body["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        h.outbox().await,
-        vec![(org, Some(user), "create_survey".to_string())]
-    );
+    assert!(h.outbox().await.is_empty(), "creating a survey is free");
 
-    // Every other survey operation is free.
     let u = h
         .call(
             "PUT",
@@ -788,7 +782,6 @@ async fn only_creating_a_survey_charges_and_it_charges_once(pool: PgPool) {
             "{uri}"
         );
     }
-    // A refused create rolls its charge back with it.
     let bad = h
         .call(
             "POST",
@@ -808,7 +801,7 @@ async fn only_creating_a_survey_charges_and_it_charges_once(pool: PgPool) {
         .await;
     assert_eq!(del.status, StatusCode::OK);
 
-    assert_eq!(h.outbox().await.len(), 1);
+    assert!(h.outbox().await.is_empty());
 }
 
 // -------------------------------------------------------------------- teams
@@ -1200,12 +1193,11 @@ async fn bodies_over_256_kib_are_413(pool: PgPool) {
     );
 }
 
-/// The console's billable route is refused like the billable tool once the
-/// org's allowance is used up (enforcing meter): 429 `quota_exceeded`,
-/// nothing created, nothing recorded. Free routes still work.
+/// `POST /api/v1/surveys` is free, so an org whose billing is blocked still
+/// creates surveys over REST, and nothing is recorded.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn an_org_over_its_allowance_cannot_create_a_survey_over_rest(pool: PgPool) {
-    let h = harness_opts(pool, SECRET, true, SearchLimiter::for_pool(5)).await;
+async fn an_org_whose_billing_is_blocked_still_creates_surveys_over_rest(pool: PgPool) {
+    let h = harness(pool).await;
     h.stub.lock().unwrap().blocked = true;
     let (org, _, t) = h.caller(RW);
 
@@ -1217,14 +1209,13 @@ async fn an_org_over_its_allowance_cannot_create_a_survey_over_rest(pool: PgPool
             Some(json!({"title": "NPS", "questions": []})),
         )
         .await;
-    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
-    assert_eq!(r.body["code"], "quota_exceeded");
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let surveys: i64 = sqlx::query_scalar("SELECT count(*) FROM surveys WHERE org_id = $1")
         .bind(org)
         .fetch_one(&h.pool)
         .await
         .unwrap();
-    assert_eq!(surveys, 0, "nothing created");
+    assert_eq!(surveys, 1, "the survey was created");
     assert!(h.outbox().await.is_empty(), "nothing recorded");
 
     let r = h
@@ -1459,7 +1450,7 @@ async fn flood(
     busy: u32,
 ) -> (StatusCode, Vec<StatusCode>) {
     let pool = pool_of_five(opts, connect.clone()).await;
-    let h = harness_opts(pool.clone(), SECRET, false, limiter).await;
+    let h = harness_opts(pool.clone(), SECRET, limiter).await;
     let (_, _, t) = h.caller(RW);
     let made = h
         .call(
@@ -1532,7 +1523,7 @@ async fn without_the_cap_a_search_flood_starves_a_write(
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn a_search_without_a_permit_is_unavailable(pool: PgPool) {
     let limiter = SearchLimiter::new(1);
-    let h = harness_opts(pool, SECRET, false, limiter.clone()).await;
+    let h = harness_opts(pool, SECRET, limiter.clone()).await;
     let (_, _, t) = h.caller(RO);
     let _held = limiter.acquire().await.unwrap();
     // Halfway through the permit wait (500 ms), nothing is checked out.

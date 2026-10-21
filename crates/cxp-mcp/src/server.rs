@@ -9,7 +9,7 @@
 //! `platform_events::begin_live`, the only way a request reaches tenant data.
 //!
 //! **A tool body:** check the scope, open the transaction, do one thing,
-//! commit. The four billable tools also warm the quota
+//! commit. The three billable tools also warm the quota
 //! ([`Cxp::warm_quota`]) before the transaction and charge inside it
 //! ([`Cxp::charge`]): a failed call is never billed. Besides the platform's
 //! token introspection (every request, in the auth middleware), only they
@@ -134,16 +134,16 @@ impl Cxp {
 
     /// Look the org's quota standing up at the platform, before a billable
     /// tool opens its transaction, so the network call never holds a pooled
-    /// connection. Only the four `cxp_core::usage::BILLABLE` tools call this;
+    /// connection. Only the three `cxp_core::usage::BILLABLE` tools call this;
     /// of the rest, only `whoami` and `usage` call the platform (for the
     /// caller's membership and the org's usage report).
     pub async fn warm_quota(&self, caller: &Principal) {
         self.meter.warm(caller.org_id).await;
     }
 
-    /// Record one call of a billable tool (and refuse it if the org is out of
-    /// budget), inside the tool's own transaction and before its write. Only
-    /// the four `cxp_core::usage::BILLABLE` tools call this.
+    /// Record one call of a billable tool (and refuse it while the org's
+    /// billing is blocked), inside the tool's own transaction and before its write. Only
+    /// the three `cxp_core::usage::BILLABLE` tools call this.
     pub async fn charge(
         &self,
         tx: &mut Tx<'_>,

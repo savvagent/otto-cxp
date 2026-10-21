@@ -1,8 +1,14 @@
-//! Usage metering: the `BILLABLE` tools, the `Meter` that charges
-//! one `usage_outbox` row in the tool's own transaction (with optional quota
-//! enforcement) and reports the org's usage, and the shipper (`ship_once`,
-//! `run`) that drains the outbox to the platform.
+//! Usage metering: the [`BILLABLE`] tools and the value meter each one
+//! charges, the `Meter` that charges one `usage_outbox` row in the tool's own
+//! transaction (refusing it while billing is blocked) and reports the org's
+//! usage, and the shipper (`ship_once`, `run`) that drains the outbox to the
+//! platform.
 //!
+//! - **Meters.** This service declares two value meters
+//!   ([`METER_DECLARATIONS`]): [`SURVEYS_SENT`], charged by `send_survey`,
+//!   and [`RESPONSES_COLLECTED`], charged by `submit_feedback` and
+//!   `submit_survey_response` ([`BILLABLE_METERS`]). Each call records
+//!   quantity 1 on its tool's meter.
 //! - **Recording is local and atomic.** [`Meter::charge`] writes a
 //!   `usage_outbox` row in the tool's own transaction, so a failed call rolls
 //!   its record back and a successful one is recorded even while the platform
@@ -22,17 +28,19 @@
 //!   none of them. A failure that is not about the rows (the
 //!   platform unreachable, a 5xx, 408, or 429, this service's credential
 //!   refused, the org or URL unknown) keeps every row in the outbox, retried
-//!   with backoff for as long as it lasts and still counted toward its
-//!   period's quota. The sweep forgets rejected rows after
-//!   `platform_events::REJECTED_USAGE_KEEP_DAYS`.
-//! - **Enforcing** reads the platform's cached usage status (and counts this
-//!   org's unshipped rows from the platform's current billing period on top).
-//!   Off by default (`CXP_ENFORCE_QUOTAS`). If the platform cannot answer, the
-//!   call is allowed and still recorded.
+//!   with backoff for as long as it lasts. The sweep forgets rejected rows
+//!   after `platform_events::REJECTED_USAGE_KEEP_DAYS`.
+//! - **Enforcement is always on, and fails open.** [`Meter::charge`] reads
+//!   the platform's cached usage status and refuses a billable call while
+//!   the platform says billable calls are blocked
+//!   ([`UsageStatus::billable_blocked`]: this service's budget hard stop, or
+//!   payment required), as [`Error::BillingBlocked`]. If the platform cannot
+//!   answer, the call is allowed and still recorded.
 //!
-//! Only the four [`BILLABLE`] tools are recorded. Everything else is free and
-//! records nothing; [`Meter::charge`] refuses any other name as an internal
-//! error, so a free tool cannot be metered by mistake.
+//! Only the three [`BILLABLE`] tools are recorded. Everything else, including
+//! `create_survey`, is free and records nothing; [`Meter::charge`] refuses
+//! any other name as an internal error, so a free tool cannot be metered by
+//! mistake.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,24 +54,57 @@ use sqlx::FromRow;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::error::{Error, Result};
+use crate::error::{BlockedReason, Error, Result};
 
-/// The tools that consume the plan's allowance, and the only ones recorded.
-pub const BILLABLE: &[&str] = &[
-    "submit_feedback",
-    "create_survey",
-    "send_survey",
-    "submit_survey_response",
+/// The `surveys_sent` value meter: one per survey sent to a customer.
+pub const SURVEYS_SENT: &str = "otto-cxp/surveys_sent";
+/// The `responses_collected` value meter: one per piece of feedback or
+/// survey response recorded.
+pub const RESPONSES_COLLECTED: &str = "otto-cxp/responses_collected";
+
+/// The meters this service declares to the platform: (key, display name,
+/// unit), in the order `whoami` and `usage` report them.
+pub const METER_DECLARATIONS: &[(&str, &str, &str)] = &[
+    (SURVEYS_SENT, "Surveys sent", "survey"),
+    (RESPONSES_COLLECTED, "Responses collected", "response"),
 ];
 
+/// Each billable tool and the value meter it charges: the one definition of
+/// what is billed. Every other tool is free.
+pub const BILLABLE_METERS: &[(&str, &str)] = &[
+    ("send_survey", SURVEYS_SENT),
+    ("submit_feedback", RESPONSES_COLLECTED),
+    ("submit_survey_response", RESPONSES_COLLECTED),
+];
+
+/// The tools of [`BILLABLE_METERS`], in its order, and the only ones
+/// recorded. A copy, since a `const` cannot map; a unit test keeps the two
+/// equal.
+pub const BILLABLE: &[&str] = &["send_survey", "submit_feedback", "submit_survey_response"];
+
+/// The value meter `tool` charges, or `None` for a free tool.
+///
+/// ```
+/// use cxp_core::usage::{meter_for, SURVEYS_SENT};
+/// assert_eq!(meter_for("send_survey"), Some(SURVEYS_SENT));
+/// assert_eq!(meter_for("create_survey"), None);
+/// ```
+pub fn meter_for(tool: &str) -> Option<&'static str> {
+    BILLABLE_METERS
+        .iter()
+        .find(|(t, _)| *t == tool)
+        .map(|(_, meter)| *meter)
+}
+
 pub fn is_billable(tool: &str) -> bool {
-    BILLABLE.contains(&tool)
+    meter_for(tool).is_some()
 }
 
 const QUOTA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const FAIL_OPEN_FOR: Duration = Duration::from_secs(5);
-/// The share of the allowance at or past which [`Status::warning`] is set.
-pub const WARN_AT: f64 = 0.8;
+/// The percent of this service's budget at or past which [`Status::warning`]
+/// is set.
+pub const WARN_AT_PERCENT: i64 = 80;
 /// How many failures about a usage row itself (see
 /// [`ShipError::faults_the_rows`]) it survives before it is given up on and
 /// moved to `usage_outbox_rejected`. Failures that are not about the rows
@@ -74,91 +115,67 @@ pub const MAX_ROW_FAILURES: i32 = 20;
 pub struct Meter {
     platform: Arc<PlatformClient>,
     fail_open: Arc<Mutex<HashMap<OrgId, Instant>>>,
-    pub enforce: bool,
+    /// Where a refused caller is sent to fix billing.
     pub upgrade_url: String,
 }
 
 impl std::fmt::Debug for Meter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Meter")
-            .field("enforce", &self.enforce)
+            .field("upgrade_url", &self.upgrade_url)
             .finish_non_exhaustive()
     }
 }
 
 impl Meter {
-    pub fn new(
-        platform: Arc<PlatformClient>,
-        enforce: bool,
-        upgrade_url: impl Into<String>,
-    ) -> Self {
+    pub fn new(platform: Arc<PlatformClient>, upgrade_url: impl Into<String>) -> Self {
         Self {
             platform,
             fail_open: Arc::default(),
-            enforce,
             upgrade_url: upgrade_url.into(),
         }
     }
 
     /// Look the org's standing up before a transaction opens, so a slow
-    /// platform never holds a pooled connection. A no-op unless enforcing.
+    /// platform never holds a pooled connection. [`Meter::charge`] then reads
+    /// the platform client's cached answer.
     pub async fn warm(&self, org: OrgId) {
-        if self.enforce {
-            let _ = self.status_for(org).await;
-        }
+        let _ = self.status_for(org).await;
     }
 
-    /// Record one call of a [`BILLABLE`] tool in `tx`, or refuse it if the org
-    /// is out of budget. Any other tool name is a programming error in the
-    /// caller, not the agent's request: it is refused with [`Error::Internal`]
-    /// without recording anything.
+    /// Record one call of a [`BILLABLE`] tool in `tx`, on its meter with
+    /// quantity 1, or refuse it with [`Error::BillingBlocked`] while the
+    /// platform says billable calls are blocked. Any other tool name is a
+    /// programming error in the caller, not the agent's request: it is
+    /// refused with [`Error::Internal`] without recording anything.
     ///
-    /// The quota is soft at the boundary: concurrent calls can each see the
-    /// same count before either commits, so an org can end a few calls over.
+    /// Fails open: with no answer from the platform, the call is recorded.
+    /// The refusal is soft at the boundary: concurrent calls can each pass a
+    /// cached status just before it turns blocked.
     pub async fn charge(&self, tx: &mut Tx<'_>, user: UserId, tool: &str) -> Result<()> {
-        if !is_billable(tool) {
+        let Some(meter) = meter_for(tool) else {
             tracing::error!(tool, "refusing to meter a tool that is not billable");
             return Err(Error::Internal(format!(
                 "{tool} is not a billable tool; only {} are metered",
                 BILLABLE.join(", ")
             )));
-        }
+        };
         let org = tx.org();
-        if self.enforce {
-            if let Some(mut status) = self.status_for(org).await {
-                // Only rows from the platform's current period: a row from an
-                // earlier one, still unshipped, is not this period's usage.
-                let period_start = status
-                    .period_start
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap_or_default()
-                    .and_utc();
-                let unshipped: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM usage_outbox \
-                     WHERE org_id = $1 AND billable AND occurred_at >= $2",
-                )
-                .bind(org)
-                .bind(period_start)
-                .fetch_one(tx.conn())
-                .await?;
-                status.billable_count += unshipped;
-                if status.is_blocked() {
-                    return Err(Error::QuotaExceeded {
-                        tool: tool.to_string(),
-                        used: status.billable_count,
-                        included: status.included_ops,
-                        plan: plan_name(&status.plan),
-                        upgrade_url: self.upgrade_url.clone(),
-                    });
-                }
-            }
+        if let Some(reason) = self.status_for(org).await.as_ref().and_then(blocked_reason) {
+            return Err(Error::BillingBlocked {
+                reason,
+                tool: tool.to_string(),
+                url: self.upgrade_url.clone(),
+            });
         }
         sqlx::query(
-            "INSERT INTO usage_outbox (org_id, user_id, tool, billable) VALUES ($1, $2, $3, true)",
+            "INSERT INTO usage_outbox (org_id, user_id, tool, billable, meter, quantity) \
+             VALUES ($1, $2, $3, true, $4, 1)",
         )
         .bind(org)
         .bind(user)
         .bind(tool)
+        .bind(meter)
         .execute(tx.conn())
         .await?;
         Ok(())
@@ -215,8 +232,22 @@ impl Meter {
             .usage_status(org.as_uuid())
             .await
             .map_err(|e| Error::platform_for(org, e))?;
-        Ok(Status::new(usage, self.enforce))
+        Ok(Status::new(usage))
     }
+}
+
+/// Why billable calls must be refused now, or `None` when they may proceed.
+/// `payment_required` is its own reason; anything else that blocks (the
+/// budget's hard stop, a reason this build does not know, a blocked budget
+/// with no reason) is [`BlockedReason::BudgetExceeded`].
+fn blocked_reason(status: &UsageStatus) -> Option<BlockedReason> {
+    if !status.billable_blocked() {
+        return None;
+    }
+    Some(match status.blocked_reason.as_deref() {
+        Some(otto_resource::PAYMENT_REQUIRED) => BlockedReason::PaymentRequired,
+        _ => BlockedReason::BudgetExceeded,
+    })
 }
 
 pub(crate) fn plan_name(plan: &str) -> String {
@@ -227,30 +258,113 @@ pub(crate) fn plan_name(plan: &str) -> String {
     }
 }
 
-/// Where an org stands against its monthly allowance (shared by every otto-*
-/// service the org uses).
+/// Where an org stands this month: this service's meters and budget, and
+/// whether its billable calls are blocked. The legacy fields describe the
+/// family-wide bucket shared by every otto-* service and are deprecated.
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    /// **Deprecated** (the family-wide bucket): the org's legacy plan name.
     pub plan: String,
+    /// **Deprecated** (the family-wide bucket): operations the legacy plan
+    /// includes.
     pub included_ops: i64,
+    /// **Deprecated** (the family-wide bucket): billable calls this month
+    /// across every service.
     pub billable_used: i64,
+    /// **Deprecated** (the family-wide bucket): operations left, never
+    /// negative.
     pub remaining: i64,
+    /// **Deprecated** (the family-wide bucket): every call this month across
+    /// every service.
     pub total_calls: i64,
+    /// First day of the UTC billing month the figures are for.
     pub period_start: chrono::NaiveDate,
-    /// True once 80 % of the allowance ([`WARN_AT`]) is used, and always on a
-    /// plan that includes none. Worth telling a human.
+    /// True while billable calls are blocked, or once this service's budget
+    /// is at least 80 % spent ([`WARN_AT_PERCENT`]). Worth telling a human.
     pub warning: bool,
+    /// **Deprecated** (the family-wide bucket): never refuses anything.
     pub hard_stop: bool,
-    /// Whether this server refuses billable calls over the allowance at all.
+    /// Whether this server refuses billable calls while billing is blocked.
+    /// Always true.
     pub enforced: bool,
+    /// The service the platform reports these meters and budget for.
+    pub service: Option<String>,
+    /// This month's usage of each meter this service declares, in
+    /// [`METER_DECLARATIONS`] order; 0 for one with no usage yet.
+    pub meters: Vec<MeterOut>,
+    /// This service's monthly budget, if the org has set one.
+    pub budget: Option<BudgetOut>,
+    /// Why billable calls are refused now (`budget_exceeded`,
+    /// `payment_required`), as the platform gives it; `None` while they are
+    /// not.
+    pub blocked_reason: Option<String>,
+}
+
+/// One declared meter's usage this month, in [`Status::meters`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterOut {
+    /// The meter's key, `otto-cxp/<meter>`.
+    pub meter: String,
+    pub display_name: String,
+    pub unit: String,
+    pub quantity: u64,
+}
+
+/// This service's budget this month, in [`Status::budget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetOut {
+    /// The budget for one UTC calendar month, in US cents.
+    pub monthly_budget_cents: i64,
+    /// What this service has cost this month, in US cents; `None` when the
+    /// platform could not compute it.
+    pub spend_cents: Option<i64>,
+    /// Whole percent of the budget spent; can exceed 100. `None` when spend
+    /// is unknown.
+    pub percent_used: Option<i64>,
+    /// The alert thresholds (percent) that have fired this month.
+    pub thresholds_reached: Vec<u8>,
+    /// Whether the org refuses billable calls once spend reaches the budget.
+    pub hard_stop: bool,
+    /// Whether the budget refuses billable calls now.
+    pub blocked: bool,
+    /// Why `blocked` is set, or why spend is unknown.
+    pub reason: Option<String>,
+}
+
+impl From<otto_resource::BudgetStatus> for BudgetOut {
+    fn from(b: otto_resource::BudgetStatus) -> Self {
+        Self {
+            monthly_budget_cents: b.monthly_budget_cents,
+            spend_cents: b.spend_cents,
+            percent_used: b.percent_used,
+            thresholds_reached: b.thresholds_reached,
+            hard_stop: b.hard_stop,
+            blocked: b.blocked,
+            reason: b.reason,
+        }
+    }
 }
 
 impl Status {
-    fn new(u: UsageStatus, enforced: bool) -> Self {
+    fn new(u: UsageStatus) -> Self {
         let remaining = u.included_ops.saturating_sub(u.billable_count).max(0);
-        let warning =
-            u.included_ops <= 0 || u.billable_count as f64 >= u.included_ops as f64 * WARN_AT;
+        let warning = u.billable_blocked()
+            || u.budget
+                .as_ref()
+                .and_then(|b| b.percent_used)
+                .is_some_and(|p| p >= WARN_AT_PERCENT);
+        let meters = METER_DECLARATIONS
+            .iter()
+            .map(|(key, display_name, unit)| MeterOut {
+                meter: (*key).to_string(),
+                display_name: (*display_name).to_string(),
+                unit: (*unit).to_string(),
+                quantity: u.meter(key).map_or(0, |m| m.quantity),
+            })
+            .collect();
         Self {
             plan: plan_name(&u.plan),
             included_ops: u.included_ops,
@@ -260,7 +374,11 @@ impl Status {
             period_start: u.period_start,
             warning,
             hard_stop: u.hard_stop,
-            enforced,
+            enforced: true,
+            service: u.service,
+            meters,
+            budget: u.budget.map(BudgetOut::from),
+            blocked_reason: u.blocked_reason,
         }
     }
 }
@@ -771,19 +889,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exactly_the_four_writes_are_billable() {
+    fn exactly_the_three_value_writes_are_billable() {
         assert_eq!(
             BILLABLE,
-            [
-                "submit_feedback",
-                "create_survey",
-                "send_survey",
-                "submit_survey_response"
-            ]
+            ["send_survey", "submit_feedback", "submit_survey_response"]
         );
+        // `BILLABLE` is a copy of the table's tools (a `const` cannot map),
+        // so the two can never disagree.
+        let tools: Vec<&str> = BILLABLE_METERS.iter().map(|(t, _)| *t).collect();
+        assert_eq!(BILLABLE, tools.as_slice());
         for t in [
             "whoami",
             "usage",
+            "create_survey",
             "create_customer",
             "create_ticket",
             "list_feedback",
@@ -791,6 +909,35 @@ mod tests {
             "search_knowledge",
         ] {
             assert!(!is_billable(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn each_billable_tool_charges_its_value_meter() {
+        assert_eq!(meter_for("send_survey"), Some(SURVEYS_SENT));
+        assert_eq!(meter_for("submit_feedback"), Some(RESPONSES_COLLECTED));
+        assert_eq!(
+            meter_for("submit_survey_response"),
+            Some(RESPONSES_COLLECTED)
+        );
+        assert_eq!(meter_for("create_survey"), None);
+        assert_eq!(meter_for("whoami"), None);
+        for tool in BILLABLE {
+            assert!(is_billable(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn the_declared_meters_are_exactly_this_services_two() {
+        let keys: Vec<&str> = METER_DECLARATIONS.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(keys, [SURVEYS_SENT, RESPONSES_COLLECTED]);
+        for (key, display, unit) in METER_DECLARATIONS {
+            assert!(key.starts_with("otto-cxp/"), "{key}");
+            assert!(!display.is_empty() && !unit.is_empty(), "{key}");
+        }
+        // Every meter a tool charges is declared.
+        for (tool, meter) in BILLABLE_METERS {
+            assert!(keys.contains(meter), "{tool}: {meter}");
         }
     }
 
@@ -817,18 +964,168 @@ mod tests {
         }
     }
 
+    fn budget(percent_used: Option<i64>, blocked: bool) -> otto_resource::BudgetStatus {
+        otto_resource::BudgetStatus {
+            monthly_budget_cents: 1000,
+            spend_cents: percent_used.map(|p| p * 10),
+            percent_used,
+            thresholds_reached: vec![50, 80],
+            hard_stop: true,
+            blocked,
+            reason: blocked.then(|| otto_resource::BUDGET_EXCEEDED.to_string()),
+        }
+    }
+
+    fn reported(meter: &str, quantity: u64) -> otto_resource::MeterUsage {
+        otto_resource::MeterUsage {
+            meter: meter.into(),
+            display_name: "platform's name".into(),
+            unit: "platform's unit".into(),
+            quantity,
+        }
+    }
+
+    /// `payment_required` is its own refusal; any other reason, including
+    /// one this build does not know and a blocked budget with no reason at
+    /// all, is `budget_exceeded`, which sends an owner to the console.
     #[test]
-    fn status_warns_past_eighty_percent_and_never_goes_negative() {
-        let s = Status::new(usage(79, 100), false);
-        assert!(!s.warning);
+    fn a_blocked_status_maps_to_its_refusal() {
+        let with = |reason: Option<&str>, budget_blocked: bool| {
+            let mut u = usage(0, 0);
+            u.blocked_reason = reason.map(str::to_string);
+            u.budget = budget_blocked.then(|| budget(Some(120), true));
+            blocked_reason(&u)
+        };
+        assert_eq!(
+            with(Some("payment_required"), false),
+            Some(BlockedReason::PaymentRequired)
+        );
+        assert_eq!(
+            with(Some("budget_exceeded"), false),
+            Some(BlockedReason::BudgetExceeded)
+        );
+        assert_eq!(
+            with(Some("something_new"), false),
+            Some(BlockedReason::BudgetExceeded)
+        );
+        assert_eq!(with(None, true), Some(BlockedReason::BudgetExceeded));
+        assert_eq!(with(None, false), None);
+        let mut spend_unknown = usage(0, 0);
+        spend_unknown.budget = Some(otto_resource::BudgetStatus {
+            blocked: false,
+            reason: Some(otto_resource::SPEND_UNAVAILABLE.into()),
+            ..budget(None, false)
+        });
+        assert_eq!(blocked_reason(&spend_unknown), None);
+        assert_eq!(
+            BlockedReason::BudgetExceeded.code(),
+            otto_resource::BUDGET_EXCEEDED
+        );
+        assert_eq!(
+            BlockedReason::PaymentRequired.code(),
+            otto_resource::PAYMENT_REQUIRED
+        );
+    }
+
+    /// Both declared meters, in declaration order, whatever the platform
+    /// sends: a meter it omits reads 0, and one this service did not declare
+    /// is dropped, so agents see a stable list.
+    #[test]
+    fn status_reports_both_meters_in_declaration_order() {
+        let mut u = usage(5, 10);
+        u.service = Some("otto-cxp".into());
+        u.meters = vec![
+            reported("otto-cxp/something_else", 9),
+            reported(RESPONSES_COLLECTED, 4),
+        ];
+        let s = Status::new(u);
+        assert_eq!(s.service.as_deref(), Some("otto-cxp"));
+        let got: Vec<(&str, &str, &str, u64)> = s
+            .meters
+            .iter()
+            .map(|m| {
+                (
+                    m.meter.as_str(),
+                    m.display_name.as_str(),
+                    m.unit.as_str(),
+                    m.quantity,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (SURVEYS_SENT, "Surveys sent", "survey", 0),
+                (RESPONSES_COLLECTED, "Responses collected", "response", 4),
+            ]
+        );
+
+        let mut both = usage(0, 0);
+        both.meters = vec![reported(RESPONSES_COLLECTED, 2), reported(SURVEYS_SENT, 7)];
+        let s = Status::new(both);
+        let quantities: Vec<u64> = s.meters.iter().map(|m| m.quantity).collect();
+        assert_eq!(quantities, [7, 2]);
+    }
+
+    #[test]
+    fn status_mirrors_the_budget_and_blocked_reason() {
+        let mut u = usage(0, 0);
+        u.budget = Some(budget(Some(125), true));
+        u.blocked_reason = Some(otto_resource::BUDGET_EXCEEDED.into());
+        let s = Status::new(u);
+        assert_eq!(
+            s.budget,
+            Some(BudgetOut {
+                monthly_budget_cents: 1000,
+                spend_cents: Some(1250),
+                percent_used: Some(125),
+                thresholds_reached: vec![50, 80],
+                hard_stop: true,
+                blocked: true,
+                reason: Some(otto_resource::BUDGET_EXCEEDED.into()),
+            })
+        );
+        assert_eq!(s.blocked_reason.as_deref(), Some("budget_exceeded"));
+        assert!(s.enforced);
+
+        let s = Status::new(usage(0, 10));
+        assert_eq!((s.budget, s.blocked_reason), (None, None));
+        assert!(s.enforced, "enforcement is always on");
+    }
+
+    /// `warning` follows this service's budget: blocked, or 80 % of it
+    /// spent. Never the deprecated family-wide bucket, whose "always warn on
+    /// a plan that includes nothing" would now be noise.
+    #[test]
+    fn status_warns_when_blocked_or_past_eighty_percent_of_the_budget() {
+        let warns = |percent: Option<i64>, blocked: bool, reason: Option<&str>| {
+            let mut u = usage(0, 0);
+            u.budget = Some(budget(percent, blocked));
+            u.blocked_reason = reason.map(str::to_string);
+            Status::new(u).warning
+        };
+        assert!(!warns(Some(79), false, None));
+        assert!(warns(Some(80), false, None));
+        assert!(warns(Some(130), true, Some("budget_exceeded")));
+        assert!(!warns(None, false, None), "spend unknown");
+        assert!(warns(Some(0), false, Some("payment_required")));
+        assert!(warns(None, true, None), "blocked with no reason");
+        // A plan that includes no legacy operations no longer warns.
+        assert!(!Status::new(usage(0, 0)).warning);
+        assert!(!Status::new(usage(150, 100)).warning);
+    }
+
+    #[test]
+    fn status_keeps_the_deprecated_bucket_fields() {
+        let s = Status::new(usage(79, 100));
         assert_eq!(s.remaining, 21);
-        let s = Status::new(usage(80, 100), true);
-        assert!(s.warning && s.enforced);
-        let s = Status::new(usage(150, 100), false);
+        let s = Status::new(usage(150, 100));
         assert_eq!(s.remaining, 0);
         assert_eq!(s.plan, "Team");
         assert_eq!(s.total_calls, 153);
+        assert_eq!((s.included_ops, s.billable_used), (100, 150));
     }
+
     fn status(status: u16) -> ShipError {
         ShipError::Platform(otto_resource::Error::Status {
             status,

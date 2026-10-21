@@ -68,9 +68,13 @@ struct Platform {
     ship_delay: Option<Duration>,
     /// Every usage event received, in order.
     received: Vec<UsageEvent>,
-    /// Billable count and hard stop reported by usage-status.
+    /// The deprecated family-wide billable count usage-status reports.
     used: i64,
-    hard_stop: bool,
+    /// What usage-status reports as `blocked_reason`, `budget` and `meters`
+    /// (omitted while unset, as an older platform would).
+    blocked_reason: Option<String>,
+    budget: Option<Value>,
+    meters: Option<Value>,
 }
 
 type Shared = Arc<Mutex<Platform>>;
@@ -172,15 +176,27 @@ async fn ship(
 
 async fn usage_status(State(p): State<Shared>, Path(org): Path<Uuid>) -> Json<Value> {
     let p = p.lock().unwrap();
-    Json(json!({
+    // A v0.10.0 platform always sends the legacy hard stop off.
+    let mut body = json!({
         "org_id": org,
         "plan": "free",
         "period_start": Utc::now().date_naive(),
         "billable_count": p.used,
         "total_count": p.used + 7,
         "included_ops": 10,
-        "hard_stop": p.hard_stop,
-    }))
+        "hard_stop": false,
+        "service": "otto-cxp",
+    });
+    if let Some(reason) = &p.blocked_reason {
+        body["blocked_reason"] = json!(reason);
+    }
+    if let Some(budget) = &p.budget {
+        body["budget"] = budget.clone();
+    }
+    if let Some(meters) = &p.meters {
+        body["meters"] = meters.clone();
+    }
+    Json(body)
 }
 
 async fn start_platform() -> (Arc<PlatformClient>, Shared) {
@@ -913,14 +929,21 @@ async fn the_sweep_forgets_old_rejected_usage(pool: PgPool) {
 async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, _) = start_platform().await;
-    let meter = Meter::new(platform, false, "https://otto.example.com/billing");
+    let meter = Meter::new(platform, "https://otto.example.com");
     let (o, u) = (org(), user());
 
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
     for tool in usage::BILLABLE {
         meter.charge(&mut tx, u, tool).await.unwrap();
     }
-    for free in ["whoami", "usage", "create_customer", "list_feedback", ""] {
+    for free in [
+        "create_survey",
+        "whoami",
+        "usage",
+        "create_customer",
+        "list_feedback",
+        "",
+    ] {
         // Metering a free tool is the server's bug, not the agent's request.
         let err = meter.charge(&mut tx, u, free).await.unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "{free}: {err:?}");
@@ -929,8 +952,18 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
     }
     tx.commit().await.unwrap();
 
-    let rows: Vec<(Uuid, Uuid, Option<Uuid>, String, bool)> = sqlx::query_as(
-        "SELECT event_id, org_id, user_id, tool, billable FROM usage_outbox ORDER BY id",
+    type Charged = (
+        Uuid,
+        Uuid,
+        Option<Uuid>,
+        String,
+        bool,
+        Option<String>,
+        Option<i64>,
+    );
+    let rows: Vec<Charged> = sqlx::query_as(
+        "SELECT event_id, org_id, user_id, tool, billable, meter, quantity \
+         FROM usage_outbox ORDER BY id",
     )
     .fetch_all(&pool)
     .await
@@ -938,64 +971,108 @@ async fn charge_records_one_row_per_billable_call_and_refuses_free_tools(pool: P
     assert_eq!(rows.len(), usage::BILLABLE.len(), "{rows:?}");
     let ids: HashSet<Uuid> = rows.iter().map(|r| r.0).collect();
     assert_eq!(ids.len(), rows.len(), "every event_id is unique");
-    for ((_, org_id, user_id, tool, billable), expected) in rows.iter().zip(usage::BILLABLE) {
+    for ((_, org_id, user_id, tool, billable, meter, quantity), expected) in
+        rows.iter().zip(usage::BILLABLE)
+    {
         assert_eq!(*org_id, o.as_uuid());
         assert_eq!(*user_id, Some(u.as_uuid()));
         assert_eq!(tool, expected);
         assert!(billable);
+        assert_eq!(meter.as_deref(), usage::meter_for(expected), "{tool}");
+        assert_eq!(*quantity, Some(1), "{tool}");
     }
+    let meters: Vec<&str> = rows.iter().filter_map(|r| r.5.as_deref()).collect();
+    assert_eq!(
+        meters,
+        [
+            usage::SURVEYS_SENT,
+            usage::RESPONSES_COLLECTED,
+            usage::RESPONSES_COLLECTED
+        ]
+    );
 
     // A call whose transaction rolls back leaves no record.
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
     meter.charge(&mut tx, u, "submit_feedback").await.unwrap();
     tx.rollback().await.unwrap();
-    assert_eq!(count(&pool, "usage_outbox", o).await, 4);
+    assert_eq!(count(&pool, "usage_outbox", o).await, 3);
 }
 
+/// A platform that says billable calls are blocked refuses them with its
+/// reason's code, writing nothing; budget data that blocks nothing (spend
+/// the platform could not compute) refuses nothing.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn an_enforcing_meter_refuses_an_org_out_of_budget(pool: PgPool) {
     let db = db(pool.clone());
-    let (platform, stub) = start_platform().await;
     let (o, u) = (org(), user());
-    {
-        let mut p = stub.lock().unwrap();
-        p.used = 9;
-        p.hard_stop = true;
+    for reason in ["budget_exceeded", "payment_required"] {
+        // A platform of its own: the client caches the usage status.
+        let (platform, stub) = start_platform().await;
+        stub.lock().unwrap().blocked_reason = Some(reason.into());
+        let meter = Meter::new(platform, "https://otto.example.com");
+        meter.warm(o).await;
+
+        let report = meter.report(o).await.unwrap();
+        assert_eq!(report.blocked_reason.as_deref(), Some(reason));
+        assert!(report.warning && report.enforced, "{reason}");
+
+        let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
+        let err = meter.charge(&mut tx, u, "send_survey").await.unwrap_err();
+        assert_eq!(err.code(), reason, "{err}");
+        assert!(!err.retriable() && !err.is_internal(), "{reason}");
+        assert!(err.to_string().contains("send_survey"), "{err}");
+        assert!(
+            err.to_string().contains("https://otto.example.com"),
+            "{err}"
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(count(&pool, "usage_outbox", o).await, 0, "{reason}");
     }
 
-    let meter = Meter::new(platform.clone(), true, "https://otto.example.com/billing");
+    let (platform, stub) = start_platform().await;
+    stub.lock().unwrap().meters = Some(json!([{
+        "meter": usage::RESPONSES_COLLECTED,
+        "display_name": "Responses collected",
+        "unit": "response",
+        "quantity": 12,
+    }]));
+    stub.lock().unwrap().budget = Some(json!({
+        "monthly_budget_cents": 1000,
+        "spend_cents": null,
+        "percent_used": null,
+        "thresholds_reached": [],
+        "hard_stop": true,
+        "blocked": false,
+        "reason": otto_resource::SPEND_UNAVAILABLE,
+    }));
+    let meter = Meter::new(platform, "https://otto.example.com");
     let report = meter.report(o).await.unwrap();
-    assert_eq!(report.plan, "Free");
-    assert_eq!(report.remaining, 1);
-    assert!(report.warning && report.enforced && report.hard_stop);
-
-    // 9 counted at the platform + this one = 10 of 10 included: allowed.
+    assert_eq!(report.blocked_reason, None);
+    assert!(!report.warning, "{report:?}");
+    assert_eq!(report.service.as_deref(), Some("otto-cxp"));
+    let meters: Vec<(&str, u64)> = report
+        .meters
+        .iter()
+        .map(|m| (m.meter.as_str(), m.quantity))
+        .collect();
+    assert_eq!(
+        meters,
+        [(usage::SURVEYS_SENT, 0), (usage::RESPONSES_COLLECTED, 12)]
+    );
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    meter.charge(&mut tx, u, "create_survey").await.unwrap();
+    meter.charge(&mut tx, u, "send_survey").await.unwrap();
     tx.commit().await.unwrap();
-
-    // The unshipped row counts on top, so the next one is over.
-    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    let err = meter.charge(&mut tx, u, "send_survey").await.unwrap_err();
-    assert_eq!(err.code(), "quota_exceeded", "{err}");
-    tx.rollback().await.unwrap();
     assert_eq!(count(&pool, "usage_outbox", o).await, 1);
-
-    // A meter that does not enforce records it anyway.
-    let lax = Meter::new(platform, false, "https://otto.example.com/billing");
-    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    lax.charge(&mut tx, u, "send_survey").await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(count(&pool, "usage_outbox", o).await, 2);
 }
 
-/// If the platform cannot say how much is used, billable work is allowed and
-/// still recorded.
+/// If the platform cannot say whether billing is blocked, billable work is
+/// allowed and still recorded.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn an_enforcing_meter_fails_open(pool: PgPool) {
     let db = db(pool.clone());
-    let meter = Meter::new(client("http://127.0.0.1:1"), true, "https://x");
+    let meter = Meter::new(client("http://127.0.0.1:1"), "https://x");
     let (o, u) = (org(), user());
+    meter.warm(o).await;
     let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
     meter.charge(&mut tx, u, "submit_feedback").await.unwrap();
     tx.commit().await.unwrap();
@@ -1033,7 +1110,7 @@ async fn make_due(pool: &PgPool) {
 async fn ship_once_ships_deletes_and_handles_duplicates_and_rejections(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
     let (a, b) = (org(), org());
     charge_n(&db, &meter, a, 2).await;
@@ -1113,7 +1190,7 @@ async fn ship_once_ships_deletes_and_handles_duplicates_and_rejections(pool: PgP
 async fn ship_once_drains_every_org_as_otto_app(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let (a, b) = (org(), org());
     charge_n(&db, &meter, a, 2).await;
     charge_n(&db, &meter, b, 1).await;
@@ -1159,7 +1236,7 @@ async fn ship_once_drains_every_org_as_otto_app(pool: PgPool) {
 async fn run_ships_then_flushes_on_shutdown(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let o = org();
     charge_n(&db, &meter, o, 1).await;
 
@@ -1347,7 +1424,7 @@ async fn outbox_failures(pool: &PgPool) -> Vec<(Uuid, i32, Option<String>)> {
 async fn a_refusal_of_every_event_or_of_the_credential_never_counts_against_the_rows(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 2).await;
 
@@ -1415,7 +1492,7 @@ async fn a_refusal_of_every_event_or_of_the_credential_never_counts_against_the_
 async fn a_poisoned_batch_is_split_and_only_the_poisoned_event_is_given_up_on(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
 
     for status in [
@@ -1487,7 +1564,7 @@ async fn a_poisoned_batch_is_split_and_only_the_poisoned_event_is_given_up_on(po
 async fn splitting_stops_at_the_request_budget_and_keeps_the_rest(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig {
         split_budget: 3,
         ..ShipperConfig::default()
@@ -1532,7 +1609,7 @@ async fn splitting_stops_at_the_request_budget_and_keeps_the_rest(pool: PgPool) 
 async fn splitting_stops_at_half_the_claim_lease(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig {
         claim_lease: Duration::from_millis(200),
         ..ShipperConfig::default()
@@ -1564,7 +1641,7 @@ async fn splitting_stops_at_half_the_claim_lease(pool: PgPool) {
 async fn a_failed_settle_still_reschedules_the_failed_pieces(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 3).await;
     let rows = outbox(&pool).await;
@@ -1625,7 +1702,7 @@ async fn a_failed_settle_still_reschedules_the_failed_pieces(pool: PgPool) {
 async fn an_unreachable_platform_never_gives_usage_up(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, _stub) = start_platform().await;
-    let meter = Meter::new(platform, false, "https://x");
+    let meter = Meter::new(platform, "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 2).await;
 
@@ -1658,7 +1735,7 @@ async fn an_unreachable_platform_never_gives_usage_up(pool: PgPool) {
 async fn usage_the_platform_keeps_failing_to_account_for_is_given_up_on(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 2).await;
     stub.lock().unwrap().undercount = true;
@@ -1705,7 +1782,7 @@ async fn usage_the_platform_keeps_failing_to_account_for_is_given_up_on(pool: Pg
 async fn a_receipt_rejecting_ids_outside_the_batch_keeps_every_row(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let cfg = ShipperConfig::default();
     charge_n(&db, &meter, org(), 3).await;
 
@@ -1733,7 +1810,7 @@ async fn a_receipt_rejecting_ids_outside_the_batch_keeps_every_row(pool: PgPool)
 async fn concurrent_shippers_deliver_each_event_once(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     for _ in 0..4 {
         charge_n(&db, &meter, org(), 5).await;
     }
@@ -1767,39 +1844,6 @@ async fn concurrent_shippers_deliver_each_event_once(pool: PgPool) {
         deliveries.values().all(|n| *n == 1),
         "an event was delivered more than once: {deliveries:?}"
     );
-}
-
-/// The quota counts unshipped rows from the platform's current period only:
-/// one left over from an earlier period is not this period's usage.
-#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn an_enforcing_meter_counts_only_this_periods_unshipped_usage(pool: PgPool) {
-    let db = db(pool.clone());
-    let (platform, stub) = start_platform().await;
-    let (o, u) = (org(), user());
-    {
-        let mut p = stub.lock().unwrap();
-        p.used = 9;
-        p.hard_stop = true;
-    }
-    // Left over from before the period the stub reports (it starts today).
-    sqlx::query(
-        "INSERT INTO usage_outbox (org_id, tool, billable, occurred_at) \
-         VALUES ($1, 'submit_feedback', true, now() - interval '2 days')",
-    )
-    .bind(o)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let meter = Meter::new(platform, true, "https://x");
-    // 9 counted + the old row would be 10 already; it does not count.
-    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    meter.charge(&mut tx, u, "create_survey").await.unwrap();
-    tx.commit().await.unwrap();
-    // This period's unshipped row does.
-    let mut tx = begin_live(&db, o, Some(u)).await.unwrap();
-    let err = meter.charge(&mut tx, u, "create_survey").await.unwrap_err();
-    assert_eq!(err.code(), "quota_exceeded", "{err}");
 }
 
 /// A removal is per org: the same user in another org keeps working.

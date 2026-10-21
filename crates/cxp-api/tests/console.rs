@@ -208,7 +208,7 @@ async fn harness_with(pool: PgPool, console: bool) -> Harness {
         PlatformClient::new(ClientConfig::new(base.clone(), RESOURCE, "otto_rs_test")).unwrap(),
     );
     let db = Db::from_pool(pool.clone());
-    let meter = Arc::new(Meter::new(platform.clone(), false, "https://x.example"));
+    let meter = Arc::new(Meter::new(platform.clone(), "https://x.example"));
     let mut state = AppState::new(
         db.clone(),
         platform.clone(),
