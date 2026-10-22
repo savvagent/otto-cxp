@@ -1816,6 +1816,80 @@ async fn run_paused_does_not_flush_on_shutdown(pool: PgPool) {
     assert_eq!(stub.lock().unwrap().received.len(), 0);
 }
 
+/// An alarm raised while the shipper is asleep between passes (not at its
+/// start) still stops the final flush: the check is made when shutdown arrives,
+/// not only when the loop begins a pass. The rows stay in the outbox.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_does_not_flush_on_shutdown_after_an_alarm_raised_while_sleeping(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), "https://x");
+
+    // A long poll, so the shipper is asleep when the alarm is raised.
+    let cfg = ShipperConfig {
+        poll: Duration::from_secs(30),
+        ..ShipperConfig::default()
+    };
+    let (pause_tx, pause) = tokio::sync::watch::channel(false);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(db.clone(), platform, cfg, pause, shutdown));
+    // The first pass finds nothing and the shipper goes to sleep.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    charge_n(&db, &meter, org(), 1).await;
+    pause_tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns on shutdown")
+        .unwrap()
+        .expect("a paused shutdown is clean");
+    assert_eq!(outbox(&pool).await.len(), 1, "nothing shipped while paused");
+    assert_eq!(stub.lock().unwrap().received.len(), 0);
+}
+
+/// An alarm raised during the sleep is acted on at once, and clearing it
+/// resumes shipping without waiting out the poll.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_notices_an_alarm_raised_during_the_sleep(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), "https://x");
+
+    let cfg = ShipperConfig {
+        poll: Duration::from_secs(30),
+        ..ShipperConfig::default()
+    };
+    let (pause_tx, pause) = tokio::sync::watch::channel(false);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(db.clone(), platform, cfg, pause, shutdown));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Raise, then clear: the shipper wakes for each and the clear starts a pass
+    // immediately, so the row ships well inside the 30 s poll.
+    pause_tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    charge_n(&db, &meter, org(), 1).await;
+    assert_eq!(outbox(&pool).await.len(), 1, "paused: nothing shipped");
+    pause_tx.send(false).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !outbox(&pool).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("clearing the alarm resumes shipping without waiting out the poll");
+    assert_eq!(stub.lock().unwrap().received.len(), 1);
+
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns on shutdown")
+        .unwrap()
+        .expect("the final flush succeeds");
+}
+
 // ---------------------------------------------------------------------- auth
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]

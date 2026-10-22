@@ -1226,7 +1226,26 @@ pub async fn run(
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            // An alarm raised during the sleep takes effect now, not after
+            // the backoff (up to a minute) has run out: the next pass starts
+            // at the pause check above.
+            changed = pause.changed() => {
+                // The sender is shared with the process's lifetime; a closed
+                // channel means the process is winding down.
+                if changed.is_err() {
+                    return Ok(());
+                }
+            }
             _ = shutdown.changed() => {
+                // The final flush is still a pass as the connecting role, so a
+                // raised alarm skips it too: the rows wait for the next start.
+                if *pause.borrow() {
+                    tracing::warn!(
+                        "shutting down while usage shipping is paused; no final flush, the \
+                         rows stay queued for the next start"
+                    );
+                    return Ok(());
+                }
                 return match ship_once(&db, &platform, &cfg).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
