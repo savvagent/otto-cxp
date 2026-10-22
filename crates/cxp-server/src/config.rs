@@ -128,6 +128,92 @@ pub fn retired_vars(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
         .collect()
 }
 
+/// What `cxp-server migrate` reads, and nothing more. It runs in its own Fly
+/// app (#45) that holds the migration owner's credential and no other
+/// secret, so unlike [`Config`] it requires nothing: not the platform
+/// secrets, not the public URL. [`crate::migrate`] refuses to run in a
+/// deployment without the owner's credential.
+#[derive(Clone)]
+pub struct MigrateConfig {
+    /// `CXP_MIGRATION_DATABASE_URL` (secret): the database owner's login.
+    pub migration_database_url: Option<String>,
+    /// `CXP_DATABASE_URL` or `DATABASE_URL`: the runtime login. Used only on
+    /// a developer's machine, where one role both owns and serves.
+    pub database_url: Option<String>,
+    /// `FLY_APP_NAME`, set by Fly on every machine.
+    pub fly_app_name: Option<String>,
+    /// `CXP_PUBLIC_URL` and `CXP_RESOURCE_URI`, unvalidated: only whether
+    /// they point off a developer's machine matters here.
+    pub public_url: Option<String>,
+    pub resource_uri: Option<String>,
+    pub log_format: LogFormat,
+}
+
+impl std::fmt::Debug for MigrateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrateConfig")
+            .field(
+                "migration_database_url",
+                &self.migration_database_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("fly_app_name", &self.fly_app_name)
+            .field("public_url", &self.public_url)
+            .field("resource_uri", &self.resource_uri)
+            .field("log_format", &self.log_format)
+            // The database URLs carry passwords.
+            .finish_non_exhaustive()
+    }
+}
+
+impl MigrateConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let vars = Vars(&get);
+        Ok(Self {
+            migration_database_url: vars.optional("CXP_MIGRATION_DATABASE_URL"),
+            database_url: vars
+                .optional("CXP_DATABASE_URL")
+                .or_else(|| vars.optional("DATABASE_URL")),
+            fly_app_name: vars.optional("FLY_APP_NAME"),
+            public_url: vars.optional("CXP_PUBLIC_URL"),
+            resource_uri: vars.optional("CXP_RESOURCE_URI"),
+            log_format: vars.parse("CXP_LOG_FORMAT", "text", |s| match s {
+                "text" => Ok(LogFormat::Text),
+                "json" => Ok(LogFormat::Json),
+                _ => Err(anyhow!("text or json")),
+            })?,
+        })
+    }
+
+    /// As [`Config::is_deployment`]: a Fly machine, or a public URL or token
+    /// audience that is set and not loopback (or does not parse).
+    pub fn is_deployment(&self) -> bool {
+        let off_loopback = |v: &Option<String>| {
+            v.as_deref()
+                .is_some_and(|v| url::Url::parse(v).map_or(true, |u| !is_loopback(&u)))
+        };
+        off_loopback(&self.public_url)
+            || off_loopback(&self.resource_uri)
+            || self.fly_app_name.is_some()
+    }
+}
+
+impl From<&Config> for MigrateConfig {
+    fn from(c: &Config) -> Self {
+        Self {
+            migration_database_url: c.migration_database_url.clone(),
+            database_url: Some(c.database_url.clone()),
+            fly_app_name: c.fly_app_name.clone(),
+            public_url: Some(c.public_url.clone()),
+            resource_uri: Some(c.resource_uri.clone()),
+            log_format: c.log_format,
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_lookup(|name| std::env::var(name).ok())
@@ -883,5 +969,69 @@ mod tests {
         );
         let s = format!("{:?}", load(&env(&[])).unwrap());
         assert!(s.contains("migration_database_url: None"), "{s}");
+    }
+
+    /// Only what is given: unlike [`env`], nothing else is set.
+    fn migrate_cfg(pairs: &[(&str, &str)]) -> Result<MigrateConfig> {
+        let vars: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        MigrateConfig::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    /// `cxp-server migrate` reads only what migrating needs, so the app that
+    /// runs it (#45) holds the owner's credential and nothing else: no
+    /// introspection secret, no webhook secret, no public URL.
+    #[test]
+    fn migrate_config_needs_only_the_owner_credential() {
+        let owner = "postgres://cxp_owner:sw0rdfish@db.internal/otto_cxp";
+        let c = migrate_cfg(&[
+            ("CXP_MIGRATION_DATABASE_URL", owner),
+            ("FLY_APP_NAME", "otto-cxp-migrate"),
+        ])
+        .unwrap();
+        assert_eq!(c.migration_database_url.as_deref(), Some(owner));
+        assert!(c.is_deployment());
+        assert_eq!(c.log_format, LogFormat::Text);
+        let s = format!("{c:?}");
+        assert!(!s.contains("sw0rdfish") && !s.contains("cxp_owner"), "{s}");
+    }
+
+    /// Nothing is required to parse: a deployment without the credential is
+    /// refused later, by `migration_url`, with its own message.
+    #[test]
+    fn migrate_config_parses_with_nothing_set_and_is_then_local() {
+        let c = migrate_cfg(&[]).unwrap();
+        assert!(c.migration_database_url.is_none() && c.database_url.is_none());
+        assert!(!c.is_deployment());
+        let c = migrate_cfg(&[("CXP_LOG_FORMAT", "json")]).unwrap();
+        assert_eq!(c.log_format, LogFormat::Json);
+        assert!(migrate_cfg(&[("CXP_LOG_FORMAT", "yaml")]).is_err());
+    }
+
+    /// Deployment is judged as for the server: a Fly machine, or a public
+    /// URL or token audience that is not loopback, and an unparsable one.
+    #[test]
+    fn migrate_config_is_a_deployment_by_fly_or_by_non_loopback_urls() {
+        let dep = |k: &str, v: &str| migrate_cfg(&[(k, v)]).unwrap();
+        assert!(dep("FLY_APP_NAME", "x").is_deployment());
+        assert!(dep("CXP_PUBLIC_URL", "https://cxp.example.com").is_deployment());
+        assert!(dep("CXP_RESOURCE_URI", "https://cxp.example.com/mcp").is_deployment());
+        assert!(dep("CXP_PUBLIC_URL", "not a url").is_deployment());
+        assert!(!dep("CXP_PUBLIC_URL", "http://localhost:8080").is_deployment());
+        assert!(!dep("CXP_RESOURCE_URI", "http://127.0.0.1:8080/mcp").is_deployment());
+    }
+
+    /// The server's own `Config` converts, so `migrate` has one input type
+    /// and the e2e tests keep passing the config they build.
+    #[test]
+    fn migrate_config_from_a_server_config_keeps_the_migrating_fields() {
+        let mut c = Config::for_test();
+        c.migration_database_url = Some("postgres://o@db/x".into());
+        let m = MigrateConfig::from(&c);
+        assert_eq!(m.migration_database_url, c.migration_database_url);
+        assert_eq!(m.database_url.as_deref(), Some(c.database_url.as_str()));
+        assert_eq!(m.is_deployment(), c.is_deployment());
     }
 }

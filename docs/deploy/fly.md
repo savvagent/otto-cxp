@@ -40,7 +40,7 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   `cxp_app` and `cxp_runtime` (and of the shared `otto_app` until
   [runbook T5](#runbook-give-otto-cxp-its-own-tenant-role-human-only-rob)), and with `cxp_owner` the only roles besides superusers that may
   connect to `otto_cxp`. `cxp_owner` owns `otto_cxp` and everything in it, and logs in only from
-  the release command, to migrate (see [Database role](#database-role)). Tenant transactions run
+  the migration app's one-off machine, to migrate (see [Database role](#database-role)). Tenant transactions run
   as `cxp_app`, otto-cxp's own tenant role ([#28](https://github.com/savvagent/otto-cxp/issues/28)),
   under row-level security, which `cxp-server` proves at boot
   (`tenant isolation enforced as role "cxp_app"`) and refuses to start without; everything
@@ -65,19 +65,28 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   start within 500 ms answers `unavailable` (503 with `Retry-After`)
   ([#42](https://github.com/savvagent/otto-cxp/issues/42)).
   Split onto a dedicated instance before real customers.
-- **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`). They run in Fly's release
-  command (`[deploy] release_command = "migrate"`, so `cxp-server migrate` under the image's
-  entrypoint), as `cxp_owner` through `CXP_MIGRATION_DATABASE_URL`, in a temporary machine of the
-  new image before any machine is updated, under sqlx's advisory lock; a failure aborts the
-  deploy and leaves the old release serving. The serving machines run with
-  `CXP_RUN_MIGRATIONS=false` and never migrate. Never run the platform's migrations here.
+- **App** `otto-cxp-migrate` (#45): holds one secret, `CXP_MIGRATION_DATABASE_URL` (`cxp_owner`),
+  and no running machine and no service. It exists so that credential lives outside `otto-cxp`:
+  Fly secrets are app-wide, so on `otto-cxp` it would reach every serving machine, and so root on
+  one, or anyone with that app's deploy token (`fly ssh`, or a machine they start), could read
+  it. Its own deploy token is held by CI alone.
+- **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`). The CI deploy job runs
+  `cxp-server migrate` (the image's entrypoint plus `migrate`; `scripts/deploy/run-migrate.sh`)
+  as a one-off machine of `otto-cxp-migrate`, from the very image it is about to deploy, as
+  `cxp_owner`, under sqlx's advisory lock, and only then runs `fly deploy -a otto-cxp --image`
+  with that image. A failed migration (nonzero exit, or no exit within 300 s) stops the job
+  before any machine of the new release starts, and the old release keeps serving. `migrate`
+  reads only `CXP_MIGRATION_DATABASE_URL` (and `FLY_APP_NAME`, which Fly sets), so the migration
+  app needs no platform secret. The serving machines run with `CXP_RUN_MIGRATIONS=false` and
+  never migrate; `fly.toml` has no `release_command`, so **a hand `fly deploy -a otto-cxp` does
+  not migrate** (see [Deploys](#deploys)). Never run the platform's migrations here.
 
 ## Secrets
 
 | Secret | What | Where from |
 |---|---|---|
 | `DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_server` (the runtime role, which owns nothing) | [Database role](#database-role) (replaces the one `fly postgres attach` set) |
-| `CXP_MIGRATION_DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_owner`. Read only by the release command (`cxp-server migrate`); a deployment's `migrate` refuses to run without it, and the serving process never reads it | [Split the migration owner](#runbook-split-the-migration-owner-from-the-runtime-role-human-only-rob), S6 (staged, so only a release that sheds it receives it) |
+| `CXP_MIGRATION_DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_owner`. A secret of the **`otto-cxp-migrate`** app only, never of `otto-cxp` (#45; `fly secrets list -a otto-cxp` must not show it). Read only by `cxp-server migrate`; a deployment's `migrate` refuses to run without it | [Runbook: move the owner credential](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob) (S6 stages it on the wrong app for a setup made after #45: use that runbook instead) |
 | `CXP_RUN_MIGRATIONS` | `false`. Also in `fly.toml` `[env]`; kept as a secret (which wins over `[env]`) so a rollback to an image from before #27, whose `fly.toml` lacks it, does not try to migrate as the runtime role | Same runbook, S1 |
 | `CXP_INTROSPECTION_SECRET` | `otto_rs_...`, authenticates every call to the platform | `resource rotate-secret` |
 | `CXP_PLATFORM_WEBHOOK_SECRET` | `otto_whsec_...`, verifies platform webhooks | `resource set-webhook` |
@@ -93,7 +102,7 @@ Four roles, since #27 ([split runbook](#runbook-split-the-migration-owner-from-t
 | Role | Login | Owns | Holds | Used by |
 |---|---|---|---|---|
 | `cxp_server` | yes | nothing | member of `cxp_app` and `cxp_runtime` (and of `otto_app` until T5); `CONNECT` on `otto_cxp` | the serving machines (`DATABASE_URL`) |
-| `cxp_owner` | yes | database `otto_cxp` and every object in it | `SET` on the parameter `app.console_session_lookup` | the release command, `cxp-server migrate` (`CXP_MIGRATION_DATABASE_URL`) |
+| `cxp_owner` | yes | database `otto_cxp` and every object in it | `SET` on the parameter `app.console_session_lookup` | `cxp-server migrate` in `otto-cxp-migrate` (`CXP_MIGRATION_DATABASE_URL`) |
 | `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0006) | the runtime's grants beyond the tenant role |
 | `cxp_app` | no | nothing | `otto_cxp`'s tenant grants, the same as `otto_app`'s there (migration 0008) | `SET LOCAL ROLE` in tenant transactions; inherited by `cxp_server` for the background work |
 
@@ -115,13 +124,14 @@ Why the split: an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`, `DISA
 SECURITY`, or `DROP POLICY`, and `TRUNCATE` ignores RLS altogether, so any SQL running as an
 owning runtime role (the sweep, the shipper, the tombstone, `/readyz`, a future injection bug)
 could switch tenant isolation off for every org. `cxp_server` owns nothing and holds no
-`TRUNCATE` or `TRIGGER`, so it cannot. The owner never serves: its credential is used only by the
-release command. (A NOLOGIN owner that `cxp_server` could assume would not do: assuming a role is
+`TRUNCATE` or `TRIGGER`, so it cannot. The owner never serves: its credential is used only by
+`cxp-server migrate`. (A NOLOGIN owner that `cxp_server` could assume would not do: assuming a role is
 a `SET ROLE`, which any SQL the runtime login runs could repeat; and a NOLOGIN owner assumed by
 a second login only moves the exposure to that login's credential.)
 
-**The owner's credential and the serving machines.** Fly secrets are app-wide, so
-`CXP_MIGRATION_DATABASE_URL` reaches every serving machine, not only the release command's. A
+**The owner's credential and the serving machines.** Fly secrets are app-wide, so, were
+`CXP_MIGRATION_DATABASE_URL` a secret of `otto-cxp` (as #27 first shipped it), it would reach every
+serving machine, not only the migration's. A
 serving `cxp-server` therefore sheds it before doing anything else: finding it in its
 environment, it re-executes itself with the same arguments and the environment minus that
 variable, before reading its configuration or starting a thread (`unsetenv` alone would leave the
@@ -135,12 +145,15 @@ environment dump in the serving process does not find its credential either.
 What remains: Fly's init (PID 1, root) still holds the app's secrets for the machine's life, so
 root on a serving machine (`fly ssh console`, or an exploit that escalates from the
 unprivileged `cxp` user to root) can read the owner's credential, and so can anyone with the
-app's Fly deploy token (`fly ssh`, or a machine they start). Closing that means the owner's
-credential living outside this app: a separate Fly app (say `otto-cxp-migrate`) holding only
-`CXP_MIGRATION_DATABASE_URL` and running `cxp-server migrate` as a one-off machine from the
-deploy job before `fly deploy`. That is a follow-up,
-[#45](https://github.com/savvagent/otto-cxp/issues/45), not done here: it adds an app, its own
-deploy token, and ordering in CI.
+app's Fly deploy token (`fly ssh`, or a machine they start). [#45](https://github.com/savvagent/otto-cxp/issues/45) closed that by
+moving the owner's credential out of this app: the separate Fly app `otto-cxp-migrate` holds only
+`CXP_MIGRATION_DATABASE_URL`, and the CI deploy job runs `cxp-server migrate` there as a one-off
+machine before `fly deploy` ([Infrastructure](#infrastructure); the runbook is
+[below](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob)). With the secret
+unset on `otto-cxp`, the serving process has nothing to shed (its re-exec stays as a guard
+against it being set by mistake), and neither root on a serving machine nor `otto-cxp`'s deploy
+token reaches the owner's credential. What is left is the migration app's own deploy token (CI
+only) and whoever administers the `savvagent` org.
 
 The `SECURITY DEFINER` functions run as their owner, `cxp_owner`: `console_session_org` (the
 console's cookie lookup, which `cxp_server` may call through `cxp_app`'s `EXECUTE`) and
@@ -676,7 +689,7 @@ your password manager (hex, so it needs no escaping in a URL): `openssl rand -he
 
 ```sql
 \set ON_ERROR_STOP on
--- The migration owner. It logs in only from the release command: CONNECTION LIMIT covers its
+-- The migration owner. It logs in only to migrate: CONNECTION LIMIT covers its
 -- 2-connection pool and a psql session.
 CREATE ROLE cxp_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION
   CONNECTION LIMIT 3;
@@ -899,38 +912,40 @@ ALTER DEFAULT PRIVILEGES FOR ROLE cxp_server IN SCHEMA public
 COMMIT;
 ```
 
-**S6. Stage the owner's credential, then merge the PR for #27.** Staged, so the running release
-(which cannot shed it) never receives it; it applies with the next deploy, to the release command
-and to the new release, which re-executes itself without it:
+**S6. Give the migration app the owner's credential, then merge the PR for #27.** Since #45 the
+credential belongs to the `otto-cxp-migrate` app, never to `otto-cxp`: do not stage it on
+`otto-cxp` (if you already did, the
+[runbook below](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob) unsets it). Do
+that runbook's M1 to M3 now, and merge the PR for #27 together with the one for #45 (or #45 first
+if #27 is already merged); the migration then runs in the CI deploy job, as `cxp_owner`, before
+the new release starts:
 
 ```bash
-read -rs PW     # paste cxp_owner's password, then Enter; nothing is shown
-printf 'CXP_MIGRATION_DATABASE_URL=postgres://cxp_owner:%s@otto-db.flycast:5432/otto_cxp?sslmode=disable\n' \
-  "$PW" | fly secrets import -a otto-cxp --stage
-unset PW
-fly secrets list -a otto-cxp        # CXP_MIGRATION_DATABASE_URL listed as staged
+fly secrets list -a otto-cxp-migrate   # CXP_MIGRATION_DATABASE_URL listed
+fly secrets list -a otto-cxp           # and NOT listed here
 ```
 
-(Same host, port, and query string as `DATABASE_URL`; R0 noted them. `read` and `printf` are shell
-builtins: the password reaches neither the history nor the process list.) Then merge; with
-`FLY_DEPLOY` enabled the merge deploys, otherwise `fly deploy -a otto-cxp --remote-only`. Fly
-first runs the release command, `cxp-server migrate`, in a temporary machine as `cxp_owner`; it
+Then merge; with `FLY_DEPLOY` enabled the merge deploys, otherwise do the hand deploy in
+[Deploys](#deploys). `cxp-server migrate` runs first, in a one-off machine of `otto-cxp-migrate`
+as `cxp_owner`; it
 applies 0006 and 0007 (0007 recreates `console_session_org`, whose `SET` clause needs the
 parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
 serving. After migrating it verifies that 0006's grant landed: if `cxp_runtime` did not exist when
 0006 ran, 0006's own `NOTICE` is all that stood in its way, and the release command now fails with
 `refusing to finish the release: the release cannot finish without ...` rather than deploy a fleet
 whose machines all refuse to boot (`missing_cxp_runtime_install`). Then see [Verify](#verify): the
-release command's log shows `database role "cxp_owner"
+migration machine's log shows `database role "cxp_owner"
 holds no superuser-equivalent privilege ...`, `applying migrations`, `migrations applied`; each
 machine's shows `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment ...`,
 `database role "cxp_server" ... it owns nothing in this database, can TRUNCATE or add a TRIGGER
 to no table, and can create no schema, object, or temporary table in it ...`, `not migrating`,
 `tenant isolation enforced as role "otto_app"` (releases before #28; from #28 on, `"cxp_app"`).
 
-Rolling back after S6 means rolling back the code, and the release command is the catch: an image
+Rolling back after S6 means rolling back the code, and the release command is the catch for an
+image deployed with #27's `fly.toml` (before #45): an image
 from before #27 does not know `migrate` and would start serving inside the release machine until
-Fly's release-command timeout (5 minutes by default) aborts the deploy. Revert the PR (the reverted `fly.toml` has no release command), or deploy the
+Fly's release-command timeout (5 minutes by default) aborts the deploy. With #45 there is no
+release command, so deploying an older image needs no migration step. Revert the PR (the reverted `fly.toml` has no release command), or deploy the
 previous image with the previous commit's `fly.toml` (`git show <previous commit>:fly.toml >
 /tmp/fly.toml && fly deploy -a otto-cxp --image <previous image> -c /tmp/fly.toml`). Either way
 the `CXP_RUN_MIGRATIONS` secret keeps the old binary from migrating, and S4 proved it serves as
@@ -938,8 +953,71 @@ a non-owner. Never undo S3 after S6: the new release refuses an owning runtime r
 
 **S7. Nothing to retire.** `cxp_server` keeps its password and `DATABASE_URL`. `cxp_owner`'s
 password lives only in `CXP_MIGRATION_DATABASE_URL` and your password manager; rotate it with
-`\password cxp_owner` and the same `read -rs PW ... | fly secrets import -a otto-cxp` (unstaged
-is fine once #27 is deployed: the serving release sheds it on restart).
+`\password cxp_owner` and the same `read -rs PW ... | fly secrets import -a otto-cxp-migrate`
+(M3 below; the migration app has no running machine, so there is nothing to restart).
+
+### Runbook: move the owner credential out of otto-cxp (human-only, Rob)
+
+[#45](https://github.com/savvagent/otto-cxp/issues/45). Starts from the state #27 left (or, if
+S6 was not yet run, before it). Ends with `CXP_MIGRATION_DATABASE_URL` a secret of the new app
+`otto-cxp-migrate` only, and the CI deploy job migrating there. The agent that wrote this ran none
+of it: each step creates an app, sets or unsets a secret, or sets a repo credential. **Do M1 to M6
+before the PR for #45 merges**: the deploy job it changes needs the new app, its secret, and its
+token, and `FLY_DEPLOY=enabled` makes the merge deploy.
+
+```bash
+# M0. Cost check first. An app with no machine running should bill nothing (compute is billed
+#     per running machine-second; stopped machines pay only for their root filesystem, and this
+#     app creates machines only to destroy them). Confirm on Fly's pricing page, and after the first
+#     run in the org's billing view, that otto-cxp-migrate adds no recurring line. No volume, no
+#     IP address, no certificate: allocate none.
+
+# M1. The app. No deploy, no IPs; it only holds a secret and receives one-off machines.
+fly apps create otto-cxp-migrate --org savvagent
+
+# M2. A deploy token scoped to this app only, for CI. It can start machines here and read this
+#     app's secrets through them, so it is the new keeper of the owner credential: keep it out of
+#     every other place (not otto-cxp's token, not your shell history).
+fly tokens create deploy -a otto-cxp-migrate     # prints the token
+gh secret set FLY_API_TOKEN_MIGRATE --repo savvagent/otto-cxp   # paste it
+
+# M3. The owner's credential, on the new app only. Same host, port, and query string as
+#     DATABASE_URL (R0 noted them); read and printf are shell builtins, so the password reaches
+#     neither the history nor the process list. No --stage needed: the app runs nothing.
+read -rs PW     # paste cxp_owner's password, then Enter; nothing is shown
+printf 'CXP_MIGRATION_DATABASE_URL=postgres://cxp_owner:%s@otto-db.flycast:5432/otto_cxp?sslmode=disable\n' \
+  "$PW" | fly secrets import -a otto-cxp-migrate
+unset PW
+
+# M4. Take it off otto-cxp (skip if S6 never staged it there). --stage keeps the running release
+#     undisturbed; the deploy for this PR applies it. Skipping --stage restarts the machines,
+#     which is also fine once #27 is deployed.
+fly secrets unset -a otto-cxp --stage CXP_MIGRATION_DATABASE_URL
+
+# M5. Confirm. The first list must show CXP_MIGRATION_DATABASE_URL; the second must NOT
+#     (acceptance criterion; a staged unset can still show it until the next deploy: re-check after
+#     the deploy, and after it `fly secrets list -a otto-cxp` must be clean).
+fly secrets list -a otto-cxp-migrate
+fly secrets list -a otto-cxp
+
+# M6. One-time check that a machine of otto-cxp-migrate can pull otto-cxp's image: the deploy
+#     job pushes registry.fly.io/otto-cxp:sha-<sha> with otto-cxp's token and runs it in the
+#     other app. Push any image of the app (`fly deploy -a otto-cxp --build-only --push
+#     --image-label m6`), then start it here with an argument cxp-server rejects before it
+#     touches anything (no database, no migration). It must start and exit 1 with `unknown
+#     argument "bogus"`; a registry "denied" or "unauthorized" instead means the pull is refused,
+#     and run-migrate.sh/ci.yml must push to the migration app's registry as well.
+fly machine run registry.fly.io/otto-cxp:m6 bogus -a otto-cxp-migrate --restart no --name pull-check
+fly logs -a otto-cxp-migrate --no-tail
+fly machine destroy "$(fly machines list -a otto-cxp-migrate --json | jq -r '.[]|select(.name=="pull-check").id')" -a otto-cxp-migrate --force
+```
+
+Then merge. The deploy job builds and pushes the image, runs `scripts/deploy/run-migrate.sh`
+(a machine named `migrate-<sha>`, destroyed afterwards, success only on exit code 0), and
+deploys that image. Verify as in [Verify](#verify). Rotating the owner password later is S7.
+Rolling back: revert the PR and re-stage `CXP_MIGRATION_DATABASE_URL` on `otto-cxp`, because the
+reverted `fly.toml` runs `migrate` as the release command again; or deploy an older image, which
+needs no migration step.
 
 ### Runbook: give otto-cxp its own tenant role (human-only, Rob)
 
@@ -1288,11 +1366,11 @@ fly certs add otto-cxp.savvagent.com -a otto-cxp
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL to a superuser,
 #    which a deployment refuses: run "Database role" below before step 5 (on a fresh
 #    setup its step R5 imports the secret with --stage, and R6 and R7 follow the first deploy),
-#    then the split runbook's S1 to S4 and S6's staged secret (with nothing deployed yet,
-#    S1's secret restarts nothing, and S4's checks of tables and console_session_org wait
-#    until after the first deploy, as does its restart). Then the tenant-role runbook's T1
+#    then the split runbook's S1 to S4, and the "move the owner credential" runbook's M1 to M5
+#    (with nothing deployed yet, S1's secret restarts nothing, and S4's checks of tables and
+#    console_session_org wait until after the first deploy, as does its restart). Then the tenant-role runbook's T1
 #    (cxp_app), before the first release command runs migration 0008.
-#    The first deploy's release command then migrates as cxp_owner.
+#    The first deploy migrates as cxp_owner from otto-cxp-migrate: step 5 below.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
 # 3. Register the resource server at the platform (run on the platform's machine).
@@ -1309,9 +1387,11 @@ fly ssh console -a otto-platform -C 'otto-platform-server resource set-webhook \
 fly secrets set -a otto-cxp --stage \
   CXP_INTROSPECTION_SECRET='otto_rs_...' CXP_PLATFORM_WEBHOOK_SECRET='otto_whsec_...'
 
-# 5. First deploy, by hand (the CI deploy job is still off).
-fly deploy -a otto-cxp --remote-only
+# 5. First deploy, by hand (the CI deploy job is still off). The same three steps the job runs:
+#    build and push, migrate in otto-cxp-migrate, deploy that image ("Deploys").
 ```
+
+(Step 5 is [the hand deploy](#deploys).)
 
 Run [Verify](#verify). Only when it passes, enable CI deploys:
 
@@ -1319,6 +1399,7 @@ Run [Verify](#verify). Only when it passes, enable CI deploys:
 # 6. A deploy token scoped to this one app, then the repo credentials.
 fly tokens create deploy -a otto-cxp                  # prints the token
 gh secret set FLY_API_TOKEN --repo savvagent/otto-cxp # paste the token
+# FLY_API_TOKEN_MIGRATE (otto-cxp-migrate's token) is set in the owner-credential runbook, M2.
 gh variable set FLY_DEPLOY --body enabled --repo savvagent/otto-cxp
 ```
 
@@ -1427,7 +1508,9 @@ fly logs -a otto-cxp --no-tail
 
 The logs must show, in order:
 
-- from the release command's machine: `database role "cxp_owner" holds no superuser-equivalent
+- from the migration machine (`fly logs -a otto-cxp-migrate --no-tail`, or the deploy job's
+  "Migrate" step, which prints it; the machine is destroyed after the run, so Fly's log shipper
+  keeps it only briefly): `database role "cxp_owner" holds no superuser-equivalent
   privilege (...) ... and can connect to no other service's database; it owns database
   "otto_cxp", ...`, then `applying migrations`, then `migrations applied`;
 - from each serving machine: `removed CXP_MIGRATION_DATABASE_URL from the serving process's
@@ -1508,7 +1591,23 @@ ignored and logs a startup warning if set.
 Every push to `main` that passes CI deploys (`.github/workflows/ci.yml`, job `deploy`, which
 needs `rust`, `docker-build`, and `web`). The job runs only while the repo variable
 `FLY_DEPLOY` is `enabled`, which Rob sets after the hand-run first deploy is verified; until
-then a merge deploys nothing. `FLY_API_TOKEN` is the deploy token from step 6. A hand deploy is `fly deploy -a otto-cxp --remote-only`.
+then a merge deploys nothing. `FLY_API_TOKEN` is the deploy token from step 6; `FLY_API_TOKEN_MIGRATE` is the migration
+app's (M2 of the [owner-credential runbook](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob)).
+The job builds and pushes one image, migrates with it in `otto-cxp-migrate`
+(`scripts/deploy/run-migrate.sh`, which fails the job unless the machine exits 0), then deploys
+that image to `otto-cxp`.
+
+A hand deploy does the same three steps, because `fly deploy` alone no longer migrates (the
+tokens are your own; nothing here needs the CI ones):
+
+```bash
+SHA=$(git rev-parse HEAD)
+fly deploy --build-only --push --remote-only -a otto-cxp --image-label "sha-$SHA"
+scripts/deploy/run-migrate.sh "registry.fly.io/otto-cxp:sha-$SHA" "$SHA"   # stops on failure
+fly deploy --image "registry.fly.io/otto-cxp:sha-$SHA" -a otto-cxp
+```
+
+Skipping the middle step deploys code onto an unmigrated schema.
 
 ## Migrations
 
@@ -1516,9 +1615,9 @@ Migrations are append-only: a schema change is a new `crates/cxp-core/migrations
 never an edit, rename, or delete of an existing one. sqlx refuses to boot when an applied
 migration's checksum changed, and CI's `migrations-append-only` job rejects such a PR.
 `MIGRATOR` sets `ignore_missing`, so the previous release boots against a newer schema (a
-rollback of the image works), which means every migration must be additive. They run in the
-release command as `cxp_owner` (see [Infrastructure](#infrastructure)); confirm with the
-`applying migrations` and `migrations applied` lines in the release command's log. A migration
+rollback of the image works), which means every migration must be additive. They run in the CI
+deploy job as `cxp_owner`, in `otto-cxp-migrate` (see [Infrastructure](#infrastructure)); confirm
+with the `applying migrations` and `migrations applied` lines in the "Migrate" step's log. A migration
 that gives the runtime a privilege beyond the tenant role `cxp_app`'s grants it to `cxp_runtime`, guarded by
 `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_runtime')` as 0006 does.
 

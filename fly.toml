@@ -11,15 +11,17 @@
 # can connect to another service's database, or one that owns anything in
 # `otto_cxp`, may TRUNCATE or add a TRIGGER to a table, or may CREATE or create
 # TEMPORARY tables there, here (FLY_APP_NAME is set on every Fly
-# machine). Migrations run in the release command as `cxp_owner`, the owner
-# (#27; docs/deploy/fly.md, "Database role"). Isolation
+# machine). Migrations run as `cxp_owner`, the owner, from the CI deploy job in a
+# one-off machine of a separate app, otto-cxp-migrate (#27, #45;
+# docs/deploy/fly.md, "Topology"), so this app holds no owner credential. Isolation
 # rests on `SET LOCAL ROLE cxp_app` (otto-cxp's own tenant role, #28)
 # under row-level security; cxp-server proves that at boot and refuses to
 # serve otherwise.
 #
 # Secrets (`fly secrets set`, never here):
 #   DATABASE_URL                    as cxp_server (docs/deploy/fly.md, "Database role")
-#   CXP_MIGRATION_DATABASE_URL      as cxp_owner; read only by the release command
+#   (CXP_MIGRATION_DATABASE_URL, as cxp_owner, is a secret of otto-cxp-migrate ONLY and
+#   must not be set on this app; the CI deploy job migrates there, #45)
 #   CXP_RUN_MIGRATIONS              false, duplicating [env] below so a rollback to a
 #                                   release from before #27 does not migrate either
 #   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
@@ -35,11 +37,9 @@ kill_timeout = 30
 [build]
   dockerfile = "Dockerfile"
 
-[deploy]
-  # Migrations, as the owner (CXP_MIGRATION_DATABASE_URL), in a temporary machine
-  # of the new image before any machine is updated; a failure aborts the deploy.
-  # The image's ENTRYPOINT is cxp-server, so this runs `cxp-server migrate`.
-  release_command = "migrate"
+# No [deploy] release_command: migrations run before `fly deploy`, in CI, in the
+# otto-cxp-migrate app (docs/deploy/fly.md, "Topology"). A hand `fly deploy`
+# does not migrate; run scripts/deploy/run-migrate.sh first.
 
 [env]
   CXP_BIND = "0.0.0.0:8080"
@@ -52,7 +52,7 @@ kill_timeout = 30
   CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
   # Small: otto-db is a shared 512 MB instance.
   CXP_DB_MAX_CONNECTIONS = "5"
-  # The serving role owns nothing and cannot migrate; the release command does.
+  # The serving role owns nothing and cannot migrate; the CI deploy job does (otto-cxp-migrate).
   # A deployment refuses to serve with this on.
   CXP_RUN_MIGRATIONS = "false"
   # The web console's sign-in is off until the first-party client is registered at the
@@ -85,7 +85,7 @@ kill_timeout = 30
     interval = "15s"
     timeout = "5s"
     # Boot connects, checks the database role, proves tenant isolation, and asks
-    # the platform before it serves; migrations ran in the release command.
+    # the platform before it serves; migrations ran before the deploy.
     # A database role the hourly re-check refuses fails this check too.
     grace_period = "30s"
 

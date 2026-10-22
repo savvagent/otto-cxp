@@ -141,3 +141,62 @@ fn migrate_keeps_the_secret_and_never_logs_it() {
     assert!(!text.contains(SECRET), "{text}");
     assert!(!text.contains("CXP_MIGRATION_SECRET_REMOVED"), "{text}");
 }
+
+/// The app that runs `migrate` (#45) holds the owner's credential and no
+/// other secret: with only that set, `migrate` gets as far as connecting
+/// rather than refusing for a missing platform secret or public URL.
+#[test]
+fn migrate_needs_no_secret_but_the_owners() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let db = silent.local_addr().unwrap();
+    drop(silent); // nothing listens: the connect fails at once
+    let out = Command::new(env!("CARGO_BIN_EXE_cxp-server"))
+        .arg("migrate")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("FLY_APP_NAME", "otto-cxp-migrate")
+        .env(
+            "CXP_MIGRATION_DATABASE_URL",
+            format!("postgres://owner:{SECRET}@{db}/x"),
+        )
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("could not connect to the database to migrate"),
+        "{text}"
+    );
+    for missing in [
+        "CXP_PUBLIC_URL",
+        "CXP_INTROSPECTION_SECRET",
+        "configuration is incomplete",
+    ] {
+        assert!(!text.contains(missing), "{text}");
+    }
+    assert!(!text.contains(SECRET), "{text}");
+
+    // And a deployment without the owner's credential is refused, by name,
+    // even though DATABASE_URL would connect.
+    let out = Command::new(env!("CARGO_BIN_EXE_cxp-server"))
+        .arg("migrate")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("FLY_APP_NAME", "otto-cxp-migrate")
+        .env("DATABASE_URL", format!("postgres://srv:srv@{db}/x"))
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("CXP_MIGRATION_DATABASE_URL is required"),
+        "{text}"
+    );
+}
