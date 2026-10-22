@@ -1365,10 +1365,7 @@ async fn criterion_2_org_b_cannot_read_or_write_org_a_through_any_tool_or_route(
                         .count();
                     assert_eq!(
                         r.body,
-                        json!({"total_customers": n("customers"), "total_tickets": n("tickets"),
-                               "open_tickets": open, "total_feedback": n("feedback"),
-                               "total_surveys": n("surveys"), "total_experiences": n("experiences"),
-                               "totalCustomers": n("customers"), "totalTickets": n("tickets"),
+                        json!({"totalCustomers": n("customers"), "totalTickets": n("tickets"),
                                "openTickets": open, "totalFeedback": n("feedback"),
                                "totalSurveys": n("surveys"), "totalExperiences": n("experiences")}),
                         "{what}"
