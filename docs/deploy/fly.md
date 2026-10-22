@@ -92,7 +92,7 @@ Three roles, since #27 ([split runbook](#runbook-split-the-migration-owner-from-
 |---|---|---|---|---|
 | `cxp_server` | yes | nothing | member of `otto_app` and `cxp_runtime`; `CONNECT` on `otto_cxp` | the serving machines (`DATABASE_URL`) |
 | `cxp_owner` | yes | database `otto_cxp` and every object in it | `SET` on the parameter `app.console_session_lookup` | the release command, `cxp-server migrate` (`CXP_MIGRATION_DATABASE_URL`) |
-| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0005) | the runtime's grants beyond `otto_app` |
+| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0006) | the runtime's grants beyond `otto_app` |
 
 All three are NOSUPERUSER, NOBYPASSRLS, NOCREATEDB, NOCREATEROLE, NOREPLICATION; `cxp_server`
 has CONNECTION LIMIT 15, `cxp_owner` 3. `cxp_server` is a member of `otto_app` so tenant
@@ -187,7 +187,7 @@ can only `SET ROLE` to, `PUBLIC` included. And it refuses `CXP_RUN_MIGRATIONS=tr
 role cannot migrate), and a runtime role that lacks what its own work needs: `INSERT` on
 `deleted_orgs` (the tombstone) and inheriting `otto_app` (the background tasks); the message
 names the fix (`GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "<role>"`,
-`GRANT otto_app TO "<role>" WITH INHERIT TRUE`). Migration 0006 also pins both `SECURITY DEFINER`
+`GRANT otto_app TO "<role>" WITH INHERIT TRUE`). Migration 0007 also pins both `SECURITY DEFINER`
 functions to `search_path = pg_catalog, public, pg_temp` with every call schema-qualified.
 
 It logs, for example,
@@ -657,7 +657,7 @@ CREATE ROLE cxp_owner LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NORE
 -- 0003's console_session_org names this parameter in its SET clause; a fresh database migrated
 -- by cxp_owner needs the grant (R1 gave it to cxp_server, which no longer migrates).
 GRANT SET ON PARAMETER app.console_session_lookup TO cxp_owner;
--- The runtime's grants beyond otto_app (migration 0005 and later grant to this role).
+-- The runtime's grants beyond otto_app (migration 0006 and later grant to this role).
 CREATE ROLE cxp_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
 GRANT cxp_runtime TO cxp_server;
 ```
@@ -733,8 +733,8 @@ ALTER DATABASE otto_cxp OWNER TO cxp_owner;
 -- new owner; without this it could open no new connection.
 GRANT CONNECT ON DATABASE otto_cxp TO cxp_server;
 -- What the old release does as itself, now as a non-owner: the org.deleted tombstone. Migration
--- 0005 grants the same; this covers the release still running until #27 deploys (and does
--- nothing on a fresh setup, where 0005 will).
+-- 0006 grants the same; this covers the release still running until #27 deploys (and does
+-- nothing on a fresh setup, where 0006 will).
 DO $$
 BEGIN
   IF to_regclass('public.deleted_orgs') IS NOT NULL THEN
@@ -855,10 +855,10 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = 'cxp_owner'::regrole AND datname <> 'otto_cxp') THEN
     RAISE EXCEPTION 'cxp_owner owns another database, which REASSIGN OWNED would move too';
   END IF;
-  -- Migration 0005 runs only in #27's release command: once it has, S6 happened, and the new
+  -- Migration 0006 runs only in #27's release command: once it has, S6 happened, and the new
   -- release refuses an owning runtime role.
   IF EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version >= 5) THEN
-    RAISE EXCEPTION '#27 is deployed (migration 0005 applied): roll the code back first, never S3';
+    RAISE EXCEPTION '#27 is deployed (migration 0006 applied): roll the code back first, never S3';
   END IF;
 END $$;
 REASSIGN OWNED BY cxp_owner TO cxp_server;
@@ -888,7 +888,7 @@ fly secrets list -a otto-cxp        # CXP_MIGRATION_DATABASE_URL listed as stage
 builtins: the password reaches neither the history nor the process list.) Then merge; with
 `FLY_DEPLOY` enabled the merge deploys, otherwise `fly deploy -a otto-cxp --remote-only`. Fly
 first runs the release command, `cxp-server migrate`, in a temporary machine as `cxp_owner`; it
-applies 0005 and 0006 (0006 recreates `console_session_org`, whose `SET` clause needs the
+applies 0006 and 0007 (0007 recreates `console_session_org`, whose `SET` clause needs the
 parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
 serving. Then see [Verify](#verify): the release command's log shows `database role "cxp_owner"
 holds no superuser-equivalent privilege ...`, `applying migrations`, `migrations applied`; each
@@ -1334,7 +1334,7 @@ rollback of the image works), which means every migration must be additive. They
 release command as `cxp_owner` (see [Infrastructure](#infrastructure)); confirm with the
 `applying migrations` and `migrations applied` lines in the release command's log. A migration
 that gives the runtime a privilege beyond `otto_app`'s grants it to `cxp_runtime`, guarded by
-`IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_runtime')` as 0005 does.
+`IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_runtime')` as 0006 does.
 
 ## Local seeding (human-only against otto-db)
 

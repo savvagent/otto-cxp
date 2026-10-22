@@ -10,7 +10,7 @@ boot fails `/readyz` within the hour.
 **Architecture:** `cxp_core::db_role` learns what a role owns and which tables it may `TRUNCATE`
 or add a `TRIGGER` to; `cxp-server` refuses an owning runtime role and `CXP_RUN_MIGRATIONS=true`
 in a deployment, gains `cxp-server migrate` (connecting with `CXP_MIGRATION_DATABASE_URL`), and
-re-checks the role in the hourly sweep, raising a readiness alarm. Migration 0005 grants the one
+re-checks the role in the hourly sweep, raising a readiness alarm. Migration 0006 grants the one
 privilege the runtime needs beyond `otto_app` (`INSERT` on `deleted_orgs`) to the group role
 `cxp_runtime`.
 
@@ -33,7 +33,7 @@ privilege the runtime needs beyond `otto_app` (`INSERT` on `deleted_orgs`) to th
 - Evidence: report pass counts per test binary. `cargo test` without `DATABASE_URL` panics
   rather than skipping; a panic there is a missing variable, not a pass. Skipped tests are not a
   pass.
-- Invariants that apply: append-only, additive migrations (0005 is new; never edit 0001–0004);
+- Invariants that apply: append-only, additive migrations (0006 is new; never edit 0001–0004);
   tenant isolation is RLS, proven at boot; `SECURITY DEFINER` functions keep running as their
   owner and `console_sessions_lookup` follows `console_session_org`'s owner; no SQL outside
   `cxp-core`; runtime `sqlx::query*` only, never `query!`; database error text never reaches a
@@ -52,7 +52,7 @@ privilege the runtime needs beyond `otto_app` (`INSERT` on `deleted_orgs`) to th
 | File | Responsibility |
 |---|---|
 | **Modify.** `crates/cxp-core/src/db_role.rs` | `OwnedObject`, `TablePrivilege`, `DbRole::{owned, owned_total, table_privileges}`, `owns_objects`, `can_alter_tables`, summary clause, `RUNTIME_GRANTS`, `missing_runtime_grants` |
-| **Create.** `crates/cxp-core/migrations/0005_runtime_role_grants.sql` | `GRANT INSERT ON deleted_orgs TO cxp_runtime` when that role exists |
+| **Create.** `crates/cxp-core/migrations/0006_runtime_role_grants.sql` | `GRANT INSERT ON deleted_orgs TO cxp_runtime` when that role exists |
 | **Modify.** `crates/cxp-core/tests/db.rs` | catalog tests for ownership, table privileges, runtime grants |
 | **Modify.** `crates/cxp-server/src/config.rs` | `migration_database_url` (`CXP_MIGRATION_DATABASE_URL`) |
 | **Modify.** `crates/cxp-server/src/health.rs` | `RoleAlarm`, `Readiness`, `/readyz` reason `database role refused` |
@@ -98,10 +98,10 @@ Model: opus (catalog SQL with membership semantics).
     unique_violation` pattern, never drop it) and `GRANT cxp_runtime TO <login>` → empty.
   - `missing_runtime_grants_is_empty_before_migrations`: a separate
     `#[sqlx::test(migrations = false)]` test on the unmigrated database → empty.
-  - `migration_0005_grants_the_tombstone_insert_to_cxp_runtime`: with `cxp_runtime` existing
+  - `migration_0006_grants_the_tombstone_insert_to_cxp_runtime`: with `cxp_runtime` existing
     before migrating (`#[sqlx::test(migrations = false)]`, create the role, run
     `cxp_core::migrate`), `has_table_privilege('cxp_runtime', 'deleted_orgs', 'INSERT')` is true.
-  - Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-core --test db -- the_database_role_check_sees_what missing_runtime migration_0005`
+  - Run: `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-core --test db -- the_database_role_check_sees_what missing_runtime migration_0006`
     — expect compile failure / failures.
 - [x] **Step 2: implement** in `crates/cxp-core/src/db_role.rs` per the spec's "cxp_core::db_role"
   section: types `OwnedObject { user, kind: &'static str, name, owner }`,
@@ -123,7 +123,7 @@ Model: opus (catalog SQL with membership semantics).
   `INSERT on deleted_orgs`, only when `to_regclass('public.deleted_orgs')` is not null).
   Unit tests in the module: summary text for an owner, a TRUNCATE holder, a clean role, differing
   users; `can_alter_tables`.
-- [x] **Step 3: migration** `crates/cxp-core/migrations/0005_runtime_role_grants.sql`, exactly the
+- [x] **Step 3: migration** `crates/cxp-core/migrations/0006_runtime_role_grants.sql`, exactly the
   spec's DDL with its comment.
 - [x] **Step 4: run** `DATABASE_URL=postgres://cxp:cxp@localhost:15464/otto_cxp cargo test -p cxp-core`
   — all pass (existing summary assertions in `db.rs` and `db_role.rs` that compare a whole clean
@@ -205,7 +205,7 @@ Model: sonnet.
   `runtime_role(pool, name)` (LOGIN, not privileged, member of `otto_app` and `cxp_runtime`,
   `GRANT CONNECT`); `otto_app` and `cxp_runtime` created idempotently, never dropped;
   `DropRoleOnExit` for both logins. Order matters: create `otto_app`, `cxp_runtime`, and both
-  logins **before** calling `cxp_server::boot::migrate`, because 0005 grants to `cxp_runtime`
+  logins **before** calling `cxp_server::boot::migrate`, because 0006 grants to `cxp_runtime`
   only if it exists when it runs. Remove Task 2's `#[ignore]` marker.
   - `the_service_runs_whole_as_a_runtime_role_that_owns_nothing` (from
     `the_service_runs_whole_as_a_least_privilege_database_owner`): `cxp_server::boot::migrate`
@@ -293,7 +293,7 @@ Model: orchestrator (docs; reviewed like code).
   `main.rs` re-exec without `CXP_MIGRATION_DATABASE_URL`; `tests/secret_env.rs` on the built
   binary; residual risk in the spec and fly.md; follow-up #45.
 - [x] **Round 1:** `TEMPORARY`/`CREATE` read and refusal (`db_role.rs`, `db.rs`, e2e); migration
-  `0006_security_definer_search_path.sql`; runtime grants include inheriting `otto_app`; re-check
+  `0007_security_definer_search_path.sql`; runtime grants include inheriting `otto_app`; re-check
   timeout, escalation, hourly grant check; tombstone-grant e2e tests; runbook stages the owner's
   credential (S6) and revokes `TEMPORARY`/`CREATE` from `PUBLIC` (S3); CLAUDE.md Ship > verify.
 - [x] **Round 2:** S5 guard against undoing after #27 deploys; S1 warning about other migrations;

@@ -131,7 +131,7 @@ the hour.
 
 **In:** the ownership/`TRUNCATE`/`TRIGGER` check in `cxp_core::db_role`; `cxp-server migrate`;
 `CXP_MIGRATION_DATABASE_URL`; refusing an owner runtime role and `CXP_RUN_MIGRATIONS=true` in a
-deployment; the runtime grant check (`INSERT` on `deleted_orgs`); migration 0005 (the grant to
+deployment; the runtime grant check (`INSERT` on `deleted_orgs`); migration 0006 (the grant to
 `cxp_runtime`); the hourly re-check and its `/readyz` signal; `fly.toml` (`release_command`,
 `CXP_RUN_MIGRATIONS = "false"`); `.env.example`; `docs/deploy/fly.md` (role section, runbook,
 secrets table, Verify, Migrations); CLAUDE.md's config table and invariant text.
@@ -149,7 +149,7 @@ from `PUBLIC` beyond what Postgres 15+ already does; anything on other services'
 |---|---|---|---|---|
 | `cxp_owner` | yes | database `otto_cxp` and every object in it | `SET` on `app.console_session_lookup` | `cxp-server migrate` (Fly `release_command`), via `CXP_MIGRATION_DATABASE_URL` |
 | `cxp_server` | yes | nothing | member of `otto_app` and `cxp_runtime`; `CONNECT` on `otto_cxp` | the serving process, via `DATABASE_URL` |
-| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0005) | group role for the runtime's grants beyond `otto_app` |
+| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (migration 0006) | group role for the runtime's grants beyond `otto_app` |
 | `otto_app` | no | nothing | the tenant grants (unchanged) | `SET LOCAL ROLE` in tenant transactions |
 
 Neither login is privileged (#16's check applies to both). `cxp_owner` is never a member of
@@ -216,7 +216,7 @@ pub struct TablePrivilege { pub user: String, pub table: String, pub privileges:
   'public.deleted_orgs', 'INSERT')` is false; empty otherwise (including before migrations).
   `RUNTIME_GRANTS` documents the list.
 
-### Migration `0005_runtime_role_grants.sql`
+### Migration `0006_runtime_role_grants.sql`
 
 ```sql
 -- The runtime login (cxp_server in production) owns nothing (#27). Beyond otto_app it needs only
@@ -304,8 +304,8 @@ Behavior change (intended): a deployment refuses an owning runtime role and
 
 ## Invariants impact
 
-- **Append-only migrations:** new `0005_runtime_role_grants.sql`, a grant only; previous release
-  unaffected. Renumbered at rebase if another PR takes 0005.
+- **Append-only migrations:** new `0006_runtime_role_grants.sql`, a grant only; previous release
+  unaffected. Renumbered at rebase if another PR takes 0006.
 - **Tenant isolation is RLS, proven:** strengthened. The boot proof is unchanged; RLS now binds a
   runtime role that cannot alter, drop, or truncate any table. Maintenance and the tombstone still
   run as the connecting role, now a non-owner, bound by the same policies. CLAUDE.md's invariant
@@ -323,7 +323,7 @@ Behavior change (intended): a deployment refuses an owning runtime role and
 
 ## Migration
 
-`crates/cxp-core/migrations/0005_runtime_role_grants.sql` as above. Compatible with the code
+`crates/cxp-core/migrations/0006_runtime_role_grants.sql` as above. Compatible with the code
 running during rollout in both directions: it adds one grant to a role that may not exist.
 
 ## Out-of-band
@@ -337,8 +337,8 @@ All human-only (Rob), **before merge**, per CLAUDE.md "Database role change" and
    Postgres is 15+ (schema `public` follows the database owner); create `cxp_owner` and
    `cxp_runtime`; set `CXP_MIGRATION_DATABASE_URL`; in one transaction transfer ownership from
    `cxp_server` to `cxp_owner`, re-grant `CONNECT` on `otto_cxp` to `cxp_server`, grant `INSERT`
-   on `deleted_orgs` to `cxp_runtime` by hand (idempotent with 0005, so the old release's
-   tombstone keeps working before 0005 runs), add `ALTER DEFAULT PRIVILEGES FOR ROLE cxp_owner`
+   on `deleted_orgs` to `cxp_runtime` by hand (idempotent with 0006, so the old release's
+   tombstone keeps working before 0006 runs), add `ALTER DEFAULT PRIVILEGES FOR ROLE cxp_owner`
    entries and remove `cxp_server`'s, and revoke the parameter grant from `cxp_server`; prove
    both roles read-only and restart the old release to prove it boots as a non-owner; then merge
    (or hand deploy if `FLY_DEPLOY` is not enabled) and verify the release-command and boot log
@@ -428,7 +428,7 @@ revoked), after which the new binary serves as `cxp_server`.
   (CVE-2018-1058). The check now reads `CREATE` and `TEMPORARY` on the database and `CREATE` on
   every non-system schema, for every role the user can `SET ROLE` to (`PUBLIC` included), and
   refuses them for a serving role; the runbook's S3 revokes `TEMPORARY` (and `CREATE` on `public`)
-  from `PUBLIC`; migration `0006_security_definer_search_path.sql` recreates both `SECURITY
+  from `PUBLIC`; migration `0007_security_definer_search_path.sql` recreates both `SECURITY
   DEFINER` functions with every call schema-qualified and `search_path = pg_catalog, public,
   pg_temp`. The clean summary clause is now `it owns nothing in this database, can TRUNCATE or
   add a TRIGGER to no table, and can create no schema, object, or temporary table in it`.
