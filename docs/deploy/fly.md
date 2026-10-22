@@ -917,8 +917,8 @@ builtins: the password reaches neither the history nor the process list.) Then m
 first runs the release command, `cxp-server migrate`, in a temporary machine as `cxp_owner`; it
 applies 0006 and 0007 (0007 recreates `console_session_org`, whose `SET` clause needs the
 parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
-serving. After migrating it verifies that 0005's grant landed: if `cxp_runtime` did not exist when
-0005 ran, 0005's own `NOTICE` is all that stood in its way, and the release command now fails with
+serving. After migrating it verifies that 0006's grant landed: if `cxp_runtime` did not exist when
+0006 ran, 0006's own `NOTICE` is all that stood in its way, and the release command now fails with
 `refusing to finish the release: the release cannot finish without ...` rather than deploy a fleet
 whose machines all refuse to boot (`missing_cxp_runtime_install`). Then see [Verify](#verify): the
 release command's log shows `database role "cxp_owner"

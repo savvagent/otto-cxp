@@ -916,15 +916,15 @@ pub async fn holds_shared_tenant_role(db: &Db) -> Result<bool> {
     Ok(member)
 }
 
-/// The runtime group role migration 0005 grants the tombstone `INSERT` to. A
+/// The runtime group role migration 0006 grants the tombstone `INSERT` to. A
 /// deployment creates it (and grants it to its runtime login) before the first
-/// migration; 0005 grants to it only when it already exists.
+/// migration; 0006 grants to it only when it already exists.
 pub const CXP_RUNTIME_ROLE: &str = "cxp_runtime";
 
-/// What migration 0005 needs to have left in place, in this order: the
+/// What migration 0006 needs to have left in place, in this order: the
 /// [`CXP_RUNTIME_ROLE`] exists, and it holds `INSERT` on `deleted_orgs`.
 ///
-/// 0005 grants the tombstone `INSERT` to `cxp_runtime` only if the role
+/// 0006 grants the tombstone `INSERT` to `cxp_runtime` only if the role
 /// already exists, and a migration never runs twice, so a deployment's
 /// `cxp-server migrate` reads this *after* migrating and aborts the release
 /// when either is missing: serving would refuse to boot on every machine

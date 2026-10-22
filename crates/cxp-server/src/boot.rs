@@ -269,7 +269,7 @@ pub fn migration_url(config: &Config) -> Result<&str> {
 /// nothing, so it cannot), and never reads the owner's credential.
 ///
 /// After migrating, a deployment verifies what it must have left in place:
-/// migration 0005 grants the tombstone `INSERT` to `cxp_runtime` only when the
+/// migration 0006 grants the tombstone `INSERT` to `cxp_runtime` only when the
 /// role already exists ([`cxp_core::db_role::missing_cxp_runtime_install`]),
 /// so a missing role or grant fails the release rather than boot a fleet that
 /// refuses to serve.
@@ -308,7 +308,7 @@ async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
     cxp_core::migrate(db).await.context("migrations failed")?;
     tracing::info!("migrations applied");
     if is_deployment(&role, config) {
-        // 0005 grants the tombstone INSERT to `cxp_runtime` only when the role
+        // 0006 grants the tombstone INSERT to `cxp_runtime` only when the role
         // already exists, and a migration never runs twice. Without it every
         // serving machine refuses to boot, so abort the release here instead.
         let missing = cxp_core::db_role::missing_cxp_runtime_install(db)
@@ -459,7 +459,7 @@ fn missing_grants(missing: &[&str], role: &str) -> String {
 
 /// What a missing [`cxp_core::db_role::missing_cxp_runtime_install`] entry
 /// means, and the statements that fix each, for the release command to log
-/// before it aborts. Migration 0005 grants the tombstone `INSERT` to
+/// before it aborts. Migration 0006 grants the tombstone `INSERT` to
 /// `cxp_runtime` only when the role already exists, and a migration never
 /// runs twice, so a deployment that reaches serving without this refuses to
 /// boot.
@@ -477,7 +477,7 @@ fn missing_cxp_runtime(missing: &[&str]) -> String {
         fixes.push("GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string());
     }
     format!(
-        "the release cannot finish without {}: migration 0005 grants the org.deleted tombstone \
+        "the release cannot finish without {}: migration 0006 grants the org.deleted tombstone \
          to cxp_runtime only when the role already exists, so every serving machine would \
          refuse to boot; fix with: {}",
         missing.join(" and "),
