@@ -982,7 +982,7 @@ that owns and holds nothing: no restart.
 SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
 FROM pg_roles WHERE rolname = 'cxp_app';
 SELECT roleid::regrole FROM pg_auth_members WHERE member = 'cxp_app'::regrole;
--- Its members: cxp_server only, with admin_option f (migration 0007 refuses a cxp_app that
+-- Its members: cxp_server only, with admin_option f (migration 0008 refuses a cxp_app that
 -- anyone holds WITH ADMIN OPTION, since that holder could grant it, and every tenant grant).
 SELECT member::regrole, admin_option, grantor::regrole FROM pg_auth_members
 WHERE roleid = 'cxp_app'::regrole;

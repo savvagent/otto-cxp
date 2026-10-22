@@ -49,8 +49,8 @@ pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// The role every tenant transaction assumes (`SET LOCAL ROLE`): otto-cxp's own (#28), never
 /// the `otto_app` the otto services on a shared instance may share, so a privilege another
 /// service grants `otto_app` never reaches a tenant transaction here. A NOLOGIN role holding
-/// `otto_cxp`'s tenant grants and nothing else (migration 0007); the runtime login is made a member
-/// of it (runbook T1; 0007 grants it to no one), and inherits its grants for the background
+/// `otto_cxp`'s tenant grants and nothing else (migration 0008); the runtime login is made a member
+/// of it (runbook T1; 0008 grants it to no one), and inherits its grants for the background
 /// work it does as itself.
 pub const TENANT_ROLE: &str = "cxp_app";
 

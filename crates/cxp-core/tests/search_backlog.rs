@@ -33,7 +33,7 @@ async fn least_privilege_owner(pool: &PgPool, role: &str) -> PgPool {
              NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
         ),
         // The database starts as the previous release left it, whose tenant role was otto_app
-        // (0001 to 0004 grant to it; cxp_app arrives with 0007).
+        // (0001 to 0004 grant to it; cxp_app arrives with 0008).
         "DO $$ BEGIN CREATE ROLE otto_app NOLOGIN; \
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
             .to_string(),
@@ -187,7 +187,7 @@ async fn build_under(pool: PgPool, role: String) {
 
     // A database as it was before #17, with rows in two orgs.
     before_the_index().run(&as_role).await.unwrap();
-    // The rows predate 0007, so they are written as the tenant role of that release.
+    // The rows predate 0008, so they are written as the tenant role of that release.
     #[allow(clippy::disallowed_methods)]
     let before = Db::from_pool(as_role.clone())
         .with_tenant_role("otto_app")

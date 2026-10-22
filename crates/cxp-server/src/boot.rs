@@ -695,7 +695,7 @@ const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 /// (the tombstone), and would serve every request with them, silently. So boot refuses unless
 /// the report says the role was assumed and is the effective role, on every machine: unlike the
 /// privilege checks (which only warn locally, where Postgres hands out a superuser), a local
-/// superuser passes this one (0007 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
+/// superuser passes this one (0008 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
 /// a local exception would only ever admit the silent fallback this exists to stop.
 pub fn check_tenant_role(
     report: &otto_tenant::isolation::IsolationReport,

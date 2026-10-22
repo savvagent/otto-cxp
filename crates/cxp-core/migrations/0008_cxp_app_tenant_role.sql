@@ -5,7 +5,7 @@
 -- Roles are cluster-wide. Create it where the migrating role may (tests, a local superuser),
 -- tolerating a concurrent creator. Where it may not (production's cxp_owner has no CREATEROLE)
 -- it must already exist (docs/deploy/fly.md, runbook T1); otherwise this migration fails, so the
--- release command aborts the deploy instead of recording 0007 with no grants made. The DO block
+-- release command aborts the deploy instead of recording 0008 with no grants made. The DO block
 -- exists so the failure names the fix (without it the GRANTs below would fail on a missing role
 -- anyway).
 DO $$
@@ -77,7 +77,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT USAGE, SELECT ON SEQUENCES TO cxp_app;
 -- As 0001 for otto_app: a tombstone is permanent and written by the runtime role (cxp_runtime,
--- 0005), never by a tenant transaction; removed members expire only through
+-- 0006), never by a tenant transaction; removed members expire only through
 -- expire_removed_members(); the migrator's ledger is not the app's.
 REVOKE INSERT, UPDATE, DELETE ON deleted_orgs FROM cxp_app;
 REVOKE DELETE ON removed_members FROM cxp_app;

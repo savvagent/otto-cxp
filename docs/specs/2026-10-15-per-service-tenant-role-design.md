@@ -71,7 +71,7 @@ and `cxp_server` can open only `otto_cxp`.
   never the shared `:15435`.
 - PR #46's runbook (S0 to S6) has run and #27 is deployed before this PR merges: `cxp_owner` owns
   `otto_cxp`, `cxp_server` owns nothing and is a member of `otto_app` and `cxp_runtime`, and
-  migrations 0005 and 0006 are applied. This runbook's first step checks that read-only.
+  migrations 0006 and 0007 are applied. This runbook's first step checks that read-only.
 - The name `cxp_app`, as the ticket suggests: `cxp_` like `cxp_server`/`cxp_owner`/`cxp_runtime`,
   `_app` like `of_app`. Roles are cluster-wide; T0 checks nobody else uses the name.
 - `cxp_app` holds exactly what `otto_app` holds in `otto_cxp` (parity), including `EXECUTE` on the
@@ -93,7 +93,7 @@ reaches otto-cxp.
   assumable by the runtime login, refuses to serve and names the fix.
 - Every `Db` in the workspace is built by `cxp_core::tenant_db`; `cargo clippy` fails on a direct
   `otto_tenant::Db::from_pool` / `Db::connect` anywhere else.
-- Migration 0007 gives `cxp_app` the same effective privileges as `otto_app` on every table,
+- Migration 0008 gives `cxp_app` the same effective privileges as `otto_app` on every table,
   sequence, function, and schema in `otto_cxp`; a test compares the two role by role.
 - The whole service runs end to end (e2e) as a runtime login that is a member of `cxp_app` and
   `cxp_runtime` and not of `otto_app`.
@@ -102,7 +102,7 @@ reaches otto-cxp.
 ## Scope
 
 **In:** `cxp_core::TENANT_ROLE` and `cxp_core::tenant_db`; `clippy.toml` (`disallowed-methods`);
-migration `0007_cxp_app_tenant_role.sql`; `db_role::RUNTIME_GRANTS` ("inheriting cxp_app") and
+migration `0008_cxp_app_tenant_role.sql`; `db_role::RUNTIME_GRANTS` ("inheriting cxp_app") and
 `missing_runtime_grants`; `db_role::holds_shared_tenant_role` (boot warns while the runtime login
 still belongs to `otto_app`); `boot::check_tenant_role` (refuse unless assumed, everywhere);
 every `Db` construction moved to the helper; the tests (core, api, mcp, server, e2e) moved from
@@ -124,8 +124,8 @@ grants and so keeps working).
 |---|---|---|---|---|
 | `cxp_owner` | yes | `otto_cxp` and everything in it | `SET` on `app.console_session_lookup` | `cxp-server migrate` (release command), unchanged |
 | `cxp_server` | yes | nothing | member of `cxp_app` and `cxp_runtime` (and `otto_app` until T5); `CONNECT` on `otto_cxp` | the serving process |
-| `cxp_app` | no | nothing | `otto_cxp`'s tenant grants (migration 0007): the same as `otto_app`'s there | `SET LOCAL ROLE` in tenant transactions; inherited by `cxp_server` for the background work |
-| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (0005), unchanged | the runtime's grants beyond the tenant role |
+| `cxp_app` | no | nothing | `otto_cxp`'s tenant grants (migration 0008): the same as `otto_app`'s there | `SET LOCAL ROLE` in tenant transactions; inherited by `cxp_server` for the background work |
+| `cxp_runtime` | no | nothing | `INSERT` on `deleted_orgs` (0006), unchanged | the runtime's grants beyond the tenant role |
 | `otto_app` | no | nothing | its grants in `otto_cxp`, left in place for the previous release | nothing in this release |
 
 ### Why a new `cxp_app`, not #27's `cxp_runtime`
@@ -146,7 +146,7 @@ two privilege sets apart: `cxp_app` is the request's identity and holds only the
 - `lib.rs`:
   ```rust
   /// The role every tenant transaction assumes (`SET LOCAL ROLE`): otto-cxp's own (#28), never
-  /// the `otto_app` the otto services share. Migration 0007 creates it where it can and grants it
+  /// the `otto_app` the otto services share. Migration 0008 creates it where it can and grants it
   /// otto_cxp's tenant grants.
   pub const TENANT_ROLE: &str = "cxp_app";
 
@@ -180,7 +180,7 @@ two privilege sets apart: `cxp_app` is the request's identity and holds only the
   - Module docs: tenant transactions drop to `cxp_app`.
 - `platform_events.rs:273` comment: "the tenant role may not DELETE tombstones".
 
-### Migration `0007_cxp_app_tenant_role.sql`
+### Migration `0008_cxp_app_tenant_role.sql`
 
 ```sql
 -- otto-cxp's own tenant role (#28). Tenant transactions SET LOCAL ROLE cxp_app
@@ -190,7 +190,7 @@ two privilege sets apart: `cxp_app` is the request's identity and holds only the
 -- Roles are cluster-wide. Create it where this role may (tests, local superusers), tolerating a
 -- concurrent creator; where it may not (production's cxp_owner has no CREATEROLE), it must
 -- already exist (docs/deploy/fly.md, runbook T1), and otherwise this migration fails, so the
--- release command aborts the deploy rather than record 0007 with no grants made.
+-- release command aborts the deploy rather than record 0008 with no grants made.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cxp_app') THEN
@@ -250,7 +250,7 @@ functions too (owned by `cxp_owner` since S3's `REASSIGN OWNED`), as 0001's did 
     runbook T1)` (`WITH INHERIT TRUE`, so the hint also fixes a member that does not inherit).
   `<login>` is `role.current_user`. Why no local exception (unlike the privilege checks, which
   only warn locally because a local Postgres hands out a superuser): a local superuser creates
-  `cxp_app` in 0007 and can `SET ROLE` to it, so the check passes there anyway; CI and the tests
+  `cxp_app` in 0008 and can `SET ROLE` to it, so the check passes there anyway; CI and the tests
   create it; and a local non-superuser runtime that cannot assume it would be exactly the silent
   fallback this exists to stop. Refusing everywhere means no configuration ever runs tenant
   transactions as anything but `cxp_app`.
@@ -273,16 +273,16 @@ or secret changes.
 
 ## Invariants impact
 
-- **Append-only migrations:** new `0007_cxp_app_tenant_role.sql` (after #27's 0005/0006); a role
+- **Append-only migrations:** new `0008_cxp_app_tenant_role.sql` (after #27's 0006/0007); a role
   and grants only. The previous release (tenant role `otto_app`) is unaffected: `otto_app`'s grants
-  stay. `ignore_missing` lets it boot against 0007.
+  stay. `ignore_missing` lets it boot against 0008.
 - **Tenant isolation is RLS, proven:** strengthened. The boot proof now also requires that the
   tenant role was actually assumed in a deployment. The policies name no role, so they bind
   `cxp_app` as they bound `otto_app`; FORCE RLS is unchanged. The tenant-isolation test asserts
   `cxp_app`. CLAUDE.md's text ("Tenant transactions run as `otto_app`", "grants to `otto_app`") is
   updated; new tenant tables grant to `cxp_app` (default privileges cover the migrating role's new
   tables; a migration still grants explicitly, as 0003/0004 did).
-- **`SECURITY DEFINER` functions:** unchanged and still `REVOKE ALL … FROM PUBLIC`; 0007 grants
+- **`SECURITY DEFINER` functions:** unchanged and still `REVOKE ALL … FROM PUBLIC`; 0008 grants
   `EXECUTE` to `cxp_app` (parity with `otto_app`). CLAUDE.md's "before being granted to `otto_app`"
   becomes "to the tenant role `cxp_app`".
 - **Request paths use `begin_live`; unpinned access only through `maintenance`:** unchanged; the
@@ -296,10 +296,10 @@ or secret changes.
 
 ## Migration
 
-`crates/cxp-core/migrations/0007_cxp_app_tenant_role.sql`, as above. Rollout in both directions:
+`crates/cxp-core/migrations/0008_cxp_app_tenant_role.sql`, as above. Rollout in both directions:
 the old release ignores `cxp_app` and keeps using `otto_app`; the new release needs `cxp_app` to
 exist before the release command runs (T1) and refuses to serve without it. If T1 was skipped, the
-release command fails on 0007 (nothing recorded; sqlx runs it in one transaction), the deploy
+release command fails on 0008 (nothing recorded; sqlx runs it in one transaction), the deploy
 aborts, and the old release keeps serving.
 
 ## Out-of-band
@@ -321,7 +321,7 @@ All human-only (Rob), per CLAUDE.md "Database role change". The runbook goes in
     nothing, holds no privilege yet. `cxp_server`: `pg_has_role(…, 'cxp_app', 'USAGE')` and
     `'MEMBER'` true; and, with `cxp_server`'s own login through `fly proxy`, `BEGIN; SET LOCAL
     ROLE cxp_app; SELECT current_user; ROLLBACK;` answers `cxp_app`.
-- **Merge** (or hand `fly deploy` while `FLY_DEPLOY` is off). The release command applies 0007 as
+- **Merge** (or hand `fly deploy` while `FLY_DEPLOY` is off). The release command applies 0008 as
   `cxp_owner`.
 - **After deploy:**
   - **T3 (verify).** Release command log: `applying migrations`, `migrations applied`. Each
@@ -340,7 +340,7 @@ change"). No new secret, config key, or scope; no recurring cost.
 
 ## Error handling & edge cases
 
-- **`cxp_app` missing at the release command** (T1 skipped): 0007 raises, naming the fix; the
+- **`cxp_app` missing at the release command** (T1 skipped): 0008 raises, naming the fix; the
   deploy aborts; the old release serves.
 - **`cxp_app` exists but `cxp_server` is not a member** (T1's `GRANT` skipped): the new release's
   runtime-grant check (`inheriting cxp_app` missing) and `check_tenant_role` both refuse to serve;
@@ -356,16 +356,16 @@ change"). No new secret, config key, or scope; no recurring cost.
 - **`cxp_app` revoked from `cxp_server` after boot:** the cached assumability is stale; `SET
   LOCAL ROLE` fails and every tenant transaction errors (fails closed); the hourly runtime-grant
   re-check logs `error`. A restart refuses with the fix.
-- **Local superuser:** creates `cxp_app` in 0007 and may `SET ROLE` to anything; `check_tenant_role`
+- **Local superuser:** creates `cxp_app` in 0008 and may `SET ROLE` to anything; `check_tenant_role`
   passes (assumed). A local non-superuser runtime that cannot assume `cxp_app`: refused, like a
   deployment (no local exception).
-- **A local non-superuser, non-CREATEROLE owner migrating a cluster with no `cxp_app`:** 0007
+- **A local non-superuser, non-CREATEROLE owner migrating a cluster with no `cxp_app`:** 0008
   fails (where 0001 only logged a NOTICE for `otto_app`), naming the fix. `.env.example`'s local
   split recipe creates `cxp_app` first.
 - **T4's parity query returns rows in production** (production's `otto_app` grants could differ
   from a fresh migration's): stop before T5, keep `cxp_server` in `otto_app`, and report the
   difference; the release still serves, as `cxp_app`.
-- **Concurrent test databases creating `cxp_app`:** tolerated in 0007; CI pre-creates it anyway.
+- **Concurrent test databases creating `cxp_app`:** tolerated in 0008; CI pre-creates it anyway.
 
 ## Testing approach
 
@@ -392,10 +392,10 @@ changes. Plus a manual check: a direct `otto_tenant::Db::from_pool` in a test ma
     `cxp_runtime` (created by the test) can `INSERT INTO deleted_orgs` unpinned as itself, but not
     inside `tenant_db(..).begin(org)` on its own pool (42501): `SET LOCAL ROLE cxp_app` leaves
     `cxp_runtime`'s grant behind.
-  - new `the_previous_release_still_isolates_as_otto_app`: after 0007, a default `otto_tenant::Db`
+  - new `the_previous_release_still_isolates_as_otto_app`: after 0008, a default `otto_tenant::Db`
     (the previous release's) passes `verify_tenant_isolation` as `otto_app` (local `#[allow]`).
   - `missing_runtime_grants_*`: `inheriting cxp_app`; a member of `otto_app` only lacks it.
-  - 0007's refusal when `cxp_app` is absent and cannot be created is not testable in the shared
+  - 0008's refusal when `cxp_app` is absent and cannot be created is not testable in the shared
     test cluster (`cxp_app` is cluster-wide, and dropping it would break concurrent tests). It is
     proved manually instead, on a second scratch container that has no `cxp_app`: the built image's
     `migrate`, as a non-CREATEROLE owner, exits non-zero naming the fix, and `_sqlx_migrations`
@@ -426,7 +426,7 @@ changes. Plus a manual check: a direct `otto_tenant::Db::from_pool` in a test ma
 
 ## Review round 1 (PR #49)
 
-- **0007 refuses a `cxp_app` that is not a plain group role.** The role is cluster-wide, so one
+- **0008 refuses a `cxp_app` that is not a plain group role.** The role is cluster-wide, so one
   created by someone else first could carry LOGIN, an attribute, membership in another role, or a
   member WITH ADMIN OPTION (on Postgres 16 a non-superuser creator gets ADMIN on its roles); any
   of these would hand every tenant grant past otto-cxp. The migration's second block refuses each,
@@ -462,6 +462,6 @@ changes. Plus a manual check: a direct `otto_tenant::Db::from_pool` in a test ma
   role with `ADMIN` on `cxp_app` can, and every other service connects as a superuser today
   (#28's comment). Not preventable from inside `otto_cxp`.
 - **The migration creates a cluster role where it can.** On a developer's or CI's superuser
-  Postgres, 0007 leaves `cxp_app` behind across databases, as 0001 does with `otto_app`.
+  Postgres, 0008 leaves `cxp_app` behind across databases, as 0001 does with `otto_app`.
 - **Production steps are human-only** and must run after #27's runbook and before merge; this
   agent ran them only against a local container.

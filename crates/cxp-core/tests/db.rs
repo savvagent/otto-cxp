@@ -2631,7 +2631,7 @@ async fn tenant_transactions_cannot_write_the_tombstone(pool: PgPool) {
 }
 
 /// The release before #28 builds its Db with otto-tenant's default role. During the rollout,
-/// and after a rollback, it runs against a schema migration 0007 has changed: otto_app keeps
+/// and after a rollback, it runs against a schema migration 0008 has changed: otto_app keeps
 /// every grant, so isolation still holds as otto_app.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_previous_release_still_isolates_as_otto_app(pool: PgPool) {
@@ -2756,7 +2756,7 @@ async fn cxp_app_is_independent_of_otto_app(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    // 0007's default privileges gave cxp_app this table; take them back so only otto_app holds it.
+    // 0008's default privileges gave cxp_app this table; take them back so only otto_app holds it.
     sqlx::query("REVOKE ALL ON t_shared FROM cxp_app")
         .execute(&pool)
         .await
@@ -2779,7 +2779,7 @@ async fn cxp_app_is_independent_of_otto_app(pool: PgPool) {
     assert!(!member, "cxp_app is a member of otto_app");
 }
 
-/// Migration 0007 refuses a pre-existing `cxp_app` that is not a plain group role. A negative
+/// Migration 0008 refuses a pre-existing `cxp_app` that is not a plain group role. A negative
 /// test would mutate the cluster-wide role other tests share, so this runs the check against
 /// the test cluster's real `cxp_app` (which migrating just accepted) and asserts the catalog
 /// facts the check reads.
@@ -2802,15 +2802,15 @@ async fn cxp_app_is_a_plain_group_role(pool: PgPool) {
     assert_eq!(memberships, 0, "cxp_app is a member of another role");
 }
 
-/// 0007's check of an existing `cxp_app` refuses one that is not a plain group role. The real
+/// 0008's check of an existing `cxp_app` refuses one that is not a plain group role. The real
 /// role is cluster-wide and shared by concurrent tests, so the check's block runs, as written in
 /// the migration, against a stand-in role of its own.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn migration_0007_refuses_a_cxp_app_that_is_not_a_plain_group_role(pool: PgPool) {
-    let migration = include_str!("../migrations/0007_cxp_app_tenant_role.sql");
+async fn migration_0008_refuses_a_cxp_app_that_is_not_a_plain_group_role(pool: PgPool) {
+    let migration = include_str!("../migrations/0008_cxp_app_tenant_role.sql");
     let start = migration
         .find("DO $$\nDECLARE")
-        .expect("0007's plain-group-role check");
+        .expect("0008's plain-group-role check");
     let end = start + migration[start..].find("END $$;").expect("its end") + "END $$;".len();
     let check = &migration[start..end];
     let mut roles = TestRoles::new(&pool);
@@ -2848,9 +2848,9 @@ async fn migration_0007_refuses_a_cxp_app_that_is_not_a_plain_group_role(pool: P
 }
 
 /// Tables and sequences a later migration creates as the migrating role reach `cxp_app`
-/// through 0007's default privileges, minus `TRUNCATE`.
+/// through 0008's default privileges, minus `TRUNCATE`.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn migration_0007_sets_default_privileges_for_the_migrating_role(pool: PgPool) {
+async fn migration_0008_sets_default_privileges_for_the_migrating_role(pool: PgPool) {
     sqlx::query("CREATE TABLE later_t (id int)")
         .execute(&pool)
         .await

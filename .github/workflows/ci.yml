@@ -57,7 +57,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # 0001 creates otto_app and 0007 creates cxp_app, each tolerating a lost race, but
+      # 0001 creates otto_app and 0008 creates cxp_app, each tolerating a lost race, but
       # many test databases migrate in parallel against these cluster-scoped roles; creating
       # them first takes the race out.
       - name: Pre-create the tenant roles
