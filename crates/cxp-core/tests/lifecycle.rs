@@ -1849,6 +1849,34 @@ async fn run_does_not_flush_on_shutdown_after_an_alarm_raised_while_sleeping(poo
     assert_eq!(stub.lock().unwrap().received.len(), 0);
 }
 
+/// The pause sender closing (the process winding down) is a shutdown too, and
+/// can arrive together with it: the final flush still runs.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn run_flushes_when_the_pause_sender_closes_during_the_sleep(pool: PgPool) {
+    let db = db(pool.clone());
+    let (platform, stub) = start_platform().await;
+    let meter = Meter::new(platform.clone(), "https://x");
+
+    let cfg = ShipperConfig {
+        poll: Duration::from_secs(30),
+        ..ShipperConfig::default()
+    };
+    let (pause_tx, pause) = tokio::sync::watch::channel(false);
+    let (_stop, shutdown) = tokio::sync::watch::channel(false);
+    let shipper = tokio::spawn(usage::run(db.clone(), platform, cfg, pause, shutdown));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    charge_n(&db, &meter, org(), 1).await;
+    drop(pause_tx);
+    tokio::time::timeout(Duration::from_secs(10), shipper)
+        .await
+        .expect("run returns when the pause sender closes")
+        .unwrap()
+        .expect("a clean stop");
+    assert!(outbox(&pool).await.is_empty(), "the final flush shipped");
+    assert_eq!(stub.lock().unwrap().received.len(), 1);
+}
+
 /// An alarm raised during the sleep is acted on at once, and clearing it
 /// resumes shipping without waiting out the poll.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]

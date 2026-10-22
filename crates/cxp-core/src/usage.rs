@@ -1231,36 +1231,50 @@ pub async fn run(
             // at the pause check above.
             changed = pause.changed() => {
                 // The sender is shared with the process's lifetime; a closed
-                // channel means the process is winding down.
-                if changed.is_err() {
-                    return Ok(());
+                // channel means the process is winding down, as a shutdown
+                // does, and the two can arrive together. It gets the final
+                // flush too (the last alarm state stays readable).
+                if changed.is_ok() {
+                    continue;
                 }
+                final_flush(&db, &platform, &cfg, &pause).await?;
+                return Ok(());
             }
             _ = shutdown.changed() => {
-                // The final flush is still a pass as the connecting role, so a
-                // raised alarm skips it too: the rows wait for the next start.
-                if *pause.borrow() {
-                    tracing::warn!(
-                        "shutting down while usage shipping is paused; no final flush, the \
-                         rows stay queued for the next start"
-                    );
-                    return Ok(());
-                }
-                return match ship_once(&db, &platform, &cfg).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        if e.is_retriable() {
-                            tracing::warn!(error = %e,
-                                "the final usage flush could not ship; rows stay in the outbox \
-                                 for the next start");
-                        } else {
-                            tracing::error!(error = %e,
-                                "final usage flush failed; rows stay in the outbox");
-                        }
-                        Err(e)
-                    }
-                };
+                final_flush(&db, &platform, &cfg, &pause).await?;
+                return Ok(());
             }
+        }
+    }
+}
+
+/// The last pass before the shipper stops. It is still a pass as the
+/// connecting role, so a raised alarm skips it: the rows wait for the next
+/// start.
+async fn final_flush(
+    db: &Db,
+    platform: &PlatformClient,
+    cfg: &ShipperConfig,
+    pause: &watch::Receiver<bool>,
+) -> std::result::Result<(), ShipError> {
+    if *pause.borrow() {
+        tracing::warn!(
+            "shutting down while usage shipping is paused; no final flush, the rows stay \
+             queued for the next start"
+        );
+        return Ok(());
+    }
+    match ship_once(db, platform, cfg).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.is_retriable() {
+                tracing::warn!(error = %e,
+                    "the final usage flush could not ship; rows stay in the outbox for the \
+                     next start");
+            } else {
+                tracing::error!(error = %e, "final usage flush failed; rows stay in the outbox");
+            }
+            Err(e)
         }
     }
 }
