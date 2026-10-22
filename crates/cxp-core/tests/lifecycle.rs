@@ -1543,10 +1543,12 @@ async fn run_declares_both_meters_before_the_first_shipment(pool: PgPool) {
     charge_tool(&db, &meter, org(), "send_survey").await;
 
     let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (_resume, pause) = tokio::sync::watch::channel(false);
     let shipper = tokio::spawn(usage::run(
         db.clone(),
         platform,
         fast_declare_cfg(),
+        pause,
         shutdown,
     ));
     wait_until_outbox_empty(&pool).await;
@@ -1582,10 +1584,12 @@ async fn run_ships_nothing_while_declaring_fails_and_loses_nothing(pool: PgPool)
         }
 
         let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let (_resume, pause) = tokio::sync::watch::channel(false);
         let shipper = tokio::spawn(usage::run(
             db.clone(),
             platform.clone(),
             fast_declare_cfg(),
+            pause,
             shutdown,
         ));
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1620,10 +1624,12 @@ async fn run_ships_nothing_while_declaring_fails_and_loses_nothing(pool: PgPool)
         p.declare_service_not_set = false;
     }
     let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (_resume, pause) = tokio::sync::watch::channel(false);
     let shipper = tokio::spawn(usage::run(
         db.clone(),
         platform,
         fast_declare_cfg(),
+        pause,
         shutdown,
     ));
     wait_until_outbox_empty(&pool).await;
@@ -1657,10 +1663,12 @@ async fn a_receipt_refusing_one_meter_still_lets_the_other_ship(pool: PgPool) {
     }
 
     let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (_resume, pause) = tokio::sync::watch::channel(false);
     let shipper = tokio::spawn(usage::run(
         db.clone(),
         platform,
         fast_declare_cfg(),
+        pause,
         shutdown,
     ));
     wait_until_outbox_empty(&pool).await;
@@ -1734,7 +1742,7 @@ async fn rows_that_all_have_an_invalid_quantity_send_no_request(pool: PgPool) {
 async fn run_pauses_while_the_role_is_refused(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     let o = org();
     charge_n(&db, &meter, o, 1).await;
 
@@ -1784,7 +1792,7 @@ async fn run_pauses_while_the_role_is_refused(pool: PgPool) {
 async fn run_paused_does_not_flush_on_shutdown(pool: PgPool) {
     let db = db(pool.clone());
     let (platform, stub) = start_platform().await;
-    let meter = Meter::new(platform.clone(), false, "https://x");
+    let meter = Meter::new(platform.clone(), "https://x");
     charge_n(&db, &meter, org(), 1).await;
 
     let (_pause_tx, pause) = tokio::sync::watch::channel(true);
