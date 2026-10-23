@@ -32,13 +32,16 @@
 //! the table; the owner of a database or schema may drop what is in it; an
 //! extension's owner may drop it with every object it holds. `TRUNCATE`
 //! ignores RLS outright, and `TRIGGER` lets a role attach code that runs as
-//! whoever next writes the table. So the check also reads, per user, the
-//! objects in the current database owned by a role it is or can `SET ROLE`
-//! to ([`DbRole::owned`]), and the tables it may `TRUNCATE` or add a
-//! `TRIGGER` to without owning them ([`DbRole::table_privileges`]). The
-//! runtime role must have neither; the migration owner has the first by
-//! design. Schema `public` is owned by `pg_database_owner`, so the
-//! database's owner is reported as owning it.
+//! whoever next writes the table. Postgres 17's `MAINTAIN` (`LOCK`,
+//! `CLUSTER`, `REINDEX`, ...) does not get around RLS, but would let the
+//! runtime role cause denial of service on the shared instance, so it counts
+//! too. So the check also reads, per user, the objects in the current
+//! database owned by a role it is or can `SET ROLE` to ([`DbRole::owned`]),
+//! and the tables it may `TRUNCATE`, add a `TRIGGER` to, or `MAINTAIN`
+//! without owning them ([`DbRole::table_privileges`]). The runtime role must
+//! have none of them; the migration owner has the first by design. Schema
+//! `public` is owned by `pg_database_owner`, so the database's owner is
+//! reported as owning it.
 //!
 //! Creating objects is the last way around it ([`DbRole::create_privileges`]).
 //! `TEMPORARY` on the database lets a role create a temporary table named
@@ -69,8 +72,9 @@ use otto_tenant::Db;
 use crate::Result;
 
 /// At most this many privileged roles, reachable databases, owned objects,
-/// tables it may `TRUNCATE` or add a `TRIGGER` to, or places it may create
-/// in are read per user: one is enough to refuse. Public only so tests can follow it.
+/// tables it may `TRUNCATE`, add a `TRIGGER` to, or `MAINTAIN`, or places it
+/// may create in are read per user: one is enough to refuse. Public only so
+/// tests can follow it.
 #[doc(hidden)]
 pub const MAX_REPORTED: i64 = 8;
 
@@ -146,10 +150,13 @@ pub struct DbRole {
     /// of which [`DbRole::owned`] lists the first few.
     pub owned_total: i64,
     /// Tables, views, and foreign tables either user, or a role it can `SET
-    /// ROLE` to (inherited or not), may `TRUNCATE` or add a `TRIGGER` to
-    /// without owning them, at most `MAX_REPORTED` per
-    /// user. Not read for a superuser user.
+    /// ROLE` to (inherited or not), may `TRUNCATE`, add a `TRIGGER` to, or
+    /// (Postgres 17 and later) `MAINTAIN` without owning them, at most
+    /// `MAX_REPORTED` per user. Not read for a superuser user.
     pub table_privileges: Vec<TablePrivilege>,
+    /// Whether the check read the `MAINTAIN` privilege, so the summary's
+    /// clean clause names it: true on Postgres 17 and later.
+    pub reports_maintain: bool,
     /// The current database (`CREATE`, `TEMPORARY`) and schemas (`CREATE`)
     /// either user, or a role it can `SET ROLE` to (inherited or not), may
     /// create in without owning them, `PUBLIC`'s grants included: the
@@ -196,21 +203,36 @@ pub struct OwnedObject {
     pub owner: String,
 }
 
-/// A relation one of the session's users may `TRUNCATE` or add a `TRIGGER`
-/// to without owning it.
+/// A relation one of the session's users may `TRUNCATE`, add a `TRIGGER` to,
+/// or `MAINTAIN` (Postgres 17 and later) without owning it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePrivilege {
     /// The `session_user` or `current_user` that holds the privileges.
     pub user: String,
     pub table: String,
-    /// `"TRUNCATE"`, `"TRIGGER"`, or both, in that order.
+    /// `"TRUNCATE"`, `"TRIGGER"`, and `"MAINTAIN"` (Postgres 17 and later,
+    /// the one the check reads), in that order, omitting the ones not held.
     pub privileges: Vec<&'static str>,
 }
 
-/// The ownership clause of [`DbRole::summary`] for a role that can change
-/// or shadow nothing.
+/// The ownership clause of [`DbRole::summary`] for a role that can change or
+/// shadow nothing, on servers before Postgres 17 (no `MAINTAIN` privilege to
+/// report).
 pub const CLEAN_OWNERSHIP: &str = "it owns nothing in this database, can TRUNCATE or add a \
     TRIGGER to no table, and can create no schema, object, or temporary table in it";
+
+/// [`CLEAN_OWNERSHIP`] on Postgres 17 and later, where the check also reads
+/// `MAINTAIN`: a role that holds it can `LOCK` and `REINDEX` the shared
+/// instance's tables, which is denial of service rather than an RLS bypass, so
+/// a deployment refuses it too.
+pub const CLEAN_OWNERSHIP_WITH_MAINTAIN: &str = "it owns nothing in this database, can TRUNCATE, \
+    add a TRIGGER, or MAINTAIN no table, and can create no schema, object, or temporary table in \
+    it";
+
+/// The Postgres major version that added the `MAINTAIN` table privilege
+/// (`LOCK`, `CLUSTER`, `REINDEX`, `VACUUM`, `ANALYZE`, `REFRESH MATERIALIZED
+/// VIEW`). Looked up by name, so a smaller server simply never reports it.
+const MAINTAIN_VERSION: i32 = 170000;
 
 /// The kinds of owned object reported, in the order they are listed.
 pub const OWNED_KINDS: [&str; 15] = [
@@ -333,9 +355,11 @@ impl DbRole {
 
     /// Whether either user can change or shadow the schema, and so step
     /// around row-level security, without a superuser-equivalent privilege:
-    /// by owning something here, by holding `TRUNCATE` or `TRIGGER` on a
-    /// table, or by holding `CREATE` on the database or a schema or
-    /// `TEMPORARY` on the database.
+    /// by owning something here, by holding `TRUNCATE`, `TRIGGER`, or (on
+    /// Postgres 17 and later) `MAINTAIN` on a table, or by holding `CREATE` on
+    /// the database or a schema or `TEMPORARY` on the database. `MAINTAIN`
+    /// does not get around RLS, but would let the runtime role take locks and
+    /// reindex the shared instance's tables.
     pub fn can_alter_tables(&self) -> bool {
         self.owns_objects()
             || !self.table_privileges.is_empty()
@@ -350,12 +374,22 @@ impl DbRole {
             .any(|p| p.name == p.user && p.privileges.contains(&Privilege::Superuser))
     }
 
+    /// The clean ownership clause for this server: the one that names
+    /// `MAINTAIN` on Postgres 17 and later, where the check read it.
+    fn clean_ownership(&self) -> &'static str {
+        if self.reports_maintain {
+            CLEAN_OWNERSHIP_WITH_MAINTAIN
+        } else {
+            CLEAN_OWNERSHIP
+        }
+    }
+
     /// The ownership clause of [`DbRole::summary`], without its leading
     /// `"; "`, or `None` for a superuser session (nothing was read, so
     /// "owns nothing" would mislead).
     fn ownership_clause(&self, who: impl Fn(&str) -> String) -> Option<String> {
         if !self.can_alter_tables() {
-            return (!self.has_superuser_user()).then(|| CLEAN_OWNERSHIP.to_string());
+            return (!self.has_superuser_user()).then(|| self.clean_ownership().to_string());
         }
         let same = self.session_user == self.current_user;
         let mut parts = Vec::new();
@@ -503,6 +537,7 @@ impl DbRole {
             owned: Vec::new(),
             owned_total: 0,
             table_privileges: Vec::new(),
+            reports_maintain: false,
             create_privileges: Vec::new(),
         }
     }
@@ -524,6 +559,14 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
         sqlx::query_as("SELECT session_user::text, current_user::text")
             .fetch_one(&mut *conn)
             .await?;
+    // Postgres 17 added the `MAINTAIN` table privilege; older servers reject
+    // `has_table_privilege(..., 'MAINTAIN')`, so the query names it only when
+    // the server understands it.
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&mut *conn)
+            .await?;
+    let reports_maintain = server_version >= MAINTAIN_VERSION;
     let mut users = vec![session_user.clone()];
     if current_user != session_user {
         users.push(current_user.clone());
@@ -693,13 +736,22 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
             }
         }));
 
-        // Relations it may TRUNCATE (which ignores RLS) or add a TRIGGER to
-        // (code that runs as whoever writes next) without owning them.
-        // has_table_privilege(user, ...) counts only what the user inherits;
-        // a NOINHERIT login, or a grant WITH INHERIT FALSE, SET TRUE, still
-        // reaches a role's privileges by SET ROLE, so each role the user is a
-        // member of (itself included) is asked in turn.
-        let rows: Vec<(String, bool, bool)> = sqlx::query_as(&format!(
+        // Relations it may TRUNCATE (which ignores RLS), add a TRIGGER to
+        // (code that runs as whoever writes next), or MAINTAIN (Postgres 17:
+        // LOCK, CLUSTER, REINDEX, and the rest; denial of service, not an RLS
+        // bypass) without owning them. has_table_privilege(user, ...) counts
+        // only what the user inherits; a NOINHERIT login, or a grant WITH
+        // INHERIT FALSE, SET TRUE, still reaches a role's privileges by SET
+        // ROLE, so each role the user is a member of (itself included) is
+        // asked in turn. The MAINTAIN expression is `false` before 17, where
+        // the name would be rejected.
+        let maintain_expr = if reports_maintain {
+            "EXISTS (SELECT 1 FROM roles r WHERE \
+             pg_catalog.has_table_privilege(r.oid, c.oid, 'MAINTAIN'))"
+        } else {
+            "false"
+        };
+        let rows: Vec<(String, bool, bool, bool)> = sqlx::query_as(&format!(
             "WITH schemas AS ({SCHEMAS}), \
              roles AS ( \
                SELECT r.oid FROM pg_catalog.pg_roles r \
@@ -712,13 +764,14 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
                         AS can_truncate, \
                       EXISTS (SELECT 1 FROM roles r WHERE \
                               pg_catalog.has_table_privilege(r.oid, c.oid, 'TRIGGER')) \
-                        AS can_trigger \
+                        AS can_trigger, \
+                      {maintain_expr} AS can_maintain \
                FROM pg_catalog.pg_class c JOIN schemas s ON s.oid = c.relnamespace \
                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
                  AND NOT pg_catalog.pg_has_role($1::text::name, c.relowner, 'MEMBER') \
              ) \
-             SELECT oid::pg_catalog.regclass::text, can_truncate, can_trigger \
-             FROM relations WHERE can_truncate OR can_trigger \
+             SELECT oid::pg_catalog.regclass::text, can_truncate, can_trigger, can_maintain \
+             FROM relations WHERE can_truncate OR can_trigger OR can_maintain \
              ORDER BY 1 \
              LIMIT $2"
         ))
@@ -726,16 +779,21 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
         .bind(MAX_REPORTED)
         .fetch_all(&mut *conn)
         .await?;
-        table_privileges.extend(rows.into_iter().map(|(table, truncate, trigger)| {
-            TablePrivilege {
-                user: user.clone(),
-                table,
-                privileges: [(truncate, "TRUNCATE"), (trigger, "TRIGGER")]
+        table_privileges.extend(
+            rows.into_iter()
+                .map(|(table, truncate, trigger, maintain)| TablePrivilege {
+                    user: user.clone(),
+                    table,
+                    privileges: [
+                        (truncate, "TRUNCATE"),
+                        (trigger, "TRIGGER"),
+                        (maintain, "MAINTAIN"),
+                    ]
                     .into_iter()
                     .filter_map(|(has, p)| has.then_some(p))
                     .collect(),
-            }
-        }));
+                }),
+        );
 
         // Where it may create without owning: CREATE and TEMPORARY on the
         // current database (a temporary table shadows a tenant table through
@@ -810,6 +868,7 @@ pub async fn inspect_with(db: &Db, service_databases: &[&str]) -> Result<DbRole>
         owned,
         owned_total,
         table_privileges,
+        reports_maintain,
         create_privileges,
     })
 }
@@ -856,6 +915,54 @@ pub async fn holds_shared_tenant_role(db: &Db) -> Result<bool> {
     .await?;
     Ok(member)
 }
+
+/// The runtime group role migration 0006 grants the tombstone `INSERT` to. A
+/// deployment creates it (and grants it to its runtime login) before the first
+/// migration; 0006 grants to it only when it already exists.
+pub const CXP_RUNTIME_ROLE: &str = "cxp_runtime";
+
+/// What migration 0006 needs to have left in place, in this order: the
+/// [`CXP_RUNTIME_ROLE`] exists, and it holds `INSERT` on `deleted_orgs`.
+///
+/// 0006 grants the tombstone `INSERT` to `cxp_runtime` only if the role
+/// already exists, and a migration never runs twice, so a deployment's
+/// `cxp-server migrate` reads this *after* migrating and aborts the release
+/// when either is missing: serving would refuse to boot on every machine
+/// otherwise (`missing_runtime_grants`).
+pub async fn missing_cxp_runtime_install(db: &Db) -> Result<Vec<&'static str>> {
+    missing_cxp_runtime_install_named(db, CXP_RUNTIME_ROLE).await
+}
+
+/// [`missing_cxp_runtime_install`] with the role named, so a test can use a
+/// role of its own that it creates and drops.
+#[doc(hidden)]
+pub async fn missing_cxp_runtime_install_named(db: &Db, role: &str) -> Result<Vec<&'static str>> {
+    // has_table_privilege(role_name, ...) raises for a role that does not
+    // exist, so it is asked only for a row of pg_roles (none -> no row ->
+    // NULL -> coalesced false). to_regclass is NULL before migrations.
+    let (exists, can_insert): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1), \
+                coalesce((SELECT pg_catalog.has_table_privilege($1, \
+                          pg_catalog.to_regclass('public.deleted_orgs'), 'INSERT') \
+                          FROM pg_catalog.pg_roles WHERE rolname = $1), false)",
+    )
+    .bind(role)
+    .fetch_one(db.pool())
+    .await?;
+    Ok([
+        (!exists, CXP_RUNTIME_MISSING_ROLE),
+        (!can_insert, CXP_RUNTIME_MISSING_GRANT),
+    ]
+    .into_iter()
+    .filter_map(|(missing, item)| missing.then_some(item))
+    .collect())
+}
+
+/// The missing item when [`CXP_RUNTIME_ROLE`] does not exist.
+pub const CXP_RUNTIME_MISSING_ROLE: &str = "the cxp_runtime role";
+/// The missing item when `cxp_runtime` exists but cannot insert into
+/// `deleted_orgs`.
+pub const CXP_RUNTIME_MISSING_GRANT: &str = "INSERT on deleted_orgs for cxp_runtime";
 
 #[cfg(test)]
 mod tests {
@@ -1094,10 +1201,34 @@ mod tests {
     }
 
     #[test]
+    fn a_postgres_17_role_reports_maintain_like_truncate() {
+        // The clean clause names MAINTAIN only when the check read it (17+).
+        let mut pg17 = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        assert!(!pg17.can_alter_tables());
+        pg17.reports_maintain = true;
+        assert!(pg17.summary().ends_with(CLEAN_OWNERSHIP_WITH_MAINTAIN));
+
+        // A role that holds only MAINTAIN is refused, named like TRUNCATE.
+        let mut maintain = DbRole::for_test("cxp_server", "cxp_server", &[]);
+        maintain.reports_maintain = true;
+        maintain.table_privileges = vec![TablePrivilege {
+            user: "cxp_server".into(),
+            table: "customers".into(),
+            privileges: vec!["MAINTAIN"],
+        }];
+        assert!(maintain.can_alter_tables());
+        assert!(maintain
+            .summary()
+            .ends_with(r#"; it owns nothing in this database; can MAINTAIN table "customers""#));
+    }
+
+    #[test]
     fn the_lists_hold_what_the_check_must_refuse_and_nothing_a_service_needs() {
         // Every database owner is implicitly a member of pg_database_owner.
         assert!(!PREDEFINED_ROLES.contains(&"pg_database_owner"));
         // This service's own database is never "another service's".
         assert!(!OTHER_SERVICE_DATABASES.contains(&"otto_cxp"));
+        // MAINTAIN is Postgres 17's, and the version it landed in.
+        assert_eq!(MAINTAIN_VERSION, 170000);
     }
 }

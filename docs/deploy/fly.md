@@ -188,8 +188,10 @@ current user, and refuses when either:
 A serving process (not `cxp-server migrate`, whose role is meant to own) also refuses when either
 user owns, or is a member of a role that owns, anything in `otto_cxp`: the database, a schema
 (`public` follows the database owner through `pg_database_owner`), a table, sequence, index or
-other relation, a function, a type, or an extension; or may `TRUNCATE` or add a `TRIGGER` to any
-table, view, or foreign table; or may `CREATE` in the database or one of its schemas, or create
+other relation, a function, a type, or an extension; or may `TRUNCATE`, add a `TRIGGER` to, or
+(on Postgres 17 and later) `MAINTAIN` any table, view, or foreign table (`MAINTAIN` is `LOCK`,
+`CLUSTER`, `REINDEX`, and the rest: not an RLS bypass, but denial of service on the shared
+instance); or may `CREATE` in the database or one of its schemas, or create
 `TEMPORARY` tables there (a temporary table named like a tenant table would shadow it, with no
 RLS, for every later transaction on that pooled connection; `CREATE` on a schema would let it
 plant an overload a `SECURITY DEFINER` function resolves) — each through any role it inherits or
@@ -220,13 +222,19 @@ A developer's machine (loopback URLs, no `FLY_APP_NAME`, none of those databases
 Postgres) only warns, since a local Postgres hands out a superuser.
 
 **The check runs again every hour,** after the retention sweep, because a later `ALTER ROLE cxp_server BYPASSRLS`, `GRANT pg_read_all_data TO
-cxp_server`, or `GRANT TRUNCATE ... TO cxp_server` would otherwise go unnoticed until a restart.
+cxp_server`, or `GRANT TRUNCATE ... TO cxp_server` (or, on Postgres 17, `GRANT MAINTAIN ...`) would otherwise go
+unnoticed until a restart.
 When the role is one a deployment would refuse, the machine logs at `error`
 `the database role changed after boot: <summary>; /readyz answers 503 until it is fixed`, and
 `/readyz` answers 503 `{"status":"unready","reason":"database role refused"}` (each probe logs a
 `warn` with that fixed reason). `/readyz` is the app's only health check, so with one machine
 **this takes the service out of rotation**, deliberately: it is the role boot refuses. The outage
-lasts until the next hourly pass after the fix or a restart. To recover, undo the change (revoke
+lasts until the next hourly pass after the fix or a restart. While the alarm is raised the
+background maintenance pauses, too: the retention sweep is skipped (`the retention sweep is
+paused: the database role re-check is holding /readyz back`) and the usage shipper stops
+(`usage shipping is paused: ...`), both resuming once a pass clears the alarm — a role that
+gained `BYPASSRLS` after boot must not keep writing as it. Pending usage waits in the outbox; the
+final flush on shutdown is skipped while paused as well. To recover, undo the change (revoke
 the grant or attribute); the next pass clears the alarm and logs `the database role re-check
 passes again`, or restart the machines (`fly apps restart otto-cxp`) to re-run the boot check at
 once. The re-check gives up after 30 seconds; a failed or timed-out re-check leaves the alarm as
@@ -909,7 +917,11 @@ builtins: the password reaches neither the history nor the process list.) Then m
 first runs the release command, `cxp-server migrate`, in a temporary machine as `cxp_owner`; it
 applies 0006 and 0007 (0007 recreates `console_session_org`, whose `SET` clause needs the
 parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
-serving. Then see [Verify](#verify): the release command's log shows `database role "cxp_owner"
+serving. After migrating it verifies that 0006's grant landed: if `cxp_runtime` did not exist when
+0006 ran, 0006's own `NOTICE` is all that stood in its way, and the release command now fails with
+`refusing to finish the release: the release cannot finish without ...` rather than deploy a fleet
+whose machines all refuse to boot (`missing_cxp_runtime_install`). Then see [Verify](#verify): the
+release command's log shows `database role "cxp_owner"
 holds no superuser-equivalent privilege ...`, `applying migrations`, `migrations applied`; each
 machine's shows `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment ...`,
 `database role "cxp_server" ... it owns nothing in this database, can TRUNCATE or add a TRIGGER
@@ -1422,7 +1434,8 @@ The logs must show, in order:
   environment; only cxp-server migrate uses it`, then `database role "cxp_server" holds no superuser-equivalent
   privilege (...) ... and can connect to no other service's database; it owns nothing in this
   database, can TRUNCATE or add a TRIGGER to no table, and can create no schema, object, or
-  temporary table in it; the instance also hosts ...`
+  temporary table in it; the instance also hosts ...` (on Postgres 17 and later the clause reads
+  `can TRUNCATE, add a TRIGGER, or MAINTAIN no table`, since the check also reads `MAINTAIN`)
 - `not migrating: migrations run as the database owner through cxp-server migrate`
 - `tenant isolation enforced as role "cxp_app" (assumed via SET LOCAL ROLE cxp_app)`
 - `the otto platform accepted this service's credential`

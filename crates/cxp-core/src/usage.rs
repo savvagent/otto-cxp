@@ -1152,10 +1152,17 @@ async fn declare_meters(
 ///
 /// A shipping failure that passes on its own is logged at `warn`; one that
 /// needs an operator at `error`.
+///
+/// `pause` reads `true` while the database-role check refuses the connecting
+/// role (the server's readiness alarm): the shipper runs as that role, so it
+/// pauses — up to and including the final flush on `shutdown` — until the
+/// alarm clears, rather than ship as a role that may now hold `BYPASSRLS`.
+/// Rows wait in the outbox; nothing is lost.
 pub async fn run(
     db: Db,
     platform: Arc<PlatformClient>,
     cfg: ShipperConfig,
+    mut pause: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<(), ShipError> {
     if !declare_meters(&db, &platform, &cfg, &mut shutdown).await {
@@ -1169,6 +1176,23 @@ pub async fn run(
     }
     let mut failures: u32 = 0;
     loop {
+        if *pause.borrow() {
+            tracing::warn!(
+                "usage shipping is paused: the database role the shipper runs as is refused; \
+                 rows stay in the outbox until it is fixed"
+            );
+            tokio::select! {
+                resumed = pause.wait_for(|paused| !*paused) => {
+                    // The sender is shared with the process's lifetime; a
+                    // closed channel means the process is winding down.
+                    if resumed.is_err() {
+                        return Ok(());
+                    }
+                }
+                _ = shutdown.changed() => return Ok(()),
+            }
+            continue;
+        }
         let wait = match ship_once(&db, &platform, &cfg).await {
             Ok(n) => {
                 failures = 0;
@@ -1202,22 +1226,55 @@ pub async fn run(
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
-            _ = shutdown.changed() => {
-                return match ship_once(&db, &platform, &cfg).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        if e.is_retriable() {
-                            tracing::warn!(error = %e,
-                                "the final usage flush could not ship; rows stay in the outbox \
-                                 for the next start");
-                        } else {
-                            tracing::error!(error = %e,
-                                "final usage flush failed; rows stay in the outbox");
-                        }
-                        Err(e)
-                    }
-                };
+            // An alarm raised during the sleep takes effect now, not after
+            // the backoff (up to a minute) has run out: the next pass starts
+            // at the pause check above.
+            changed = pause.changed() => {
+                // The sender is shared with the process's lifetime; a closed
+                // channel means the process is winding down, as a shutdown
+                // does, and the two can arrive together. It gets the final
+                // flush too (the last alarm state stays readable).
+                if changed.is_ok() {
+                    continue;
+                }
+                final_flush(&db, &platform, &cfg, &pause).await?;
+                return Ok(());
             }
+            _ = shutdown.changed() => {
+                final_flush(&db, &platform, &cfg, &pause).await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The last pass before the shipper stops. It is still a pass as the
+/// connecting role, so a raised alarm skips it: the rows wait for the next
+/// start.
+async fn final_flush(
+    db: &Db,
+    platform: &PlatformClient,
+    cfg: &ShipperConfig,
+    pause: &watch::Receiver<bool>,
+) -> std::result::Result<(), ShipError> {
+    if *pause.borrow() {
+        tracing::warn!(
+            "shutting down while usage shipping is paused; no final flush, the rows stay \
+             queued for the next start"
+        );
+        return Ok(());
+    }
+    match ship_once(db, platform, cfg).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.is_retriable() {
+                tracing::warn!(error = %e,
+                    "the final usage flush could not ship; rows stay in the outbox for the \
+                     next start");
+            } else {
+                tracing::error!(error = %e, "final usage flush failed; rows stay in the outbox");
+            }
+            Err(e)
         }
     }
 }

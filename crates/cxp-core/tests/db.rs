@@ -2684,6 +2684,50 @@ async fn migration_0006_grants_the_tombstone_insert_to_cxp_runtime(pool: PgPool)
     assert!(granted);
 }
 
+/// `cxp-server migrate` reads this after migrating in a deployment (#47):
+/// the `cxp_runtime` group role exists and holds `INSERT` on `deleted_orgs`,
+/// which 0006 grants only when the role already existed. A role of the
+/// test's own stands in for `cxp_runtime`, which is cluster-wide and shared.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn missing_cxp_runtime_install_names_the_role_and_the_grant(pool: PgPool) {
+    use cxp_core::db_role::{
+        missing_cxp_runtime_install_named, CXP_RUNTIME_MISSING_GRANT, CXP_RUNTIME_MISSING_ROLE,
+    };
+    let mut roles = TestRoles::new(&pool);
+
+    // A role that does not exist: both the role and the grant are missing.
+    let absent = format!("cxp_t_absent_{}", Uuid::new_v4().simple());
+    assert_eq!(
+        missing_cxp_runtime_install_named(&db(pool.clone()), &absent)
+            .await
+            .unwrap(),
+        [CXP_RUNTIME_MISSING_ROLE, CXP_RUNTIME_MISSING_GRANT]
+    );
+
+    // Created but not granted: only the grant is missing.
+    let runtime = roles
+        .nologin(&pool, "cxp_t_runtime", "NOSUPERUSER NOBYPASSRLS")
+        .await;
+    assert_eq!(
+        missing_cxp_runtime_install_named(&db(pool.clone()), &runtime)
+            .await
+            .unwrap(),
+        [CXP_RUNTIME_MISSING_GRANT]
+    );
+
+    // Granted: nothing missing.
+    sqlx::query(&format!("GRANT INSERT ON deleted_orgs TO {runtime}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        missing_cxp_runtime_install_named(&db(pool.clone()), &runtime)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// Migration 0007 pins both SECURITY DEFINER functions' search_path with
 /// `pg_temp` last and schema-qualifies every call in them, so nothing a
 /// lesser role creates (an overload in a schema it may CREATE in, a
