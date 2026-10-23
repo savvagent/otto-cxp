@@ -1548,6 +1548,14 @@ impl Drop for TestRoles {
                             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                              WHERE usename = '{name}'"
                         ),
+                        // A role that owns objects here (the ownership
+                        // checks make some) cannot be dropped until they
+                        // go back to the test superuser.
+                        format!(
+                            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{name}') \
+                             THEN REASSIGN OWNED BY {name} TO CURRENT_USER; DROP OWNED BY {name}; \
+                             END IF; END $$"
+                        ),
                         format!("DROP ROLE IF EXISTS {name}"),
                     ] {
                         sqlx::query(&stmt).execute(&mut conn).await?;
@@ -2010,4 +2018,524 @@ async fn the_outbox_tables_carry_a_meter_quantity_pair_kept_together_by_a_check(
                 .unwrap_or_else(|e| panic!("{table}: meter {meter}, quantity {quantity}: {e}"));
         }
     }
+}
+
+/// `(kind, name, owner)` of each object `inspect` found owned.
+fn owned(role: &cxp_core::db_role::DbRole) -> Vec<(&str, &str, &str)> {
+    role.owned
+        .iter()
+        .map(|o| (o.kind, o.name.as_str(), o.owner.as_str()))
+        .collect()
+}
+
+/// What the runtime role owns and may TRUNCATE or add a TRIGGER to (#27):
+/// each is a way around row-level security (an owner may `NO FORCE` RLS or
+/// drop a policy; TRUNCATE ignores RLS; a trigger runs as whoever fires
+/// it), so the check names every one, however it is held.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: PgPool) {
+    use cxp_core::db_role::inspect;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    // The superuser pool owns everything; its ownership is not read.
+    let su = inspect(&db(pool.clone())).await.unwrap();
+    assert!(su.owned.is_empty(), "{}", su.summary());
+    assert!(su.table_privileges.is_empty(), "{}", su.summary());
+
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (table_owner, table_owner_db) = roles.login(&pool, "cxp_t_tbl_owner", base).await;
+    let group_owner = roles.nologin(&pool, "cxp_t_grp_owner", base).await;
+    let (member, member_db) = roles.login(&pool, "cxp_t_member", base).await;
+    let (truncate, truncate_db) = roles.login(&pool, "cxp_t_truncate", base).await;
+    let (trigger, trigger_db) = roles.login(&pool, "cxp_t_trigger", base).await;
+    let (db_owner, db_owner_db) = roles.login(&pool, "cxp_t_db_owner", base).await;
+    // TRUNCATE held by a group the login can SET ROLE to but does not
+    // inherit from: NOINHERIT, or (Postgres 16) a grant WITH INHERIT FALSE.
+    let truncate_group = roles.nologin(&pool, "cxp_t_trunc_grp", base).await;
+    let (noinherit, noinherit_db) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    let (set_only, set_only_db) = roles.login(&pool, "cxp_t_set_only", base).await;
+    for stmt in [
+        format!("GRANT otto_app TO {plain}, {table_owner}, {member}, {truncate}, {trigger}"),
+        format!("ALTER TABLE tickets OWNER TO {table_owner}"),
+        format!("ALTER TABLE segments OWNER TO {group_owner}"),
+        format!("GRANT {group_owner} TO {member}"),
+        format!("GRANT TRUNCATE ON customers TO {truncate}"),
+        format!("GRANT TRIGGER ON feedback TO {trigger}"),
+        format!("GRANT TRUNCATE ON customers TO {truncate_group}"),
+        format!("GRANT {truncate_group} TO {noinherit}"),
+        format!("GRANT {truncate_group} TO {set_only} WITH INHERIT FALSE, SET TRUE"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    // A member of otto_app only: nothing owned, nothing to truncate, and,
+    // once PUBLIC's default TEMPORARY on the database is revoked (as the
+    // runbook does), nowhere to create.
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "REVOKE TEMPORARY ON DATABASE \"{database}\" FROM PUBLIC"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&plain_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
+    assert_eq!(role.owned_total, 0);
+    assert!(role.table_privileges.is_empty(), "{}", role.summary());
+    assert!(!role.owns_objects());
+    assert!(!role.can_alter_tables());
+    assert!(
+        role.summary().ends_with(
+            "; it owns nothing in this database, can TRUNCATE or add a TRIGGER to no table, \
+             and can create no schema, object, or temporary table in it"
+        ),
+        "{}",
+        role.summary()
+    );
+    plain_db.pool().close().await;
+
+    // The owner of one table (and, with it, its indexes).
+    let role = inspect(&table_owner_db).await.unwrap();
+    assert!(
+        owned(&role).contains(&("table", "tickets", table_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(role.owned.iter().all(|o| o.user == table_owner));
+    // Its indexes and owned sequences come with it, counted from the
+    // catalog so the test follows the schema; the table is listed first
+    // (kinds in order) and the list stops at the cap.
+    let expected: i64 = sqlx::query_scalar(
+        "SELECT 1 \
+           + (SELECT count(*) FROM pg_index WHERE indrelid = 'tickets'::regclass) \
+           + (SELECT count(*) FROM pg_depend d \
+              JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+              WHERE d.refobjid = 'tickets'::regclass AND d.deptype IN ('a', 'i'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cap = cxp_core::db_role::MAX_REPORTED;
+    assert_eq!(role.owned_total, expected, "{}", role.summary());
+    assert_eq!(
+        role.owned.len() as i64,
+        expected.min(cap),
+        "{}",
+        role.summary()
+    );
+    assert_eq!(
+        owned(&role)[0],
+        ("table", "tickets", table_owner.as_str()),
+        "{}",
+        role.summary()
+    );
+    // Owned relations are not reported again as table privileges.
+    assert!(role.table_privileges.is_empty(), "{}", role.summary());
+    assert!(role.owns_objects());
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"table "tickets""#),
+        "{}",
+        role.summary()
+    );
+    table_owner_db.pool().close().await;
+
+    // A member of a NOLOGIN owner: one SET ROLE away, named as the owner.
+    let role = inspect(&member_db).await.unwrap();
+    assert!(
+        owned(&role).contains(&("table", "segments", group_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(role.owned.iter().all(|o| o.user == member));
+    assert!(role.can_alter_tables());
+    member_db.pool().close().await;
+
+    // TRUNCATE and TRIGGER, held without owning the table.
+    let role = inspect(&truncate_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
+    let privileges: Vec<_> = role
+        .table_privileges
+        .iter()
+        .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+        .collect();
+    assert_eq!(
+        privileges,
+        [(truncate.as_str(), "customers", vec!["TRUNCATE"])]
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"can TRUNCATE table "customers""#),
+        "{}",
+        role.summary()
+    );
+    truncate_db.pool().close().await;
+    let role = inspect(&trigger_db).await.unwrap();
+    assert!(role.owned.is_empty(), "{}", role.summary());
+    let privileges: Vec<_> = role
+        .table_privileges
+        .iter()
+        .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+        .collect();
+    assert_eq!(
+        privileges,
+        [(trigger.as_str(), "feedback", vec!["TRIGGER"])]
+    );
+    assert!(role.can_alter_tables());
+    trigger_db.pool().close().await;
+
+    // TRUNCATE one SET ROLE away counts, inherited or not.
+    for (login, as_login) in [(&noinherit, noinherit_db), (&set_only, set_only_db)] {
+        let role = inspect(&as_login).await.unwrap();
+        let privileges: Vec<_> = role
+            .table_privileges
+            .iter()
+            .map(|t| (t.user.as_str(), t.table.as_str(), t.privileges.clone()))
+            .collect();
+        assert_eq!(
+            privileges,
+            [(login.as_str(), "customers", vec!["TRUNCATE"])],
+            "{}",
+            role.summary()
+        );
+        assert!(role.can_alter_tables());
+        as_login.pool().close().await;
+    }
+
+    // The database's owner: the database, and schema public through
+    // pg_database_owner, which every database owner is implicitly in.
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{database}\" OWNER TO {db_owner}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&db_owner_db).await.unwrap();
+    let found = owned(&role);
+    assert!(
+        found.contains(&("database", database.as_str(), db_owner.as_str())),
+        "{}",
+        role.summary()
+    );
+    assert!(
+        found.contains(&("schema", "public", "pg_database_owner")),
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary()
+            .contains(&format!("it owns database {database:?}")),
+        "{}",
+        role.summary()
+    );
+    // What it owns is not reported again as somewhere it may create.
+    assert!(role.create_privileges.is_empty(), "{}", role.summary());
+    db_owner_db.pool().close().await;
+}
+
+/// `(user, object, privileges)` of each place `inspect` found the role may
+/// create in.
+fn creatable(role: &cxp_core::db_role::DbRole) -> Vec<(String, String, Vec<&'static str>)> {
+    role.create_privileges
+        .iter()
+        .map(|c| (c.user.clone(), c.object(), c.privileges.clone()))
+        .collect()
+}
+
+/// Where the runtime role may create (#27): `TEMPORARY` on the database (a
+/// temporary table shadows a tenant table through `pg_temp`), `CREATE` on a
+/// schema (an overload a SECURITY DEFINER function resolves), and `CREATE`
+/// on the database (new schemas), held directly, through `PUBLIC`, or one
+/// `SET ROLE` away through a NOINHERIT membership.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_database_role_check_sees_where_a_role_may_create(pool: PgPool) {
+    use cxp_core::db_role::inspect;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let db_object = format!("database {database:?}");
+
+    let (plain, plain_db) = roles.login(&pool, "cxp_t_plain", base).await;
+    let (schema_create, schema_create_db) = roles.login(&pool, "cxp_t_sch_create", base).await;
+    let (db_create, db_create_db) = roles.login(&pool, "cxp_t_db_create", base).await;
+    let create_group = roles.nologin(&pool, "cxp_t_create_grp", base).await;
+    let (noinherit, noinherit_db) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    for stmt in [
+        format!("GRANT otto_app TO {plain}, {schema_create}, {db_create}, {noinherit}"),
+        format!("GRANT {create_group} TO {noinherit}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    // A fresh database: PUBLIC holds TEMPORARY, so every login may create a
+    // temporary table, and is flagged.
+    let role = inspect(&plain_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(plain.clone(), db_object.clone(), vec!["TEMPORARY"])],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(!role.is_refused_in_a_deployment());
+    assert!(
+        role.summary()
+            .contains(&format!("can TEMPORARY in {db_object}")),
+        "{}",
+        role.summary()
+    );
+
+    // Revoked from PUBLIC (the runbook's S3): nowhere to create.
+    sqlx::query(&format!(
+        "REVOKE TEMPORARY ON DATABASE \"{database}\" FROM PUBLIC"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&plain_db).await.unwrap();
+    assert!(role.create_privileges.is_empty(), "{}", role.summary());
+    assert!(!role.can_alter_tables(), "{}", role.summary());
+    plain_db.pool().close().await;
+
+    // CREATE on schema public, granted to the login.
+    sqlx::query(&format!("GRANT CREATE ON SCHEMA public TO {schema_create}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let role = inspect(&schema_create_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(
+            schema_create.clone(),
+            r#"schema "public""#.to_string(),
+            vec!["CREATE"]
+        )],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    assert!(
+        role.summary().contains(r#"can CREATE in schema "public""#),
+        "{}",
+        role.summary()
+    );
+    schema_create_db.pool().close().await;
+
+    // CREATE on the database, granted to the login.
+    sqlx::query(&format!(
+        "GRANT CREATE ON DATABASE \"{database}\" TO {db_create}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let role = inspect(&db_create_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [(db_create.clone(), db_object.clone(), vec!["CREATE"])],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    db_create_db.pool().close().await;
+
+    // CREATE and TEMPORARY held by a group a NOINHERIT login can SET ROLE
+    // to but does not inherit from: one SET ROLE away still counts.
+    for stmt in [
+        format!("GRANT CREATE, TEMPORARY ON DATABASE \"{database}\" TO {create_group}"),
+        format!("GRANT CREATE ON SCHEMA public TO {create_group}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    let role = inspect(&noinherit_db).await.unwrap();
+    assert_eq!(
+        creatable(&role),
+        [
+            (
+                noinherit.clone(),
+                db_object.clone(),
+                vec!["CREATE", "TEMPORARY"]
+            ),
+            (
+                noinherit.clone(),
+                r#"schema "public""#.to_string(),
+                vec!["CREATE"]
+            ),
+        ],
+        "{}",
+        role.summary()
+    );
+    assert!(role.can_alter_tables());
+    noinherit_db.pool().close().await;
+}
+
+/// The runtime role needs, beyond `otto_app`, only `INSERT` on
+/// `deleted_orgs` (the `org.deleted` tombstone, written as itself), which
+/// migration 0006 grants to `cxp_runtime` (#27).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
+    use cxp_core::db_role::missing_runtime_grants;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+
+    assert!(missing_runtime_grants(&db(pool.clone()))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let (login, as_login) = roles.login(&pool, "cxp_t_runtime", base).await;
+    sqlx::query(&format!("GRANT otto_app TO {login}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_runtime_grants(&as_login).await.unwrap(),
+        ["INSERT on deleted_orgs"]
+    );
+
+    // cxp_runtime is cluster-wide and shared by concurrent tests: created
+    // if missing, never dropped.
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        "GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string(),
+        format!("GRANT cxp_runtime TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(missing_runtime_grants(&as_login).await.unwrap().is_empty());
+    as_login.pool().close().await;
+
+    // A NOINHERIT login that is a member of otto_app holds none of its
+    // privileges without SET ROLE: reported, with the insert it inherits
+    // nothing of either.
+    let (noinherit, as_noinherit) = roles
+        .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
+        .await;
+    for stmt in [
+        format!("GRANT otto_app TO {noinherit}"),
+        format!("GRANT cxp_runtime TO {noinherit}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert_eq!(
+        missing_runtime_grants(&as_noinherit).await.unwrap(),
+        ["INSERT on deleted_orgs", "inheriting otto_app"]
+    );
+    // A grant directly to the login fixes the insert, not the inheritance.
+    sqlx::query(&format!("GRANT INSERT ON deleted_orgs TO {noinherit}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_runtime_grants(&as_noinherit).await.unwrap(),
+        ["inheriting otto_app"]
+    );
+    as_noinherit.pool().close().await;
+}
+
+/// Before migrations there is no `deleted_orgs` to need a grant on.
+#[sqlx::test(migrations = false)]
+async fn missing_runtime_grants_is_empty_before_migrations(pool: PgPool) {
+    assert!(cxp_core::db_role::missing_runtime_grants(&db(pool))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Where `cxp_runtime` exists before migrating (the runbook creates it),
+/// migration 0006 grants it the tombstone insert.
+#[sqlx::test(migrations = false)]
+async fn migration_0006_grants_the_tombstone_insert_to_cxp_runtime(pool: PgPool) {
+    sqlx::query(
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    cxp_core::migrate(&db(pool.clone())).await.unwrap();
+    let granted: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('cxp_runtime', 'public.deleted_orgs', 'INSERT')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(granted);
+}
+
+/// Migration 0007 pins both SECURITY DEFINER functions' search_path with
+/// `pg_temp` last and schema-qualifies every call in them, so nothing a
+/// lesser role creates (an overload in a schema it may CREATE in, a
+/// temporary object) is resolved as the owner (#27).
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0007_pins_the_security_definer_functions(pool: PgPool) {
+    let rows: Vec<(String, bool, Vec<String>, String, bool)> = sqlx::query_as(
+        "SELECT p.oid::regprocedure::text, p.prosecdef, coalesce(p.proconfig, '{}'), p.prosrc, \
+                EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a \
+                        WHERE a.grantee = 0) \
+         FROM pg_proc p WHERE p.prosecdef AND p.pronamespace = 'public'::regnamespace \
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        names,
+        ["console_session_org(bytea)", "expire_removed_members()"],
+        "every SECURITY DEFINER function is covered here"
+    );
+    for (name, definer, config, src, public_execute) in &rows {
+        assert!(definer, "{name}");
+        assert!(
+            config
+                .iter()
+                .any(|c| c == "search_path=pg_catalog, public, pg_temp"),
+            "{name}: {config:?}"
+        );
+        assert!(!public_execute, "{name}: PUBLIC may execute it");
+        // Every now(), make_interval(, and count( is pg_catalog's.
+        for call in ["now()", "make_interval(", "count("] {
+            let unqualified = src
+                .match_indices(call)
+                .filter(|(at, _)| !src[..*at].ends_with("pg_catalog."))
+                .count();
+            assert_eq!(unqualified, 0, "{name} calls {call} unqualified: {src}");
+        }
+    }
+    let lookup = rows
+        .iter()
+        .find(|r| r.0.starts_with("console_session_org"))
+        .unwrap();
+    assert!(
+        lookup
+            .2
+            .iter()
+            .any(|c| c == "app.console_session_lookup=on"),
+        "{:?}",
+        lookup.2
+    );
+    assert!(lookup.3.contains("pg_catalog.now()"), "{}", lookup.3);
+    let expire = rows
+        .iter()
+        .find(|r| r.0.starts_with("expire_removed_members"))
+        .unwrap();
+    assert!(
+        expire.3.contains("pg_catalog.make_interval(secs => 600)"),
+        "{}",
+        expire.3
+    );
 }
