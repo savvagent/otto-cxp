@@ -62,7 +62,11 @@ if [ "$state" != stopped ] && [ "$state" != destroyed ]; then
   exit 1
 fi
 
-code="$(jq -r '[.events[]? | select(.type == "exit") | .request.exit_event.exit_code] | first // empty' <<<"$m")"
+# Fly leaves exit_code out of the event when it is 0 (the event then carries only
+# "signal": -1), so an exit event with no code and no signal is exit 0. A process
+# killed by a signal has no code and a signal other than -1: that stays unrecorded.
+code="$(jq -r '[.events[]? | select(.type == "exit") | .request.exit_event
+  | (.exit_code // (if (.signal // -1) == -1 then 0 else empty end))] | first // empty' <<<"$m")"
 if [ "$code" != 0 ]; then
   echo "::error::cxp-server migrate did not exit 0 (exit code: ${code:-none recorded}); the deploy is stopped" >&2
   exit 1
