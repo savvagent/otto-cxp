@@ -318,7 +318,7 @@ async fn migrate_on(db: &Db, config: &MigrateConfig) -> Result<String> {
     tracing::info!("applying migrations");
     cxp_core::migrate(db).await.context("migrations failed")?;
     tracing::info!("migrations applied");
-    if is_deployment(&role, config) {
+    if config.is_deployment() || role.shares_the_instance() {
         // 0006 grants the tombstone INSERT to `cxp_runtime` only when the role
         // already exists, and a migration never runs twice. Without it every
         // serving machine refuses to boot, so abort the release here instead.

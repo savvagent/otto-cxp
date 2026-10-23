@@ -896,7 +896,7 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = 'cxp_owner'::regrole AND datname <> 'otto_cxp') THEN
     RAISE EXCEPTION 'cxp_owner owns another database, which REASSIGN OWNED would move too';
   END IF;
-  -- Migration 0006 runs only in #27's release command: once it has, S6 happened, and the new
+  -- Migration 0006 runs only in the first deploy of #27: once it has, S6 happened, and the new
   -- release refuses an owning runtime role.
   IF EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version >= 5) THEN
     RAISE EXCEPTION '#27 is deployed (migration 0006 applied): roll the code back first, never S3';
@@ -932,7 +932,7 @@ as `cxp_owner`; it
 applies 0006 and 0007 (0007 recreates `console_session_org`, whose `SET` clause needs the
 parameter grant S1 gave `cxp_owner`); a failure there aborts the deploy and leaves the old release
 serving. After migrating it verifies that 0006's grant landed: if `cxp_runtime` did not exist when
-0006 ran, 0006's own `NOTICE` is all that stood in its way, and the release command now fails with
+0006 ran, 0006's own `NOTICE` is all that stood in its way, and the deploy job's migration step now fails with
 `refusing to finish the release: the release cannot finish without ...` rather than deploy a fleet
 whose machines all refuse to boot (`missing_cxp_runtime_install`). Then see [Verify](#verify): the
 migration machine's log shows `database role "cxp_owner"
@@ -1032,7 +1032,7 @@ and is a member of `otto_app` and `cxp_runtime`, and migrations 1 to 6 are appli
 tenant transactions running as `cxp_app` and `cxp_server` no longer a member of `otto_app`. Every
 step is a production role change on the shared `otto-db`; the agent that wrote this ran the SQL
 only against a local container put in the same state. **T0 to T2 must be done before the PR for
-#28 merges**: its release command fails on migration 0008 if `cxp_app` does not exist (`cxp_owner`
+#28 merges**: its migration step fails on migration 0008 if `cxp_app` does not exist (`cxp_owner`
 cannot create roles), and its machines refuse to serve unless `cxp_server` can assume it. T3 to T5
 follow the deploy. Nothing before T5 changes what the running release does.
 
@@ -1103,11 +1103,11 @@ BEGIN; SET LOCAL ROLE cxp_app; SELECT current_user; ROLLBACK;   -- cxp_app
 ```
 
 **Then merge the PR for #28** (with `FLY_DEPLOY` enabled the merge deploys; otherwise `fly deploy
--a otto-cxp --remote-only`). The release command applies 0008 as `cxp_owner`. If T1 was skipped
+-a otto-cxp --remote-only`). The deploy job's migration step applies 0008 as `cxp_owner`. If T1 was skipped
 it fails with `role cxp_app does not exist and cxp_owner may not create it`, nothing is recorded,
 and the old release keeps serving: run T1, then deploy again.
 
-**T3. Verify the deploy.** See [Verify](#verify). The release command's log shows `applying
+**T3. Verify the deploy.** See [Verify](#verify). The migration step's log shows `applying
 migrations`, `migrations applied`; each machine's shows `tenant isolation enforced as role
 "cxp_app" (assumed via SET LOCAL ROLE cxp_app)`, and, until T5, `database role "cxp_server" is
 still a member of otto_app, the tenant role the otto services share; this release no longer uses
@@ -1374,7 +1374,7 @@ fly certs add otto-cxp.savvagent.com -a otto-cxp
 #    then the split runbook's S1 to S4, and the "move the owner credential" runbook's M1 to M5
 #    (with nothing deployed yet, S1's secret restarts nothing, and S4's checks of tables and
 #    console_session_org wait until after the first deploy, as does its restart). Then the tenant-role runbook's T1
-#    (cxp_app), before the first release command runs migration 0008.
+#    (cxp_app), before the first deploy runs migration 0008.
 #    The first deploy migrates as cxp_owner from otto-cxp-migrate: step 5 below.
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
