@@ -954,7 +954,7 @@ a non-owner. Never undo S3 after S6: the new release refuses an owning runtime r
 
 **S7. Nothing to retire.** `cxp_server` keeps its password and `DATABASE_URL`. `cxp_owner`'s
 password lives only in `CXP_MIGRATION_DATABASE_URL` and your password manager; rotate it with
-`\password cxp_owner` and the same `read -rs PW ... | fly secrets import -a otto-cxp-migrate`
+`\password cxp_owner` and the same `read -rs PW ... | fly secrets import --stage -a otto-cxp-migrate`
 (M3 below; the migration app has no running machine, so there is nothing to restart).
 
 ### Runbook: move the owner credential out of otto-cxp (human-only, Rob)
@@ -984,10 +984,10 @@ gh secret set FLY_API_TOKEN_MIGRATE --repo savvagent/otto-cxp   # paste it
 
 # M3. The owner's credential, on the new app only. Same host, port, and query string as
 #     DATABASE_URL (R0 noted them); read and printf are shell builtins, so the password reaches
-#     neither the history nor the process list. No --stage needed: the app runs nothing.
+#     neither the history nor the process list. --stage is required: the app has no machine to read its config from, and shows the secret as Staged.
 read -rs PW     # paste cxp_owner's password, then Enter; nothing is shown
 printf 'CXP_MIGRATION_DATABASE_URL=postgres://cxp_owner:%s@otto-db.flycast:5432/otto_cxp?sslmode=disable\n' \
-  "$PW" | fly secrets import -a otto-cxp-migrate
+  "$PW" | fly secrets import --stage -a otto-cxp-migrate
 unset PW
 
 # M4. Take it off otto-cxp (skip if S6 never staged it there). --stage keeps the running release
