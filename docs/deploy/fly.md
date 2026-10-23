@@ -72,7 +72,8 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
   it. Its own deploy token is held by CI alone.
 - **Migrations** are otto-cxp's own (`crates/cxp-core/migrations`). The CI deploy job runs
   `cxp-server migrate` (the image's entrypoint plus `migrate`; `scripts/deploy/run-migrate.sh`)
-  as a one-off machine of `otto-cxp-migrate`, from the very image it is about to deploy, as
+  as a one-off machine of `otto-cxp-migrate`, from the very image it is about to deploy (copied
+  into that app's registry by `scripts/deploy/copy-image.sh`, same digest), as
   `cxp_owner`, under sqlx's advisory lock, and only then runs `fly deploy -a otto-cxp --image`
   with that image. A failed migration (nonzero exit, or no exit within 300 s) stops the job
   before any machine of the new release starts, and the old release keeps serving. `migrate`
@@ -1000,15 +1001,19 @@ fly secrets unset -a otto-cxp --stage CXP_MIGRATION_DATABASE_URL
 fly secrets list -a otto-cxp-migrate
 fly secrets list -a otto-cxp
 
-# M6. One-time check that a machine of otto-cxp-migrate can pull otto-cxp's image: the deploy
-#     job pushes registry.fly.io/otto-cxp:sha-<sha> with otto-cxp's token and runs it in the
-#     other app. Push any image of the app (`fly deploy -a otto-cxp --build-only --push
-#     --image-label m6`), then start it here with an argument cxp-server rejects before it
-#     touches anything (no database, no migration). It must start and exit 1 with `unknown
-#     argument "bogus"`; a registry "denied" or "unauthorized" instead means the pull is refused,
-#     and run-migrate.sh/ci.yml must push to the migration app's registry as well.
-fly machine run registry.fly.io/otto-cxp:m6 bogus -a otto-cxp-migrate --restart no --name pull-check
-fly logs -a otto-cxp-migrate --no-tail
+# M6. One-time check that a machine of otto-cxp-migrate can run a copy of otto-cxp's image.
+#     flyctl looks an image up inside the app named by -a, so the deploy job copies
+#     registry.fly.io/otto-cxp:sha-<sha> to registry.fly.io/otto-cxp-migrate:sha-<sha>
+#     (scripts/deploy/copy-image.sh) before migrating. Check it by hand with a throwaway
+#     image: push one (`fly deploy -a otto-cxp --build-only --push --image-label m6`), copy it,
+#     then start it here with an argument cxp-server rejects before it touches anything (no
+#     database, no migration). It must start and exit 1.
+fly deploy -a otto-cxp --build-only --push --remote-only --image-label m6
+FLY_API_TOKEN="$(fly tokens create deploy -a otto-cxp)" \
+FLY_API_TOKEN_MIGRATE="$(fly tokens create deploy -a otto-cxp-migrate)" \
+  scripts/deploy/copy-image.sh registry.fly.io/otto-cxp:m6 registry.fly.io/otto-cxp-migrate:m6
+fly machine run registry.fly.io/otto-cxp-migrate:m6 bogus -a otto-cxp-migrate --restart no --name pull-check
+fly logs -a otto-cxp-migrate --no-tail            # exited with code 1
 fly machine destroy "$(fly machines list -a otto-cxp-migrate --json | jq -r '.[]|select(.name=="pull-check").id')" -a otto-cxp-migrate --force
 ```
 
@@ -1593,17 +1598,21 @@ needs `rust`, `docker-build`, and `web`). The job runs only while the repo varia
 `FLY_DEPLOY` is `enabled`, which Rob sets after the hand-run first deploy is verified; until
 then a merge deploys nothing. `FLY_API_TOKEN` is the deploy token from step 6; `FLY_API_TOKEN_MIGRATE` is the migration
 app's (M2 of the [owner-credential runbook](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob)).
-The job builds and pushes one image, migrates with it in `otto-cxp-migrate`
+The job builds and pushes one image, copies it to the `otto-cxp-migrate` registry
+(`scripts/deploy/copy-image.sh`), migrates with that copy in `otto-cxp-migrate`
 (`scripts/deploy/run-migrate.sh`, which fails the job unless the machine exits 0), then deploys
-that image to `otto-cxp`.
+the image to `otto-cxp`.
 
-A hand deploy does the same three steps, because `fly deploy` alone no longer migrates (the
+A hand deploy does the same steps, because `fly deploy` alone no longer migrates (the
 tokens are your own; nothing here needs the CI ones):
 
 ```bash
 SHA=$(git rev-parse HEAD)
 fly deploy --build-only --push --remote-only -a otto-cxp --image-label "sha-$SHA"
-scripts/deploy/run-migrate.sh "registry.fly.io/otto-cxp:sha-$SHA" "$SHA"   # stops on failure
+FLY_API_TOKEN="$(fly tokens create deploy -a otto-cxp)" \
+FLY_API_TOKEN_MIGRATE="$(fly tokens create deploy -a otto-cxp-migrate)" \
+  scripts/deploy/copy-image.sh "registry.fly.io/otto-cxp:sha-$SHA" "registry.fly.io/otto-cxp-migrate:sha-$SHA"
+scripts/deploy/run-migrate.sh "registry.fly.io/otto-cxp-migrate:sha-$SHA" "$SHA"   # stops on failure
 fly deploy --image "registry.fly.io/otto-cxp:sha-$SHA" -a otto-cxp
 ```
 
