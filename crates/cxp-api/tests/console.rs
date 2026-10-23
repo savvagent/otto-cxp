@@ -20,7 +20,6 @@ use cxp_api::{router, AppState, Config};
 use cxp_http::console::{pkce_challenge, Console, ConsoleKeys, ConsoleSettings};
 use otto_resource::{ClientConfig, IntrospectionResponse, PlatformClient, Role, TokenKind};
 use otto_tenant::crypto::Cipher;
-use otto_tenant::Db;
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -206,7 +205,7 @@ async fn harness_with(pool: PgPool, console: bool) -> Harness {
     let platform = Arc::new(
         PlatformClient::new(ClientConfig::new(base.clone(), RESOURCE, "otto_rs_test")).unwrap(),
     );
-    let db = Db::from_pool(pool.clone());
+    let db = cxp_core::tenant_db(pool.clone());
     let mut state = AppState::new(
         db.clone(),
         platform.clone(),

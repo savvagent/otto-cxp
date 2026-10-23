@@ -1,5 +1,5 @@
 //! The experience catalog and the dashboard against a real Postgres, as
-//! `otto_app` pinned to an org (`Db::begin`), so row-level security applies.
+//! `cxp_app` pinned to an org (`Db::begin`), so row-level security applies.
 
 mod common;
 

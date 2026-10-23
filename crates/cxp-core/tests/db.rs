@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{as_app_maintenance, as_app_unpinned, db, org, otto_app_db, sqlstate};
+use common::{as_app_maintenance, as_app_unpinned, db, org, sqlstate, tenant_role_db};
 use otto_tenant::ids::OrgId;
 use otto_tenant::Db;
 use sqlx::migrate::MigrateError;
@@ -58,7 +58,7 @@ struct Seeded {
     article: Uuid,
 }
 
-/// Insert one row into every tenant table for `org`, as `otto_app` pinned to
+/// Insert one row into every tenant table for `org`, as `cxp_app` pinned to
 /// it, and commit.
 async fn seed(db: &Db, org: OrgId) -> Seeded {
     let s = Seeded {
@@ -180,8 +180,20 @@ async fn count(db: &Db, org: OrgId, table: &str) -> i64 {
 async fn tenant_isolation_is_enforced_on_every_tenant_table(pool: PgPool) {
     let db = db(pool);
     let report = db.verify_tenant_isolation().await.expect("isolation");
+    assert_eq!(report.tenant_role, cxp_core::TENANT_ROLE);
+    assert!(
+        report.tenant_role_assumed,
+        "SET LOCAL ROLE {} was not issued",
+        cxp_core::TENANT_ROLE
+    );
+    assert_eq!(report.effective_role, cxp_core::TENANT_ROLE);
     let summary = report.summary();
-    assert!(summary.contains("otto_app"), "{summary}");
+    assert!(
+        summary.contains(
+            r#"tenant isolation enforced as role "cxp_app" (assumed via SET LOCAL ROLE cxp_app)"#
+        ),
+        "{summary}"
+    );
 
     let mut expected: Vec<&str> = DOMAIN_TABLES
         .iter()
@@ -325,10 +337,10 @@ async fn another_org_can_neither_see_nor_change_an_orgs_rows(pool: PgPool) {
 }
 
 /// A request path that forgot to pin (current_org() NULL) reads and writes
-/// nothing in a domain table: as `otto_app` with no org set, no tenant
+/// nothing in a domain table: as `cxp_app` with no org set, no tenant
 /// policy matches any row.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn unpinned_otto_app_sees_no_domain_rows(pool: PgPool) {
+async fn unpinned_tenant_role_sees_no_domain_rows(pool: PgPool) {
     let admin = db(pool.clone());
     let a = org();
     seed(&admin, a).await;
@@ -358,7 +370,7 @@ async fn unpinned_otto_app_sees_no_domain_rows(pool: PgPool) {
     assert_eq!(sqlstate(&err), "42501");
 }
 
-/// The platform_events retention sweep runs unpinned as otto_app: it needs
+/// The platform_events retention sweep runs unpinned as cxp_app: it needs
 /// the maintenance marker to read or delete, and with it, it can.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_platform_events_sweep_needs_the_maintenance_marker(pool: PgPool) {
@@ -409,8 +421,8 @@ async fn the_platform_events_sweep_needs_the_maintenance_marker(pool: PgPool) {
     tx.rollback().await.unwrap();
 
     // Pinned deletes (the org.deleted purge) need no marker, through a pool
-    // whose every connection is otto_app.
-    let app_db = otto_app_db(&pool).await;
+    // whose every connection is cxp_app.
+    let app_db = tenant_role_db(&pool).await;
     let mut tx = app_db.begin(a).await.unwrap();
     let n = sqlx::query("DELETE FROM platform_events WHERE org_id = $1")
         .bind(a)
@@ -570,7 +582,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
     assert_eq!(sqlstate(&err), "42501", "the marked sweep moved a session");
     tx.rollback().await.unwrap();
 
-    // The function, called as otto_app with no org pinned.
+    // The function, called as cxp_app with no org pinned.
     let lookup = |hash: Vec<u8>| {
         let pool = pool.clone();
         async move {
@@ -598,7 +610,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
     };
     assert_eq!(lookup(live.clone()).await, Some(a.as_uuid()));
 
-    // Setting the lookup's marker by hand admits otto_app to nothing: the
+    // Setting the lookup's marker by hand admits cxp_app to nothing: the
     // lookup policy admits only the function's owner.
     let mut tx = as_app_unpinned(&pool).await;
     sqlx::query("SET LOCAL app.console_session_lookup = 'on'")
@@ -609,7 +621,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-    assert_eq!(n, 0, "otto_app read sessions by setting the lookup marker");
+    assert_eq!(n, 0, "cxp_app read sessions by setting the lookup marker");
     tx.rollback().await.unwrap();
     // It names no role: who it admits is read from the function's owner at
     // query time, so moving that ownership needs no ALTER POLICY.
@@ -625,7 +637,7 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
     assert_eq!(lookup(vec![9u8; 32]).await, None, "an unknown hash");
 
     // Its shape: SECURITY DEFINER with a pinned search_path, executable by
-    // otto_app and not by PUBLIC.
+    // cxp_app and not by PUBLIC.
     let (definer, config): (bool, Vec<String>) = sqlx::query_as(
         "SELECT prosecdef, coalesce(proconfig, '{}') FROM pg_proc \
          WHERE proname = 'console_session_org'",
@@ -639,14 +651,14 @@ async fn a_console_session_is_found_before_its_org_only_through_the_lookup_funct
         "{config:?}"
     );
     let grants: (bool, bool) = sqlx::query_as(
-        "SELECT has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE'), \
+        "SELECT has_function_privilege('cxp_app', 'console_session_org(bytea)', 'EXECUTE'), \
                 EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) acl \
                         WHERE p.proname = 'console_session_org' AND acl.grantee = 0)",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(grants, (true, false), "(otto_app may, PUBLIC may not)");
+    assert_eq!(grants, (true, false), "(cxp_app may, PUBLIC may not)");
 }
 
 /// Today the migrating role is a superuser, so `console_session_org` bypasses
@@ -764,9 +776,9 @@ async fn lookup_as_non_superuser_owner(pool: PgPool, owner: String) {
     assert_eq!(lookup(vec![9u8; 32]).await, None);
 
     // Plain SELECTs, unpinned: the new owner without the marker, and
-    // otto_app (not the owner) with the marker set by hand. Neither sees a
+    // cxp_app (not the owner) with the marker set by hand. Neither sees a
     // row.
-    for (role, marker) in [(owner.as_str(), false), ("otto_app", true)] {
+    for (role, marker) in [(owner.as_str(), false), (cxp_core::TENANT_ROLE, true)] {
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(&format!("SET LOCAL ROLE {role}"))
             .execute(&mut *tx)
@@ -932,17 +944,17 @@ async fn lookup_survives_drop_owned(pool: PgPool, old: String, new: String) {
     .await
     .unwrap();
     assert_eq!(owners, (new.clone(), new.clone()));
-    // otto_app keeps what the requests need: the grants moved with the
+    // cxp_app keeps what the requests need: the grants moved with the
     // ownership rather than leaving with the dropped role.
     let (table, function): (bool, bool) = sqlx::query_as(
-        "SELECT has_table_privilege('otto_app', 'console_sessions', \
+        "SELECT has_table_privilege('cxp_app', 'console_sessions', \
                                     'SELECT, INSERT, UPDATE, DELETE'), \
-                has_function_privilege('otto_app', 'console_session_org(bytea)', 'EXECUTE')",
+                has_function_privilege('cxp_app', 'console_session_org(bytea)', 'EXECUTE')",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((table, function), (true, true), "otto_app's grants");
+    assert_eq!((table, function), (true, true), "cxp_app's grants");
 
     let lookup = |hash: Vec<u8>| {
         let pool = pool.clone();
@@ -1218,7 +1230,7 @@ async fn customer_email_is_unique_per_org(pool: PgPool) {
 
 /// Structural invariants, read back from the catalog: every foreign key
 /// between public tables is (org_id, x_id) -> (org_id, id), every tenant
-/// table with an id carries UNIQUE (org_id, id), otto_app may read and write
+/// table with an id carries UNIQUE (org_id, id), cxp_app may read and write
 /// every table, every non-unique index but the two cross-org queues leads
 /// with org_id, and the objects the baseline dropped are gone.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -1276,7 +1288,8 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
         assert!(org_not_null, "{table}.org_id is nullable");
     }
 
-    // otto_app's grants, privilege by privilege (`has_table_privilege` with
+    // The grants of the tenant role and of otto_app (which the previous release still
+    // runs as), privilege by privilege (`has_table_privilege` with
     // a list answers whether ANY is held, so each is asked alone).
     let all = ["SELECT", "INSERT", "UPDATE", "DELETE"];
     let mut expected: Vec<(&str, &[&str])> = DOMAIN_TABLES
@@ -1291,19 +1304,22 @@ async fn the_schema_keeps_its_structural_invariants(pool: PgPool) {
     expected.push(("deleted_orgs", &["SELECT"]));
     expected.push(("removed_members", &["SELECT", "INSERT", "UPDATE"]));
     expected.push(("_sqlx_migrations", &[]));
-    for (table, granted) in expected {
-        for privilege in all {
-            let has: bool = sqlx::query_scalar("SELECT has_table_privilege('otto_app', $1, $2)")
-                .bind(table)
-                .bind(privilege)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(
-                has,
-                granted.contains(&privilege),
-                "otto_app {privilege} on {table}"
-            );
+    for role in [cxp_core::TENANT_ROLE, "otto_app"] {
+        for (table, granted) in &expected {
+            for privilege in all {
+                let has: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+                    .bind(role)
+                    .bind(table)
+                    .bind(privilege)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    has,
+                    granted.contains(&privilege),
+                    "{role} {privilege} on {table}"
+                );
+            }
         }
     }
 
@@ -1509,7 +1525,7 @@ impl TestRoles {
             .connect_with(options)
             .await
             .unwrap();
-        (name, Db::from_pool(as_role))
+        (name, cxp_core::tenant_db(as_role))
     }
 
     /// `CREATE ROLE name NOLOGIN <attributes>`, registered for the drop.
@@ -1624,9 +1640,12 @@ async fn the_database_role_check_sees_every_superuser_equivalent(pool: PgPool) {
         format!("GRANT {bypass_group} TO {member}"),
         format!("GRANT pg_execute_server_program TO {exec}"),
         format!("GRANT pg_read_all_data TO {read_all}"),
-        // otto_app is not privileged: membership in it, which every
+        // The tenant role is not privileged: membership in it, which every
         // deployment needs, must not count.
-        format!("GRANT otto_app TO {plain}, {member}, {exec}"),
+        format!(
+            "GRANT {} TO {plain}, {member}, {exec}",
+            cxp_core::TENANT_ROLE
+        ),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
@@ -1724,7 +1743,9 @@ async fn the_database_role_check_sees_a_superuser_session_behind_set_role(pool: 
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .unwrap();
-    let role = inspect(&Db::from_pool(as_plain.clone())).await.unwrap();
+    let role = inspect(&cxp_core::tenant_db(as_plain.clone()))
+        .await
+        .unwrap();
     as_plain.close().await;
 
     assert_eq!(role.current_user, plain);
@@ -2058,7 +2079,10 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         .await;
     let (set_only, set_only_db) = roles.login(&pool, "cxp_t_set_only", base).await;
     for stmt in [
-        format!("GRANT otto_app TO {plain}, {table_owner}, {member}, {truncate}, {trigger}"),
+        format!(
+            "GRANT {} TO {plain}, {table_owner}, {member}, {truncate}, {trigger}",
+            cxp_core::TENANT_ROLE
+        ),
         format!("ALTER TABLE tickets OWNER TO {table_owner}"),
         format!("ALTER TABLE segments OWNER TO {group_owner}"),
         format!("GRANT {group_owner} TO {member}"),
@@ -2071,7 +2095,7 @@ async fn the_database_role_check_sees_what_a_role_owns_and_can_truncate(pool: Pg
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
 
-    // A member of otto_app only: nothing owned, nothing to truncate, and,
+    // A member of the tenant role only: nothing owned, nothing to truncate, and,
     // once PUBLIC's default TEMPORARY on the database is revoked (as the
     // runbook does), nowhere to create.
     let database: String = sqlx::query_scalar("SELECT current_database()::text")
@@ -2273,7 +2297,10 @@ async fn the_database_role_check_sees_where_a_role_may_create(pool: PgPool) {
         .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
         .await;
     for stmt in [
-        format!("GRANT otto_app TO {plain}, {schema_create}, {db_create}, {noinherit}"),
+        format!(
+            "GRANT {} TO {plain}, {schema_create}, {db_create}, {noinherit}",
+            cxp_core::TENANT_ROLE
+        ),
         format!("GRANT {create_group} TO {noinherit}"),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
@@ -2380,7 +2407,7 @@ async fn the_database_role_check_sees_where_a_role_may_create(pool: PgPool) {
     noinherit_db.pool().close().await;
 }
 
-/// The runtime role needs, beyond `otto_app`, only `INSERT` on
+/// The runtime role needs, beyond the tenant role (`cxp_app`), only `INSERT` on
 /// `deleted_orgs` (the `org.deleted` tombstone, written as itself), which
 /// migration 0006 grants to `cxp_runtime` (#27).
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
@@ -2395,7 +2422,7 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
         .is_empty());
 
     let (login, as_login) = roles.login(&pool, "cxp_t_runtime", base).await;
-    sqlx::query(&format!("GRANT otto_app TO {login}"))
+    sqlx::query(&format!("GRANT {} TO {login}", cxp_core::TENANT_ROLE))
         .execute(&pool)
         .await
         .unwrap();
@@ -2418,21 +2445,21 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
     assert!(missing_runtime_grants(&as_login).await.unwrap().is_empty());
     as_login.pool().close().await;
 
-    // A NOINHERIT login that is a member of otto_app holds none of its
+    // A NOINHERIT login that is a member of cxp_app holds none of its
     // privileges without SET ROLE: reported, with the insert it inherits
     // nothing of either.
     let (noinherit, as_noinherit) = roles
         .login(&pool, "cxp_t_noinherit", &format!("{base} NOINHERIT"))
         .await;
     for stmt in [
-        format!("GRANT otto_app TO {noinherit}"),
+        format!("GRANT {} TO {noinherit}", cxp_core::TENANT_ROLE),
         format!("GRANT cxp_runtime TO {noinherit}"),
     ] {
         sqlx::query(&stmt).execute(&pool).await.unwrap();
     }
     assert_eq!(
         missing_runtime_grants(&as_noinherit).await.unwrap(),
-        ["INSERT on deleted_orgs", "inheriting otto_app"]
+        ["INSERT on deleted_orgs", "inheriting cxp_app"]
     );
     // A grant directly to the login fixes the insert, not the inheritance.
     sqlx::query(&format!("GRANT INSERT ON deleted_orgs TO {noinherit}"))
@@ -2441,14 +2468,195 @@ async fn missing_runtime_grants_names_the_tombstone_insert(pool: PgPool) {
         .unwrap();
     assert_eq!(
         missing_runtime_grants(&as_noinherit).await.unwrap(),
-        ["inheriting otto_app"]
+        ["inheriting cxp_app"]
     );
     as_noinherit.pool().close().await;
+
+    // A login in otto_app and cxp_runtime but not cxp_app lacks the tenant role.
+    let (other, as_other) = roles.login(&pool, "cxp_t_shared", base).await;
+    for stmt in [
+        format!("GRANT otto_app TO {other}"),
+        format!("GRANT cxp_runtime TO {other}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert_eq!(
+        missing_runtime_grants(&as_other).await.unwrap(),
+        ["inheriting cxp_app"]
+    );
+    as_other.pool().close().await;
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn holds_shared_tenant_role_sees_membership_in_otto_app(pool: PgPool) {
+    use cxp_core::db_role::holds_shared_tenant_role;
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let (member, as_member) = roles.login(&pool, "cxp_t_member", base).await;
+    sqlx::query(&format!("GRANT otto_app TO {member}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(holds_shared_tenant_role(&as_member).await.unwrap());
+    as_member.pool().close().await;
+
+    let (own, as_own) = roles.login(&pool, "cxp_t_own", base).await;
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        format!("GRANT {} TO {own}", cxp_core::TENANT_ROLE),
+        format!("GRANT cxp_runtime TO {own}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    assert!(!holds_shared_tenant_role(&as_own).await.unwrap());
+    as_own.pool().close().await;
+}
+
+/// Every privilege otto_app holds, cxp_app holds too, and no more: the two are
+/// interchangeable to the schema, which is what lets the previous release run against it.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_holds_exactly_what_otto_app_holds(pool: PgPool) {
+    let queries: [(&str, String); 4] = [
+        (
+            "relations",
+            privilege_diff(
+                "SELECT c.oid::regclass::text AS name, p AS privilege FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace, \
+                 unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p \
+                 WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')",
+                "has_table_privilege",
+            ),
+        ),
+        (
+            "sequences",
+            privilege_diff(
+                "SELECT c.oid::regclass::text AS name, p AS privilege FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace, \
+                 unnest(ARRAY['USAGE','SELECT','UPDATE']) p \
+                 WHERE n.nspname = 'public' AND c.relkind = 'S'",
+                "has_sequence_privilege",
+            ),
+        ),
+        (
+            "functions",
+            privilege_diff(
+                "SELECT f.oid::regprocedure::text AS name, 'EXECUTE' AS privilege FROM pg_proc f \
+                 JOIN pg_namespace n ON n.oid = f.pronamespace WHERE n.nspname = 'public'",
+                "has_function_privilege",
+            ),
+        ),
+        (
+            "schema",
+            privilege_diff(
+                "SELECT n.oid::regnamespace::text AS name, p AS privilege FROM pg_namespace n, \
+                 unnest(ARRAY['USAGE','CREATE']) p WHERE n.nspname = 'public'",
+                "has_schema_privilege",
+            ),
+        ),
+    ];
+    for (kind, sql) in &queries {
+        let diff: Vec<(String, String)> = sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
+        assert!(
+            diff.is_empty(),
+            "{kind} differ between cxp_app and otto_app: {diff:?}"
+        );
+    }
+    for f in [
+        "public.console_session_org(bytea)",
+        "public.expire_removed_members()",
+    ] {
+        let (tenant, public): (bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('cxp_app', $1, 'EXECUTE'), \
+                    has_function_privilege('public', $1, 'EXECUTE')",
+        )
+        .bind(f)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(tenant, "cxp_app cannot execute {f}");
+        assert!(!public, "PUBLIC can execute {f}");
+    }
+}
+
+/// The rows of `candidates` (name, privilege) on which `has` answers differently for the two roles.
+fn privilege_diff(candidates: &str, has: &str) -> String {
+    format!(
+        "SELECT name, privilege FROM ({candidates}) AS q(name, privilege) WHERE \
+         {has}('cxp_app', name, privilege) IS DISTINCT FROM {has}('otto_app', name, privilege)"
+    )
+}
+
+/// A tenant transaction runs as cxp_app, which may not write the tombstone; the connecting
+/// login (through cxp_runtime) may.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn tenant_transactions_cannot_write_the_tombstone(pool: PgPool) {
+    let mut roles = TestRoles::new(&pool);
+    let base = "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION";
+    let (login, as_login) = roles.login(&pool, "cxp_t_tomb", base).await;
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE cxp_runtime NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+            .to_string(),
+        "GRANT INSERT ON deleted_orgs TO cxp_runtime".to_string(),
+        format!("GRANT {} TO {login}", cxp_core::TENANT_ROLE),
+        format!("GRANT cxp_runtime TO {login}"),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+    // begin() needs a second connection beside the transaction's own.
+    let wide = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(as_login.pool().connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    as_login.pool().close().await;
+    let as_login = cxp_core::tenant_db(wide);
+    sqlx::query("INSERT INTO deleted_orgs (org_id) VALUES ($1)")
+        .bind(Uuid::new_v4())
+        .execute(as_login.pool())
+        .await
+        .expect("the connecting role writes the tombstone");
+
+    let mut tx = as_login.begin(org()).await.unwrap();
+    let err = sqlx::query("INSERT INTO deleted_orgs (org_id) VALUES ($1)")
+        .bind(Uuid::new_v4())
+        .execute(tx.conn())
+        .await
+        .expect_err("a tenant transaction may not write a tombstone");
+    assert_eq!(sqlstate(&err), "42501", "{err}");
+    drop(tx);
+    as_login.pool().close().await;
+}
+
+/// The release before #28 builds its Db with otto-tenant's default role. During the rollout,
+/// and after a rollback, it runs against a schema migration 0008 has changed: otto_app keeps
+/// every grant, so isolation still holds as otto_app.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_previous_release_still_isolates_as_otto_app(pool: PgPool) {
+    #[allow(clippy::disallowed_methods)] // deliberately the previous release's construction
+    let previous = otto_tenant::Db::from_pool(pool.clone());
+    let report = previous
+        .verify_tenant_isolation()
+        .await
+        .expect("isolation as otto_app");
+    assert_eq!(report.effective_role, "otto_app");
+    assert!(report.tenant_role_assumed);
 }
 
 /// Before migrations there is no `deleted_orgs` to need a grant on.
 #[sqlx::test(migrations = false)]
 async fn missing_runtime_grants_is_empty_before_migrations(pool: PgPool) {
+    // A missing cxp_app now counts as a missing grant, so the role must exist for the list to
+    // be empty. Roles are cluster-wide and tests run concurrently: tolerate a concurrent creator.
+    sqlx::query(
+        "DO $$ BEGIN CREATE ROLE cxp_app NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     assert!(cxp_core::db_role::missing_runtime_grants(&db(pool))
         .await
         .unwrap()
@@ -2538,4 +2746,140 @@ async fn migration_0007_pins_the_security_definer_functions(pool: PgPool) {
         "{}",
         expire.3
     );
+}
+
+/// `cxp_app` shares nothing with `otto_app`: a privilege granted to `otto_app` after migrating
+/// does not reach a tenant transaction, and the roles are not members of each other.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_is_independent_of_otto_app(pool: PgPool) {
+    sqlx::query("CREATE TABLE t_shared (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 0008's default privileges gave cxp_app this table; take them back so only otto_app holds it.
+    sqlx::query("REVOKE ALL ON t_shared FROM cxp_app")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("GRANT SELECT ON t_shared TO otto_app")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = db(pool.clone()).begin(org()).await.unwrap();
+    let err = sqlx::query("SELECT count(*) FROM t_shared")
+        .fetch_one(&mut *tx.conn())
+        .await
+        .expect_err("cxp_app was never granted t_shared");
+    assert_eq!(sqlstate(&err), "42501");
+    drop(tx);
+    let member: bool = sqlx::query_scalar("SELECT pg_has_role('cxp_app', 'otto_app', 'MEMBER')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!member, "cxp_app is a member of otto_app");
+}
+
+/// Migration 0008 refuses a pre-existing `cxp_app` that is not a plain group role. A negative
+/// test would mutate the cluster-wide role other tests share, so this runs the check against
+/// the test cluster's real `cxp_app` (which migrating just accepted) and asserts the catalog
+/// facts the check reads.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn cxp_app_is_a_plain_group_role(pool: PgPool) {
+    let flags: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication \
+         FROM pg_roles WHERE rolname = 'cxp_app'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flags, (false, false, false, false, false, false));
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_auth_members WHERE member = 'cxp_app'::regrole",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(memberships, 0, "cxp_app is a member of another role");
+}
+
+/// 0008's check of an existing `cxp_app` refuses one that is not a plain group role. The real
+/// role is cluster-wide and shared by concurrent tests, so the check's block runs, as written in
+/// the migration, against a stand-in role of its own.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0008_refuses_a_cxp_app_that_is_not_a_plain_group_role(pool: PgPool) {
+    let migration = include_str!("../migrations/0008_cxp_app_tenant_role.sql");
+    let start = migration
+        .find("DO $$\nDECLARE")
+        .expect("0008's plain-group-role check");
+    let end = start + migration[start..].find("END $$;").expect("its end") + "END $$;".len();
+    let check = &migration[start..end];
+    let mut roles = TestRoles::new(&pool);
+    let run = |role: &str| {
+        let sql = check.replace("cxp_app", role);
+        let pool = pool.clone();
+        async move { sqlx::query(&sql).execute(&pool).await }
+    };
+
+    let plain = roles.nologin(&pool, "cxp_app_plain", "").await;
+    run(&plain).await.expect("a plain group role passes");
+
+    let (login, db) = roles.login(&pool, "cxp_app_login", "").await;
+    db.pool().close().await;
+    let err = run(&login).await.unwrap_err().to_string();
+    assert!(err.contains(&format!("role {login} has LOGIN")), "{err}");
+
+    let member = roles.nologin(&pool, "cxp_app_member", "").await;
+    let group = roles.nologin(&pool, "cxp_app_group", "").await;
+    sqlx::query(&format!("GRANT {group} TO {member}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = run(&member).await.unwrap_err().to_string();
+    assert!(err.contains("membership in another role"), "{err}");
+
+    let admin = roles.nologin(&pool, "cxp_app_admin", "").await;
+    let holder = roles.nologin(&pool, "cxp_app_holder", "").await;
+    sqlx::query(&format!("GRANT {admin} TO {holder} WITH ADMIN OPTION"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = run(&admin).await.unwrap_err().to_string();
+    assert!(err.contains("a member WITH ADMIN OPTION"), "{err}");
+}
+
+/// Tables and sequences a later migration creates as the migrating role reach `cxp_app`
+/// through 0008's default privileges, minus `TRUNCATE`.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn migration_0008_sets_default_privileges_for_the_migrating_role(pool: PgPool) {
+    sqlx::query("CREATE TABLE later_t (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE SEQUENCE later_s")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (privilege, expected) in [
+        ("SELECT", true),
+        ("INSERT", true),
+        ("UPDATE", true),
+        ("DELETE", true),
+        ("TRUNCATE", false),
+    ] {
+        let has: bool = sqlx::query_scalar("SELECT has_table_privilege('cxp_app', 'later_t', $1)")
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(has, expected, "{privilege} on a later table");
+    }
+    for privilege in ["USAGE", "SELECT"] {
+        let has: bool =
+            sqlx::query_scalar("SELECT has_sequence_privilege('cxp_app', 'later_s', $1)")
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(has, "{privilege} on a later sequence");
+    }
 }

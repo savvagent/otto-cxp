@@ -1,5 +1,5 @@
 //! The support domain (tickets, knowledge base, chat) against a real
-//! Postgres, as `otto_app` pinned to an org.
+//! Postgres, as `cxp_app` pinned to an org.
 
 mod common;
 

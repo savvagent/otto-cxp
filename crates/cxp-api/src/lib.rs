@@ -315,7 +315,7 @@ mod tests {
             .unwrap(),
         );
         let state = AppState::new(
-            Db::from_pool(pool),
+            cxp_core::tenant_db(pool),
             platform,
             SearchLimiter::for_pool(5),
             Config {

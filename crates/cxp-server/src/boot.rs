@@ -277,7 +277,7 @@ pub async fn migrate(config: &Config) -> Result<String> {
         .connect(url)
         .await
         .context("could not connect to the database to migrate")?;
-    let db = Db::from_pool(pool);
+    let db = cxp_core::tenant_db(pool);
     let result = migrate_on(&db, config).await;
     db.pool().close().await;
     result
@@ -318,8 +318,11 @@ pub const RECHECK_ESCALATE_AFTER: u32 = 3;
 /// ([`crate::health`]). Called by the sweeper after each pass, so a grant
 /// made after boot is noticed within the hour. In a deployment it also
 /// re-runs the runtime-grant check ([`cxp_core::db_role::missing_runtime_grants`]),
-/// logged at `error` when something is missing (no alarm: requests still
-/// work; the `org.deleted` webhook or the background tasks do not).
+/// logged at `error` when something is missing. Losing the tenant role
+/// (`inheriting cxp_app`) raises the alarm too: the `Db` resolved at boot that
+/// it may `SET LOCAL ROLE cxp_app`, so every tenant transaction now fails, and
+/// readiness should say so. A missing tombstone grant raises nothing (requests
+/// still work; the `org.deleted` webhook does not, and the platform retries it).
 ///
 /// A read that fails or takes longer than [`RECHECK_TIMEOUT`] leaves the
 /// alarm as it was (`/readyz` reports an unreachable database itself) and is
@@ -332,25 +335,8 @@ pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
         Ok(Err(e)) => return recheck_failed(alarm, "the database role", &e),
         Err(_) => return recheck_timed_out(alarm, "the database role"),
     };
-    match role_verdict(&role, config) {
-        Verdict::Refused => {
-            let summary = role.summary();
-            tracing::error!(
-                "the database role changed after boot: {summary}; /readyz answers 503 until it \
-                 is fixed"
-            );
-            alarm.raise(summary);
-        }
-        Verdict::Clean | Verdict::AllowedLocally => {
-            if alarm.clear() {
-                tracing::info!(
-                    "the database role re-check passes again; /readyz no longer holds back"
-                );
-            }
-        }
-    }
-    if is_deployment(&role, config) {
-        let missing = match tokio::time::timeout(
+    let missing = if is_deployment(&role, config) {
+        match tokio::time::timeout(
             RECHECK_TIMEOUT,
             cxp_core::db_role::missing_runtime_grants(db),
         )
@@ -359,12 +345,33 @@ pub async fn recheck_db_role(db: &Db, config: &Config, alarm: &RoleAlarm) {
             Ok(Ok(missing)) => missing,
             Ok(Err(e)) => return recheck_failed(alarm, "the runtime role's grants", &e),
             Err(_) => return recheck_timed_out(alarm, "the runtime role's grants"),
-        };
-        if !missing.is_empty() {
+        }
+    } else {
+        Vec::new()
+    };
+    let grants = (!missing.is_empty()).then(|| missing_grants(&missing, &role.current_user));
+    if let Some(grants) = &grants {
+        tracing::error!("the database role changed after boot: {grants}");
+    }
+    let [_, tenant] = cxp_core::db_role::RUNTIME_GRANTS;
+    let refused = match role_verdict(&role, config) {
+        Verdict::Refused => Some(role.summary()),
+        Verdict::Clean | Verdict::AllowedLocally => grants.filter(|_| missing.contains(&tenant)),
+    };
+    match refused {
+        Some(summary) => {
             tracing::error!(
-                "the database role changed after boot: {}",
-                missing_grants(&missing, &role.current_user)
+                "the database role changed after boot: {summary}; /readyz answers 503 until it \
+                 is fixed"
             );
+            alarm.raise(summary);
+        }
+        None => {
+            if alarm.clear() {
+                tracing::info!(
+                    "the database role re-check passes again; /readyz no longer holds back"
+                );
+            }
         }
     }
     alarm.record_success();
@@ -410,14 +417,18 @@ fn missing_grants(missing: &[&str], role: &str) -> String {
     let role = sql_identifier(role);
     let mut fixes = Vec::new();
     // Matched on the constant itself, so rewording an entry cannot drop its fix.
-    let [tombstone, otto_app] = cxp_core::db_role::RUNTIME_GRANTS;
+    let [tombstone, tenant] = cxp_core::db_role::RUNTIME_GRANTS;
     if missing.contains(&tombstone) {
         fixes.push(format!(
             "GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO {role}"
         ));
     }
-    if missing.contains(&otto_app) {
-        fixes.push(format!("GRANT otto_app TO {role} WITH INHERIT TRUE"));
+    if missing.contains(&tenant) {
+        let tenant_role = cxp_core::TENANT_ROLE;
+        fixes.push(format!(
+            "CREATE ROLE {tenant_role} NOLOGIN (if it does not exist); GRANT {tenant_role} TO \
+             {role} WITH INHERIT TRUE"
+        ));
     }
     format!(
         "the runtime role {role} lacks {} (the org.deleted tombstone and the background tasks \
@@ -472,7 +483,7 @@ where
         .connect(&config.database_url)
         .await
         .context("could not connect to the database")?;
-    let db = Db::from_pool(pool);
+    let db = cxp_core::tenant_db(pool);
     // Sized from the same setting as the pool: one limiter for the process.
     let search = cxp_core::search::SearchLimiter::for_pool(config.db_max_connections);
 
@@ -517,14 +528,35 @@ where
         tracing::warn!("{why}: allowed only because this is not a deployment");
     }
 
+    // The shared tenant role is no longer used: a leftover membership is
+    // harmless, but it is a privilege this service should not hold.
+    if deployment {
+        match cxp_core::db_role::holds_shared_tenant_role(&db).await {
+            Ok(true) => tracing::warn!(
+                "database role {} is still a member of {}, the tenant role the otto services \
+                 share; this release no longer uses it: REVOKE {} FROM {} once it is verified \
+                 (docs/deploy/fly.md, runbook T5)",
+                sql_identifier(&role.current_user),
+                cxp_core::db_role::SHARED_TENANT_ROLE,
+                cxp_core::db_role::SHARED_TENANT_ROLE,
+                sql_identifier(&role.current_user),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e.log_detail(),
+                "could not read whether the database role still belongs to {}",
+                cxp_core::db_role::SHARED_TENANT_ROLE),
+        }
+    }
+
     // Prove tenant isolation before serving. The same migrations isolate
     // perfectly under one database role and not at all under another, and
     // only the running database can say which this is.
-    let isolation = db
+    let report = db
         .verify_tenant_isolation()
         .await
-        .context("refusing to serve: tenant isolation is not enforced by this database")?
-        .summary();
+        .context("refusing to serve: tenant isolation is not enforced by this database")?;
+    let isolation = report.summary();
+    check_tenant_role(&report, &role.current_user)?;
     tracing::info!("{isolation}");
 
     let platform = platform_client(&config)?;
@@ -656,6 +688,35 @@ fn flush_result(
 /// than sweep platform events.
 const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 
+/// Whether tenant transactions really run as otto-cxp's own tenant role. otto-tenant issues
+/// `SET LOCAL ROLE cxp_app` only when the role exists and the login holds it, and otherwise
+/// runs tenant transactions as the login itself, which `verify_tenant_isolation` accepts for any
+/// role that is neither superuser nor BYPASSRLS. That login also holds the background grants
+/// (the tombstone), and would serve every request with them, silently. So boot refuses unless
+/// the report says the role was assumed and is the effective role, on every machine: unlike the
+/// privilege checks (which only warn locally, where Postgres hands out a superuser), a local
+/// superuser passes this one (0008 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
+/// a local exception would only ever admit the silent fallback this exists to stop.
+pub fn check_tenant_role(
+    report: &otto_tenant::isolation::IsolationReport,
+    login: &str,
+) -> Result<()> {
+    if report.tenant_role_assumed && report.effective_role == cxp_core::TENANT_ROLE {
+        return Ok(());
+    }
+    let role = cxp_core::TENANT_ROLE;
+    let why = format!(
+        "tenant transactions run as {}, not otto-cxp's own tenant role {role} (it does not \
+         exist, or {} cannot assume it): as a superuser, CREATE ROLE {role} NOLOGIN; GRANT \
+         {role} TO {} WITH INHERIT TRUE; then migrate (docs/deploy/fly.md, runbook T1)",
+        sql_identifier(&report.effective_role),
+        sql_identifier(login),
+        sql_identifier(login),
+    );
+    tracing::error!("{why}: refusing to serve");
+    Err(anyhow!("refusing to serve: {why}"))
+}
+
 /// `name` as a quoted SQL identifier, ready to paste into a statement:
 /// always double-quoted, with every embedded double quote doubled, so a name
 /// Postgres would fold (`Cxp`), misparse (`cxp-runtime`), or read as a
@@ -706,6 +767,36 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use otto_resource::{ClientConfig, IntrospectionResponse};
+
+    fn report(effective: &str, assumed: bool) -> otto_tenant::isolation::IsolationReport {
+        otto_tenant::isolation::IsolationReport {
+            tenant_role: cxp_core::TENANT_ROLE.into(),
+            effective_role: effective.into(),
+            tenant_role_assumed: assumed,
+            role_is_superuser: false,
+            role_bypasses_rls: false,
+            tables: vec![],
+        }
+    }
+
+    #[test]
+    fn boot_refuses_tenant_transactions_that_did_not_assume_cxp_app() {
+        assert!(check_tenant_role(&report("cxp_app", true), "cxp_server").is_ok());
+        // cxp_app missing, or the login not a member: otto-tenant skipped SET LOCAL ROLE.
+        let err = check_tenant_role(&report("cxp_server", false), "cxp_server")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(r#"tenant transactions run as "cxp_server""#),
+            "{err}"
+        );
+        assert!(err.contains(r#"GRANT cxp_app TO "cxp_server""#), "{err}");
+        // Assumed, but landing somewhere else, is refused too.
+        assert!(check_tenant_role(&report("otto_app", true), "cxp_server").is_err());
+        // Not assumed but the effective role happens to be named cxp_app (a login called
+        // cxp_app): refused, since nothing dropped privileges.
+        assert!(check_tenant_role(&report("cxp_app", false), "cxp_app").is_err());
+    }
 
     /// A platform whose introspection endpoint answers `status` (with an
     /// inactive-token body when 200), or one that cannot be reached.
@@ -1023,15 +1114,15 @@ mod tests {
              deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO \"cxp_server\""
         );
         assert_eq!(
-            missing_grants(&["inheriting otto_app"], "Cxp"),
-            "the runtime role \"Cxp\" lacks inheriting otto_app (the org.deleted tombstone \
-             and the background tasks need them); fix with: GRANT otto_app TO \"Cxp\" WITH \
-             INHERIT TRUE"
+            missing_grants(&["inheriting cxp_app"], "Cxp"),
+            "the runtime role \"Cxp\" lacks inheriting cxp_app (the org.deleted tombstone \
+             and the background tasks need them); fix with: CREATE ROLE cxp_app NOLOGIN (if it \
+             does not exist); GRANT cxp_app TO \"Cxp\" WITH INHERIT TRUE"
         );
         let both = missing_grants(&cxp_core::db_role::RUNTIME_GRANTS, "r");
         assert!(
             both.ends_with(
-                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; GRANT otto_app TO "r" WITH INHERIT TRUE"#
+                r#"GRANT INSERT ON deleted_orgs TO cxp_runtime; GRANT cxp_runtime TO "r"; CREATE ROLE cxp_app NOLOGIN (if it does not exist); GRANT cxp_app TO "r" WITH INHERIT TRUE"#
             ),
             "{both}"
         );
