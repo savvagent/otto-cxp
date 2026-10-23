@@ -74,6 +74,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # The deploy job's copy and migration steps, against a fake container CLI
+      # and a fake flyctl.
+      - name: Test the deploy scripts
+        run: |
+          scripts/deploy/test-copy-image.sh
+          scripts/deploy/test-run-migrate.sh
+
   # Migrations are append-only. sqlx stores each applied migration's checksum
   # and refuses to start when a known file no longer matches, so editing even
   # a comment in an applied migration takes down the next deploy. sqlx ignores
@@ -145,23 +152,53 @@ jobs:
 
   # Every green push to main deploys, once the repo variable FLY_DEPLOY is
   # `enabled`. Rob sets it only after the first deploy (a hand `fly deploy`) has
-  # been verified; until then this job is skipped and a merge deploys nothing. flyctl builds remotely on Fly's builder, the same path as a
-  # hand-run `fly deploy`. FLY_API_TOKEN is a deploy token scoped to this one
-  # app (`fly tokens create deploy -a otto-cxp`).
+  # been verified; until then this job is skipped and a merge deploys nothing.
+  # flyctl builds remotely on Fly's builder, the same path as a hand-run
+  # `fly deploy`.
+  #
+  # Three steps, in order (docs/deploy/fly.md, "Topology"), so the migration
+  # owner's credential never lives in the otto-cxp app (#45):
+  #   1. build and push the image once, with otto-cxp's deploy token;
+  #   2. copy that image into the otto-cxp-migrate registry (a machine can run
+  #      only its own app's images) and run `cxp-server migrate` from it as a
+  #      one-off machine of the separate otto-cxp-migrate app, which alone holds
+  #      CXP_MIGRATION_DATABASE_URL, with its own deploy token; a failure stops
+  #      the job here, so no machine of the new release starts on an unmigrated
+  #      schema;
+  #   3. deploy that same image to otto-cxp.
+  # Secrets: FLY_API_TOKEN is a deploy token scoped to otto-cxp
+  # (`fly tokens create deploy -a otto-cxp`); FLY_API_TOKEN_MIGRATE one scoped to
+  # otto-cxp-migrate (`fly tokens create deploy -a otto-cxp-migrate`).
   deploy:
     runs-on: ubuntu-latest
     needs: [rust, docker-build, web]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.FLY_DEPLOY == 'enabled'
-    timeout-minutes: 15
+    timeout-minutes: 20
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+    env:
+      IMAGE: registry.fly.io/otto-cxp:sha-${{ github.sha }}
+      MIGRATE_IMAGE: registry.fly.io/otto-cxp-migrate:sha-${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+      - name: Build and push the image
+        run: flyctl deploy --build-only --push --remote-only -a otto-cxp --image-label "sha-${GITHUB_SHA}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Copy the image to otto-cxp-migrate
+        run: scripts/deploy/copy-image.sh "$IMAGE" "$MIGRATE_IMAGE"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN_MIGRATE: ${{ secrets.FLY_API_TOKEN_MIGRATE }}
+      - name: Migrate (otto-cxp-migrate)
+        run: scripts/deploy/run-migrate.sh "$MIGRATE_IMAGE" "$GITHUB_SHA"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_MIGRATE }}
       - name: Deploy to Fly.io
-        run: flyctl deploy --remote-only -a otto-cxp
+        run: flyctl deploy --image "$IMAGE" -a otto-cxp
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

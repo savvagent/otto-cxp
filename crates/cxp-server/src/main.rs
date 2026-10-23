@@ -4,12 +4,14 @@
 //! library, where the e2e tests run it whole.
 //!
 //! `cxp-server migrate` instead applies the migrations as the database owner
-//! ([`cxp_server::migrate`]) and exits, binding no port: it is Fly's release
-//! command (`release_command = "migrate"`, given to the image's entrypoint).
+//! ([`cxp_server::migrate`]) and exits, binding no port. CI runs it as a
+//! one-off machine of the `otto-cxp-migrate` Fly app, the only place the
+//! owner's credential lives (#45); it reads [`MigrateConfig`], not [`Config`],
+//! so that app holds no other secret.
 
 use anyhow::{Context, Result};
 use cxp_server::secret_env;
-use cxp_server::{migrate, run, Config, LogFormat};
+use cxp_server::{migrate, run, Config, LogFormat, MigrateConfig};
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -20,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 /// must happen while the process has one thread, before the runtime starts
 /// its workers.
 fn main() -> Result<()> {
-    // Decided before anything else, so a mistyped release command never
+    // Decided before anything else, so a mistyped command never
     // falls through to serving.
     const USAGE: &str = "usage: cxp-server [migrate]";
     // args_os: an argument that is not UTF-8 is reported, not a panic.
@@ -46,17 +48,26 @@ fn main() -> Result<()> {
     // A local .env may still name it; a serving process forgets it, still
     // single-threaded.
     let forgot_dotenv_secret = !migrating && secret_env::forget_migration_secret();
-    let config = Config::from_env().context(
-        "configuration is incomplete. Copy .env.example to .env for local runs, or set the \
-         variables named above in the deployment",
-    )?;
-    init_tracing(config.log_format);
-    for name in cxp_server::config::retired_vars(|n| std::env::var(n).ok()) {
-        tracing::warn!(
-            "{name} is retired and ignored: billable calls are refused whenever the platform \
-             reports the org blocked (budget_exceeded, payment_required)"
-        );
-    }
+    // `migrate` reads only what it needs: its app holds no other secret.
+    let (config, migrate_config) = if migrating {
+        let migrate_config =
+            MigrateConfig::from_env().context("migrate configuration is invalid")?;
+        init_tracing(migrate_config.log_format);
+        (None, Some(migrate_config))
+    } else {
+        let config = Config::from_env().context(
+            "configuration is incomplete. Copy .env.example to .env for local runs, or set the \
+             variables named above in the deployment",
+        )?;
+        init_tracing(config.log_format);
+        for name in cxp_server::config::retired_vars(|n| std::env::var(n).ok()) {
+            tracing::warn!(
+                "{name} is retired and ignored: billable calls are refused whenever the platform \
+                 reports the org blocked (budget_exceeded, payment_required)"
+            );
+        }
+        (Some(config), None)
+    };
     if let Ok(path) = dotenv {
         tracing::debug!(path = %path.display(), "loaded .env");
     }
@@ -72,11 +83,12 @@ fn main() -> Result<()> {
         .build()
         .context("could not start the async runtime")?
         .block_on(async move {
-            if migrating {
+            if let Some(migrate_config) = migrate_config {
                 // An error exits non-zero, which aborts the deploy.
-                migrate(&config).await?;
+                migrate(migrate_config).await?;
                 return Ok(());
             }
+            let config = config.expect("a serving process has a Config");
             let listener = TcpListener::bind(config.bind)
                 .await
                 .with_context(|| format!("could not bind {}", config.bind))?;

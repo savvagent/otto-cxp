@@ -1,8 +1,11 @@
 //! Keeping the migration owner's credential out of the serving process (#27).
 //!
-//! Fly secrets are app-wide: `CXP_MIGRATION_DATABASE_URL`, which only the
-//! release command (`cxp-server migrate`) needs, is also in the environment of
-//! every serving machine. The serving process must not hold it: code
+//! Fly secrets are app-wide: were `CXP_MIGRATION_DATABASE_URL`, which only
+//! `cxp-server migrate` needs, a secret of the serving app (as #27 first
+//! shipped it), it would be in the environment of every serving machine.
+//! Since #45 it is a secret of the separate `otto-cxp-migrate` app only; the
+//! shedding below stays as a guard against it being set on `otto-cxp` by
+//! mistake. The serving process must not hold it: code
 //! execution in it, or anything that dumps its environment, would otherwise
 //! hand over the owner role, which is what the split exists to keep from it.
 //!

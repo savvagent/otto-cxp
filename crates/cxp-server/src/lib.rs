@@ -54,7 +54,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub use boot::{migrate, run, run_with, Boot, PlatformCheck};
-pub use config::{Config, LogFormat};
+pub use config::{Config, LogFormat, MigrateConfig};
 
 /// The one client every platform call goes through (it holds the caches).
 ///

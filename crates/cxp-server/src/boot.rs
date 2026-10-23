@@ -26,7 +26,7 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 
 use crate::health::{Readiness, RoleAlarm};
-use crate::{meter, platform_client, router, Config};
+use crate::{meter, platform_client, router, Config, MigrateConfig};
 
 /// How long in-flight requests get to finish after the stop signal.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -147,20 +147,24 @@ pub fn role_verdict(role: &DbRole, config: &Config) -> Verdict {
     verdict(
         role.is_refused_in_a_deployment() || role.can_alter_tables(),
         role,
-        config,
+        config.is_deployment(),
     )
 }
 
 /// [`role_verdict`] for the migrating role, which is meant to own the
 /// schema: only a privilege or another service's database refuses it.
-fn migration_verdict(role: &DbRole, config: &Config) -> Verdict {
-    verdict(role.is_refused_in_a_deployment(), role, config)
+fn migration_verdict(role: &DbRole, config: &MigrateConfig) -> Verdict {
+    verdict(
+        role.is_refused_in_a_deployment(),
+        role,
+        config.is_deployment(),
+    )
 }
 
-fn verdict(refusable: bool, role: &DbRole, config: &Config) -> Verdict {
+fn verdict(refusable: bool, role: &DbRole, configured_deployment: bool) -> Verdict {
     if !refusable {
         Verdict::Clean
-    } else if is_deployment(role, config) {
+    } else if configured_deployment || role.shares_the_instance() {
         Verdict::Refused
     } else {
         Verdict::AllowedLocally
@@ -218,7 +222,7 @@ pub fn check_db_role(role: &DbRole, config: &Config) -> Result<()> {
 /// [`check_db_role`] for the role `cxp-server migrate` connects as: the
 /// owner may own (that is its job), but a deployment still refuses a
 /// superuser-equivalent one or one that reaches another service's database.
-pub fn check_migration_role(role: &DbRole, config: &Config) -> Result<()> {
+pub fn check_migration_role(role: &DbRole, config: &MigrateConfig) -> Result<()> {
     let summary = role.summary();
     match migration_verdict(role, config) {
         Verdict::Clean => {
@@ -226,15 +230,20 @@ pub fn check_migration_role(role: &DbRole, config: &Config) -> Result<()> {
             Ok(())
         }
         Verdict::AllowedLocally => {
-            tracing::warn!(public_url = %config.public_url, "{summary}: {ALLOWED_LOCALLY}");
+            tracing::warn!(
+                public_url = config.public_url.as_deref().unwrap_or(""),
+                "{summary}: {ALLOWED_LOCALLY}"
+            );
             Ok(())
         }
         Verdict::Refused => {
-            tracing::error!(public_url = %config.public_url,
+            tracing::error!(
+                public_url = config.public_url.as_deref().unwrap_or(""),
                 fly_app_name = config.fly_app_name.as_deref().unwrap_or(""),
                 "{summary}: refusing to migrate. A deployment migrates as the database owner, a \
                  role that holds no superuser-equivalent privilege and can connect to no other \
-                 service's database (docs/deploy/fly.md)");
+                 service's database (docs/deploy/fly.md)"
+            );
             Err(anyhow!(
                 "refusing to migrate: {summary}; a deployment migrates as a role that is not a \
                  superuser, holds no BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION, or \
@@ -252,11 +261,11 @@ const MIGRATION_URL_REQUIRED: &str = "CXP_MIGRATION_DATABASE_URL is required in 
 /// The URL [`migrate`] connects with: the owner's
 /// ([`Config::migration_database_url`]), or, only on a developer's machine,
 /// where one role both owns and serves, the runtime one.
-pub fn migration_url(config: &Config) -> Result<&str> {
-    match &config.migration_database_url {
-        Some(url) => Ok(url),
-        None if !config.is_deployment() => Ok(&config.database_url),
-        None => Err(anyhow!("{MIGRATION_URL_REQUIRED}")),
+pub fn migration_url(config: &MigrateConfig) -> Result<&str> {
+    match (&config.migration_database_url, &config.database_url) {
+        (Some(url), _) => Ok(url),
+        (None, Some(url)) if !config.is_deployment() => Ok(url),
+        _ => Err(anyhow!("{MIGRATION_URL_REQUIRED}")),
     }
 }
 
@@ -273,7 +282,9 @@ pub fn migration_url(config: &Config) -> Result<&str> {
 /// role already exists ([`cxp_core::db_role::missing_cxp_runtime_install`]),
 /// so a missing role or grant fails the release rather than boot a fleet that
 /// refuses to serve.
-pub async fn migrate(config: &Config) -> Result<String> {
+pub async fn migrate(config: impl Into<MigrateConfig>) -> Result<String> {
+    let config: MigrateConfig = config.into();
+    let config = &config;
     let url = migration_url(config)?;
     // Two connections: the migrator and sqlx's advisory lock, on a database
     // shared with every otto service.
@@ -289,7 +300,7 @@ pub async fn migrate(config: &Config) -> Result<String> {
     result
 }
 
-async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
+async fn migrate_on(db: &Db, config: &MigrateConfig) -> Result<String> {
     let role = cxp_core::db_role::inspect(db)
         .await
         .context("could not read the database role's privileges")?;
@@ -307,7 +318,7 @@ async fn migrate_on(db: &Db, config: &Config) -> Result<String> {
     tracing::info!("applying migrations");
     cxp_core::migrate(db).await.context("migrations failed")?;
     tracing::info!("migrations applied");
-    if is_deployment(&role, config) {
+    if config.is_deployment() || role.shares_the_instance() {
         // 0006 grants the tombstone INSERT to `cxp_runtime` only when the role
         // already exists, and a migration never runs twice. Without it every
         // serving machine refuses to boot, so abort the release here instead.
@@ -1129,17 +1140,17 @@ mod tests {
     #[test]
     fn the_migration_role_may_own_but_not_be_privileged() {
         use cxp_core::db_role::Privilege::*;
-        let deployed = Config::for_test();
+        let deployed = MigrateConfig::from(&Config::for_test());
         assert!(check_migration_role(&owner(), &deployed).is_ok());
         assert!(check_migration_role(&truncate_holder(), &deployed).is_ok());
         let su = DbRole::for_test("s", "s", &[("s", "s", &[Superuser])]);
         let err = format!("{:#}", check_migration_role(&su, &deployed).unwrap_err());
         assert!(err.contains("refusing to migrate"), "{err}");
         assert!(err.contains(&su.summary()), "{err}");
-        assert!(check_migration_role(&su, &local_config()).is_ok());
+        assert!(check_migration_role(&su, &(&local_config()).into()).is_ok());
         let mut proxied = su.clone();
         proxied.shared_with = vec!["otto_platform".into()];
-        assert!(check_migration_role(&proxied, &local_config()).is_err());
+        assert!(check_migration_role(&proxied, &(&local_config()).into()).is_err());
     }
 
     /// `migrate` uses the owner's URL when set; without it, a developer's
@@ -1148,19 +1159,19 @@ mod tests {
     fn the_migration_url_is_the_owners_and_required_in_a_deployment() {
         let owner_url = "postgres://cxp_owner:x@db/otto_cxp";
         let mut deployed = Config::for_test();
-        let err = format!("{:#}", migration_url(&deployed).unwrap_err());
+        let err = format!("{:#}", migration_url(&(&deployed).into()).unwrap_err());
         assert!(
             err.contains("CXP_MIGRATION_DATABASE_URL is required"),
             "{err}"
         );
         assert!(err.contains("never as the runtime role"), "{err}");
         deployed.migration_database_url = Some(owner_url.into());
-        assert_eq!(migration_url(&deployed).unwrap(), owner_url);
+        assert_eq!(migration_url(&(&deployed).into()).unwrap(), owner_url);
 
         let mut local = local_config();
-        assert_eq!(migration_url(&local).unwrap(), local.database_url);
+        assert_eq!(migration_url(&(&local).into()).unwrap(), local.database_url);
         local.migration_database_url = Some(owner_url.into());
-        assert_eq!(migration_url(&local).unwrap(), owner_url);
+        assert_eq!(migration_url(&(&local).into()).unwrap(), owner_url);
     }
 
     /// The suggested `GRANT` pastes as is: the name is always quoted, so a
