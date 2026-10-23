@@ -21,7 +21,16 @@ cli="${CONTAINER_CLI:-docker}"
 
 # One registry entry at a time: the second login replaces the first.
 printf '%s' "$FLY_API_TOKEN" | "$cli" login registry.fly.io -u x --password-stdin
-"$cli" pull "$src"
+# The registry can answer "manifest unknown" for a few seconds after the push that
+# made the image (the deploy job copies it straight away), so retry the pull.
+tries="${COPY_PULL_TRIES:-12}"
+delay="${COPY_PULL_DELAY_SECONDS:-5}"
+for ((i = 1; ; i++)); do
+  "$cli" pull "$src" && break
+  [ "$i" -lt "$tries" ] || { echo "::error::could not pull $src after $tries tries" >&2; exit 1; }
+  echo "pull of $src failed (try $i of $tries); retrying in ${delay}s" >&2
+  sleep "$delay"
+done
 printf '%s' "$FLY_API_TOKEN_MIGRATE" | "$cli" login registry.fly.io -u x --password-stdin
 "$cli" tag "$src" "$dst"
 "$cli" push "$dst"
