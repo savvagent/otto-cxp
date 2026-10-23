@@ -9,7 +9,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin"
 
-# FAKE_SCENARIO: ok | fail | no-exit | hang | no-machine | run-fails
+# FAKE_SCENARIO: ok | fail | killed | no-exit | hang | no-machine | run-fails
 cat > "$tmp/bin/flyctl" <<'FAKE'
 #!/usr/bin/env bash
 echo "flyctl $*" >> "$FAKE_LOG"
@@ -20,7 +20,8 @@ case "$1 $2" in
   "machines list")
     [ "$FAKE_SCENARIO" = no-machine ] && { echo '[]'; exit 0; }
     case "$FAKE_SCENARIO" in
-      ok)      state=stopped; ev='[{"type":"exit","request":{"exit_event":{"exit_code":0}}},{"type":"start"}]' ;;
+      ok)      state=stopped; ev='[{"type":"exit","request":{"exit_event":{"guest_signal":-1,"signal":-1}}},{"type":"start"}]' ;;
+      killed)  state=stopped; ev='[{"type":"exit","request":{"exit_event":{"guest_signal":9,"signal":9}}},{"type":"start"}]' ;;
       fail)    state=stopped; ev='[{"type":"exit","request":{"exit_event":{"exit_code":1}}},{"type":"start"}]' ;;
       no-exit) state=stopped; ev='[{"type":"start"}]' ;;
       hang)    state=started; ev='[{"type":"start"}]' ;;
@@ -59,6 +60,7 @@ has_log "machine destroy"
 run fail 1 "nonzero exit fails"
 has_log "machine destroy"
 run no-exit 1 "stopped without an exit event fails"
+run killed 1 "a process killed by a signal fails"
 run hang 1 "a machine that never stops times out"
 has_log "machine destroy"
 run no-machine 1 "no machine fails"
