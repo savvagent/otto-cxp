@@ -24,10 +24,13 @@ cxp-api = { path = "crates/cxp-api" }
 # teams, plans, and billing live there. This workspace links only the
 # tenant-isolation substrate (`otto-tenant`: pinned transactions, RLS proof)
 # and the resource-server client (`otto-resource`: introspection, usage
-# shipping, member and team lookups, webhook verification). One rev for both,
-# bumped deliberately and together rather than tracking a branch.
+# shipping, member and team lookups, webhook verification). Each is pinned to
+# a rev and bumped deliberately rather than tracking a branch. otto-resource
+# is ahead of otto-tenant so the service accepts `sav_at_`/`sav_pat_` tokens
+# before the platform mints them (savvagent/otto-platform#128); otto-tenant
+# stays put until it has a reason to move.
 otto-tenant = { git = "https://github.com/savvagent/otto-platform", rev = "bfda55e155be8985761850a7c42980cc926fd4cb" }
-otto-resource = { git = "https://github.com/savvagent/otto-platform", rev = "bfda55e155be8985761850a7c42980cc926fd4cb" }
+otto-resource = { git = "https://github.com/savvagent/otto-platform", rev = "03f52e9f2139d08d60d0695b5cde4834f0cf19c2" }
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
