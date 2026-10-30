@@ -189,7 +189,19 @@ async fn start_platform() -> (String, Shared) {
 /// Mint a well-formed token the stub introspects as given, and make its user
 /// a member of the org (on no team).
 fn token(p: &Shared, org: Uuid, user: Uuid, scopes: &[&str], aud: &str) -> String {
-    let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    prefixed_token(p, "otto_at_", org, user, scopes, aud)
+}
+
+/// [`token`], with the given prefix (`otto_at_`, `sav_at_`, ...).
+fn prefixed_token(
+    p: &Shared,
+    prefix: &str,
+    org: Uuid,
+    user: Uuid,
+    scopes: &[&str],
+    aud: &str,
+) -> String {
+    let t = format!("{prefix}{}{}", "a".repeat(11), Uuid::new_v4().simple());
     assert!(otto_resource::looks_like_token(&t), "{t}");
     let mut p = p.lock().unwrap();
     p.tokens.insert(
@@ -376,6 +388,20 @@ async fn no_token_is_401_with_the_discovery_challenge(pool: PgPool) {
         .unwrap();
     assert_eq!(h.send(req).await.status, StatusCode::UNAUTHORIZED);
     assert!(h.outbox().await.is_empty());
+}
+
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn sav_and_otto_prefixed_tokens_are_both_accepted(pool: PgPool) {
+    // The platform moves to `sav_` tokens (savvagent/otto-platform#128); the
+    // service must accept them before the platform mints them, and keep
+    // accepting `otto_` ones until every outstanding one has expired.
+    let h = harness(pool).await;
+    for prefix in ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"] {
+        let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
+        let t = prefixed_token(&h.stub, prefix, org, user, RW, RESOURCE);
+        let r = h.call("GET", "/api/v1/customers", Some(&t), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{prefix}: {}", r.body);
+    }
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
