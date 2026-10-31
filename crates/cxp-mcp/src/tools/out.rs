@@ -82,6 +82,9 @@ impl From<otto_resource::Role> for Role {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WhoAmI {
+    /// This service's name, as the consent screen and its metadata show it
+    /// (`Savvagent CXP`).
+    pub service: &'static str,
     pub user: UserOut,
     pub org: OrgOut,
     /// The caller's role in this org, as the platform reports it now.

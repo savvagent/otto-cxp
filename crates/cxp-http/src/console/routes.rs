@@ -322,7 +322,7 @@ fn unavailable() -> Response {
     let mut res = json_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "unavailable",
-        "otto-cxp could not complete this right now; nothing was changed. Retry shortly",
+        "Savvagent CXP could not complete this right now; nothing was changed. Retry shortly",
     );
     res.headers_mut().insert(
         header::RETRY_AFTER,

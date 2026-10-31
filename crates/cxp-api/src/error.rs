@@ -256,7 +256,7 @@ mod tests {
         let res = scope.into_response();
         assert_eq!(
             res.headers()[header::WWW_AUTHENTICATE],
-            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
+            r#"Bearer realm="Savvagent CXP", error="insufficient_scope", scope="cxp:write""#
         );
     }
 

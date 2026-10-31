@@ -59,7 +59,7 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct Config {
     /// This service's public origin (`CXP_PUBLIC_URL`, e.g.
-    /// `https://otto-cxp.savvagent.com`). A `401`'s `WWW-Authenticate` points
+    /// `https://cxp.savvagent.com`). A `401`'s `WWW-Authenticate` points
     /// at `{public_url}/.well-known/oauth-protected-resource`.
     pub public_url: String,
     /// The secret the platform signs lifecycle webhooks with

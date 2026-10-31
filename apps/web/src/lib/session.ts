@@ -36,10 +36,10 @@ export type SignedOut = z.infer<typeof signedOutSchema>;
 
 /** Why the last sign-in failed, from the `login_error` the server redirects with. */
 export const LOGIN_ERRORS: Record<string, string> = {
-  access_denied: "Sign-in was cancelled at the otto platform.",
+  access_denied: "Sign-in was cancelled at the Savvagent platform.",
   invalid_state: "That sign-in link expired or was started in another tab. Try again.",
-  platform_unavailable: "The otto platform could not be reached. Try again shortly.",
-  unavailable: "otto-cxp could not finish signing you in. Try again shortly.",
+  platform_unavailable: "The Savvagent platform could not be reached. Try again shortly.",
+  unavailable: "Savvagent CXP could not finish signing you in. Try again shortly.",
   failed: "Sign-in failed. Try again, or ask an admin of your organization for access.",
 };
 
@@ -102,7 +102,7 @@ export async function signOut(): Promise<void> {
   try {
     response = await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
   } catch {
-    toast.error("Could not reach otto-cxp to sign out. Try again.");
+    toast.error("Could not reach Savvagent CXP to sign out. Try again.");
     return;
   }
   if (!response.ok) {

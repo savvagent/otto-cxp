@@ -1,12 +1,12 @@
-# otto-cxp
+# Savvagent CXP (otto-cxp)
 
-otto-cxp is the customer-experience service of the [otto platform](https://otto.savvagent.com):
+Savvagent CXP is the customer-experience service of the [Savvagent platform](https://savvagent.com):
 customers and their interactions, support tickets, a knowledge base, chat, feedback and
 surveys (with NPS, CSAT, and sentiment analysis), and an experience catalog. It is built for AI
 agents to work through, over MCP, and for apps to reach over a REST API.
 
 It is an HTTP-only resource server. The platform owns identity, OAuth, orgs, teams, and
-billing; otto-cxp validates the platform's bearer tokens and keeps only its own data.
+billing; Savvagent CXP validates the platform's bearer tokens and keeps only its own data.
 
 ## What it serves
 
@@ -29,19 +29,19 @@ the isolation check fails. Org and user ids are opaque uuids issued by the platf
 
 ## Connecting an MCP client
 
-The endpoint is `https://otto-cxp.savvagent.com/mcp` (streamable HTTP). You need an account in
-an org on the [otto platform](https://otto.savvagent.com); the platform handles sign-in.
+The endpoint is `https://cxp.savvagent.com/mcp` (streamable HTTP). You need an account in
+an org on the [Savvagent platform](https://savvagent.com); the platform handles sign-in.
 
 **Claude Code:**
 
 ```bash
-claude mcp add --transport http --scope user otto-cxp https://otto-cxp.savvagent.com/mcp
+claude mcp add --transport http --scope user savvagent-cxp https://cxp.savvagent.com/mcp
 ```
 
 `--scope user` makes it available in every project; leave it out to add it to the current
-project only. Then, in a Claude Code session, run `/mcp`, pick `otto-cxp`, and choose
+project only. Then, in a Claude Code session, run `/mcp`, pick `savvagent-cxp`, and choose
 **Authenticate**. Your browser opens the platform's sign-in and consent page; approve it and
-return to Claude Code. Ask it to call the otto-cxp `whoami` tool: it answers with your org and
+return to Claude Code. Ask it to call the savvagent-cxp `whoami` tool: it answers with your org and
 user as the platform knows them.
 
 **Other MCP clients:** add a remote (streamable HTTP) server with the URL above. No client id or
@@ -73,7 +73,7 @@ cp .env.example .env                     # then fill in the platform settings
 cargo run -p cxp-server                  # or ./scripts/start-server.sh
 ```
 
-Migrations run at startup. `cxp-server` needs a reachable otto platform
+Migrations run at startup. `cxp-server` needs a reachable Savvagent platform
 (`CXP_PLATFORM_URL`) and the secrets from registering this service there; see
 [docs/deploy/fly.md](./docs/deploy/fly.md).
 

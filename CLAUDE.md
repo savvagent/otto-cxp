@@ -142,17 +142,17 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CXP_PUBLIC_URL` | required | public origin, no path (e.g. `https://otto-cxp.savvagent.com`); a non-loopback host here or in `CXP_RESOURCE_URI`, or a set `FLY_APP_NAME`, makes the process a deployment, which refuses a superuser-equivalent database role |
+| `CXP_PUBLIC_URL` | required | public origin, no path (e.g. `https://cxp.savvagent.com`); a non-loopback host here or in `CXP_RESOURCE_URI`, or a set `FLY_APP_NAME`, makes the process a deployment, which refuses a superuser-equivalent database role |
 | `CXP_RESOURCE_URI` | `{public}/mcp` | token audience; must equal the URI registered at the platform |
 | `CXP_PLATFORM_URL` | required | the otto platform; `https` unless the host is loopback |
-| `CXP_INTROSPECTION_SECRET` | required (secret) | `otto_rs_...` |
-| `CXP_PLATFORM_WEBHOOK_SECRET` | required (secret) | `otto_whsec_...` |
+| `CXP_INTROSPECTION_SECRET` | required (secret) | `sav_rs_...` (an `otto_rs_...` issued before #59 still works) |
+| `CXP_PLATFORM_WEBHOOK_SECRET` | required (secret) | `sav_whsec_...` (likewise `otto_whsec_...`) |
 | `CXP_DATABASE_URL` | falls back to `DATABASE_URL` | `postgres://cxp:cxp@localhost:15435/otto_cxp` locally |
 | `CXP_DB_MAX_CONNECTIONS` | `5` | 2 to 20; the production database is shared and small |
 | `CXP_RUN_MIGRATIONS` | `true` | migrate at boot as the serving role; a deployment refuses `true` (`fly.toml` sets `false`; also a secret in production, for rollbacks) |
 | `CXP_MIGRATION_DATABASE_URL` | unset (secret) | the owner (`cxp_owner`), read only by `cxp-server migrate` (a secret of the `otto-cxp-migrate` Fly app only, never of `otto-cxp`; `MigrateConfig` reads nothing else secret); required there in a deployment, which never falls back to the runtime URL |
 | `CXP_BIND` | `0.0.0.0:8080` | |
-| `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts, as `host` or `host:port`; the `CXP_PUBLIC_URL` host is always allowed |
+| `CXP_ALLOWED_HOSTS` | empty | EXTRA Host headers `/mcp` accepts, as `host` or `host:port`; the `CXP_PUBLIC_URL` host is always allowed (production adds `otto-cxp.fly.dev` and the legacy `otto-cxp.savvagent.com`) |
 | `CXP_ALLOWED_ORIGINS` | empty | browser origins for `/mcp`, as `scheme://host[:port]`; empty means no check |
 | `CXP_ENFORCE_QUOTAS` | retired | ignored; warns at startup if set (enforcement is always on, fails open) |
 | `CXP_LOG_FORMAT` | `text` | `text` or `json` |
@@ -244,7 +244,7 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 ### Ship
 - deploy: ci-auto
 - merge gate: on the PR's head SHA: `rust`, `docker-build`, `migrations-append-only` and `web` (CI workflow) succeeded, plus every other check that ran on the head SHA (the ruleset requires none). Before `.github/workflows/ci.yml` exists on the PR's head, the merge gate is the full local gate run on the head SHA with a clean tree
-- verify: the SHA proxy is the `deploy` job of the CI run for the merge SHA (`gh run list -R savvagent/otto-cxp --workflow CI --commit <merge-sha> --json databaseId,status,conclusion`); then `fly status -a otto-cxp` shows the machines on the new release; `curl -s https://otto-cxp.savvagent.com/readyz` returns ready; `fly logs -a otto-cxp --no-tail` shows, from the deploy job's "Migrate" step (`otto-cxp-migrate`'s one-off machine), `applying migrations` and `migrations applied` (as `cxp_owner`), and from each serving machine `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment`, `database role "cxp_server" … it owns nothing in this database …`, `not migrating`, `tenant isolation enforced as role "cxp_app"`, `the otto platform accepted this service's credential`, and `declared usage meters`; then exercise the changed surface read-only (`whoami` first). The first deploy is a hand `fly deploy -a otto-cxp --remote-only` (Rob); he sets `FLY_DEPLOY=enabled` only after verifying it. While the repo variable `FLY_DEPLOY` is not `enabled` the deploy job is skipped and a merge deploys nothing: report merged, not live
+- verify: the SHA proxy is the `deploy` job of the CI run for the merge SHA (`gh run list -R savvagent/otto-cxp --workflow CI --commit <merge-sha> --json databaseId,status,conclusion`); then `fly status -a otto-cxp` shows the machines on the new release; `curl -s https://cxp.savvagent.com/readyz` returns ready; `fly logs -a otto-cxp --no-tail` shows, from the deploy job's "Migrate" step (`otto-cxp-migrate`'s one-off machine), `applying migrations` and `migrations applied` (as `cxp_owner`), and from each serving machine `removed CXP_MIGRATION_DATABASE_URL from the serving process's environment`, `database role "cxp_server" … it owns nothing in this database …`, `not migrating`, `tenant isolation enforced as role "cxp_app"`, `the otto platform accepted this service's credential`, and `declared usage meters`; then exercise the changed surface read-only (`whoami` first). The first deploy is a hand `fly deploy -a otto-cxp --remote-only` (Rob); he sets `FLY_DEPLOY=enabled` only after verifying it. While the repo variable `FLY_DEPLOY` is not `enabled` the deploy job is skipped and a merge deploys nothing: report merged, not live
 - release: none (continuous deploy of `main`); `@cxp/sdk` and `@cxp/react` are not published, and a publish is a human decision (Rob)
 - version files: crates/*/Cargo.toml (workspace version), sdk/typescript/package.json, packages/react/package.json
 

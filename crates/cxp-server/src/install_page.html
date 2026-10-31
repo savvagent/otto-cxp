@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Otto CXP connector</title>
+<title>Savvagent CXP connector</title>
 <style>
 :root {
   color-scheme: dark;
@@ -106,9 +106,9 @@ footer p { margin: 0; }
 </head>
 <body>
 <main>
-<p class="eyebrow">Otto CXP · connector</p>
-<h1>Use Otto CXP from your AI assistant</h1>
-<p class="lead">Otto CXP doesn't have a web page here. Add it to your AI assistant as a connector, then ask about customers, tickets and feedback in plain language. The first time, you sign in with your Otto account.</p>
+<p class="eyebrow">Savvagent CXP · connector</p>
+<h1>Use Savvagent CXP from your AI assistant</h1>
+<p class="lead">Savvagent CXP doesn't have a web page here. Add it to your AI assistant as a connector, then ask about customers, tickets and feedback in plain language. The first time, you sign in with your Savvagent account.</p>
 
 <section aria-labelledby="address-heading">
 <h2 id="address-heading">Connector address</h2>
@@ -124,7 +124,7 @@ footer p { margin: 0; }
 <ol>
 <li>Open <strong>Settings</strong>, then <strong>Connectors</strong>.</li>
 <li>Choose <strong>Add custom connector</strong> and paste the connector address.</li>
-<li>Choose <strong>Connect</strong>, then sign in with your Otto account.</li>
+<li>Choose <strong>Connect</strong>, then sign in with your Savvagent account.</li>
 </ol>
 </section>
 
@@ -133,7 +133,7 @@ footer p { margin: 0; }
 <ol>
 <li>Open <strong>Settings</strong>, then <strong>Connectors</strong>, and turn on developer mode.</li>
 <li>Choose <strong>Create</strong> and paste the connector address.</li>
-<li>Sign in with your Otto account when asked.</li>
+<li>Sign in with your Savvagent account when asked.</li>
 </ol>
 </section>
 
@@ -142,16 +142,16 @@ footer p { margin: 0; }
 <ol>
 <li>Run this in your terminal:
 <div class="copy">
-<code id="command">claude mcp add --transport http otto-cxp {{CONNECTOR_URL}}</code>
+<code id="command">claude mcp add --transport http savvagent-cxp {{CONNECTOR_URL}}</code>
 <button type="button" data-copy="command" data-status="command-status" aria-label="Copy the command" hidden>Copy</button>
 </div>
 <p class="status" id="command-status" role="status"></p>
 </li>
-<li>In Claude Code, type <code>/mcp</code> and sign in with your Otto account.</li>
+<li>In Claude Code, type <code>/mcp</code> and sign in with your Savvagent account.</li>
 </ol>
 </section>
 
-<p class="links"><a href="{{GUIDE_URL}}">Full setup guide</a> <a href="{{CONSOLE_URL}}">Open your Otto console</a></p>
+<p class="links"><a href="{{GUIDE_URL}}">Full setup guide</a> <a href="{{CONSOLE_URL}}">Open your Savvagent console</a></p>
 
 <footer>
 <p>Developers: the MCP endpoint is <code>{{CONNECTOR_URL}}</code>; the REST API is under <code>/api/v1</code>; OAuth metadata is at <code>/.well-known/oauth-protected-resource</code>.</p>

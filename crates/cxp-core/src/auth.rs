@@ -433,7 +433,7 @@ mod tests {
         let missing = www_authenticate("https://cxp.example.com/", &AuthFailure::Missing);
         assert_eq!(
             missing,
-            r#"Bearer realm="otto-cxp", resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#
+            r#"Bearer realm="Savvagent CXP", resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#
         );
         assert!(!missing.contains("error"), "{missing}");
         assert!(!AuthFailure::Missing.reason().contains(['"', '\\']));
@@ -447,7 +447,7 @@ mod tests {
             assert_eq!(
                 header,
                 format!(
-                    r#"Bearer realm="otto-cxp", error="invalid_token", error_description="{}", resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#,
+                    r#"Bearer realm="Savvagent CXP", error="invalid_token", error_description="{}", resource_metadata="https://cxp.example.com/.well-known/oauth-protected-resource""#,
                     failure.reason()
                 )
             );
@@ -474,7 +474,7 @@ mod tests {
             doc,
             serde_json::json!({
                 "resource": "https://cxp.example.com/mcp",
-                "resource_name": "otto-cxp",
+                "resource_name": "Savvagent CXP",
                 "authorization_servers": ["https://otto.example.com"],
                 "scopes_supported": ["cxp:read", "cxp:write"],
                 "bearer_methods_supported": ["header"],
@@ -542,7 +542,10 @@ mod tests {
         assert_eq!(r.status, 401);
         assert_eq!(
             r.headers,
-            vec![("www-authenticate", r#"Bearer realm="otto-cxp""#.to_string())]
+            vec![(
+                "www-authenticate",
+                r#"Bearer realm="Savvagent CXP""#.to_string()
+            )]
         );
     }
 
@@ -567,7 +570,7 @@ mod tests {
         let fallback = refusal(hostile, &AuthFailure::Revoked);
         assert_eq!(
             fallback.www_authenticate(),
-            Some(r#"Bearer realm="otto-cxp""#)
+            Some(r#"Bearer realm="Savvagent CXP""#)
         );
         assert_eq!(
             refusal("https://x", &AuthFailure::Unavailable).www_authenticate(),
@@ -579,7 +582,7 @@ mod tests {
     fn the_scope_challenge_names_the_missing_scope() {
         assert_eq!(
             scope_challenge("cxp:write"),
-            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
+            r#"Bearer realm="Savvagent CXP", error="insufficient_scope", scope="cxp:write""#
         );
     }
 }

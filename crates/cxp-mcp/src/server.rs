@@ -35,9 +35,13 @@ use rmcp::{tool_handler, RoleServer, ServerHandler};
 
 use crate::error;
 
+/// The name this MCP server gives in `serverInfo` (#59). Billing keeps the
+/// `otto-cxp` service slug and meters; only the names people see change.
+pub const SERVER_NAME: &str = "savvagent-cxp";
+
 /// What the server tells an agent before it calls anything.
 pub(crate) const INSTRUCTIONS: &str = "\
-otto-cxp is a customer experience platform: customer profiles and their \
+Savvagent CXP is a customer experience platform: customer profiles and their \
 interactions and segments, support tickets, the knowledge base and chat, and \
 feedback and surveys, all scoped to the one organization your token opens.
 
@@ -172,7 +176,7 @@ impl ServerHandler for Cxp {
                 .enable_prompts()
                 .build(),
         );
-        info.server_info = Implementation::new("otto-cxp", env!("CARGO_PKG_VERSION"));
+        info.server_info = Implementation::new(SERVER_NAME, env!("CARGO_PKG_VERSION"));
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
     }

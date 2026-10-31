@@ -1,5 +1,5 @@
 //! The connector install page: what a person who opens `/` in a browser gets
-//! instead of the JSON 404 (#25). otto-cxp has no web console; people use it
+//! instead of the JSON 404 (#25). Savvagent CXP has no web console; people use it
 //! from an AI assistant as a custom connector, and this page says how.
 //!
 //! Only a browser gets it: [`wants_page`] needs an `Accept` that names
@@ -239,7 +239,7 @@ mod tests {
         // The address field, the Claude Code command, the developer note.
         assert_eq!(html.matches(escaped).count(), 3, "{html}");
         assert!(html.contains(&format!(
-            "claude mcp add --transport http otto-cxp {escaped}</code>"
+            "claude mcp add --transport http savvagent-cxp {escaped}</code>"
         )));
         assert!(html.contains("href=\"https://platform.example.com/products/cxp#connect\""));
         assert!(html.contains("href=\"https://platform.example.com/\""));

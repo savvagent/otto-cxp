@@ -369,7 +369,7 @@ async fn no_token_is_401_with_the_discovery_challenge(pool: PgPool) {
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
         let challenge = r.headers["www-authenticate"].to_str().unwrap();
         assert!(
-            challenge.starts_with("Bearer realm=\"otto-cxp\""),
+            challenge.starts_with("Bearer realm=\"Savvagent CXP\""),
             "{challenge}"
         );
         assert!(challenge.contains(&metadata_pointer()), "{challenge}");
@@ -477,7 +477,7 @@ async fn a_read_only_token_reads_but_cannot_write(pool: PgPool) {
         assert_eq!(r.body["code"], "insufficient_scope");
         assert_eq!(
             r.headers["www-authenticate"],
-            r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:write""#
+            r#"Bearer realm="Savvagent CXP", error="insufficient_scope", scope="cxp:write""#
         );
         assert!(r.body["error"].as_str().unwrap().contains("cxp:write"));
     }
@@ -494,7 +494,7 @@ async fn a_read_only_token_reads_but_cannot_write(pool: PgPool) {
     assert_eq!(r.body["code"], "insufficient_scope");
     assert_eq!(
         r.headers["www-authenticate"],
-        r#"Bearer realm="otto-cxp", error="insufficient_scope", scope="cxp:read""#
+        r#"Bearer realm="Savvagent CXP", error="insufficient_scope", scope="cxp:read""#
     );
 
     assert!(

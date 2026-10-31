@@ -166,10 +166,10 @@ describe("sign-in and sign-out", () => {
 
   it("a refused sign-out is shown and stays put", async () => {
     const location = browserAt("/console/tickets");
-    respond(503, { error: "otto-cxp could not complete this right now", code: "unavailable" });
+    respond(503, { error: "Savvagent CXP could not complete this right now", code: "unavailable" });
     await expect(signOut()).resolves.toBeUndefined();
     expect(location.assign).not.toHaveBeenCalled();
-    expect(toastError).toHaveBeenCalledWith("otto-cxp could not complete this right now");
+    expect(toastError).toHaveBeenCalledWith("Savvagent CXP could not complete this right now");
   });
 
   it("an unreachable server is shown, and nothing rejects", async () => {
