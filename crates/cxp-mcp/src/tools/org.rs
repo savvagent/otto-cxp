@@ -18,10 +18,11 @@ pub struct NoArgs {}
 impl Cxp {
     #[tool(
         name = "whoami",
-        description = "Who this token says you are: your user, the one organization it opens, your \
-                       role there, the scopes it carries, and this service's meters and the org's \
-                       otto-cxp budget (null if the platform cannot say right now; call usage \
-                       later). Call this first in a session. Free.",
+        description = "Who this token says you are on Savvagent CXP: your user, the one \
+                       organization it opens, your role there, the scopes it carries, and this \
+                       service's meters and the org's Savvagent CXP budget (null if the \
+                       platform cannot say right now; call usage later). Call this first in a \
+                       session. Free.",
         annotations(read_only_hint = true)
     )]
     pub async fn whoami(
@@ -54,6 +55,7 @@ impl Cxp {
         let user = member.as_ref().map(|m| &m.user);
         let org = member.as_ref().map(|m| &m.org);
         Ok(Json(out::WhoAmI {
+            service: cxp_core::scopes::RESOURCE_NAME,
             user: out::UserOut {
                 id: caller.user_id,
                 email: user.and_then(|u| u.email.clone()),
@@ -84,7 +86,7 @@ impl Cxp {
     #[tool(
         name = "usage",
         description = "This service's own meters this month (otto-cxp/surveys_sent and \
-                       otto-cxp/responses_collected), the organization's otto-cxp budget, and \
+                       otto-cxp/responses_collected), the organization's Savvagent CXP budget, and \
                        `blockedReason` (budget_exceeded or payment_required while billed calls \
                        are refused, else null). Only send_survey, submit_feedback, and \
                        submit_survey_response add to them. Free. If `warning` is true, tell the \

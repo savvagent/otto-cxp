@@ -21,7 +21,7 @@ export function SignIn({ loginEnabled }: { loginEnabled: boolean }) {
         {loginEnabled ? (
           <>
             <p className="text-sm text-muted-foreground">
-              Sign in with your otto account to continue.
+              Sign in with your Savvagent account to continue.
             </p>
             {error && (
               <p role="alert" className="text-sm text-destructive">
@@ -31,14 +31,14 @@ export function SignIn({ loginEnabled }: { loginEnabled: boolean }) {
             <Button asChild className="w-full">
               <a href={loginUrl(next)}>
                 <LogIn className="h-4 w-4" aria-hidden="true" />
-                Sign in with otto
+                Sign in with Savvagent
               </a>
             </Button>
           </>
         ) : (
           <p className="text-sm text-muted-foreground">
             Console sign-in is not configured on this server. API and MCP clients
-            authenticate with their own otto tokens.
+            authenticate with their own Savvagent tokens.
           </p>
         )}
       </div>

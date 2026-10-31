@@ -187,6 +187,11 @@ async fn harness(pool: PgPool) -> Harness {
 
 /// [`harness`], with the given search limiter.
 async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
+    harness_with(pool, search, &[HOST]).await
+}
+
+/// [`harness`], with the given search limiter and allowed hosts.
+async fn harness_with(pool: PgPool, search: SearchLimiter, hosts: &[&str]) -> Harness {
     let (base, platform) = start_platform().await;
     let client =
         Arc::new(PlatformClient::new(ClientConfig::new(&base, RESOURCE, "otto_rs_test")).unwrap());
@@ -198,7 +203,7 @@ async fn harness_search(pool: PgPool, search: SearchLimiter) -> Harness {
         search,
         Config {
             public_url: PUBLIC_URL.into(),
-            allowed_hosts: vec![HOST.into()],
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
             allowed_origins: vec![],
         },
     )
@@ -645,6 +650,7 @@ async fn whoami_and_usage_need_no_scope_and_record_nothing(pool: PgPool) {
     let bare = token(&h.platform, org, &[]);
 
     let me = h.tool(&bare, "whoami", json!({})).await.unwrap();
+    assert_eq!(me["service"], "Savvagent CXP", "{me}");
     assert_eq!(me["org"]["id"], org.to_string(), "{me}");
     assert_eq!(me["org"]["slug"], "acme");
     assert_eq!(me["role"], "member");
@@ -948,6 +954,59 @@ async fn a_foreign_host_header_is_refused(pool: PgPool) {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, _, _) = h.send(req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// #59: the server introduces itself as `savvagent-cxp`, and an extra
+/// allowed host (production's legacy otto-cxp.savvagent.com) is served
+/// exactly as the public host is, while any other host stays refused.
+#[sqlx::test(migrator = "cxp_core::MIGRATOR")]
+async fn the_server_is_savvagent_cxp_on_its_host_and_the_legacy_one(pool: PgPool) {
+    const LEGACY_HOST: &str = "otto-cxp.example.com";
+    let h = harness_with(pool, SearchLimiter::for_pool(5), &[HOST, LEGACY_HOST]).await;
+    let t = token(&h.platform, Uuid::new_v4(), READ);
+
+    let init = h
+        .rpc(
+            &t,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init["serverInfo"]["name"], "savvagent-cxp", "{init}");
+    assert_eq!(init["serverInfo"]["name"], cxp_mcp::server::SERVER_NAME);
+    assert!(
+        init["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("Savvagent CXP is"),
+        "{init}"
+    );
+
+    let whoami = |host: &str| {
+        Request::post("/mcp")
+            .header("host", host)
+            .header("authorization", format!("Bearer {t}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "whoami", "arguments": {}}})
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    for host in [HOST, LEGACY_HOST] {
+        let (status, _, v) = h.send(whoami(host)).await;
+        assert_eq!(status, StatusCode::OK, "{host}: {v}");
+        assert_eq!(
+            v["result"]["structuredContent"]["service"], "Savvagent CXP",
+            "{host}: {v}"
+        );
+    }
+    let (status, _, _) = h.send(whoami("evil.example.net")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 

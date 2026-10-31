@@ -1,4 +1,4 @@
-//! The scopes otto-cxp's resource server understands.
+//! The scopes Savvagent CXP's resource server understands.
 //!
 //! Registered with the platform (`otto-platform-server resource register
 //! --scopes …`, see docs/deploy/fly.md), advertised in
@@ -6,8 +6,10 @@
 //! by every tool except `whoami` and `usage`, which need no scope. One list,
 //! so the three cannot drift.
 
-/// What this resource server is called on a consent screen and in its metadata.
-pub const RESOURCE_NAME: &str = "otto-cxp";
+/// What this resource server is called on a consent screen, in its metadata,
+/// in `WWW-Authenticate`'s realm, and in `whoami`: the name it is registered
+/// under at the platform (#59). The billing service slug stays `otto-cxp`.
+pub const RESOURCE_NAME: &str = "Savvagent CXP";
 
 /// Read customers, tickets, knowledge, chat, feedback, surveys, the catalog,
 /// and the dashboard.
@@ -30,7 +32,7 @@ mod tests {
     /// platform. Changing one breaks every existing grant.
     #[test]
     fn the_scope_list_is_stable() {
-        assert_eq!(RESOURCE_NAME, "otto-cxp");
+        assert_eq!(RESOURCE_NAME, "Savvagent CXP");
         assert_eq!(KNOWN, ["cxp:read", "cxp:write"]);
         assert_eq!(DEFAULT, ["cxp:read"]);
         assert!(DEFAULT.iter().all(|s| KNOWN.contains(s)));

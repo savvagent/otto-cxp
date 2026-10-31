@@ -41,7 +41,7 @@ pub use server::Cxp;
 /// Deployment settings the MCP surface cannot infer.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Public base URL of this service (e.g. `https://otto-cxp.savvagent.com`),
+    /// Public base URL of this service (e.g. `https://cxp.savvagent.com`),
     /// for the discovery pointer in a `401`.
     pub public_url: String,
     /// Accepted `Host` headers (DNS-rebinding protection); a request with any

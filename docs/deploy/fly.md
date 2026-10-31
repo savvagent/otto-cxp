@@ -1,6 +1,8 @@
 # Hosting: Fly.io
 
-otto-cxp runs as one Fly app, `otto-cxp` (org `savvagent`, region `iad`), serving every surface
+Savvagent CXP runs as one Fly app, `otto-cxp` (org `savvagent`, region `iad`), at
+`https://cxp.savvagent.com` (the legacy host `otto-cxp.savvagent.com` still answers until the
+platform turns old hosts into redirects, savvagent/otto-platform#135), serving every surface
 on one port: the MCP endpoint agents use, the REST API apps use, the web console (signed in
 through the platform), and the platform's webhooks.
 Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
@@ -8,7 +10,7 @@ Design: `docs/specs/2026-10-14-otto-resource-server-design.md`.
 ## Topology
 
 ```
-  otto-platform  (https://otto.savvagent.com)          otto-cxp  (https://otto-cxp.savvagent.com)
+  otto-platform  (https://savvagent.com)               otto-cxp  (https://cxp.savvagent.com)
   OAuth AS, orgs, members, teams, billing               POST /mcp               agents, bearer tokens
   db: otto_platform ◄──── same instance ────►           /api/v1/...             apps, bearer tokens
                                                         db: otto_cxp            customers, tickets, feedback,
@@ -89,8 +91,8 @@ database holds only opaque `org_id`, user, and `team_id` uuids.
 | `DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_server` (the runtime role, which owns nothing) | [Database role](#database-role) (replaces the one `fly postgres attach` set) |
 | `CXP_MIGRATION_DATABASE_URL` | Postgres URL for `otto_cxp`, as `cxp_owner`. A secret of the **`otto-cxp-migrate`** app only, never of `otto-cxp` (#45; `fly secrets list -a otto-cxp` must not show it). Read only by `cxp-server migrate`; a deployment's `migrate` refuses to run without it | [Runbook: move the owner credential](#runbook-move-the-owner-credential-out-of-otto-cxp-human-only-rob) (S6 stages it on the wrong app for a setup made after #45: use that runbook instead) |
 | `CXP_RUN_MIGRATIONS` | `false`. Also in `fly.toml` `[env]`; kept as a secret (which wins over `[env]`) so a rollback to an image from before #27, whose `fly.toml` lacks it, does not try to migrate as the runtime role | Same runbook, S1 |
-| `CXP_INTROSPECTION_SECRET` | `otto_rs_...`, authenticates every call to the platform | `resource rotate-secret` |
-| `CXP_PLATFORM_WEBHOOK_SECRET` | `otto_whsec_...`, verifies platform webhooks | `resource set-webhook` |
+| `CXP_INTROSPECTION_SECRET` | `sav_rs_...` (`otto_rs_...` before #59's rotation), authenticates every call to the platform | `resource rotate-secret` |
+| `CXP_PLATFORM_WEBHOOK_SECRET` | `sav_whsec_...` (`otto_whsec_...` before #59's rotation), verifies platform webhooks | `resource set-webhook` |
 | `CXP_ENCRYPTION_KEY` | 32 bytes, base64. Never used directly: two HKDF-SHA256 subkeys seal the web console's session tokens at rest and its in-flight sign-in cookie. Required only once `CXP_CONSOLE_CLIENT_ID` is set; rotating it signs every console user out | `openssl rand -base64 32` |
 
 Everything else is in `fly.toml`'s `[env]`. A new secret needs `fly secrets set -a otto-cxp
@@ -266,7 +268,7 @@ R5 switches it only after R4 has proven the new role. **R1 to R5 must be done be
 #16 merges**: merging deploys, and that release refuses to boot as the attach role. Paste each
 SQL block whole; a failure inside `BEGIN ... COMMIT` rolls the block back.
 
-**R0. Look first (read-only).** Wake the app (`curl -s https://otto-cxp.savvagent.com/readyz`),
+**R0. Look first (read-only).** Wake the app (`curl -s https://cxp.savvagent.com/readyz`),
 then note the user, host, port, and query string of the URL it connects with (the password is
 masked):
 
@@ -578,7 +580,7 @@ unset PW
 (Replace the host, port, and query string if R0's URL had others.) Not `--stage`: this restarts the release already running, before #16 merges, so the role switch
 is proven apart from the code change (that release runs every database path the same way; the
 e2e test `the_service_runs_whole_as_a_least_privilege_database_owner` proves them as such a
-role). Then `curl -s https://otto-cxp.savvagent.com/readyz` answers ready, `fly logs -a otto-cxp
+role). Then `curl -s https://cxp.savvagent.com/readyz` answers ready, `fly logs -a otto-cxp
 --no-tail` shows `tenant isolation enforced as role "otto_app"` (the release running then, before #28), and in `fly postgres connect -a
 otto-db`:
 
@@ -713,7 +715,7 @@ reaches only the release that does.
 
 ```bash
 fly secrets set -a otto-cxp CXP_RUN_MIGRATIONS=false
-curl -s https://otto-cxp.savvagent.com/readyz      # ready
+curl -s https://cxp.savvagent.com/readyz      # ready
 ```
 
 From here until #27 deploys, nothing runs migrations: merge no other PR that adds one before
@@ -873,7 +875,7 @@ queries (now `t` for `otto_cxp` and `postgres` only), plus `SELECT has_schema_pr
 
 ```bash
 fly apps restart otto-cxp
-curl -s https://otto-cxp.savvagent.com/readyz      # ready
+curl -s https://cxp.savvagent.com/readyz      # ready
 fly logs -a otto-cxp --no-tail                     # CXP_RUN_MIGRATIONS is off; tenant isolation enforced as role "otto_app" (the release running then, before #28)
 ```
 
@@ -1163,7 +1165,7 @@ SELECT pg_has_role('cxp_server', 'otto_app', 'MEMBER');
 
 ```bash
 fly apps restart otto-cxp
-curl -s https://otto-cxp.savvagent.com/readyz      # ready
+curl -s https://cxp.savvagent.com/readyz      # ready
 fly logs -a otto-cxp --no-tail                     # tenant isolation enforced as role "cxp_app"; no "still a member of otto_app"
 ```
 
@@ -1365,8 +1367,9 @@ fly apps create otto-cxp --org savvagent
 # them. The IPv4 is the free shared one; a dedicated IPv4 is a recurring cost.
 fly ips allocate-v6 -a otto-cxp
 fly ips allocate-v4 --shared -a otto-cxp
-fly certs add otto-cxp.savvagent.com -a otto-cxp
-# DNS (Namecheap): A and AAAA records for otto-cxp -> the IPs `fly ips list -a otto-cxp` shows
+fly certs add cxp.savvagent.com -a otto-cxp
+# DNS (Namecheap): a CNAME for cxp -> otto-cxp.fly.dev (or A and AAAA records -> the IPs
+# `fly ips list -a otto-cxp` shows)
 
 # 2. Database. Attach creates database otto_cxp and sets DATABASE_URL to a superuser,
 #    which a deployment refuses: run "Database role" below before step 5 (on a fresh
@@ -1380,17 +1383,17 @@ fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
 # 3. Register the resource server at the platform (run on the platform's machine).
 fly ssh console -a otto-platform -C 'otto-platform-server resource register \
-  https://otto-cxp.savvagent.com/mcp --name otto-cxp \
-  --scopes cxp:read,cxp:write --default-scopes cxp:read'
+  https://cxp.savvagent.com/mcp --name "Savvagent CXP" \
+  --scopes cxp:read,cxp:write --default-scopes cxp:read --service otto-cxp'
 fly ssh console -a otto-platform -C 'otto-platform-server resource rotate-secret \
-  https://otto-cxp.savvagent.com/mcp'                 # prints otto_rs_... once
+  https://cxp.savvagent.com/mcp'                      # prints sav_rs_... once
 fly ssh console -a otto-platform -C 'otto-platform-server resource set-webhook \
-  https://otto-cxp.savvagent.com/mcp https://otto-cxp.savvagent.com/platform/webhooks'
-                                                      # prints otto_whsec_... once
+  https://cxp.savvagent.com/mcp https://cxp.savvagent.com/platform/webhooks'
+                                                      # prints sav_whsec_... once
 
 # 4. Secrets (staged: they apply with the first deploy).
 fly secrets set -a otto-cxp --stage \
-  CXP_INTROSPECTION_SECRET='otto_rs_...' CXP_PLATFORM_WEBHOOK_SECRET='otto_whsec_...'
+  CXP_INTROSPECTION_SECRET='sav_rs_...' CXP_PLATFORM_WEBHOOK_SECRET='sav_whsec_...'
 
 # 5. First deploy, by hand (the CI deploy job is still off). The same three steps the job runs:
 #    build and push, migrate in otto-cxp-migrate, deploy that image ("Deploys").
@@ -1415,8 +1418,106 @@ site, so it goes last, once the service is live.
 The scope list is `cxp_core::scopes::KNOWN` and the defaults `cxp_core::scopes::DEFAULT`;
 re-run the `resource register` command when a release adds a scope. `CXP_RESOURCE_URI` must be
 exactly the registered URI: it is the token audience and the HTTP Basic user on every platform
-call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name); the host of
-`CXP_PUBLIC_URL` is always accepted.
+call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name and the legacy
+`otto-cxp.savvagent.com`); the host of `CXP_PUBLIC_URL` is always accepted.
+
+## Runbook: move to cxp.savvagent.com (#59, human-only, Rob)
+
+Phase 3 of the Savvagent rebrand (savvagent/otto-platform#128) for this service. The PR that
+closes #59 changes the code and `fly.toml`; the steps below are the human part. After them the
+service is Savvagent CXP at `https://cxp.savvagent.com/mcp`, its MCP server calls itself
+`savvagent-cxp`, and it authenticates to the platform with `sav_rs_` and `sav_whsec_` secrets.
+The billing service slug (`otto-cxp`) and its meters do not change; neither do the `CXP_*`
+variable names, the Fly apps (`otto-cxp`, `otto-cxp-migrate`), or the database.
+
+What the platform already has (phase 2): the resource registry lists this service as
+`https://cxp.savvagent.com/mcp` ("Savvagent CXP"), with `https://otto-cxp.savvagent.com/mcp`
+kept as a live alias until 2027-06-30, so the platform accepts the service under either URI
+and the current `otto_rs_` credential keeps working across the deploy. Introspection answers
+`aud` in the URI the service authenticated as, so tokens minted before the switch keep passing
+the audience check after it.
+
+**R0. Look first (read-only).**
+
+```bash
+curl -fsS https://cxp.savvagent.com/healthz                       # ok: DNS and certificate
+fly certs list -a otto-cxp                                        # both hosts Issued
+fly secrets list -a otto-cxp        # no CXP_PUBLIC_URL / CXP_RESOURCE_URI secret overriding fly.toml
+fly ssh console -a otto-platform -C 'otto-platform-server resource show https://cxp.savvagent.com/mcp'
+                                    # the canonical URI, its old one a `live` alias, the webhook URL
+```
+
+**R1. Flip the Fly env: merge the PR.** CI deploys it (`FLY_DEPLOY` is `enabled`). The deploy
+changes only `fly.toml` `[env]`:
+
+| Variable | Before | After |
+|---|---|---|
+| `CXP_PUBLIC_URL` | `https://otto-cxp.savvagent.com` | `https://cxp.savvagent.com` |
+| `CXP_RESOURCE_URI` | `https://otto-cxp.savvagent.com/mcp` | `https://cxp.savvagent.com/mcp` |
+| `CXP_ALLOWED_HOSTS` | `otto-cxp.fly.dev` | `otto-cxp.fly.dev,otto-cxp.savvagent.com` |
+
+`otto-cxp.savvagent.com` stays an allowed `/mcp` host, so clients still configured with it keep
+working until #135 turns the old hosts into redirects. Then check:
+
+```bash
+curl -fsS https://cxp.savvagent.com/readyz                        # ready
+curl -fsS https://cxp.savvagent.com/.well-known/oauth-protected-resource
+  # "resource": "https://cxp.savvagent.com/mcp", "resource_name": "Savvagent CXP"
+fly logs -a otto-cxp --no-tail     # "the otto platform accepted this service's credential"
+```
+
+The protected-resource metadata names the new URI on either host. A client that signs in
+afresh through the old URL and checks that the metadata's `resource` matches the URL it called
+(RFC 9728 §3.3) refuses it; step R3 moves the client to the new URL.
+
+**R2. Rotate both secrets to `sav_`.** Both commands invalidate the old value the moment they
+print the new one, so run them back to back and set the two secrets in one `fly secrets set`
+(one restart). Until the restart, calls fail (introspection refused) and webhook deliveries
+fail their signature check; the platform retries deliveries with backoff for about a day, so
+none is lost. The webhook must name the new host before #135: the platform does not follow
+redirects.
+
+```bash
+platform() { fly ssh console --quiet -a otto-platform -C "otto-platform-server resource $*" | tr -d '\r'; }
+
+WHSEC="$(platform set-webhook https://cxp.savvagent.com/mcp https://cxp.savvagent.com/platform/webhooks | grep -E '^sav_whsec_')"
+RS="$(platform rotate-secret https://cxp.savvagent.com/mcp | grep -E '^sav_rs_')"
+[ -n "$WHSEC" ] && [ -n "$RS" ] && echo both captured || echo STOP: run the missing one again
+
+fly secrets set -a otto-cxp CXP_PLATFORM_WEBHOOK_SECRET="$WHSEC" CXP_INTROSPECTION_SECRET="$RS"
+unset WHSEC RS
+
+fly secrets list -a otto-cxp                     # both Deployed, new digests
+curl -fsS https://cxp.savvagent.com/readyz       # ready (a rejected secret is a 503 here)
+fly ssh console -a otto-platform -C 'otto-platform-server resource show https://cxp.savvagent.com/mcp'
+                                                 # webhook=https://cxp.savvagent.com/platform/webhooks
+```
+
+If a capture comes back empty, the command still ran and invalidated the old value: run that
+one command again (each run issues a fresh secret) and set it. Neither secret can be read back.
+
+**R3. Move your MCP client (`~/.claude.json`).** The server name changes with the MCP server
+name, so the tools become `mcp__savvagent-cxp__*`; update anything that names
+`mcp__otto-cxp__*` (CLAUDE.md files, hooks, permission allow-lists) at the same time.
+
+```bash
+claude mcp remove otto-cxp --scope user
+claude mcp add --transport http --scope user savvagent-cxp https://cxp.savvagent.com/mcp
+```
+
+Then `/mcp` in a Claude Code session, pick `savvagent-cxp`, and **Authenticate**.
+
+**R4. Verify `whoami` through the new host.** Call the `savvagent-cxp` `whoami` tool: it answers
+`"service": "Savvagent CXP"` with your org and user. Then follow [Verify](#verify).
+
+**Console client.** None to register now: console sign-in was never turned on (no
+`CXP_CONSOLE_CLIENT_ID`, no `CXP_ENCRYPTION_KEY`). When it is, the redirect URI to register is
+`https://cxp.savvagent.com/auth/callback` ([Web console sign-in](#web-console-sign-in)).
+
+**Rolling back.** Revert the PR: the previous release serves `otto-cxp.savvagent.com/mcp` again,
+which the platform accepts as an alias until 2027-06-30. The `sav_` secrets belong to the
+server, not to a URI, so they keep working on either release; nothing in R2 needs undoing. Move
+the webhook back only if the old host is still served directly (before #135).
 
 ## Web console sign-in
 
@@ -1438,8 +1539,8 @@ this order, because a client id without the key fails the boot (naming the key):
 # 1. Register the console as a public, first-party client (no secret, no consent screen)
 #    whose only redirect URI is {CXP_PUBLIC_URL}/auth/callback. Run on the platform's machine.
 fly ssh console -a otto-platform -C 'otto-platform-server client register \
-  --name "otto-cxp console" \
-  --redirect-uri https://otto-cxp.savvagent.com/auth/callback --first-party'
+  --name "Savvagent CXP console" \
+  --redirect-uri https://cxp.savvagent.com/auth/callback --first-party'
 #    -> prints the client_id
 
 # 2. The encryption key, staged so it applies with the next release.
@@ -1453,23 +1554,26 @@ fly secrets set -a otto-cxp --stage CXP_ENCRYPTION_KEY="$(openssl rand -base64 3
 ```
 
 The redirect URI is registered **exactly**: a deployment that moves to another hostname registers
-a new client.
+a new client. Console sign-in was never turned on at `otto-cxp.savvagent.com` (no client id, no
+key), so the move to `cxp.savvagent.com` (#59) left no client to replace: the one to register is
+the `https://cxp.savvagent.com/auth/callback` client above. The console works only on the
+`CXP_PUBLIC_URL` host: the sign-in returns there, and the session cookie is bound to it.
 
 **Step 4: verify live, after the deploy.**
 
 ```bash
 # Sign-in is on: "loginEnabled": true ("signedIn": false without a cookie).
-curl -s https://otto-cxp.savvagent.com/auth/session
+curl -s https://cxp.savvagent.com/auth/session
 ```
 
-- Open `https://otto-cxp.savvagent.com/console/`, sign in at the platform, and check that the
+- Open `https://cxp.savvagent.com/console/`, sign in at the platform, and check that the
   customers list loads; `GET /auth/session` from that browser answers `"signedIn": true`.
 - A cross-site write is refused. Copy the `__Host-cxp_session` cookie's value from the browser's
   dev tools and read it into the shell without echoing it or leaving it in history:
 
   ```bash
   read -rs CXP_COOKIE
-  curl -s -i -X POST https://otto-cxp.savvagent.com/api/v1/customers \
+  curl -s -i -X POST https://cxp.savvagent.com/api/v1/customers \
     -H "cookie: __Host-cxp_session=$CXP_COOKIE" -H 'origin: https://example.com' \
     -H 'content-type: application/json' -d '{}'
   # -> 403 with "code": "cross_site_request". The empty body is invalid, so even a broken
@@ -1482,7 +1586,7 @@ curl -s https://otto-cxp.savvagent.com/auth/session
 
   ```bash
   curl -s -o /dev/null -w '%{http_code}\n' -H "cookie: __Host-cxp_session=$CXP_COOKIE" \
-    https://otto-cxp.savvagent.com/api/v1/customers   # -> 401
+    https://cxp.savvagent.com/api/v1/customers   # -> 401
   unset CXP_COOKIE
   ```
 
@@ -1505,9 +1609,9 @@ without a refresh).
 ## Verify
 
 ```bash
-curl -s https://otto-cxp.savvagent.com/healthz
-curl -s https://otto-cxp.savvagent.com/readyz
-curl -s https://otto-cxp.savvagent.com/.well-known/oauth-protected-resource
+curl -s https://cxp.savvagent.com/healthz
+curl -s https://cxp.savvagent.com/readyz
+curl -s https://cxp.savvagent.com/.well-known/oauth-protected-resource   # "resource": "https://cxp.savvagent.com/mcp"
 fly logs -a otto-cxp --no-tail
 ```
 
@@ -1540,11 +1644,11 @@ reflects only that boot check, so a credential the platform starts refusing afte
 500s on authenticated requests and `error` logs (`the platform rejected this resource server's
 credential`), not as a failing `/readyz`.
 
-Then point an MCP client at `https://otto-cxp.savvagent.com/mcp`: it is sent to the platform to
+Then point an MCP client at `https://cxp.savvagent.com/mcp`: it is sent to the platform to
 sign in, and `whoami` answers with the platform's records. `curl -s -H 'accept: text/html'
-https://otto-cxp.savvagent.com/console/` returns the console's `index.html` (`/` serves
+https://cxp.savvagent.com/console/` returns the console's `index.html` (`/` serves
 browsers the connector install page, #29), and
-`curl -s https://otto-cxp.savvagent.com/auth/session` answers `loginEnabled` true once
+`curl -s https://cxp.savvagent.com/auth/session` answers `loginEnabled` true once
 `CXP_CONSOLE_CLIENT_ID` is set (false before).
 
 Usage backlog (should drain to 0 within seconds of activity). Connect with

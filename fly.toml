@@ -1,6 +1,6 @@
 # otto-cxp on Fly.io, org "savvagent". See docs/deploy/fly.md.
 #
-# A resource server of the otto platform (https://otto.savvagent.com): identity,
+# Savvagent CXP: a resource server of the Savvagent platform (https://savvagent.com): identity,
 # OAuth, orgs, and billing live there; this app holds only customer-experience
 # data (customers, tickets, feedback, surveys, catalog).
 #
@@ -24,8 +24,8 @@
 #   must not be set on this app; the CI deploy job migrates there, #45)
 #   CXP_RUN_MIGRATIONS              false, duplicating [env] below so a rollback to a
 #                                   release from before #27 does not migrate either
-#   CXP_INTROSPECTION_SECRET        otto_rs_...    from `resource rotate-secret`
-#   CXP_PLATFORM_WEBHOOK_SECRET     otto_whsec_... from `resource set-webhook`
+#   CXP_INTROSPECTION_SECRET        sav_rs_...    from `resource rotate-secret`
+#   CXP_PLATFORM_WEBHOOK_SECRET     sav_whsec_... from `resource set-webhook`
 #   CXP_ENCRYPTION_KEY              32 bytes base64 (`openssl rand -base64 32`); seals the
 #                                   web console's sessions. Needed once CXP_CONSOLE_CLIENT_ID is set.
 
@@ -43,13 +43,15 @@ kill_timeout = 30
 
 [env]
   CXP_BIND = "0.0.0.0:8080"
-  CXP_PUBLIC_URL = "https://otto-cxp.savvagent.com"
+  CXP_PUBLIC_URL = "https://cxp.savvagent.com"
   # The token audience: exactly the resource_uri registered at the platform.
-  CXP_RESOURCE_URI = "https://otto-cxp.savvagent.com/mcp"
+  CXP_RESOURCE_URI = "https://cxp.savvagent.com/mcp"
   CXP_PLATFORM_URL = "https://savvagent.com"
   # EXTRA hosts /mcp accepts; the CXP_PUBLIC_URL host is always allowed. The
-  # fly.dev name still answers (health checks, debugging).
-  CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
+  # fly.dev name still answers (health checks, debugging). otto-cxp.savvagent.com
+  # is the legacy host (#59): clients configured with it keep working until the
+  # platform turns the old hosts into redirects (savvagent/otto-platform#135).
+  CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev,otto-cxp.savvagent.com"
   # Small: otto-db is a shared 512 MB instance.
   CXP_DB_MAX_CONNECTIONS = "5"
   # The serving role owns nothing and cannot migrate; the CI deploy job does (otto-cxp-migrate).

@@ -29,7 +29,7 @@ export function RootLayout() {
         className="flex min-h-screen flex-col items-center justify-center gap-3 p-4 text-sm text-muted-foreground"
         aria-busy={session.isFetching}
       >
-        <p role="alert">Could not reach otto-cxp to check your sign-in.</p>
+        <p role="alert">Could not reach Savvagent CXP to check your sign-in.</p>
         <Button
           variant="outline"
           size="sm"

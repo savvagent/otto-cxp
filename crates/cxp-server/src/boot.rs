@@ -1013,7 +1013,7 @@ mod tests {
         assert!(check_db_role(&su, &on_fly).is_err());
         // So is a loopback public URL serving a real audience.
         let mut real_audience = local.clone();
-        real_audience.resource_uri = "https://otto-cxp.savvagent.com/mcp".into();
+        real_audience.resource_uri = "https://cxp.savvagent.com/mcp".into();
         assert!(check_db_role(&su, &real_audience).is_err());
 
         // Another service's database within reach is refused like a

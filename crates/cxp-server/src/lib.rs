@@ -546,7 +546,10 @@ mod tests {
             install_page::CONTENT_SECURITY_POLICY
         );
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("<title>Otto CXP connector</title>"), "{html}");
+        assert!(
+            html.contains("<title>Savvagent CXP connector</title>"),
+            "{html}"
+        );
         assert!(
             html.contains("<code id=\"address\">https://cxp.example.com/custom/mcp</code>"),
             "the address comes from CXP_RESOURCE_URI"
@@ -1019,9 +1022,17 @@ mod tests {
     #[test]
     fn mcp_gets_the_public_host_and_the_extras() {
         let mut config = Config::for_test();
-        config.extra_allowed_hosts = vec!["otto-cxp.fly.dev".into()];
+        config.extra_allowed_hosts =
+            vec!["otto-cxp.fly.dev".into(), "otto-cxp.savvagent.com".into()];
         let mcp = mcp_config(&config);
-        assert_eq!(mcp.allowed_hosts, ["cxp.example.com", "otto-cxp.fly.dev"]);
+        assert_eq!(
+            mcp.allowed_hosts,
+            [
+                "cxp.example.com",
+                "otto-cxp.fly.dev",
+                "otto-cxp.savvagent.com"
+            ]
+        );
         assert_eq!(mcp.public_url, config.public_url);
     }
 

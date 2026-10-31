@@ -58,7 +58,7 @@ pub enum Error {
     /// until a release that handles it is deployed); platform failures are
     /// [`Error::Platform`]. Also raised when a search finds every search
     /// permit taken for longer than `search::SEARCH_WAIT` (#42).
-    #[error("otto-cxp could not complete this right now; nothing was changed. Retry shortly")]
+    #[error("Savvagent CXP could not complete this right now; nothing was changed. Retry shortly")]
     Unavailable,
 
     /// A search ran past its `statement_timeout` (SQLSTATE 57014), almost
@@ -150,7 +150,7 @@ fn billing_message(reason: BlockedReason, tool: &str, url: &str) -> String {
 /// What a caller is told of any server-side failure. Shared by every surface
 /// so the wording cannot drift.
 pub const INTERNAL_MESSAGE: &str =
-    "otto-cxp hit an internal error; retry, and report it if it persists";
+    "Savvagent CXP hit an internal error; retry, and report it if it persists";
 
 fn database_message(e: &sqlx::Error) -> &'static str {
     if is_input_rejection(e) {
@@ -176,7 +176,7 @@ fn is_input_rejection(e: &sqlx::Error) -> bool {
 
 fn platform_message(e: &otto_resource::Error) -> &'static str {
     if e.is_retriable() {
-        "the otto platform could not be reached; nothing was changed. Retry shortly"
+        "the Savvagent platform could not be reached; nothing was changed. Retry shortly"
     } else if matches!(e, otto_resource::Error::NotFound) {
         "access to this organization has been revoked; sign in again"
     } else {

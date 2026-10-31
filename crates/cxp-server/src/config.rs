@@ -23,7 +23,7 @@ pub struct Config {
     pub db_max_connections: u32,
     pub run_migrations: bool,
     pub bind: SocketAddr,
-    /// Public origin, e.g. `https://otto-cxp.savvagent.com`, with no trailing
+    /// Public origin, e.g. `https://cxp.savvagent.com`, with no trailing
     /// slash. It lands inside a quoted `WWW-Authenticate` parameter, so it
     /// never contains `"`, `\`, or whitespace.
     pub public_url: String,
@@ -449,7 +449,7 @@ impl<F: Fn(&str) -> Option<String>> Vars<'_, F> {
             || parsed.password().is_some()
         {
             return Err(anyhow!(
-                "{name} must be an origin like https://otto-cxp.savvagent.com, with no path, \
+                "{name} must be an origin like https://cxp.savvagent.com, with no path, \
                  query, or credentials, got {v:?}"
             ));
         }
@@ -571,10 +571,10 @@ mod tests {
                 "DATABASE_URL",
                 "postgres://cxp:cxp@localhost:15435/otto_cxp",
             ),
-            ("CXP_PUBLIC_URL", "https://otto-cxp.savvagent.com/"),
-            ("CXP_PLATFORM_URL", "https://otto.savvagent.com"),
-            ("CXP_INTROSPECTION_SECRET", "otto_rs_abc"),
-            ("CXP_PLATFORM_WEBHOOK_SECRET", "otto_whsec_abc"),
+            ("CXP_PUBLIC_URL", "https://cxp.savvagent.com/"),
+            ("CXP_PLATFORM_URL", "https://savvagent.com"),
+            ("CXP_INTROSPECTION_SECRET", "sav_rs_abc"),
+            ("CXP_PLATFORM_WEBHOOK_SECRET", "sav_whsec_abc"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -596,9 +596,9 @@ mod tests {
     #[test]
     fn defaults_are_the_documented_ones() {
         let c = load(&env(&[])).unwrap();
-        assert_eq!(c.public_url, "https://otto-cxp.savvagent.com");
-        assert_eq!(c.resource_uri, "https://otto-cxp.savvagent.com/mcp");
-        assert_eq!(c.platform_url, "https://otto.savvagent.com");
+        assert_eq!(c.public_url, "https://cxp.savvagent.com");
+        assert_eq!(c.resource_uri, "https://cxp.savvagent.com/mcp");
+        assert_eq!(c.platform_url, "https://savvagent.com");
         assert_eq!(
             c.database_url,
             "postgres://cxp:cxp@localhost:15435/otto_cxp"
@@ -608,15 +608,15 @@ mod tests {
         assert_eq!(c.bind, "0.0.0.0:8080".parse().unwrap());
         assert!(c.extra_allowed_hosts.is_empty() && c.allowed_origins.is_empty());
         assert_eq!(c.log_format, LogFormat::Text);
-        assert_eq!(c.upgrade_url(), "https://otto.savvagent.com");
-        assert_eq!(c.allowed_hosts(), ["otto-cxp.savvagent.com"]);
+        assert_eq!(c.upgrade_url(), "https://savvagent.com");
+        assert_eq!(c.allowed_hosts(), ["cxp.savvagent.com"]);
     }
 
     #[test]
     fn every_setting_is_read() {
         let c = load(&env(&[
             ("CXP_DATABASE_URL", "postgres://own/db"),
-            ("CXP_RESOURCE_URI", "https://otto-cxp.savvagent.com/mcp/"),
+            ("CXP_RESOURCE_URI", "https://cxp.savvagent.com/mcp/"),
             ("CXP_DB_MAX_CONNECTIONS", "8"),
             ("CXP_RUN_MIGRATIONS", "off"),
             ("CXP_BIND", "127.0.0.1:9000"),
@@ -626,12 +626,12 @@ mod tests {
                 "https://Console.example:443/, http://localhost:5173",
             ),
             ("CXP_LOG_FORMAT", "json"),
-            ("CXP_INTROSPECTION_SECRET", "  otto_rs_padded \n"),
+            ("CXP_INTROSPECTION_SECRET", "  sav_rs_padded \n"),
         ]))
         .unwrap();
         assert_eq!(c.database_url, "postgres://own/db", "CXP_ wins");
         // The audience is taken verbatim: it must equal the registered URI.
-        assert_eq!(c.resource_uri, "https://otto-cxp.savvagent.com/mcp/");
+        assert_eq!(c.resource_uri, "https://cxp.savvagent.com/mcp/");
         assert_eq!(c.db_max_connections, 8);
         assert!(!c.run_migrations);
         assert_eq!(c.bind, "127.0.0.1:9000".parse().unwrap());
@@ -642,7 +642,7 @@ mod tests {
         );
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(
-            c.introspection_secret, "otto_rs_padded",
+            c.introspection_secret, "sav_rs_padded",
             "secrets are trimmed"
         );
     }
@@ -676,7 +676,7 @@ mod tests {
             assert!(!c.is_deployment(), "{local}");
         }
         for deployed in [
-            "https://otto-cxp.savvagent.com",
+            "https://cxp.savvagent.com",
             "https://otto-cxp.fly.dev",
             "http://10.0.0.5:8080",
             "http://0.0.0.0:8080",
@@ -691,8 +691,8 @@ mod tests {
         // it can still arrive through CXP_ALLOWED_HOSTS.
         let c = load(&env(&[
             ("CXP_PUBLIC_URL", "http://localhost:8080"),
-            ("CXP_RESOURCE_URI", "https://otto-cxp.savvagent.com/mcp"),
-            ("CXP_ALLOWED_HOSTS", "otto-cxp.savvagent.com"),
+            ("CXP_RESOURCE_URI", "https://cxp.savvagent.com/mcp"),
+            ("CXP_ALLOWED_HOSTS", "cxp.savvagent.com"),
         ]))
         .unwrap();
         assert!(c.is_deployment());
@@ -722,14 +722,14 @@ mod tests {
     #[test]
     fn a_bad_public_url_is_refused() {
         for bad in [
-            "otto-cxp.savvagent.com",
+            "cxp.savvagent.com",
             "/relative",
-            "ftp://otto-cxp.savvagent.com",
+            "ftp://cxp.savvagent.com",
             "mailto:ops@example.com",
-            "https://otto-cxp.savvagent.com/a\"b",
-            "https://otto-cxp.savvagent.com/a\\b",
-            "https://otto-cxp.savvagent.com/a b",
-            "https://otto-cxp.savvagent.com/a\tb",
+            "https://cxp.savvagent.com/a\"b",
+            "https://cxp.savvagent.com/a\\b",
+            "https://cxp.savvagent.com/a b",
+            "https://cxp.savvagent.com/a\tb",
         ] {
             let msg = error(&env(&[("CXP_PUBLIC_URL", bad)]));
             assert!(msg.contains("CXP_PUBLIC_URL"), "{bad:?}: {msg}");
@@ -739,28 +739,28 @@ mod tests {
         assert!(error(&vars).contains("CXP_PUBLIC_URL is required"));
         let msg = error(&env(&[("CXP_RESOURCE_URI", "not a url")]));
         assert!(msg.contains("CXP_RESOURCE_URI"), "{msg}");
-        let msg = error(&env(&[("CXP_PLATFORM_URL", "otto.savvagent.com")]));
+        let msg = error(&env(&[("CXP_PLATFORM_URL", "savvagent.com")]));
         assert!(msg.contains("CXP_PLATFORM_URL"), "{msg}");
     }
 
     #[test]
     fn the_public_url_is_an_origin_and_the_platform_is_https_off_loopback() {
         for bad in [
-            "https://otto-cxp.savvagent.com/app",
-            "https://otto-cxp.savvagent.com/?x=1",
-            "https://otto-cxp.savvagent.com/#top",
-            "https://ops:pw@otto-cxp.savvagent.com",
+            "https://cxp.savvagent.com/app",
+            "https://cxp.savvagent.com/?x=1",
+            "https://cxp.savvagent.com/#top",
+            "https://ops:pw@cxp.savvagent.com",
         ] {
             let msg = error(&env(&[("CXP_PUBLIC_URL", bad)]));
             assert!(msg.contains("CXP_PUBLIC_URL"), "{bad:?}: {msg}");
         }
-        let msg = error(&env(&[("CXP_PLATFORM_URL", "http://otto.savvagent.com")]));
+        let msg = error(&env(&[("CXP_PLATFORM_URL", "http://savvagent.com")]));
         assert!(msg.contains("must use https"), "{msg}");
         for ok in [
             "http://localhost:8090",
             "http://127.0.0.1:8090",
             "http://[::1]:8090",
-            "https://otto.savvagent.com",
+            "https://savvagent.com",
         ] {
             let c = load(&env(&[("CXP_PLATFORM_URL", ok)])).unwrap();
             assert_eq!(c.platform_url, ok);
@@ -938,10 +938,10 @@ mod tests {
         .unwrap();
         let s = format!("{c:?}");
         assert!(s.contains("cxp-console"), "{s}");
-        for secret in ["otto_rs_abc", "otto_whsec_abc", "hunter2", KEY] {
+        for secret in ["sav_rs_abc", "sav_whsec_abc", "hunter2", KEY] {
             assert!(!s.contains(secret), "{secret} leaked: {s}");
         }
-        assert!(s.contains("otto-cxp.savvagent.com"), "{s}");
+        assert!(s.contains("cxp.savvagent.com"), "{s}");
     }
 
     /// The owner's credential is read for `cxp-server migrate` only, absent
@@ -1033,5 +1033,52 @@ mod tests {
         assert_eq!(m.migration_database_url, c.migration_database_url);
         assert_eq!(m.database_url.as_deref(), Some(c.database_url.as_str()));
         assert_eq!(m.is_deployment(), c.is_deployment());
+    }
+
+    /// The `[env]` table of the repository's `fly.toml`, read line by line
+    /// (`KEY = "value"`; comments and other tables skipped): enough for the
+    /// plain strings it holds, without a TOML parser in the tree.
+    fn fly_env() -> HashMap<String, String> {
+        let fly = include_str!("../../../fly.toml");
+        let mut section = "";
+        let mut vars = HashMap::new();
+        for line in fly.lines().map(str::trim) {
+            if line.starts_with('[') {
+                section = line;
+            } else if section == "[env]" && !line.starts_with('#') {
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim();
+                    let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"'));
+                    vars.insert(k.trim().to_string(), v.expect("a quoted string").into());
+                }
+            }
+        }
+        vars
+    }
+
+    /// #59: production serves Savvagent CXP at cxp.savvagent.com, and keeps
+    /// accepting the legacy otto-cxp.savvagent.com host (and the fly.dev
+    /// name) on `/mcp` until the platform turns the old hosts into redirects
+    /// (savvagent/otto-platform#135).
+    #[test]
+    fn fly_toml_serves_cxp_savvagent_com_and_keeps_the_legacy_host() {
+        let fly = fly_env();
+        let mut vars = env(&[]);
+        vars.remove("CXP_PUBLIC_URL");
+        vars.remove("CXP_PLATFORM_URL");
+        vars.extend(fly.into_iter().filter(|(k, _)| k.starts_with("CXP_")));
+        let c = load(&vars).unwrap();
+        assert_eq!(c.public_url, "https://cxp.savvagent.com");
+        assert_eq!(c.resource_uri, "https://cxp.savvagent.com/mcp");
+        assert_eq!(c.platform_url, "https://savvagent.com");
+        assert_eq!(
+            c.allowed_hosts(),
+            [
+                "cxp.savvagent.com",
+                "otto-cxp.fly.dev",
+                "otto-cxp.savvagent.com"
+            ]
+        );
+        assert!(c.is_deployment() && !c.run_migrations);
     }
 }
