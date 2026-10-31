@@ -1418,8 +1418,9 @@ site, so it goes last, once the service is live.
 The scope list is `cxp_core::scopes::KNOWN` and the defaults `cxp_core::scopes::DEFAULT`;
 re-run the `resource register` command when a release adds a scope. `CXP_RESOURCE_URI` must be
 exactly the registered URI: it is the token audience and the HTTP Basic user on every platform
-call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name and the legacy
-`otto-cxp.savvagent.com`); the host of `CXP_PUBLIC_URL` is always accepted.
+call. `CXP_ALLOWED_HOSTS` lists EXTRA accepted Hosts (here the `fly.dev` name); the host of
+`CXP_PUBLIC_URL` is always accepted. `CXP_REDIRECT_HOSTS` lists hosts that only redirect (see
+"#135: old host redirects").
 
 ## Runbook: move to cxp.savvagent.com (#59, human-only, Rob)
 
@@ -1457,7 +1458,7 @@ changes only `fly.toml` `[env]`:
 | `CXP_ALLOWED_HOSTS` | `otto-cxp.fly.dev` | `otto-cxp.fly.dev,otto-cxp.savvagent.com` |
 
 `otto-cxp.savvagent.com` stays an allowed `/mcp` host, so clients still configured with it keep
-working until #135 turns the old hosts into redirects. Then check:
+working until #135 turns the old hosts into redirects (below). Then check:
 
 ```bash
 curl -fsS https://cxp.savvagent.com/readyz                        # ready
@@ -1518,6 +1519,36 @@ Then `/mcp` in a Claude Code session, pick `savvagent-cxp`, and **Authenticate**
 which the platform accepts as an alias until 2027-06-30. The `sav_` secrets belong to the
 server, not to a URI, so they keep working on either release; nothing in R2 needs undoing. Move
 the webhook back only if the old host is still served directly (before #135).
+
+## #135: old host redirects
+
+Part of the Savvagent rebrand epic (savvagent/otto-platform#128). After #59 the legacy host
+`otto-cxp.savvagent.com` only redirects: `fly.toml` sets `CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"` and
+`CXP_REDIRECT_HOSTS = "otto-cxp.savvagent.com"`. A request whose `Host` (port ignored) is a redirect
+host gets a `308 Permanent Redirect` to `CXP_PUBLIC_URL` plus the original path and query, with an
+empty body, for every method and path (`/mcp`, the console, the API, `.well-known`, `healthz`). It
+runs before host allow-listing and auth, and the `Location` is built from the raw path and query, never
+from a scheme or host in the request. The server refuses to start when a host is in both
+`CXP_REDIRECT_HOSTS` and `CXP_ALLOWED_HOSTS`, or is the host of `CXP_PUBLIC_URL`.
+
+The Fly health check calls `/readyz` on the machine's internal address (it sends no old `Host`), so it
+is unaffected, and so is `https://otto-cxp.fly.dev/readyz`.
+
+- **Keep the Fly cert for `otto-cxp.savvagent.com`** (`fly certs list -a otto-cxp`): without it the
+  redirect cannot be served over HTTPS and clients get a TLS error instead.
+- **Drop the platform alias afterwards.** Once clients follow the redirect, the platform's
+  `resource drop-alias` removes `https://otto-cxp.savvagent.com/mcp` as an alias of
+  `https://cxp.savvagent.com/mcp` (it is otherwise kept until 2027-06-30). That is a platform
+  step (human-only); this service needs no change for it.
+- **Verify** after the deploy:
+
+```bash
+curl -sI https://otto-cxp.savvagent.com/mcp
+  # HTTP/2 308, location: https://cxp.savvagent.com/mcp
+curl -sI 'https://otto-cxp.savvagent.com/api/v1/customers?limit=1'
+  # location: https://cxp.savvagent.com/api/v1/customers?limit=1
+curl -fsS https://cxp.savvagent.com/readyz                        # unchanged: ready
+```
 
 ## Web console sign-in
 

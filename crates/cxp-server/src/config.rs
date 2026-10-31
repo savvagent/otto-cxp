@@ -37,6 +37,11 @@ pub struct Config {
     pub platform_webhook_secret: String,
     /// `Host` headers `/mcp` accepts besides the public URL's own host.
     pub extra_allowed_hosts: Vec<String>,
+    /// `CXP_REDIRECT_HOSTS`: bare lowercase hostnames (no port) whose every
+    /// request is answered `308` to the same path and query under
+    /// `public_url`, before anything else. Disjoint from
+    /// `extra_allowed_hosts` and never the public URL's own host.
+    pub redirect_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub log_format: LogFormat,
     /// `FLY_APP_NAME`, which Fly sets on every machine: its presence alone
@@ -91,6 +96,7 @@ impl std::fmt::Debug for Config {
             .field("introspection_secret", &"<redacted>")
             .field("platform_webhook_secret", &"<redacted>")
             .field("extra_allowed_hosts", &self.extra_allowed_hosts)
+            .field("redirect_hosts", &self.redirect_hosts)
             .field("allowed_origins", &self.allowed_origins)
             .field("log_format", &self.log_format)
             .field("fly_app_name", &self.fly_app_name)
@@ -232,6 +238,16 @@ impl Config {
             None => format!("{public_url}/mcp"),
         };
         let console = console_config(&vars, &public_url)?;
+        let extra_allowed_hosts: Vec<String> = vars
+            .list("CXP_ALLOWED_HOSTS")
+            .iter()
+            .map(|h| host_entry("CXP_ALLOWED_HOSTS", h))
+            .collect::<Result<_>>()?;
+        let redirect_hosts = redirect_hosts(
+            &vars.list("CXP_REDIRECT_HOSTS"),
+            &public_url,
+            &extra_allowed_hosts,
+        )?;
         Ok(Self {
             // `fly postgres attach` sets DATABASE_URL; CXP_DATABASE_URL wins
             // so a shell with another service's DATABASE_URL cannot point this
@@ -263,11 +279,8 @@ impl Config {
             platform_url: vars.platform_url("CXP_PLATFORM_URL")?,
             introspection_secret: vars.required("CXP_INTROSPECTION_SECRET")?,
             platform_webhook_secret: vars.required("CXP_PLATFORM_WEBHOOK_SECRET")?,
-            extra_allowed_hosts: vars
-                .list("CXP_ALLOWED_HOSTS")
-                .iter()
-                .map(|h| host_entry("CXP_ALLOWED_HOSTS", h))
-                .collect::<Result<_>>()?,
+            extra_allowed_hosts,
+            redirect_hosts,
             allowed_origins: vars
                 .list("CXP_ALLOWED_ORIGINS")
                 .iter()
@@ -362,6 +375,7 @@ impl Config {
             introspection_secret: "otto_rs_test".into(),
             platform_webhook_secret: "otto_whsec_test".into(),
             extra_allowed_hosts: vec![],
+            redirect_hosts: vec![],
             allowed_origins: vec![],
             log_format: LogFormat::Text,
             fly_app_name: None,
@@ -522,6 +536,50 @@ fn host_entry(name: &str, v: &str) -> Result<String> {
         return Err(bad());
     }
     Ok(v.to_ascii_lowercase())
+}
+
+/// The host of an authority (`host` or `host:port`), lowercase.
+fn bare_host(authority: &str) -> String {
+    let host = match authority.rsplit_once(']') {
+        // `[::1]:8080`: the colons inside the brackets are the host's own.
+        Some((h, _)) => format!("{h}]"),
+        None => authority.split(':').next().unwrap_or_default().to_string(),
+    };
+    host.to_ascii_lowercase()
+}
+
+/// `CXP_REDIRECT_HOSTS`: bare hostnames, validated like the allowed hosts
+/// but with no port, and refused when one is also served (`allowed`, or the
+/// public URL's own host), since a host cannot both answer and redirect.
+fn redirect_hosts(raw: &[String], public_url: &str, allowed: &[String]) -> Result<Vec<String>> {
+    let public_host = url::Url::parse(public_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let mut hosts: Vec<String> = Vec::new();
+    for raw in raw {
+        let host = host_entry("CXP_REDIRECT_HOSTS", raw)?;
+        if host.contains([':', '[', ']']) {
+            return Err(anyhow!(
+                "CXP_REDIRECT_HOSTS entries are bare hostnames (no port), got {raw:?}"
+            ));
+        }
+        if allowed.iter().any(|a| bare_host(a) == host) {
+            return Err(anyhow!(
+                "CXP_REDIRECT_HOSTS entry {host:?} is also in CXP_ALLOWED_HOSTS: \
+                 a host either serves or redirects"
+            ));
+        }
+        if public_host.as_deref() == Some(host.as_str()) {
+            return Err(anyhow!(
+                "CXP_REDIRECT_HOSTS entry {host:?} is the CXP_PUBLIC_URL host: \
+                 it would redirect to itself"
+            ));
+        }
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    Ok(hosts)
 }
 
 /// One browser origin `/mcp` accepts: `scheme://host[:port]`, normalized
@@ -765,6 +823,65 @@ mod tests {
             let c = load(&env(&[("CXP_PLATFORM_URL", ok)])).unwrap();
             assert_eq!(c.platform_url, ok);
         }
+    }
+
+    #[test]
+    fn redirect_hosts_are_empty_by_default_and_read_as_a_list() {
+        assert!(load(&env(&[])).unwrap().redirect_hosts.is_empty());
+        let c = load(&env(&[(
+            "CXP_REDIRECT_HOSTS",
+            " Otto-CXP.savvagent.com , ,old.example,old.example",
+        )]))
+        .unwrap();
+        assert_eq!(c.redirect_hosts, ["otto-cxp.savvagent.com", "old.example"]);
+        // Another allowed host with a port is a different host from it.
+        let c = load(&env(&[
+            ("CXP_ALLOWED_HOSTS", "otto-cxp.fly.dev"),
+            ("CXP_REDIRECT_HOSTS", "otto-cxp.savvagent.com"),
+        ]))
+        .unwrap();
+        assert_eq!(c.redirect_hosts, ["otto-cxp.savvagent.com"]);
+    }
+
+    #[test]
+    fn redirect_hosts_are_validated() {
+        for bad in [
+            "https://otto-cxp.savvagent.com",
+            "otto-cxp.savvagent.com/mcp",
+            "user@otto-cxp.savvagent.com",
+            "otto-cxp.savvagent.com:notaport",
+            "otto-cxp.savvagent.com:8080",
+            "[::1]",
+        ] {
+            let msg = error(&env(&[("CXP_REDIRECT_HOSTS", bad)]));
+            assert!(msg.contains("CXP_REDIRECT_HOSTS"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_host_cannot_both_redirect_and_be_served() {
+        let msg = error(&env(&[
+            (
+                "CXP_ALLOWED_HOSTS",
+                "otto-cxp.fly.dev,Otto-CXP.savvagent.com",
+            ),
+            ("CXP_REDIRECT_HOSTS", "otto-cxp.savvagent.com"),
+        ]));
+        assert!(msg.contains("also in CXP_ALLOWED_HOSTS"), "{msg}");
+        // A port on the allowed entry is still the same host.
+        let msg = error(&env(&[
+            ("CXP_ALLOWED_HOSTS", "otto-cxp.savvagent.com:8443"),
+            ("CXP_REDIRECT_HOSTS", "otto-cxp.savvagent.com"),
+        ]));
+        assert!(msg.contains("also in CXP_ALLOWED_HOSTS"), "{msg}");
+
+        let msg = error(&env(&[("CXP_REDIRECT_HOSTS", "cxp.savvagent.com")]));
+        assert!(msg.contains("CXP_PUBLIC_URL host"), "{msg}");
+        let msg = error(&env(&[
+            ("CXP_PUBLIC_URL", "https://cxp.example.com:8443"),
+            ("CXP_REDIRECT_HOSTS", "CXP.example.com"),
+        ]));
+        assert!(msg.contains("CXP_PUBLIC_URL host"), "{msg}");
     }
 
     #[test]
@@ -1056,12 +1173,11 @@ mod tests {
         vars
     }
 
-    /// #59: production serves Savvagent CXP at cxp.savvagent.com, and keeps
-    /// accepting the legacy otto-cxp.savvagent.com host (and the fly.dev
-    /// name) on `/mcp` until the platform turns the old hosts into redirects
-    /// (savvagent/otto-platform#135).
+    /// #59: production serves Savvagent CXP at cxp.savvagent.com and still
+    /// accepts the fly.dev name on `/mcp`; #135: the legacy
+    /// otto-cxp.savvagent.com host only redirects.
     #[test]
-    fn fly_toml_serves_cxp_savvagent_com_and_keeps_the_legacy_host() {
+    fn fly_toml_serves_cxp_savvagent_com_and_redirects_the_legacy_host() {
         let fly = fly_env();
         let mut vars = env(&[]);
         vars.remove("CXP_PUBLIC_URL");
@@ -1071,14 +1187,8 @@ mod tests {
         assert_eq!(c.public_url, "https://cxp.savvagent.com");
         assert_eq!(c.resource_uri, "https://cxp.savvagent.com/mcp");
         assert_eq!(c.platform_url, "https://savvagent.com");
-        assert_eq!(
-            c.allowed_hosts(),
-            [
-                "cxp.savvagent.com",
-                "otto-cxp.fly.dev",
-                "otto-cxp.savvagent.com"
-            ]
-        );
+        assert_eq!(c.allowed_hosts(), ["cxp.savvagent.com", "otto-cxp.fly.dev"]);
+        assert_eq!(c.redirect_hosts, ["otto-cxp.savvagent.com"]);
         assert!(c.is_deployment() && !c.run_migrations);
     }
 }

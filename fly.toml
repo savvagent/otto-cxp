@@ -48,10 +48,13 @@ kill_timeout = 30
   CXP_RESOURCE_URI = "https://cxp.savvagent.com/mcp"
   CXP_PLATFORM_URL = "https://savvagent.com"
   # EXTRA hosts /mcp accepts; the CXP_PUBLIC_URL host is always allowed. The
-  # fly.dev name still answers (health checks, debugging). otto-cxp.savvagent.com
-  # is the legacy host (#59): clients configured with it keep working until the
-  # platform turns the old hosts into redirects (savvagent/otto-platform#135).
-  CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev,otto-cxp.savvagent.com"
+  # fly.dev name still answers (health checks, debugging).
+  CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
+  # Redirect-only hosts: every request for one gets a 308 to the same path and
+  # query under CXP_PUBLIC_URL, before host allow-listing and auth.
+  # otto-cxp.savvagent.com is the legacy host (#59); it only redirects since
+  # savvagent/otto-platform#135. Its Fly cert stays so the redirect works over HTTPS.
+  CXP_REDIRECT_HOSTS = "otto-cxp.savvagent.com"
   # Small: otto-db is a shared 512 MB instance.
   CXP_DB_MAX_CONNECTIONS = "5"
   # The serving role owns nothing and cannot migrate; the CI deploy job does (otto-cxp-migrate).
