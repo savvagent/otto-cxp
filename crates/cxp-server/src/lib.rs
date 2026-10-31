@@ -122,6 +122,10 @@ pub fn router(
     let hsts = config.public_url.starts_with("https://");
     // Rendered once: a bad platform URL fails boot, not a request.
     let page = InstallPage::new(&config.resource_uri, &config.platform_url)?;
+    let redirect = Arc::new(OldHosts {
+        hosts: config.redirect_hosts.clone(),
+        base: config.public_url.trim_end_matches('/').to_string(),
+    });
     Ok(health::router(db, readiness)
         // Open, and not part of either surface: every `401` points at it.
         .merge(cxp_http::protected_resource_router(
@@ -157,7 +161,71 @@ pub fn router(
             |req: &http::Request<axum::body::Body>| {
                 tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
             },
-        )))
+        ))
+        // Outermost, so it runs before the trace span, host allow-listing,
+        // and auth: an old host answers nothing but the redirect.
+        .layer(middleware::from_fn_with_state(redirect, redirect_old_hosts)))
+}
+
+/// The hosts that only redirect (`CXP_REDIRECT_HOSTS`) and where to.
+struct OldHosts {
+    hosts: Vec<String>,
+    /// `CXP_PUBLIC_URL` without a trailing `/`: the only scheme and host a
+    /// `Location` ever carries.
+    base: String,
+}
+
+/// `308` every request for an old host to the same path and query under the
+/// public URL, for every method, with an empty body.
+///
+/// The `Location` is the public URL followed by the request's raw
+/// path-and-query, byte for byte: nothing is decoded and re-encoded, and
+/// neither the scheme nor the host of the request is used.
+async fn redirect_old_hosts(
+    axum::extract::State(old): axum::extract::State<Arc<OldHosts>>,
+    req: Request,
+    next: middleware::Next,
+) -> Response {
+    if old.hosts.is_empty() || !is_old_host(&old.hosts, &req) {
+        return next.run(req).await;
+    }
+    let target = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    let target = if target.starts_with('/') { target } else { "/" };
+    let location = format!("{}{target}", old.base);
+    match HeaderValue::try_from(location) {
+        Ok(location) => {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::PERMANENT_REDIRECT;
+            res.headers_mut().insert(header::LOCATION, location);
+            res
+        }
+        // A request URI is visible ASCII, so this does not happen; if it
+        // ever did, the root of the public URL beats serving the old host.
+        Err(_) => {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::PERMANENT_REDIRECT;
+            if let Ok(root) = HeaderValue::try_from(format!("{}/", old.base)) {
+                res.headers_mut().insert(header::LOCATION, root);
+            }
+            res
+        }
+    }
+}
+
+/// Whether the request's `Host` (HTTP/2's `:authority` when there is no
+/// header), without its port, is one of `hosts` (all lowercase).
+fn is_old_host(hosts: &[String], req: &Request) -> bool {
+    let authority = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let Some(authority) = authority else {
+        return false;
+    };
+    let host = authority.split(':').next().unwrap_or_default();
+    let host = host.strip_suffix('.').unwrap_or(host);
+    hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
 
 /// The web console's sign-in, when `CXP_CONSOLE_CLIENT_ID` is set.
@@ -654,6 +722,108 @@ mod tests {
                 "{challenge}"
             );
         }
+    }
+
+    fn redirecting_app() -> Router {
+        let mut config = Config::for_test();
+        config.redirect_hosts = vec!["old.example.com".into()];
+        app_from(config, PlatformCheck::Accepted)
+    }
+
+    #[tokio::test]
+    async fn an_old_host_gets_a_308_to_the_public_url_on_every_method_and_path() {
+        for (method, target, host, location) in [
+            (
+                "GET",
+                "/mcp?session=a%2Fb&x=1",
+                "old.example.com",
+                "https://cxp.example.com/mcp?session=a%2Fb&x=1",
+            ),
+            (
+                "POST",
+                "/mcp?x=1",
+                "OLD.example.com:8080",
+                "https://cxp.example.com/mcp?x=1",
+            ),
+            (
+                "DELETE",
+                "/api/v1/customers/1",
+                "old.example.com.",
+                "https://cxp.example.com/api/v1/customers/1",
+            ),
+            (
+                "GET",
+                "/.well-known/oauth-protected-resource",
+                "old.example.com",
+                "https://cxp.example.com/.well-known/oauth-protected-resource",
+            ),
+            (
+                "GET",
+                "/healthz",
+                "old.example.com",
+                "https://cxp.example.com/healthz",
+            ),
+            (
+                "GET",
+                "/console/",
+                "old.example.com",
+                "https://cxp.example.com/console/",
+            ),
+            ("GET", "/", "old.example.com", "https://cxp.example.com/"),
+            // Raw: dot segments, doubled slashes, and escapes are not touched.
+            (
+                "GET",
+                "//evil.example/%2e%2e/a%20b?q=%zz",
+                "old.example.com",
+                "https://cxp.example.com//evil.example/%2e%2e/a%20b?q=%zz",
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(target)
+                .header("host", host)
+                .header("authorization", "Bearer nope")
+                .body(Body::from("ignored"))
+                .unwrap();
+            let (status, headers, body) = send_raw(redirecting_app(), req).await;
+            assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "{method} {target}");
+            assert_eq!(headers[header::LOCATION], location, "{method} {target}");
+            assert!(body.is_empty(), "{method} {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_cannot_choose_where_the_redirect_goes() {
+        let req = Request::builder()
+            .uri("http://evil.example/mcp")
+            .header("host", "old.example.com")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-forwarded-proto", "http")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_raw(redirecting_app(), req).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(headers[header::LOCATION], "https://cxp.example.com/mcp");
+    }
+
+    #[tokio::test]
+    async fn other_hosts_are_not_redirected() {
+        for host in [
+            "cxp.example.com",
+            "old.example.com.evil.example",
+            "xold.example.com",
+        ] {
+            let req = request("GET", "/healthz", &[]);
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert("host", host.parse().unwrap());
+            let req = Request::from_parts(parts, body);
+            let (status, headers, _) = send_raw(redirecting_app(), req).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+            assert!(headers.get(header::LOCATION).is_none(), "{host}");
+        }
+        // With none configured (the default) nothing redirects.
+        let (status, _, _) = call("GET", "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
