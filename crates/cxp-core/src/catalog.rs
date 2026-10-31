@@ -1,4 +1,4 @@
-//! The experience catalog: `CatalogExt` on `otto_tenant::Tx` —
+//! The experience catalog: `CatalogExt` on `savvagent_tenant::Tx` —
 //! experiences, applications, pages, and components, each optionally owned by
 //! a platform team (`team_id`) — with its model structs.
 //!
@@ -14,9 +14,9 @@
 //! the team is a [`TeamChange`]: leave it, clear it, or set it.
 
 use chrono::{DateTime, Utc};
-use otto_resource::PlatformClient;
-use otto_tenant::ids::{OrgId, TeamId};
-use otto_tenant::Tx;
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::ids::{OrgId, TeamId};
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::future::Future;

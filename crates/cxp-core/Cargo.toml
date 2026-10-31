@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-otto-tenant.workspace = true
-otto-resource.workspace = true
+savvagent-tenant.workspace = true
+savvagent-resource.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,8 +24,8 @@ base64.workspace = true
 # Captures log lines the tests assert on.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
-otto-resource.workspace = true
-otto-tenant.workspace = true
+savvagent-resource.workspace = true
+savvagent-tenant.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

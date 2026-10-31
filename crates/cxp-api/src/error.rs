@@ -91,7 +91,7 @@ fn status_for(e: &cxp_core::Error) -> StatusCode {
         // so gets `Retry-After`); a platform that no longer knows the org is a
         // revocation; anything else is ours to fix, not the caller's to retry.
         Error::Platform(p) if p.is_retriable() => StatusCode::SERVICE_UNAVAILABLE,
-        Error::Platform(otto_resource::Error::NotFound) => StatusCode::UNAUTHORIZED,
+        Error::Platform(savvagent_resource::Error::NotFound) => StatusCode::UNAUTHORIZED,
         Error::Platform(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         Error::Tenant(_) | Error::Database(_) => {
             if e.code() == "invalid_argument" {
@@ -114,14 +114,14 @@ impl From<cxp_core::Error> for ApiError {
     }
 }
 
-impl From<otto_tenant::Error> for ApiError {
-    fn from(e: otto_tenant::Error) -> Self {
+impl From<savvagent_tenant::Error> for ApiError {
+    fn from(e: savvagent_tenant::Error) -> Self {
         cxp_core::Error::from(e).into()
     }
 }
 
-impl From<otto_resource::Error> for ApiError {
-    fn from(e: otto_resource::Error) -> Self {
+impl From<savvagent_resource::Error> for ApiError {
+    fn from(e: savvagent_resource::Error) -> Self {
         cxp_core::Error::Platform(e).into()
     }
 }
@@ -215,18 +215,18 @@ mod tests {
             (Error::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
             (Error::QueryTooBroad, StatusCode::UNPROCESSABLE_ENTITY),
             (
-                Error::Platform(otto_resource::Error::Status {
+                Error::Platform(savvagent_resource::Error::Status {
                     status: 503,
                     body: String::new(),
                 }),
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
-                Error::Platform(otto_resource::Error::NotFound),
+                Error::Platform(savvagent_resource::Error::NotFound),
                 StatusCode::UNAUTHORIZED,
             ),
             (
-                Error::Platform(otto_resource::Error::Unauthorized),
+                Error::Platform(savvagent_resource::Error::Unauthorized),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
@@ -234,7 +234,7 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
-                Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
+                Error::Tenant(savvagent_tenant::Error::Invalid("bad".into())),
                 StatusCode::BAD_REQUEST,
             ),
             (
@@ -274,8 +274,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(res.headers().get(header::RETRY_AFTER).is_none());
         // A platform failure no retry can fix is not told to retry.
-        let res =
-            ApiError::from(Error::Platform(otto_resource::Error::Unauthorized)).into_response();
+        let res = ApiError::from(Error::Platform(savvagent_resource::Error::Unauthorized))
+            .into_response();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(res.headers().get(header::RETRY_AFTER).is_none());
         let big = ApiError::payload_too_large();

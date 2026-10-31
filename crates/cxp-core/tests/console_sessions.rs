@@ -10,9 +10,9 @@ use common::{db, org, tenant_role_db, user};
 use cxp_core::console_sessions::{self, Claim, Lease, NewSession, Refreshed};
 use cxp_core::platform_events::{self, Outcome};
 use cxp_core::Error;
-use otto_tenant::crypto::Cipher;
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::Db;
+use savvagent_tenant::crypto::Cipher;
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::Db;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -128,20 +128,20 @@ async fn an_expired_session_is_not_found(pool: PgPool) {
 async fn no_session_is_created_for_a_deleted_org_or_a_removed_member(pool: PgPool) {
     let db = db(pool);
     let (gone, live, leaver) = (org(), org(), user());
-    let deleted = otto_resource::webhook::body(
+    let deleted = savvagent_resource::webhook::body(
         Uuid::new_v4(),
         "org.deleted",
         Utc::now(),
         &json!({"org_id": gone.as_uuid()}),
     );
-    let removed = otto_resource::webhook::body(
+    let removed = savvagent_resource::webhook::body(
         Uuid::new_v4(),
         "member.removed",
         Utc::now(),
         &json!({"org_id": live.as_uuid(), "user_id": leaver.as_uuid()}),
     );
     for body in [deleted, removed] {
-        let event = otto_resource::webhook::parse(&body).unwrap();
+        let event = savvagent_resource::webhook::parse(&body).unwrap();
         platform_events::apply(&db, &event).await.unwrap();
     }
     for (o, u) in [(gone, user()), (live, leaver)] {
@@ -507,7 +507,7 @@ const NO_LONGER_THAN: std::time::Duration = std::time::Duration::from_secs(10);
 /// cut a statement off.
 fn sqlstate_of<T: std::fmt::Debug>(result: &Result<T, Error>) -> Option<String> {
     match result {
-        Err(Error::Database(e)) | Err(Error::Tenant(otto_tenant::Error::Db(e))) => e
+        Err(Error::Database(e)) | Err(Error::Tenant(savvagent_tenant::Error::Db(e))) => e
             .as_database_error()
             .and_then(|d| d.code())
             .map(|c| c.into_owned()),
@@ -782,13 +782,13 @@ async fn member_removed_deletes_that_members_sessions_once(pool: PgPool) {
     let kept_other_org = new_session(&db, elsewhere, leaver, Duration::days(1)).await;
     let kept_other_user = new_session(&db, o, stays, Duration::days(1)).await;
 
-    let body = otto_resource::webhook::body(
+    let body = savvagent_resource::webhook::body(
         Uuid::new_v4(),
         "member.removed",
         Utc::now(),
         &json!({"org_id": o.as_uuid(), "user_id": leaver.as_uuid()}),
     );
-    let event = otto_resource::webhook::parse(&body).unwrap();
+    let event = savvagent_resource::webhook::parse(&body).unwrap();
     assert!(matches!(
         platform_events::apply(&db, &event).await.unwrap(),
         Outcome::Applied { .. }

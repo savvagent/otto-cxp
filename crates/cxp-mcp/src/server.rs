@@ -22,8 +22,6 @@ use std::sync::Arc;
 use cxp_core::auth::{MissingScope, Principal};
 use cxp_core::search::{SearchLimiter, SearchPermit};
 use cxp_core::usage::{Meter, Warmed};
-use otto_resource::PlatformClient;
-use otto_tenant::{Db, Tx};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
@@ -32,6 +30,8 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool_handler, RoleServer, ServerHandler};
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::{Db, Tx};
 
 use crate::error;
 
@@ -241,7 +241,7 @@ impl<T> McpResult<T> for cxp_core::Result<T> {
     }
 }
 
-impl<T> McpResult<T> for otto_tenant::Result<T> {
+impl<T> McpResult<T> for savvagent_tenant::Result<T> {
     fn mcp(self) -> Result<T, ErrorData> {
         self.map_err(error::from_tenant)
     }
@@ -253,7 +253,7 @@ impl<T> McpResult<T> for Result<T, MissingScope> {
     }
 }
 
-impl<T> McpResult<T> for otto_resource::Result<T> {
+impl<T> McpResult<T> for savvagent_resource::Result<T> {
     fn mcp(self) -> Result<T, ErrorData> {
         self.map_err(error::from_platform)
     }

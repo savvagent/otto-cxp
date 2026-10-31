@@ -316,7 +316,7 @@ reaches the server's statement log):
 CREATE ROLE cxp_server LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION
   CONNECTION LIMIT 15;
 \password cxp_server
--- INHERIT and SET, the defaults: otto-tenant needs both to SET LOCAL ROLE otto_app.
+-- INHERIT and SET, the defaults: savvagent-tenant needs both to SET LOCAL ROLE otto_app.
 GRANT otto_app TO cxp_server;
 -- Migration 0003's console_session_org sets this custom parameter in its SET clause, which only
 -- a superuser or a role granted SET on it may define (Postgres 15+). Without the grant, a
@@ -1064,7 +1064,7 @@ SELECT max(version) FROM _sqlx_migrations;
 -- NOLOGIN: only ever a SET LOCAL ROLE target. It holds nothing until migration 0008 grants it
 -- otto_cxp's tenant grants, and is a member of nothing.
 CREATE ROLE cxp_app NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
--- INHERIT and SET (the defaults): otto-tenant needs SET for SET LOCAL ROLE cxp_app, and the
+-- INHERIT and SET (the defaults): savvagent-tenant needs SET for SET LOCAL ROLE cxp_app, and the
 -- background tasks, which run as cxp_server itself, use the grants it inherits.
 GRANT cxp_app TO cxp_server;
 ```
@@ -1382,12 +1382,12 @@ fly certs add cxp.savvagent.com -a otto-cxp
 fly postgres attach otto-db -a otto-cxp --database-name otto_cxp
 
 # 3. Register the resource server at the platform (run on the platform's machine).
-fly ssh console -a otto-platform -C 'otto-platform-server resource register \
+fly ssh console -a otto-platform -C 'savvagent-platform-server resource register \
   https://cxp.savvagent.com/mcp --name "Savvagent CXP" \
   --scopes cxp:read,cxp:write --default-scopes cxp:read --service otto-cxp'
-fly ssh console -a otto-platform -C 'otto-platform-server resource rotate-secret \
+fly ssh console -a otto-platform -C 'savvagent-platform-server resource rotate-secret \
   https://cxp.savvagent.com/mcp'                      # prints sav_rs_... once
-fly ssh console -a otto-platform -C 'otto-platform-server resource set-webhook \
+fly ssh console -a otto-platform -C 'savvagent-platform-server resource set-webhook \
   https://cxp.savvagent.com/mcp https://cxp.savvagent.com/platform/webhooks'
                                                       # prints sav_whsec_... once
 
@@ -1444,7 +1444,7 @@ the audience check after it.
 curl -fsS https://cxp.savvagent.com/healthz                       # ok: DNS and certificate
 fly certs list -a otto-cxp                                        # both hosts Issued
 fly secrets list -a otto-cxp        # no CXP_PUBLIC_URL / CXP_RESOURCE_URI secret overriding fly.toml
-fly ssh console -a otto-platform -C 'otto-platform-server resource show https://cxp.savvagent.com/mcp'
+fly ssh console -a otto-platform -C 'savvagent-platform-server resource show https://cxp.savvagent.com/mcp'
                                     # the canonical URI, its old one a `live` alias, the webhook URL
 ```
 
@@ -1479,7 +1479,7 @@ none is lost. The webhook must name the new host before #135: the platform does 
 redirects.
 
 ```bash
-platform() { fly ssh console --quiet -a otto-platform -C "otto-platform-server resource $*" | tr -d '\r'; }
+platform() { fly ssh console --quiet -a otto-platform -C "savvagent-platform-server resource $*" | tr -d '\r'; }
 
 WHSEC="$(platform set-webhook https://cxp.savvagent.com/mcp https://cxp.savvagent.com/platform/webhooks | grep -E '^sav_whsec_')"
 RS="$(platform rotate-secret https://cxp.savvagent.com/mcp | grep -E '^sav_rs_')"
@@ -1490,7 +1490,7 @@ unset WHSEC RS
 
 fly secrets list -a otto-cxp                     # both Deployed, new digests
 curl -fsS https://cxp.savvagent.com/readyz       # ready (a rejected secret is a 503 here)
-fly ssh console -a otto-platform -C 'otto-platform-server resource show https://cxp.savvagent.com/mcp'
+fly ssh console -a otto-platform -C 'savvagent-platform-server resource show https://cxp.savvagent.com/mcp'
                                                  # webhook=https://cxp.savvagent.com/platform/webhooks
 ```
 
@@ -1569,7 +1569,7 @@ this order, because a client id without the key fails the boot (naming the key):
 ```bash
 # 1. Register the console as a public, first-party client (no secret, no consent screen)
 #    whose only redirect URI is {CXP_PUBLIC_URL}/auth/callback. Run on the platform's machine.
-fly ssh console -a otto-platform -C 'otto-platform-server client register \
+fly ssh console -a otto-platform -C 'savvagent-platform-server client register \
   --name "Savvagent CXP console" \
   --redirect-uri https://cxp.savvagent.com/auth/callback --first-party'
 #    -> prints the client_id

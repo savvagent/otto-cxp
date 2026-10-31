@@ -28,7 +28,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 

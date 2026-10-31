@@ -16,7 +16,7 @@ use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
 use cxp_core::search::SearchLimiter;
-use otto_resource::{
+use savvagent_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role,
     TeamInfo, TokenKind, UsageBatch, UsageReceipt, UserInfo,
 };
@@ -189,10 +189,10 @@ async fn start_platform() -> (String, Shared) {
 /// Mint a well-formed token the stub introspects as given, and make its user
 /// a member of the org (on no team).
 fn token(p: &Shared, org: Uuid, user: Uuid, scopes: &[&str], aud: &str) -> String {
-    prefixed_token(p, "otto_at_", org, user, scopes, aud)
+    prefixed_token(p, "sav_at_", org, user, scopes, aud)
 }
 
-/// [`token`], with the given prefix (`otto_at_`, `sav_at_`, ...).
+/// [`token`], with the given prefix (`sav_at_`, `sav_pat_`, ...).
 fn prefixed_token(
     p: &Shared,
     prefix: &str,
@@ -202,7 +202,7 @@ fn prefixed_token(
     aud: &str,
 ) -> String {
     let t = format!("{prefix}{}{}", "a".repeat(11), Uuid::new_v4().simple());
-    assert!(otto_resource::looks_like_token(&t), "{t}");
+    assert!(savvagent_resource::looks_like_token(&t), "{t}");
     let mut p = p.lock().unwrap();
     p.tokens.insert(
         t.clone(),
@@ -325,7 +325,7 @@ impl Harness {
             .uri("/platform/webhooks")
             .header("content-type", "application/json");
         if let Some(s) = signature {
-            req = req.header(otto_resource::webhook::SIGNATURE_HEADER, s);
+            req = req.header(savvagent_resource::webhook::SIGNATURE_HEADER, s);
         }
         self.send(req.body(Body::from(body.to_vec())).unwrap())
             .await
@@ -342,8 +342,8 @@ impl Harness {
 }
 
 fn signed(kind: &str, data: Value) -> (Vec<u8>, String) {
-    let body = otto_resource::webhook::body(Uuid::new_v4(), kind, Utc::now(), &data);
-    let sig = otto_resource::webhook::sign(SECRET, Utc::now().timestamp(), &body);
+    let body = savvagent_resource::webhook::body(Uuid::new_v4(), kind, Utc::now(), &data);
+    let sig = savvagent_resource::webhook::sign(SECRET, Utc::now().timestamp(), &body);
     (body, sig)
 }
 
@@ -391,16 +391,21 @@ async fn no_token_is_401_with_the_discovery_challenge(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
-async fn sav_and_otto_prefixed_tokens_are_both_accepted(pool: PgPool) {
-    // The platform moves to `sav_` tokens (savvagent/otto-platform#128); the
-    // service must accept them before the platform mints them, and keep
-    // accepting `otto_` ones until every outstanding one has expired.
+async fn sav_prefixed_tokens_are_accepted_and_otto_ones_refused(pool: PgPool) {
+    // The platform's switch to Savvagent (savvagent/otto-platform#128) retired
+    // every `otto_` sign-in token, so the client no longer lets one through.
     let h = harness(pool).await;
-    for prefix in ["sav_at_", "sav_pat_", "otto_at_", "otto_pat_"] {
+    for prefix in ["sav_at_", "sav_pat_"] {
         let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
         let t = prefixed_token(&h.stub, prefix, org, user, RW, RESOURCE);
         let r = h.call("GET", "/api/v1/customers", Some(&t), None).await;
         assert_eq!(r.status, StatusCode::OK, "{prefix}: {}", r.body);
+    }
+    for prefix in ["otto_at_", "otto_pat_"] {
+        let t = format!("{prefix}{}", "a".repeat(43));
+        assert!(!savvagent_resource::looks_like_token(&t), "{prefix}");
+        let r = h.call("GET", "/api/v1/customers", Some(&t), None).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{prefix}: {}", r.body);
     }
 }
 
@@ -408,7 +413,7 @@ async fn sav_and_otto_prefixed_tokens_are_both_accepted(pool: PgPool) {
 async fn a_token_for_another_resource_or_unknown_to_the_platform_is_401(pool: PgPool) {
     let h = harness(pool).await;
     let elsewhere = token(&h.stub, Uuid::new_v4(), Uuid::new_v4(), RW, OTHER_RESOURCE);
-    let unknown = format!("otto_at_{}", "b".repeat(43));
+    let unknown = format!("sav_at_{}", "b".repeat(43));
     for t in [elsewhere.as_str(), unknown.as_str()] {
         let r = h.call("GET", "/api/v1/customers", Some(t), None).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
@@ -1069,8 +1074,9 @@ async fn webhooks_are_verified_applied_once_and_null_a_deleted_teams_catalog(poo
     let (body, sig) = signed("team.deleted", json!({"org_id": org, "team_id": team}));
 
     // Missing, malformed, and wrong signatures are refused before parsing.
-    let wrong = otto_resource::webhook::sign("otto_whsec_wrong", Utc::now().timestamp(), &body);
-    let stale = otto_resource::webhook::sign(SECRET, Utc::now().timestamp() - 3600, &body);
+    let wrong =
+        savvagent_resource::webhook::sign("otto_whsec_wrong", Utc::now().timestamp(), &body);
+    let stale = savvagent_resource::webhook::sign(SECRET, Utc::now().timestamp() - 3600, &body);
     for s in [
         None,
         Some("t=1,v1=zz"),
@@ -1103,7 +1109,7 @@ async fn webhooks_are_verified_applied_once_and_null_a_deleted_teams_catalog(poo
     );
 
     // A redelivery (signed afresh, same event id) is a duplicate.
-    let resigned = otto_resource::webhook::sign(SECRET, Utc::now().timestamp(), &body);
+    let resigned = savvagent_resource::webhook::sign(SECRET, Utc::now().timestamp(), &body);
     let r = h.webhook(Some(&resigned), &body).await;
     assert_eq!(
         (r.status, r.body["result"].clone()),
@@ -1120,7 +1126,7 @@ async fn webhooks_are_verified_applied_once_and_null_a_deleted_teams_catalog(poo
 
     // Signed but unreadable is 400.
     let junk = br#"{"not": "an event"}"#;
-    let sig = otto_resource::webhook::sign(SECRET, Utc::now().timestamp(), junk);
+    let sig = savvagent_resource::webhook::sign(SECRET, Utc::now().timestamp(), junk);
     let r = h.webhook(Some(&sig), junk).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 
@@ -1177,7 +1183,7 @@ async fn a_webhook_that_cannot_be_applied_is_503(pool: PgPool) {
 async fn without_a_webhook_secret_every_delivery_is_refused(pool: PgPool) {
     let h = harness_with(pool, "").await;
     let (body, _) = signed("org.deleted", json!({"org_id": Uuid::new_v4()}));
-    let sig = otto_resource::webhook::sign("", Utc::now().timestamp(), &body);
+    let sig = savvagent_resource::webhook::sign("", Utc::now().timestamp(), &body);
     let r = h.webhook(Some(&sig), &body).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     assert_eq!(r.body["code"], "invalid_signature");
@@ -1292,7 +1298,10 @@ async fn survey_responses_answer_the_list_envelope(pool: PgPool) {
     // domain API on an org-pinned transaction, under RLS like a request. Test
     // setup only: request paths open with `begin_live`.
     let db = cxp_core::tenant_db(h.pool.clone());
-    let mut tx = db.begin(otto_tenant::ids::OrgId::from(org)).await.unwrap();
+    let mut tx = db
+        .begin(savvagent_tenant::ids::OrgId::from(org))
+        .await
+        .unwrap();
     for customer in [customers[0], customers[1], customers[0]] {
         tx.submit_survey_response(survey, customer, &json!({"q1": 9}))
             .await

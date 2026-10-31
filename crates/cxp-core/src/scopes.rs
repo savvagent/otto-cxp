@@ -1,6 +1,6 @@
 //! The scopes Savvagent CXP's resource server understands.
 //!
-//! Registered with the platform (`otto-platform-server resource register
+//! Registered with the platform (`savvagent-platform-server resource register
 //! --scopes …`, see docs/deploy/fly.md), advertised in
 //! `/.well-known/oauth-protected-resource`, and checked by every route and
 //! by every tool except `whoami` and `usage`, which need no scope. One list,

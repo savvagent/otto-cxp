@@ -1,9 +1,9 @@
-//! The knowledge base: `KnowledgeExt` on `otto_tenant::Tx` —
+//! The knowledge base: `KnowledgeExt` on `savvagent_tenant::Tx` —
 //! articles and their full-text search — with its model structs.
 
 use std::sync::LazyLock;
 
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

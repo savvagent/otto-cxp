@@ -35,11 +35,11 @@ use cxp_core::platform_events::PURGED_TABLES;
 use cxp_core::usage::{ShipperConfig, BILLABLE};
 use cxp_server::{meter, platform_client, router, Config};
 use http::{HeaderMap, Method, Request, StatusCode};
-use otto_resource::{
+use savvagent_resource::{
     IntrospectionResponse, MemberInfo, MemberTeams, OrgInfo, PlatformClient, Role, TeamInfo,
     TokenKind, UsageBatch, UsageEvent, UsageReceipt, UserInfo,
 };
-use otto_tenant::Db;
+use savvagent_tenant::Db;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -287,8 +287,8 @@ impl Server {
     /// Mint a token the mock introspects as given, for a member of `org` on
     /// no team.
     fn token_for(&self, org: Uuid, user: Uuid, scopes: &[&str], aud: &str) -> String {
-        let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
-        assert!(otto_resource::looks_like_token(&t), "{t}");
+        let t = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+        assert!(savvagent_resource::looks_like_token(&t), "{t}");
         let mut p = self.mock.lock().unwrap();
         p.tokens.insert(
             t.clone(),
@@ -430,7 +430,7 @@ impl Server {
         self.send(
             Request::post("/platform/webhooks")
                 .header("content-type", "application/json")
-                .header(otto_resource::webhook::SIGNATURE_HEADER, signature)
+                .header(savvagent_resource::webhook::SIGNATURE_HEADER, signature)
                 .body(Body::from(body.to_vec()))
                 .unwrap(),
         )
@@ -479,8 +479,8 @@ fn code(e: &Value) -> &str {
 }
 
 fn signed(event: Uuid, kind: &str, data: Value) -> (Vec<u8>, String) {
-    let body = otto_resource::webhook::body(event, kind, Utc::now(), &data);
-    let sig = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let body = savvagent_resource::webhook::body(event, kind, Utc::now(), &data);
+    let sig = savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
     (body, sig)
 }
 
@@ -546,7 +546,7 @@ async fn criterion_1_unauthenticated_and_foreign_tokens_are_401_and_discovery_is
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 
     // A well-formed token the platform does not know is inactive: 401.
-    let unknown = format!("otto_at_{}{}", "z".repeat(11), Uuid::new_v4().simple());
+    let unknown = format!("sav_at_{}{}", "z".repeat(11), Uuid::new_v4().simple());
     let mcp = s.send(Server::mcp_request(Some(&unknown), &whoami)).await;
     let api = s
         .api("GET", "/api/v1/customers", Some(&unknown), None)
@@ -854,7 +854,7 @@ async fn seed(s: &Server, a: &Caller) -> Seeded {
     // sign-in, so it is stored directly, as the callback stores it).
     cxp_core::console_sessions::create(
         &s.db,
-        &otto_tenant::crypto::Cipher::from_base64_key(
+        &savvagent_tenant::crypto::Cipher::from_base64_key(
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         )
         .unwrap(),
@@ -1787,18 +1787,20 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
     // ---------------------------------------------------------- signatures
     let deleted = Uuid::new_v4();
     let (body, sig) = signed(deleted, "org.deleted", json!({"org_id": a.org}));
-    let forged = otto_resource::webhook::sign("otto_whsec_wrong", Utc::now().timestamp(), &body);
+    let forged =
+        savvagent_resource::webhook::sign("otto_whsec_wrong", Utc::now().timestamp(), &body);
     for bad in [forged.as_str(), "t=1,v1=00", ""] {
         let r = s.webhook(&body, bad).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{bad:?}: {}", r.body);
     }
     // A genuine signature from an hour ago is a replay: refused.
-    let stale = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp() - 3600, &body);
+    let stale =
+        savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp() - 3600, &body);
     let r = s.webhook(&body, &stale).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "stale: {}", r.body);
     // Correctly signed but not an event: 400, nothing applied.
     let junk = br#"{"not": "an event"}"#;
-    let junk_sig = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), junk);
+    let junk_sig = savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), junk);
     let r = s.webhook(junk, &junk_sig).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "malformed: {}", r.body);
     assert_eq!(events_recorded(&s, deleted).await, 0);
@@ -1815,7 +1817,7 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
     // surfaces refuse it.
     assert_eq!(status_of(&s, &a.token).await, refused);
     // Replayed (re-signed, same event id): a duplicate with no further effect.
-    let resigned = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let resigned = savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
     let r = s.webhook(&body, &resigned).await;
     assert_eq!(
         (r.status, r.body["result"].clone()),
@@ -1841,7 +1843,7 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
     assert_eq!(r.body["result"], "applied", "{}", r.body);
     assert_eq!(status_of(&s, &c1.token).await, refused);
     assert_eq!(status_of(&s, &c2.token).await, ok, "only that member");
-    let resigned = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let resigned = savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
     let r = s.webhook(&body, &resigned).await;
     assert_eq!(r.body["result"], "duplicate", "{}", r.body);
     assert_eq!(events_recorded(&s, removed).await, 1);
@@ -1917,7 +1919,7 @@ async fn criterion_4_lifecycle_webhooks_are_verified_and_applied_once(pool: PgPo
         Some(json!({"team_id": kept})),
     )
     .await;
-    let resigned = otto_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let resigned = savvagent_resource::webhook::sign(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
     let r = s.webhook(&body, &resigned).await;
     assert_eq!(r.body["result"], "duplicate", "{}", r.body);
     assert_eq!(events_recorded(&s, team_event).await, 1);
@@ -2007,7 +2009,7 @@ async fn the_server_boots_serves_and_flushes_usage_on_shutdown(pool: PgPool) {
     let resource = config.resource_uri.clone();
 
     let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
-    let token = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    let token = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
     mock.lock().unwrap().tokens.insert(
         token.clone(),
         (org, user, vec!["cxp:write".into()], resource),
@@ -2145,7 +2147,7 @@ async fn surveys_and_responses_are_metered_after_the_declaration(pool: PgPool) {
     let resource = config.resource_uri.clone();
 
     let (org, user) = (Uuid::new_v4(), Uuid::new_v4());
-    let token = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    let token = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
     mock.lock().unwrap().tokens.insert(
         token.clone(),
         (org, user, vec!["cxp:write".into()], resource),
@@ -2650,7 +2652,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
 
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     let token = |org: Uuid| {
-        let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+        let t = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
         mock.lock().unwrap().tokens.insert(
             t.clone(),
             (
@@ -2726,7 +2728,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
         let res = http
             .post(format!("{base}/platform/webhooks"))
             .header("content-type", "application/json")
-            .header(otto_resource::webhook::SIGNATURE_HEADER, sig)
+            .header(savvagent_resource::webhook::SIGNATURE_HEADER, sig)
             .body(body)
             .send()
             .await
@@ -2842,7 +2844,7 @@ async fn the_service_runs_whole_as_a_runtime_role_that_owns_nothing(pool: PgPool
     let cookie = "e2e-least-privilege-cookie";
     cxp_core::console_sessions::create(
         &cxp_core::tenant_db(pool.clone()),
-        &otto_tenant::crypto::Cipher::from_base64_key(
+        &savvagent_tenant::crypto::Cipher::from_base64_key(
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         )
         .unwrap(),
@@ -3384,7 +3386,7 @@ async fn a_deployment_refuses_a_runtime_role_that_cannot_assume_cxp_app(pool: Pg
     assert!(!err.contains("tenant transactions run as"), "{err}");
 }
 
-/// Locally too: the runtime-grant check only warns there, and otto-tenant
+/// Locally too: the runtime-grant check only warns there, and savvagent-tenant
 /// would run tenant transactions as the login itself, so boot refuses.
 #[sqlx::test(migrations = false)]
 async fn a_runtime_role_that_cannot_assume_cxp_app_is_refused_even_locally(pool: PgPool) {

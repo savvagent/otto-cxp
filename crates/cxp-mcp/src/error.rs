@@ -52,12 +52,12 @@ pub fn from_core(e: &Error) -> ErrorData {
 
 /// A tenant-substrate failure: wrapped as the domain does, so only its
 /// `Invalid` text is ever shown.
-pub fn from_tenant(e: otto_tenant::Error) -> ErrorData {
+pub fn from_tenant(e: savvagent_tenant::Error) -> ErrorData {
     from_core(&Error::Tenant(e))
 }
 
 /// A platform lookup (`whoami`'s member, `usage`'s report) that failed.
-pub fn from_platform(e: otto_resource::Error) -> ErrorData {
+pub fn from_platform(e: savvagent_resource::Error) -> ErrorData {
     from_core(&Error::Platform(e))
 }
 
@@ -169,7 +169,7 @@ mod tests {
             Error::Unavailable,
             Error::QueryTooBroad,
             pg_error(),
-            Error::Tenant(otto_tenant::Error::Config("secret".into())),
+            Error::Tenant(savvagent_tenant::Error::Config("secret".into())),
         ] {
             let wire = from_core(&e);
             let d = wire.data.expect("data");
@@ -182,20 +182,20 @@ mod tests {
     /// and agrees with the code.
     #[test]
     fn platform_failures_carry_a_consistent_code_and_retriable_flag() {
-        let wire = |e: otto_resource::Error| {
+        let wire = |e: savvagent_resource::Error| {
             let w = from_platform(e);
             let d = w.data.unwrap();
             (w.code, d["code"].clone(), d["retriable"].clone())
         };
         assert_eq!(
-            wire(otto_resource::Error::Status {
+            wire(savvagent_resource::Error::Status {
                 status: 503,
                 body: "down".into()
             }),
             (ErrorCode::INTERNAL_ERROR, "unavailable".into(), true.into())
         );
         assert_eq!(
-            wire(otto_resource::Error::NotFound),
+            wire(savvagent_resource::Error::NotFound),
             (
                 ErrorCode::INVALID_REQUEST,
                 "access_revoked".into(),
@@ -203,7 +203,7 @@ mod tests {
             )
         );
         assert_eq!(
-            wire(otto_resource::Error::Unauthorized),
+            wire(savvagent_resource::Error::Unauthorized),
             (ErrorCode::INTERNAL_ERROR, "internal".into(), false.into())
         );
     }
@@ -233,11 +233,11 @@ mod tests {
         assert!(!db.message.contains("customers"), "{}", db.message);
         assert!(!db.message.contains("secret"), "{}", db.message);
 
-        let t = from_tenant(otto_tenant::Error::Config("secret key path".into()));
+        let t = from_tenant(savvagent_tenant::Error::Config("secret key path".into()));
         assert!(!t.message.contains("secret"), "{}", t.message);
         assert_eq!(t.data.unwrap()["code"], "internal");
 
-        let invalid = from_tenant(otto_tenant::Error::Invalid("bad org".into()));
+        let invalid = from_tenant(savvagent_tenant::Error::Invalid("bad org".into()));
         assert_eq!(invalid.message, "bad org");
         assert_eq!(invalid.data.unwrap()["code"], "invalid_argument");
     }

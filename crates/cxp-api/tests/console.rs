@@ -18,8 +18,8 @@ use axum::{Form, Json, Router};
 use chrono::Utc;
 use cxp_api::{router, AppState, Config};
 use cxp_http::console::{pkce_challenge, Console, ConsoleKeys, ConsoleSettings};
-use otto_resource::{ClientConfig, IntrospectionResponse, PlatformClient, Role, TokenKind};
-use otto_tenant::crypto::Cipher;
+use savvagent_resource::{ClientConfig, IntrospectionResponse, PlatformClient, Role, TokenKind};
+use savvagent_tenant::crypto::Cipher;
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -72,7 +72,7 @@ fn new_token(prefix: &str) -> String {
 }
 
 fn issue(p: &mut Platform, grant: Grant) -> Value {
-    let (access, refresh) = (new_token("otto_at_"), new_token("otto_rt_"));
+    let (access, refresh) = (new_token("sav_at_"), new_token("sav_rt_"));
     if !p.issue_inactive {
         p.tokens.insert(access.clone(), grant.clone());
     }
@@ -431,12 +431,12 @@ async fn the_console_signs_in_through_the_platform(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!((stored.0, stored.1), (org, user));
-    assert!(!stored.2.windows(7).any(|w| w == b"otto_at"));
+    assert!(!stored.2.windows(7).any(|w| w == b"sav_at"));
     // Sealed with the session-token subkey, never the configured key itself
     // or the oauth cookie's subkey.
     let keys = ConsoleKeys::derive(KEY).unwrap();
     let opened = cxp_core::sealed::open(&keys.session_tokens, &stored.2).unwrap();
-    assert!(opened.starts_with(b"otto_at_"));
+    assert!(opened.starts_with(b"sav_at_"));
     assert!(cxp_core::sealed::open(&Cipher::from_base64_key(KEY).unwrap(), &stored.2).is_err());
     assert!(cxp_core::sealed::open(&keys.oauth_flow, &stored.2).is_err());
 
@@ -643,7 +643,7 @@ async fn a_cookie_write_must_come_from_this_origin(pool: PgPool) {
 async fn a_bearer_decides_over_a_cookie(pool: PgPool) {
     let h = harness(pool).await;
     let (org, user, cookie) = h.sign_in().await;
-    let bearer = new_token("otto_at_");
+    let bearer = new_token("sav_at_");
     h.stub.lock().unwrap().tokens.insert(
         bearer.clone(),
         (org, user, vec!["cxp:read".into(), "cxp:write".into()]),
@@ -671,10 +671,7 @@ async fn a_bearer_decides_over_a_cookie(pool: PgPool) {
             "GET",
             "/api/v1/customers",
             &[
-                (
-                    "authorization",
-                    &format!("Bearer {}", new_token("otto_at_")),
-                ),
+                ("authorization", &format!("Bearer {}", new_token("sav_at_"))),
                 ("cookie", &cookie),
             ],
             None,
@@ -741,18 +738,19 @@ async fn a_dead_session_is_401(pool: PgPool) {
     for kind in ["org.deleted", "member.removed"] {
         let (org, user, cookie) = h.sign_in().await;
         assert_eq!(get(cookie.clone()).await.status, StatusCode::OK);
-        let body = otto_resource::webhook::body(
+        let body = savvagent_resource::webhook::body(
             Uuid::new_v4(),
             kind,
             Utc::now(),
             &json!({"org_id": org, "user_id": user}),
         );
-        let sig = otto_resource::webhook::sign("otto_whsec_test", Utc::now().timestamp(), &body);
+        let sig =
+            savvagent_resource::webhook::sign("otto_whsec_test", Utc::now().timestamp(), &body);
         let r = h
             .send(
                 Request::post("/platform/webhooks")
                     .header("content-type", "application/json")
-                    .header(otto_resource::webhook::SIGNATURE_HEADER, sig)
+                    .header(savvagent_resource::webhook::SIGNATURE_HEADER, sig)
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -888,19 +886,20 @@ async fn a_slow_refresh_does_not_block_an_org_deleted_webhook(
         while h.stub.lock().unwrap().refresh_requests == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let body = otto_resource::webhook::body(
+        let body = savvagent_resource::webhook::body(
             Uuid::new_v4(),
             "org.deleted",
             Utc::now(),
             &json!({"org_id": org}),
         );
-        let sig = otto_resource::webhook::sign("otto_whsec_test", Utc::now().timestamp(), &body);
+        let sig =
+            savvagent_resource::webhook::sign("otto_whsec_test", Utc::now().timestamp(), &body);
         let started = Instant::now();
         let r = h
             .send(
                 Request::post("/platform/webhooks")
                     .header("content-type", "application/json")
-                    .header(otto_resource::webhook::SIGNATURE_HEADER, sig)
+                    .header(savvagent_resource::webhook::SIGNATURE_HEADER, sig)
                     .body(Body::from(body))
                     .unwrap(),
             )

@@ -67,7 +67,7 @@
 //! row-level security on its own; the kinds that do (relations, the database,
 //! schemas, extensions, functions, and types) are all listed.
 
-use otto_tenant::Db;
+use savvagent_tenant::Db;
 
 use crate::Result;
 
@@ -261,14 +261,14 @@ pub const OWNED_KINDS: [&str; 15] = [
 /// - `inheriting cxp_app` ([`crate::TENANT_ROLE`]): the maintenance sweep, the usage shipper, and
 ///   the console lookup run as the connecting role and use the table and function grants it
 ///   inherits from the tenant role (#28); a `NOINHERIT` login, or a grant `WITH INHERIT FALSE`,
-///   holds none of them, and otto-tenant's assumability probe (`pg_has_role(..., 'USAGE')`) is then
+///   holds none of them, and savvagent-tenant's assumability probe (`pg_has_role(..., 'USAGE')`) is then
 ///   false and it skips `SET LOCAL ROLE`.
 pub const RUNTIME_GRANTS: [&str; 2] = ["INSERT on deleted_orgs", "inheriting cxp_app"];
 
 /// The tenant role the otto services on a shared instance may share. otto-cxp no longer uses it
 /// (#28), but the release before it does, so the runtime login stays a member until that
 /// release cannot come back (docs/deploy/fly.md, runbook T5).
-pub const SHARED_TENANT_ROLE: &str = otto_tenant::db::DEFAULT_TENANT_ROLE;
+pub const SHARED_TENANT_ROLE: &str = savvagent_tenant::db::DEFAULT_TENANT_ROLE;
 
 /// One privileged role, and which of the session's users holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]

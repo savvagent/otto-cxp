@@ -1,5 +1,5 @@
 //! Feedback, surveys, and survey responses: `FeedbackExt` on
-//! `otto_tenant::Tx`, with its model structs.
+//! `savvagent_tenant::Tx`, with its model structs.
 //!
 //! Customer ids arrive already resolved. Every statement binds the org
 //! explicitly as well as relying on row-level security, and the composite
@@ -8,7 +8,7 @@
 //! billable tools charge in the layer above.
 
 use chrono::{DateTime, Utc};
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

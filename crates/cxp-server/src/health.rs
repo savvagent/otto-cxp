@@ -53,7 +53,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use otto_tenant::Db;
+use savvagent_tenant::Db;
 use tokio::sync::watch;
 
 use crate::PlatformCheck;

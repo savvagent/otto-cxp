@@ -1,6 +1,6 @@
 //! otto-cxp's own migrations, in `crates/cxp-core/migrations`.
 //!
-//! **Never call `otto_tenant::Db::migrate` on this database.** It applies
+//! **Never call `savvagent_tenant::Db::migrate` on this database.** It applies
 //! otto-platform's migration history, whose version numbers collide with this
 //! one's. The platform's schema lives in the platform's database.
 //!
@@ -8,7 +8,7 @@
 //! history: the baseline here is a fresh, org-scoped schema for a fresh
 //! database.
 
-use otto_tenant::Db;
+use savvagent_tenant::Db;
 use sqlx::migrate::Migrator;
 
 /// Every migration in `./migrations`, embedded at compile time. Tests use it

@@ -45,7 +45,7 @@ is a JSON 404.
 
 **Crates (`crates/`):**
 - `cxp-core` - everything that touches SQL, plus domain logic: `migrations/` (append-only), tenancy
-  (`otto_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
+  (`savvagent_tenant`), the per-domain `*Ext` traits (customers, support, feedback, catalog, dashboard),
   analytics (NPS, CSAT, sentiment: pure functions), `scopes`, `platform_events` (lifecycle webhooks,
   `begin_live`), `usage` (metering: value meters, declaration, outbox shipper), `console_sessions`
   (the web console's sign-in sessions; tokens sealed with an HKDF subkey of `CXP_ENCRYPTION_KEY`; refresh by lease +
@@ -87,7 +87,7 @@ response. Every tool checks `cxp:read` or `cxp:write`, except `whoami` and `usag
 scope (`tools::UNSCOPED`).
 
 ### Tenancy: `Tx` extension traits and `begin_live`
-Domain operations are methods on extension traits implemented for `otto_tenant::Tx<'_>` (for example
+Domain operations are methods on extension traits implemented for `savvagent_tenant::Tx<'_>` (for example
 `impl CustomersExt for Tx<'_>`), binding `self.org()` and executing on `self.conn()`. Request paths open
 the transaction with `platform_events::begin_live` (it also refuses revoked orgs and members; `begin_live_bounded`
 is the same plus transaction-local lock and statement timeouts), never
@@ -167,7 +167,7 @@ All `CXP_*`; `cxp-server` `config.rs` is the source of truth, `.env.example` the
 - Runtime `sqlx::query`/`query_as` only, never the `query!` macros; no SQL outside `cxp-core`
 - Errors: `cxp_core::Error` with a stable `code()`; its `Display` never includes database text
 - Tests use `#[sqlx::test]` against a real Postgres, no mocks
-- Dependencies are declared in the root `[workspace.dependencies]`; `otto-tenant` and `otto-resource` share one git rev
+- Dependencies are declared in the root `[workspace.dependencies]`; `savvagent-tenant` and `savvagent-resource` share one git rev
 - TypeScript SDK: dual CJS+ESM via tsup, strict mode, `.js` extension imports
 - Licensing: AGPL-3.0-or-later for `crates/`, `apps/`, repo-level files; MIT for `sdk/` and `packages/`
 
@@ -252,14 +252,14 @@ another port (`podman run -d --name cxp-pg-<branch_> -e POSTGRES_USER=cxp -e POS
 - Migrations (agent): apply in the CI deploy job (`scripts/deploy/run-migrate.sh`: `cxp-server migrate` as `cxp_owner`, a one-off machine of `otto-cxp-migrate`, before `fly deploy`) under sqlx's advisory lock; confirm `applying migrations` / `migrations applied` in the Migrate step's log. A hand `fly deploy` does not migrate (docs/deploy/fly.md, "Deploys"). A privilege the runtime needs beyond the tenant role `cxp_app` is granted to `cxp_runtime` in the migration. In a deployment the release command also verifies that migration 0006's grant landed (`cxp_runtime` exists, with `INSERT` on `deleted_orgs`, `db_role::missing_cxp_runtime_install`) and fails the release otherwise, since 0006 grants only when the role already existed.
 - New non-secret config key (agent, in the PR): `fly.toml` `[env]`, `.env.example`, and `crates/cxp-server/src/config.rs`.
 - New secret (human: Rob, before merge): `fly secrets set -a otto-cxp --stage NAME=…`; the PR updates `.env.example` and the secrets table in `docs/deploy/fly.md`.
-- New scope (human: Rob, before merge): the PR updates `cxp_core::scopes::KNOWN`/`DEFAULT`; Rob re-runs `otto-platform-server resource register …` from `docs/deploy/fly.md`.
-- otto-platform pin (agent, own PR): `otto-tenant` and `otto-resource` move to the same rev together.
+- New scope (human: Rob, before merge): the PR updates `cxp_core::scopes::KNOWN`/`DEFAULT`; Rob re-runs `savvagent-platform-server resource register …` from `docs/deploy/fly.md`.
+- otto-platform pin (agent, own PR): `savvagent-tenant` and `savvagent-resource` move to the same rev together.
 - Database role change (human: Rob, before merge): a change to the role otto-cxp connects as, or to what it may connect to, ships with a runbook in `docs/deploy/fly.md` ("Database role") that Rob runs before the PR merges; the PR body lists the steps.
 
 ### Human-only
 Hand these to Rob with the exact command; never run them:
 - Any production write, DDL, `DROP`, or role change on `otto-db` (the shared Fly Postgres also hosting `otto_platform`, `otto_factory`, and `otto_flags`). Production diagnostics are SELECT-only.
-- `fly apps create`, `fly postgres attach`, `fly secrets set`, `fly certs add`, DNS, setting the `FLY_API_TOKEN` secret or `FLY_DEPLOY` variable on the repo, and platform-side `otto-platform-server resource …` / `client register …` commands.
+- `fly apps create`, `fly postgres attach`, `fly secrets set`, `fly certs add`, DNS, setting the `FLY_API_TOKEN` secret or `FLY_DEPLOY` variable on the repo, and platform-side `savvagent-platform-server resource …` / `client register …` commands.
 - A hand `fly deploy` (only when Rob asks).
 - Creating `otto-cxp-migrate`, its deploy token (`FLY_API_TOKEN_MIGRATE`), and setting `CXP_MIGRATION_DATABASE_URL` on it only (docs/deploy/fly.md, "owner credential" runbook).
 - Anything that adds recurring cost: a new app, bigger VM, `min_machines_running > 0`, a volume, a database, or a paid service.
@@ -280,4 +280,4 @@ Reviewers check every one. Design: `docs/specs/2026-10-14-otto-resource-server-d
 - **Untrusted text:** customer-supplied text returned by a tool is data, and database error text never reaches a response.
 - **The database is small and shared:** pool capped by `CXP_DB_MAX_CONNECTIONS` (5); no unbounded list queries.
 - **Licensing:** `crates/`, `apps/`, and repo-level files are AGPL-3.0-or-later; `sdk/` and `packages/` are MIT.
-- **otto-platform pin:** `otto-tenant` and `otto-resource` share one git rev in the root `Cargo.toml`.
+- **otto-platform pin:** `savvagent-tenant` and `savvagent-resource` share one git rev in the root `Cargo.toml`.

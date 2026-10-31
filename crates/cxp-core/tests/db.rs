@@ -7,8 +7,8 @@
 mod common;
 
 use common::{as_app_maintenance, as_app_unpinned, db, org, sqlstate, tenant_role_db};
-use otto_tenant::ids::OrgId;
-use otto_tenant::Db;
+use savvagent_tenant::ids::OrgId;
+use savvagent_tenant::Db;
 use sqlx::migrate::MigrateError;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -2630,13 +2630,13 @@ async fn tenant_transactions_cannot_write_the_tombstone(pool: PgPool) {
     as_login.pool().close().await;
 }
 
-/// The release before #28 builds its Db with otto-tenant's default role. During the rollout,
+/// The release before #28 builds its Db with savvagent-tenant's default role. During the rollout,
 /// and after a rollback, it runs against a schema migration 0008 has changed: otto_app keeps
 /// every grant, so isolation still holds as otto_app.
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn the_previous_release_still_isolates_as_otto_app(pool: PgPool) {
     #[allow(clippy::disallowed_methods)] // deliberately the previous release's construction
-    let previous = otto_tenant::Db::from_pool(pool.clone());
+    let previous = savvagent_tenant::Db::from_pool(pool.clone());
     let report = previous
         .verify_tenant_isolation()
         .await

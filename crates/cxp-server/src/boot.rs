@@ -18,8 +18,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use cxp_core::db_role::DbRole;
 use cxp_core::usage::{ShipError, ShipperConfig};
-use otto_resource::{PlatformClient, TokenClaims};
-use otto_tenant::Db;
+use savvagent_resource::{PlatformClient, TokenClaims};
+use savvagent_tenant::Db;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinError;
@@ -40,7 +40,7 @@ pub const PLATFORM_EVENT_RETENTION_DAYS: i32 = 30;
 pub struct Boot {
     /// [`DbRole::summary`] of the role this process connects as, as logged.
     pub database_role: String,
-    /// [`otto_tenant::IsolationReport::summary`], as logged.
+    /// [`savvagent_tenant::IsolationReport::summary`], as logged.
     pub isolation: String,
     pub platform: PlatformCheck,
 }
@@ -65,8 +65,8 @@ pub enum PlatformCheck {
 /// `Ok(None)`; only the platform's introspection endpoint answers that way,
 /// which is why this probes it rather than a lookup where a 404 would also be
 /// "fine".
-pub fn classify(probe: otto_resource::Result<Option<TokenClaims>>) -> PlatformCheck {
-    use otto_resource::Error;
+pub fn classify(probe: savvagent_resource::Result<Option<TokenClaims>>) -> PlatformCheck {
+    use savvagent_resource::Error;
     match probe {
         Ok(_) => PlatformCheck::Accepted,
         Err(Error::Unauthorized) => PlatformCheck::Rejected,
@@ -79,8 +79,8 @@ pub fn classify(probe: otto_resource::Result<Option<TokenClaims>>) -> PlatformCh
 /// client actually asks (it answers malformed strings itself).
 fn probe_token() -> String {
     let random = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let token = format!("otto_at_{}", &random[..43]);
-    debug_assert!(otto_resource::looks_like_token(&token));
+    let token = format!("sav_at_{}", &random[..43]);
+    debug_assert!(savvagent_resource::looks_like_token(&token));
     token
 }
 
@@ -747,7 +747,7 @@ fn flush_result(
 /// than sweep platform events.
 const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 
-/// Whether tenant transactions really run as otto-cxp's own tenant role. otto-tenant issues
+/// Whether tenant transactions really run as otto-cxp's own tenant role. savvagent-tenant issues
 /// `SET LOCAL ROLE cxp_app` only when the role exists and the login holds it, and otherwise
 /// runs tenant transactions as the login itself, which `verify_tenant_isolation` accepts for any
 /// role that is neither superuser nor BYPASSRLS. That login also holds the background grants
@@ -757,7 +757,7 @@ const SWEEPER: &str = "the sweeper (retention and database-role re-check)";
 /// superuser passes this one (0008 creates `cxp_app`, and a superuser may `SET ROLE` to it), so
 /// a local exception would only ever admit the silent fallback this exists to stop.
 pub fn check_tenant_role(
-    report: &otto_tenant::isolation::IsolationReport,
+    report: &savvagent_tenant::isolation::IsolationReport,
     login: &str,
 ) -> Result<()> {
     if report.tenant_role_assumed && report.effective_role == cxp_core::TENANT_ROLE {
@@ -849,10 +849,10 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::post;
     use axum::{Json, Router};
-    use otto_resource::{ClientConfig, IntrospectionResponse};
+    use savvagent_resource::{ClientConfig, IntrospectionResponse};
 
-    fn report(effective: &str, assumed: bool) -> otto_tenant::isolation::IsolationReport {
-        otto_tenant::isolation::IsolationReport {
+    fn report(effective: &str, assumed: bool) -> savvagent_tenant::isolation::IsolationReport {
+        savvagent_tenant::isolation::IsolationReport {
             tenant_role: cxp_core::TENANT_ROLE.into(),
             effective_role: effective.into(),
             tenant_role_assumed: assumed,
@@ -865,7 +865,7 @@ mod tests {
     #[test]
     fn boot_refuses_tenant_transactions_that_did_not_assume_cxp_app() {
         assert!(check_tenant_role(&report("cxp_app", true), "cxp_server").is_ok());
-        // cxp_app missing, or the login not a member: otto-tenant skipped SET LOCAL ROLE.
+        // cxp_app missing, or the login not a member: savvagent-tenant skipped SET LOCAL ROLE.
         let err = check_tenant_role(&report("cxp_server", false), "cxp_server")
             .unwrap_err()
             .to_string();
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn the_probe_is_a_well_formed_token_nobody_holds() {
         let (a, b) = (probe_token(), probe_token());
-        assert!(otto_resource::looks_like_token(&a), "{a}");
+        assert!(savvagent_resource::looks_like_token(&a), "{a}");
         assert_ne!(a, b);
     }
 
@@ -953,17 +953,19 @@ mod tests {
     #[test]
     fn only_a_flush_failure_that_will_not_pass_fails_the_exit() {
         let status = |status| {
-            Ok(Err(ShipError::Platform(otto_resource::Error::Status {
-                status,
-                body: String::new(),
-            })))
+            Ok(Err(ShipError::Platform(
+                savvagent_resource::Error::Status {
+                    status,
+                    body: String::new(),
+                },
+            )))
         };
         assert_eq!(flush_result(Ok(Ok(()))), Ok(()));
         for passes in [503, 502, 429, 408] {
             assert_eq!(flush_result(status(passes)), Ok(()), "{passes}");
         }
         let err = flush_result(Ok(Err(ShipError::Platform(
-            otto_resource::Error::Unauthorized,
+            savvagent_resource::Error::Unauthorized,
         ))))
         .unwrap_err();
         assert!(err.contains("final usage flush failed"), "{err}");

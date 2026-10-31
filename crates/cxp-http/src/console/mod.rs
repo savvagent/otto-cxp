@@ -125,10 +125,10 @@ use cxp_core::console_sessions::{self, Claim, Lease, Refreshed, Session, REFRESH
 use futures::future::{BoxFuture, FutureExt, Shared};
 use hkdf::Hkdf;
 use http::{HeaderMap, Method};
-use otto_resource::PlatformClient;
-use otto_tenant::crypto::Cipher;
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::Db;
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::crypto::Cipher;
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::Db;
 use sha2::Sha256;
 
 pub use cookies::same_origin;

@@ -12,7 +12,7 @@ use chrono::Utc;
 use cxp_core::auth::{self, AuthFailure};
 use cxp_core::console_sessions::{self, NewSession};
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
-use otto_resource::Role;
+use savvagent_resource::Role;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 

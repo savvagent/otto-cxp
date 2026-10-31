@@ -12,8 +12,8 @@
 
 #![allow(dead_code)]
 
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::Db;
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::Db;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -97,7 +97,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use cxp_core::catalog::{verify_team, VerifiedTeam};
-use otto_resource::{ClientConfig, PlatformClient, TeamInfo};
+use savvagent_resource::{ClientConfig, PlatformClient, TeamInfo};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -240,7 +240,7 @@ fn as_capped(ids: Vec<Uuid>, count: i64) -> Searched {
 /// `search_customers` and the pre-#17 scan, for one query and page, in the
 /// same transaction. `None` when search refuses the query as invalid.
 pub async fn customers_both_ways(
-    tx: &mut otto_tenant::Tx<'_>,
+    tx: &mut savvagent_tenant::Tx<'_>,
     q: &str,
     page: Page,
 ) -> Option<(Searched, Searched)> {
@@ -279,7 +279,7 @@ pub async fn customers_both_ways(
 
 /// `search_articles` and the pre-#17 scan, as [`customers_both_ways`].
 pub async fn articles_both_ways(
-    tx: &mut otto_tenant::Tx<'_>,
+    tx: &mut savvagent_tenant::Tx<'_>,
     q: &str,
 ) -> Option<(Searched, Searched)> {
     let org = tx.org();
@@ -363,7 +363,7 @@ pub fn within_contract(found: &Searched, scanned_count: i64, matches: &[Uuid]) -
 }
 
 /// Every customer of this org matching `q` under the pre-#17 predicate.
-pub async fn customer_matches(tx: &mut otto_tenant::Tx<'_>, q: &str) -> Vec<Uuid> {
+pub async fn customer_matches(tx: &mut savvagent_tenant::Tx<'_>, q: &str) -> Vec<Uuid> {
     let q = q.trim();
     sqlx::query_scalar(
         "SELECT id FROM customers \

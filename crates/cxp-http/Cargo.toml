@@ -7,8 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 cxp-core.workspace = true
-otto-tenant.workspace = true
-otto-resource.workspace = true
+savvagent-tenant.workspace = true
+savvagent-resource.workspace = true
 axum.workspace = true
 http.workspace = true
 tokio.workspace = true

@@ -1,5 +1,5 @@
 //! Customer segments and their members: `SegmentsExt` on
-//! `otto_tenant::Tx`, with its model structs.
+//! `savvagent_tenant::Tx`, with its model structs.
 //!
 //! A `static` segment's members are the rows in `segment_members`. A `dynamic`
 //! segment's members are the customers its `criteria` match, evaluated when
@@ -13,7 +13,7 @@
 use std::future::Future;
 
 use chrono::{DateTime, Utc};
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
