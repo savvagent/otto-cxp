@@ -1,10 +1,10 @@
 //! Customer interactions and journeys: `InteractionsExt` on
-//! `otto_tenant::Tx`, with its model structs.
+//! `savvagent_tenant::Tx`, with its model structs.
 
 use std::future::Future;
 
 use chrono::{DateTime, Utc};
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

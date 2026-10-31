@@ -30,9 +30,9 @@
 
 use std::time::Duration;
 
-use otto_resource::webhook::{LifecycleEvent, WebhookEvent};
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::{Db, Tx};
+use savvagent_resource::webhook::{LifecycleEvent, WebhookEvent};
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::{Db, Tx};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -302,10 +302,10 @@ pub async fn apply(db: &Db, event: &WebhookEvent) -> Result<Outcome> {
         LifecycleEvent::TeamDeleted { org_id, team_id } => {
             team_deleted(db, event, (*org_id).into(), *team_id).await
         }
-        // A kind otto-resource itself does not know: a platform newer than
+        // A kind savvagent-resource itself does not know: a platform newer than
         // the pinned client added it, and no release of this service could
         // act on it without a client bump first. Acknowledged, as
-        // otto-resource documents, or the platform would retry it forever.
+        // savvagent-resource documents, or the platform would retry it forever.
         LifecycleEvent::Unknown { kind } => {
             tracing::warn!(kind = %kind, event_id = %event.id, "ignoring unknown platform event");
             Ok(Outcome::Ignored)

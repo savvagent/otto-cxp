@@ -8,8 +8,8 @@ use cxp_core::customers::{Customer, CustomerFilter, CustomerUpdate, CustomersExt
 use cxp_core::interactions::{parse_json, InteractionsExt, NewInteraction, INTERACTION_TYPES};
 use cxp_core::segments::{NewSegment, SegmentsExt};
 use cxp_core::{Error, Page};
-use otto_tenant::ids::OrgId;
-use otto_tenant::Db;
+use savvagent_tenant::ids::OrgId;
+use savvagent_tenant::Db;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -31,7 +31,7 @@ async fn add(db: &Db, org: OrgId, c: NewCustomer) -> Customer {
 
 /// Put a customer in a static segment with raw SQL: nothing in the domain API
 /// writes members.
-async fn member(tx: &mut otto_tenant::Tx<'_>, org: OrgId, segment: Uuid, customer: Uuid) {
+async fn member(tx: &mut savvagent_tenant::Tx<'_>, org: OrgId, segment: Uuid, customer: Uuid) {
     sqlx::query(
         "INSERT INTO segment_members (org_id, segment_id, customer_id) VALUES ($1, $2, $3)",
     )
@@ -46,7 +46,7 @@ async fn member(tx: &mut otto_tenant::Tx<'_>, org: OrgId, segment: Uuid, custome
 /// Give a row an explicit creation time, `hours` after a fixed origin, so
 /// ordering assertions cannot pass on ties (every row of one transaction
 /// shares `now()`). `table` is a constant from these tests.
-async fn stamp(tx: &mut otto_tenant::Tx<'_>, table: &str, id: Uuid, hours: i32) {
+async fn stamp(tx: &mut savvagent_tenant::Tx<'_>, table: &str, id: Uuid, hours: i32) {
     sqlx::query(&format!(
         "UPDATE {table} SET created_at = timestamptz '2024-01-01 00:00+00' \
          + make_interval(hours => $2) WHERE id = $1"
@@ -1019,7 +1019,7 @@ const QUERIES: &[&str] = &[
     "mi",
 ];
 
-async fn seed_search_corpus(tx: &mut otto_tenant::Tx<'_>) {
+async fn seed_search_corpus(tx: &mut savvagent_tenant::Tx<'_>) {
     let people: &[(&str, Option<&str>)] = &[
         ("grace@navy.example", Some("Grace Hopper")),
         ("alan@bletchley.example", Some("Alan Turing")),
@@ -1060,7 +1060,7 @@ async fn seed_search_corpus(tx: &mut otto_tenant::Tx<'_>) {
 /// The indexed search and the old full scan agree on `q` and `page`: the
 /// same ids in the same order, and a total that is the exact count (none of
 /// these corpora reaches the cap or a read bound).
-async fn same_both_ways(tx: &mut otto_tenant::Tx<'_>, q: &str, page: Page, what: &str) {
+async fn same_both_ways(tx: &mut savvagent_tenant::Tx<'_>, q: &str, page: Page, what: &str) {
     if let Some((indexed, scanned)) = customers_both_ways(tx, q, page).await {
         assert_eq!(indexed, scanned, "{what}, query {q:?}");
     }
@@ -1550,7 +1550,7 @@ async fn indexed_search_matches_the_scan_on_near_threshold_names(pool: PgPool) {
 
 /// The ids of `found`, ordered as the pre-#17 search orders them: a page
 /// past the cap must still be in that order.
-async fn in_search_order(tx: &mut otto_tenant::Tx<'_>, q: &str, ids: &[Uuid]) -> Vec<Uuid> {
+async fn in_search_order(tx: &mut savvagent_tenant::Tx<'_>, q: &str, ids: &[Uuid]) -> Vec<Uuid> {
     sqlx::query_scalar(
         "SELECT id FROM customers WHERE org_id = $1 AND id = ANY ($4) \
          ORDER BY CASE WHEN email ILIKE $2 THEN 0 ELSE 1 END, \
@@ -1739,7 +1739,10 @@ async fn insert_untriggered(su: &PgPool, org: OrgId, sql: &str) {
 
 /// What search found for `q` against what the scan finds: within the
 /// contract, and `capped` as expected.
-async fn assert_capped_within_contract(tx: &mut otto_tenant::Tx<'_>, q: &str) -> common::Searched {
+async fn assert_capped_within_contract(
+    tx: &mut savvagent_tenant::Tx<'_>,
+    q: &str,
+) -> common::Searched {
     let (found, scanned) = customers_both_ways(tx, q, Page::default()).await.unwrap();
     let matches = common::customer_matches(tx, q).await;
     assert!(

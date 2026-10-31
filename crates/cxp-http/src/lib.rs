@@ -45,8 +45,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use cxp_core::auth::{self, AuthFailure, Principal};
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
-use otto_resource::PlatformClient;
-use otto_tenant::Db;
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::Db;
 
 /// Where the protected-resource metadata is served, and what a `401`'s
 /// `resource_metadata` points at.

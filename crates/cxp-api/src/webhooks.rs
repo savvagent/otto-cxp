@@ -19,7 +19,7 @@ use axum::extract::State;
 use axum::Json;
 use cxp_core::platform_events::{self, Outcome};
 use http::{HeaderMap, StatusCode};
-use otto_resource::webhook::{self, WebhookError};
+use savvagent_resource::webhook::{self, WebhookError};
 
 use crate::error::{ApiError, ApiResult};
 use crate::AppState;
@@ -108,9 +108,9 @@ mod tests {
             Error::Unavailable,
             Error::Database(sqlx::Error::PoolTimedOut),
             Error::Internal("bug".into()),
-            Error::Tenant(otto_tenant::Error::Db(sqlx::Error::PoolClosed)),
-            Error::Tenant(otto_tenant::Error::Config("bad key".into())),
-            Error::Platform(otto_resource::Error::Unauthorized),
+            Error::Tenant(savvagent_tenant::Error::Db(sqlx::Error::PoolClosed)),
+            Error::Tenant(savvagent_tenant::Error::Config("bad key".into())),
+            Error::Platform(savvagent_resource::Error::Unauthorized),
         ] {
             let e = apply_failed(&redeliver, id);
             assert_eq!(
@@ -122,7 +122,7 @@ mod tests {
 
         for never in [
             Error::Invalid("bad org".into()),
-            Error::Tenant(otto_tenant::Error::Invalid("bad org".into())),
+            Error::Tenant(savvagent_tenant::Error::Invalid("bad org".into())),
         ] {
             let e = apply_failed(&never, id);
             assert_eq!(

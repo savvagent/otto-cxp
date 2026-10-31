@@ -82,7 +82,7 @@ pub enum Error {
     ///   platform URL, an unreadable answer): `internal`. Retrying cannot
     ///   help, so the caller is not told to.
     #[error("{}", platform_message(.0))]
-    Platform(#[from] otto_resource::Error),
+    Platform(#[from] savvagent_resource::Error),
 
     /// A server-side programming error (e.g. metering a tool that is not
     /// billable). The detail is for logs (`Debug`); callers see only
@@ -94,7 +94,7 @@ pub enum Error {
     /// caller's request, is shown; its database failures read and code
     /// exactly as [`Error::Database`] does.
     #[error("{}", tenant_message(.0))]
-    Tenant(#[from] otto_tenant::Error),
+    Tenant(#[from] savvagent_tenant::Error),
 
     /// A database failure. A data exception the caller's input caused (a value
     /// too long for its column, out of range, or malformed; SQLSTATE class
@@ -123,8 +123,8 @@ impl BlockedReason {
     /// The stable wire code, as the platform names the reason.
     pub fn code(&self) -> &'static str {
         match self {
-            BlockedReason::BudgetExceeded => otto_resource::BUDGET_EXCEEDED,
-            BlockedReason::PaymentRequired => otto_resource::PAYMENT_REQUIRED,
+            BlockedReason::BudgetExceeded => savvagent_resource::BUDGET_EXCEEDED,
+            BlockedReason::PaymentRequired => savvagent_resource::PAYMENT_REQUIRED,
         }
     }
 }
@@ -174,20 +174,20 @@ fn is_input_rejection(e: &sqlx::Error) -> bool {
     }
 }
 
-fn platform_message(e: &otto_resource::Error) -> &'static str {
+fn platform_message(e: &savvagent_resource::Error) -> &'static str {
     if e.is_retriable() {
         "the Savvagent platform could not be reached; nothing was changed. Retry shortly"
-    } else if matches!(e, otto_resource::Error::NotFound) {
+    } else if matches!(e, savvagent_resource::Error::NotFound) {
         "access to this organization has been revoked; sign in again"
     } else {
         INTERNAL_MESSAGE
     }
 }
 
-fn tenant_message(e: &otto_tenant::Error) -> String {
+fn tenant_message(e: &savvagent_tenant::Error) -> String {
     match e {
-        otto_tenant::Error::Invalid(msg) => msg.clone(),
-        otto_tenant::Error::Db(db) => database_message(db).to_string(),
+        savvagent_tenant::Error::Invalid(msg) => msg.clone(),
+        savvagent_tenant::Error::Db(db) => database_message(db).to_string(),
         _ => INTERNAL_MESSAGE.to_string(),
     }
 }
@@ -199,8 +199,8 @@ impl Error {
     /// yet a live token for an org the platform has forgotten is worth an
     /// operator's look. Every org-scoped platform call that reaches REST or
     /// MCP goes through this.
-    pub fn platform_for(org: otto_tenant::ids::OrgId, e: otto_resource::Error) -> Self {
-        if matches!(e, otto_resource::Error::NotFound) {
+    pub fn platform_for(org: savvagent_tenant::ids::OrgId, e: savvagent_resource::Error) -> Self {
+        if matches!(e, savvagent_resource::Error::NotFound) {
             tracing::warn!(org = %org,
                 "the otto platform does not know this organization; answering access_revoked");
         }
@@ -211,7 +211,7 @@ impl Error {
     /// through the tenant substrate. Both are treated identically.
     fn db(&self) -> Option<&sqlx::Error> {
         match self {
-            Error::Database(e) | Error::Tenant(otto_tenant::Error::Db(e)) => Some(e),
+            Error::Database(e) | Error::Tenant(savvagent_tenant::Error::Db(e)) => Some(e),
             _ => None,
         }
     }
@@ -227,7 +227,9 @@ impl Error {
         }
         match self {
             Error::NotFound { .. } => "not_found",
-            Error::Invalid(_) | Error::Tenant(otto_tenant::Error::Invalid(_)) => "invalid_argument",
+            Error::Invalid(_) | Error::Tenant(savvagent_tenant::Error::Invalid(_)) => {
+                "invalid_argument"
+            }
             Error::Conflict(_) => "conflict",
             Error::UnknownTeam => "unknown_team",
             Error::AccessRevoked => "access_revoked",
@@ -235,7 +237,7 @@ impl Error {
             Error::Unavailable => "unavailable",
             Error::QueryTooBroad => "query_too_broad",
             Error::Platform(p) if p.is_retriable() => "unavailable",
-            Error::Platform(otto_resource::Error::NotFound) => "access_revoked",
+            Error::Platform(savvagent_resource::Error::NotFound) => "access_revoked",
             Error::Platform(_) | Error::Internal(_) | Error::Tenant(_) | Error::Database(_) => {
                 "internal"
             }
@@ -261,9 +263,9 @@ impl Error {
             return !is_input_rejection(e);
         }
         match self {
-            Error::Platform(otto_resource::Error::NotFound) => false,
+            Error::Platform(savvagent_resource::Error::NotFound) => false,
             Error::Platform(_) | Error::Internal(_) => true,
-            Error::Tenant(t) => !matches!(t, otto_tenant::Error::Invalid(_)),
+            Error::Tenant(t) => !matches!(t, savvagent_tenant::Error::Invalid(_)),
             _ => false,
         }
     }
@@ -467,7 +469,7 @@ mod tests {
             (Error::NotFound { kind: "customer" }, "not_found"),
             (Error::Invalid("bad".into()), "invalid_argument"),
             (
-                Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
+                Error::Tenant(savvagent_tenant::Error::Invalid("bad".into())),
                 "invalid_argument",
             ),
             (Error::Conflict("dup".into()), "conflict"),
@@ -478,26 +480,26 @@ mod tests {
             (Error::Unavailable, "unavailable"),
             (Error::QueryTooBroad, "query_too_broad"),
             (
-                Error::Platform(otto_resource::Error::Status {
+                Error::Platform(savvagent_resource::Error::Status {
                     status: 503,
                     body: String::new(),
                 }),
                 "unavailable",
             ),
             (
-                Error::Platform(otto_resource::Error::NotFound),
+                Error::Platform(savvagent_resource::Error::NotFound),
                 "access_revoked",
             ),
             (
-                Error::Platform(otto_resource::Error::Unauthorized),
+                Error::Platform(savvagent_resource::Error::Unauthorized),
                 "internal",
             ),
             (
-                Error::Platform(otto_resource::Error::Decode("x".into())),
+                Error::Platform(savvagent_resource::Error::Decode("x".into())),
                 "internal",
             ),
             (
-                Error::Tenant(otto_tenant::Error::Db(db("23505"))),
+                Error::Tenant(savvagent_tenant::Error::Db(db("23505"))),
                 "internal",
             ),
             (Error::Database(db("23505")), "internal"),
@@ -513,8 +515,8 @@ mod tests {
         let platform_body = "stack trace from the platform";
         for err in [
             Error::Database(db("23505")),
-            Error::Tenant(otto_tenant::Error::Db(db("23505"))),
-            Error::Platform(otto_resource::Error::Status {
+            Error::Tenant(savvagent_tenant::Error::Db(db("23505"))),
+            Error::Platform(savvagent_resource::Error::Status {
                 status: 500,
                 body: platform_body.into(),
             }),
@@ -535,7 +537,7 @@ mod tests {
             "no ticket with that id in this organization"
         );
         assert!(!Error::Invalid("x".into()).is_internal());
-        assert!(!Error::Tenant(otto_tenant::Error::Invalid("x".into())).is_internal());
+        assert!(!Error::Tenant(savvagent_tenant::Error::Invalid("x".into())).is_internal());
     }
 
     #[test]
@@ -554,9 +556,9 @@ mod tests {
         for yes in [
             Error::Database(db("23505")),
             Error::Database(sqlx::Error::PoolTimedOut),
-            Error::Tenant(otto_tenant::Error::Db(db("40001"))),
+            Error::Tenant(savvagent_tenant::Error::Db(db("40001"))),
             Error::Unavailable,
-            Error::Platform(otto_resource::Error::Status {
+            Error::Platform(savvagent_resource::Error::Status {
                 status: 503,
                 body: String::new(),
             }),
@@ -572,8 +574,8 @@ mod tests {
             Error::AccessRevoked,
             blocked(BlockedReason::BudgetExceeded),
             blocked(BlockedReason::PaymentRequired),
-            Error::Platform(otto_resource::Error::Unauthorized),
-            Error::Tenant(otto_tenant::Error::Invalid("bad".into())),
+            Error::Platform(savvagent_resource::Error::Unauthorized),
+            Error::Tenant(savvagent_tenant::Error::Invalid("bad".into())),
         ] {
             assert!(!no.retriable(), "{no:?}");
         }
@@ -612,14 +614,14 @@ mod tests {
     fn tenant_database_errors_are_database_errors() {
         for code in ["22001", "23514", "23505", "40001"] {
             let direct = Error::Database(db(code));
-            let tenant = Error::Tenant(otto_tenant::Error::Db(db(code)));
+            let tenant = Error::Tenant(savvagent_tenant::Error::Db(db(code)));
             assert_eq!(direct.code(), tenant.code(), "{code}");
             assert_eq!(direct.retriable(), tenant.retriable(), "{code}");
             assert_eq!(direct.is_internal(), tenant.is_internal(), "{code}");
             assert_eq!(direct.to_string(), tenant.to_string(), "{code}");
         }
         assert_eq!(
-            Error::Tenant(otto_tenant::Error::Db(db("22001"))).code(),
+            Error::Tenant(savvagent_tenant::Error::Db(db("22001"))).code(),
             "invalid_argument"
         );
     }
@@ -642,7 +644,7 @@ mod tests {
     /// that no longer knows the org is a revocation; anything else is ours.
     #[test]
     fn platform_failures_split_by_whether_a_retry_can_help() {
-        let down = Error::Platform(otto_resource::Error::Status {
+        let down = Error::Platform(savvagent_resource::Error::Status {
             status: 502,
             body: "bad gateway".into(),
         });
@@ -650,18 +652,18 @@ mod tests {
         assert!(down.retriable() && down.is_internal());
         assert!(down.to_string().contains("Retry shortly"), "{down}");
 
-        let gone = Error::Platform(otto_resource::Error::NotFound);
+        let gone = Error::Platform(savvagent_resource::Error::NotFound);
         assert_eq!(gone.code(), "access_revoked");
         assert!(!gone.retriable() && !gone.is_internal());
         assert_eq!(gone.to_string(), Error::AccessRevoked.to_string());
 
         for broken in [
-            otto_resource::Error::Unauthorized,
-            otto_resource::Error::Status {
+            savvagent_resource::Error::Unauthorized,
+            savvagent_resource::Error::Status {
                 status: 404,
                 body: "<html>".into(),
             },
-            otto_resource::Error::Decode("x".into()),
+            savvagent_resource::Error::Decode("x".into()),
         ] {
             let e = Error::Platform(broken);
             assert_eq!(e.code(), "internal", "{e:?}");
@@ -703,11 +705,11 @@ mod tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .finish();
-        let org = otto_tenant::ids::OrgId::new();
+        let org = savvagent_tenant::ids::OrgId::new();
         tracing::subscriber::with_default(subscriber, || {
-            let gone = Error::platform_for(org, otto_resource::Error::NotFound);
+            let gone = Error::platform_for(org, savvagent_resource::Error::NotFound);
             assert_eq!(gone.code(), "access_revoked");
-            let down = Error::platform_for(org, otto_resource::Error::Unauthorized);
+            let down = Error::platform_for(org, savvagent_resource::Error::Unauthorized);
             assert_eq!(down.code(), "internal");
         });
         let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();

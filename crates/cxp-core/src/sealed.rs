@@ -1,5 +1,5 @@
 //! A sealed value as one byte string: `nonce || ciphertext`, from
-//! [`otto_tenant::crypto::Cipher`] (AES-256-GCM with a fresh 96-bit nonce per
+//! [`savvagent_tenant::crypto::Cipher`] (AES-256-GCM with a fresh 96-bit nonce per
 //! seal). The console's stored tokens and its OAuth flow cookie both use this
 //! layout, so the one length check lives here.
 //!
@@ -9,7 +9,7 @@
 //! session row it lands in is still checked against the platform on every
 //! use (the token's org and user must be the row's).
 
-use otto_tenant::crypto::Cipher;
+use savvagent_tenant::crypto::Cipher;
 
 use crate::error::Result;
 
@@ -32,7 +32,7 @@ pub fn seal(cipher: &Cipher, plain: &[u8]) -> Result<Vec<u8>> {
 /// one, sealed under another key, or tampered with is an error.
 pub fn open(cipher: &Cipher, stored: &[u8]) -> Result<Vec<u8>> {
     if stored.len() < NONCE_BYTES + TAG_BYTES {
-        return Err(otto_tenant::Error::Crypto("a sealed value is truncated".into()).into());
+        return Err(savvagent_tenant::Error::Crypto("a sealed value is truncated".into()).into());
     }
     let (nonce, ciphertext) = stored.split_at(NONCE_BYTES);
     Ok(cipher.open(ciphertext, nonce)?)

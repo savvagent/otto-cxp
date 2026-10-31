@@ -19,7 +19,7 @@
 //! ([`crate::platform_events::begin_live`]). It is `pub(crate)` so nothing
 //! outside this crate can reach it.
 
-use otto_tenant::Db;
+use savvagent_tenant::Db;
 use sqlx::{Postgres, Transaction};
 
 /// Open an unpinned transaction on `db`'s pool with the maintenance marker

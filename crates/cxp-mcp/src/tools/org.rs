@@ -70,8 +70,8 @@ impl Cxp {
             role: member.as_ref().map(|m| m.role.into()),
             token: out::TokenOut {
                 kind: match caller.kind {
-                    otto_resource::TokenKind::Oauth => "oauth",
-                    otto_resource::TokenKind::Pat => "pat",
+                    savvagent_resource::TokenKind::Oauth => "oauth",
+                    savvagent_resource::TokenKind::Pat => "pat",
                 },
                 can_read: caller.can_read(),
                 can_write: caller.can_write(),

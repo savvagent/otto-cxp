@@ -20,14 +20,14 @@ use cxp_core::auth::{self, AuthFailure};
 use cxp_core::platform_events::{self, begin_live, Outcome, PURGED_TABLES};
 use cxp_core::usage::{self, Meter, ShipError, ShipperConfig};
 use cxp_core::Error;
-use otto_resource::webhook::WebhookEvent;
-use otto_resource::{
+use savvagent_resource::webhook::WebhookEvent;
+use savvagent_resource::{
     ClientConfig, IntrospectionResponse, PlatformClient, RejectedEvent, Role, TokenKind,
     UsageBatch, UsageEvent, UsageReceipt,
 };
-use otto_resource::{MeterDeclarationBatch, MeterDeclarationReceipt, RejectedMeter};
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::Db;
+use savvagent_resource::{MeterDeclarationBatch, MeterDeclarationReceipt, RejectedMeter};
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::Db;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -271,8 +271,8 @@ fn client(base: &str) -> Arc<PlatformClient> {
 
 /// Mint a well-formed token the stub platform introspects as given.
 fn token(p: &Shared, org: OrgId, user: UserId, scopes: &[&str], aud: &str) -> String {
-    let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
-    assert!(otto_resource::looks_like_token(&t), "{t}");
+    let t = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    assert!(savvagent_resource::looks_like_token(&t), "{t}");
     p.lock().unwrap().tokens.insert(
         t.clone(),
         (
@@ -288,8 +288,8 @@ fn token(p: &Shared, org: OrgId, user: UserId, scopes: &[&str], aud: &str) -> St
 // ------------------------------------------------------------------ fixtures
 
 fn event(kind: &str, data: Value) -> WebhookEvent {
-    let body = otto_resource::webhook::body(Uuid::new_v4(), kind, Utc::now(), &data);
-    otto_resource::webhook::parse(&body).unwrap()
+    let body = savvagent_resource::webhook::body(Uuid::new_v4(), kind, Utc::now(), &data);
+    savvagent_resource::webhook::parse(&body).unwrap()
 }
 
 fn org_deleted(org: OrgId) -> WebhookEvent {
@@ -310,7 +310,7 @@ fn team_deleted(org: OrgId, team: Uuid) -> WebhookEvent {
     )
 }
 
-async fn exec(tx: &mut otto_tenant::Tx<'_>, sql: &str, binds: &[Uuid]) {
+async fn exec(tx: &mut savvagent_tenant::Tx<'_>, sql: &str, binds: &[Uuid]) {
     let mut q = sqlx::query(sql);
     for b in binds {
         q = q.bind(*b);
@@ -1103,7 +1103,7 @@ async fn an_enforcing_meter_refuses_an_org_out_of_budget(pool: PgPool) {
         "thresholds_reached": [],
         "hard_stop": true,
         "blocked": false,
-        "reason": otto_resource::SPEND_UNAVAILABLE,
+        "reason": savvagent_resource::SPEND_UNAVAILABLE,
     }));
     let meter = Meter::new(platform, "https://otto.example.com");
     let report = meter.report(o).await.unwrap();
@@ -1503,7 +1503,7 @@ async fn a_quantity_the_platform_would_refuse_is_moved_aside_unsent(pool: PgPool
          VALUES ($1, 'send_survey', true, 'otto-cxp/surveys_sent', $2)",
     )
     .bind(o.as_uuid())
-    .bind(otto_resource::MAX_METER_QUANTITY as i64 + 1)
+    .bind(savvagent_resource::MAX_METER_QUANTITY as i64 + 1)
     .execute(&pool)
     .await
     .unwrap();
@@ -1529,7 +1529,7 @@ async fn a_quantity_the_platform_would_refuse_is_moved_aside_unsent(pool: PgPool
         rejected,
         vec![(
             Some("otto-cxp/surveys_sent".to_string()),
-            Some(otto_resource::MAX_METER_QUANTITY as i64 + 1),
+            Some(savvagent_resource::MAX_METER_QUANTITY as i64 + 1),
             "invalid_quantity".to_string()
         )]
     );
@@ -1708,7 +1708,7 @@ async fn rows_that_all_have_an_invalid_quantity_send_no_request(pool: PgPool) {
              VALUES ($1, 'send_survey', true, 'otto-cxp/surveys_sent', $2)",
         )
         .bind(o.as_uuid())
-        .bind(otto_resource::MAX_METER_QUANTITY as i64 + 1)
+        .bind(savvagent_resource::MAX_METER_QUANTITY as i64 + 1)
         .execute(&pool)
         .await
         .unwrap();
@@ -1955,7 +1955,7 @@ async fn authenticate_resolves_a_live_token_and_says_why_it_will_not(pool: PgPoo
 
     // Inactive: a token the platform does not know, and one that is not
     // even token-shaped.
-    let unknown = format!("otto_at_{}", "b".repeat(43));
+    let unknown = format!("sav_at_{}", "b".repeat(43));
     for t in [unknown.as_str(), "not-a-token"] {
         assert_eq!(
             auth::authenticate(&db, &platform, Some(&format!("Bearer {t}"))).await,
@@ -2359,7 +2359,10 @@ async fn an_unreachable_platform_never_gives_usage_up(pool: PgPool) {
         make_due(&pool).await;
         let err = usage::ship_once(&db, &dead, &cfg).await.unwrap_err();
         assert!(
-            matches!(err, ShipError::Platform(otto_resource::Error::Transport(_))),
+            matches!(
+                err,
+                ShipError::Platform(savvagent_resource::Error::Transport(_))
+            ),
             "{err}"
         );
         assert!(err.is_retriable());

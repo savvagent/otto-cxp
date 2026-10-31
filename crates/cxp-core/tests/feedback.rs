@@ -9,8 +9,8 @@ use cxp_core::feedback::{
     FeedbackExt, FeedbackFilter, NewFeedback, NewSurvey, SurveyFilter, SurveyUpdate,
 };
 use cxp_core::{Error, Page};
-use otto_tenant::ids::OrgId;
-use otto_tenant::Db;
+use savvagent_tenant::ids::OrgId;
+use savvagent_tenant::Db;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;

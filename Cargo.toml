@@ -22,15 +22,13 @@ cxp-api = { path = "crates/cxp-api" }
 
 # otto-cxp is a resource server of the otto platform: identity, auth, orgs,
 # teams, plans, and billing live there. This workspace links only the
-# tenant-isolation substrate (`otto-tenant`: pinned transactions, RLS proof)
-# and the resource-server client (`otto-resource`: introspection, usage
+# tenant-isolation substrate (`savvagent-tenant`: pinned transactions, RLS proof)
+# and the resource-server client (`savvagent-resource`: introspection, usage
 # shipping, member and team lookups, webhook verification). Each is pinned to
-# a rev and bumped deliberately rather than tracking a branch. otto-resource
-# is ahead of otto-tenant so the service accepts `sav_at_`/`sav_pat_` tokens
-# before the platform mints them (savvagent/otto-platform#128); otto-tenant
-# stays put until it has a reason to move.
-otto-tenant = { git = "https://github.com/savvagent/otto-platform", rev = "bfda55e155be8985761850a7c42980cc926fd4cb" }
-otto-resource = { git = "https://github.com/savvagent/otto-platform", rev = "03f52e9f2139d08d60d0695b5cde4834f0cf19c2" }
+# a rev and bumped deliberately rather than tracking a branch. Both share
+# one rev (the platform's savvagent-* crate rename), so they move together.
+savvagent-tenant = { git = "https://github.com/savvagent/otto-platform", rev = "063472cdb4eef7229d6732578cf061fd963996a4" }
+savvagent-resource = { git = "https://github.com/savvagent/otto-platform", rev = "063472cdb4eef7229d6732578cf061fd963996a4" }
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
@@ -57,12 +55,12 @@ url = "2"
 # deployment's real environment always wins over a file that got shipped.
 dotenvy = "0.15"
 # An HTTP client for the console's calls to the platform's token endpoint
-# and cxp-server's lifecycle test. Already in the tree through otto-resource
+# and cxp-server's lifecycle test. Already in the tree through savvagent-resource
 # (with rustls-tls); no default features here.
 reqwest = { version = "0.12", default-features = false }
 # The console's sign-in: the cookie's SHA-256 (what is stored), its random
 # bytes, base64url for cookies and PKCE, and constant-time comparison of the
-# OAuth state; sha2 and base64 also pin the install page's CSP hashes. All already in the tree through otto-tenant and otto-resource.
+# OAuth state; sha2 and base64 also pin the install page's CSP hashes. All already in the tree through savvagent-tenant and savvagent-resource.
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"

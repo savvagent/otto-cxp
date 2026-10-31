@@ -5,7 +5,7 @@
 
 use cxp_core::feedback::{CsatCounts, NpsCounts};
 use cxp_core::usage::Status;
-use otto_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::ids::{OrgId, UserId};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -69,12 +69,12 @@ pub enum Role {
     Member,
 }
 
-impl From<otto_resource::Role> for Role {
-    fn from(r: otto_resource::Role) -> Self {
+impl From<savvagent_resource::Role> for Role {
+    fn from(r: savvagent_resource::Role) -> Self {
         match r {
-            otto_resource::Role::Owner => Role::Owner,
-            otto_resource::Role::Admin => Role::Admin,
-            otto_resource::Role::Member => Role::Member,
+            savvagent_resource::Role::Owner => Role::Owner,
+            savvagent_resource::Role::Admin => Role::Admin,
+            savvagent_resource::Role::Member => Role::Member,
         }
     }
 }

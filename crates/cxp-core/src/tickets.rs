@@ -1,7 +1,7 @@
-//! Support tickets: `TicketsExt` on `otto_tenant::Tx`, with its
+//! Support tickets: `TicketsExt` on `savvagent_tenant::Tx`, with its
 //! model structs.
 
-use otto_tenant::Tx;
+use savvagent_tenant::Tx;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

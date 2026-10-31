@@ -47,8 +47,8 @@ use axum::{middleware, Router};
 use cxp_core::auth::Principal;
 use cxp_core::search::{SearchLimiter, SearchPermit};
 use http::Method;
-use otto_resource::PlatformClient;
-use otto_tenant::{Db, Tx};
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::{Db, Tx};
 
 pub use error::{ApiError, ApiResult};
 
@@ -295,7 +295,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http::{Request, StatusCode};
-    use otto_resource::{ClientConfig, PlatformClient};
+    use savvagent_resource::{ClientConfig, PlatformClient};
     use tower::ServiceExt;
 
     /// The routes without the bearer layer, over a database and platform

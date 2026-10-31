@@ -66,9 +66,9 @@
 //! as well; the expiry sweep runs under [`crate::maintenance`].
 
 use chrono::{DateTime, Utc};
-use otto_tenant::crypto::Cipher;
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::{Db, Tx};
+use savvagent_tenant::crypto::Cipher;
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::{Db, Tx};
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
@@ -171,7 +171,7 @@ fn seal(cipher: &Cipher, plain: &str) -> Result<Vec<u8>> {
 
 fn open(cipher: &Cipher, stored: &[u8]) -> Result<String> {
     String::from_utf8(sealed::open(cipher, stored)?).map_err(|_| {
-        otto_tenant::Error::Crypto("a sealed session token is not UTF-8".into()).into()
+        savvagent_tenant::Error::Crypto("a sealed session token is not UTF-8".into()).into()
     })
 }
 

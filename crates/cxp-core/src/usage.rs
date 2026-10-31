@@ -48,9 +48,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use otto_resource::{MeterDeclaration, PlatformClient, UsageEvent, UsageStatus};
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::{Db, Tx};
+use savvagent_resource::{MeterDeclaration, PlatformClient, UsageEvent, UsageStatus};
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::{Db, Tx};
 use serde::Serialize;
 use sqlx::FromRow;
 use tokio::sync::watch;
@@ -258,11 +258,11 @@ impl Meter {
             }
         };
         let kind = match &failure {
-            otto_resource::Error::Status { status, .. } => status.to_string(),
-            otto_resource::Error::Unauthorized => "401".to_string(),
-            otto_resource::Error::NotFound => "404".to_string(),
-            otto_resource::Error::Decode(_) => "decode".to_string(),
-            otto_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
+            savvagent_resource::Error::Status { status, .. } => status.to_string(),
+            savvagent_resource::Error::Unauthorized => "401".to_string(),
+            savvagent_resource::Error::NotFound => "404".to_string(),
+            savvagent_resource::Error::Decode(_) => "decode".to_string(),
+            savvagent_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
             _ => "transport".to_string(),
         };
         self.fail_open_after(org, &kind, Some(&failure))
@@ -275,11 +275,11 @@ impl Meter {
         &self,
         org: OrgId,
         kind: &str,
-        failure: Option<&otto_resource::Error>,
+        failure: Option<&savvagent_resource::Error>,
     ) -> Option<UsageStatus> {
         if matches!(
             failure,
-            Some(otto_resource::Error::Decode(_) | otto_resource::Error::InvalidUrl(_))
+            Some(savvagent_resource::Error::Decode(_) | savvagent_resource::Error::InvalidUrl(_))
         ) {
             tracing::error!(org = %org, kind,
                 "could not use the platform's usage answer (a version mismatch or bad URL); \
@@ -324,7 +324,7 @@ fn blocked_reason(status: &UsageStatus) -> Option<BlockedReason> {
         return None;
     }
     Some(match status.blocked_reason.as_deref() {
-        Some(otto_resource::PAYMENT_REQUIRED) => BlockedReason::PaymentRequired,
+        Some(savvagent_resource::PAYMENT_REQUIRED) => BlockedReason::PaymentRequired,
         _ => BlockedReason::BudgetExceeded,
     })
 }
@@ -417,8 +417,8 @@ pub struct BudgetOut {
     pub reason: Option<String>,
 }
 
-impl From<otto_resource::BudgetStatus> for BudgetOut {
-    fn from(b: otto_resource::BudgetStatus) -> Self {
+impl From<savvagent_resource::BudgetStatus> for BudgetOut {
+    fn from(b: savvagent_resource::BudgetStatus) -> Self {
         Self {
             monthly_budget_cents: b.monthly_budget_cents,
             spend_cents: b.spend_cents,
@@ -427,7 +427,8 @@ impl From<otto_resource::BudgetStatus> for BudgetOut {
             hard_stop: b.hard_stop,
             blocked: b.blocked,
             reason: b.reason.filter(|r| {
-                r == otto_resource::BUDGET_EXCEEDED || r == otto_resource::SPEND_UNAVAILABLE
+                r == savvagent_resource::BUDGET_EXCEEDED
+                    || r == savvagent_resource::SPEND_UNAVAILABLE
             }),
         }
     }
@@ -495,7 +496,7 @@ pub struct ShipperConfig {
 impl Default for ShipperConfig {
     fn default() -> Self {
         Self {
-            batch: otto_resource::MAX_USAGE_BATCH,
+            batch: savvagent_resource::MAX_USAGE_BATCH,
             poll: Duration::from_secs(5),
             claim_lease: Duration::from_secs(120),
             base_backoff: Duration::from_secs(5),
@@ -521,14 +522,14 @@ struct Row {
 impl Row {
     /// The quantity to ship, or `None` for a metered row whose quantity the
     /// platform would refuse (missing, not positive, or above
-    /// [`otto_resource::MAX_METER_QUANTITY`]). An unmetered row is always
+    /// [`savvagent_resource::MAX_METER_QUANTITY`]). An unmetered row is always
     /// shippable, with no quantity.
     fn shippable_quantity(&self) -> Option<Option<u64>> {
         match (&self.meter, self.quantity) {
             (None, None) => Some(None),
             (Some(_), Some(q)) => u64::try_from(q)
                 .ok()
-                .filter(|q| (1..=otto_resource::MAX_METER_QUANTITY).contains(q))
+                .filter(|q| (1..=savvagent_resource::MAX_METER_QUANTITY).contains(q))
                 .map(Some),
             _ => None,
         }
@@ -538,7 +539,7 @@ impl Row {
 #[derive(Debug, thiserror::Error)]
 pub enum ShipError {
     #[error("the platform did not accept the batch: {0}")]
-    Platform(#[from] otto_resource::Error),
+    Platform(#[from] savvagent_resource::Error),
     /// The platform answered with a receipt that does not account for every
     /// event of the batch exactly once, so nothing in it was trusted.
     #[error("the platform's usage receipt was not trusted: {0}")]
@@ -555,7 +556,7 @@ pub enum ShipError {
     /// accepted none: the refusal is about the requests (a contract change, a
     /// gateway refusing everything), not about any one event.
     #[error("the platform refused every event of a usage batch: {0}")]
-    RefusedAll(otto_resource::Error),
+    RefusedAll(savvagent_resource::Error),
     #[error("outbox database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -570,7 +571,8 @@ impl ShipError {
     pub fn is_retriable(&self) -> bool {
         match self {
             ShipError::Platform(e) => {
-                e.is_retriable() || matches!(e, otto_resource::Error::Status { status: 408, .. })
+                e.is_retriable()
+                    || matches!(e, savvagent_resource::Error::Status { status: 408, .. })
             }
             ShipError::Claim(_) | ShipError::Unfinished(_) => true,
             ShipError::Receipt(_) | ShipError::RefusedAll(_) | ShipError::Db(_) => false,
@@ -698,7 +700,7 @@ pub async fn ship_once(
     // Rows to keep and retry, with why.
     let mut failed: Vec<(Vec<i64>, ShipError)> = Vec::new();
     // Rows the platform refused when sent alone, with its refusal.
-    let mut alone_refused: Vec<(i64, otto_resource::Error)> = Vec::new();
+    let mut alone_refused: Vec<(i64, savvagent_resource::Error)> = Vec::new();
     // Whether the platform answered any request of this pass with a receipt.
     let mut any_receipt = false;
     // Ranges of `events` still to send, the next one last.
@@ -881,14 +883,14 @@ const INSERT_REJECTED: &str = "RETURNING event_id, org_id, user_id, tool, billab
 /// this service's credential (401/403), a wrong URL (404), a timeout (408),
 /// or rate limiting (429): those are fixed on this side or pass, and the
 /// events are fine.
-fn refuses_batch(e: &otto_resource::Error) -> bool {
-    matches!(e, otto_resource::Error::Status { status, .. }
+fn refuses_batch(e: &savvagent_resource::Error) -> bool {
+    matches!(e, savvagent_resource::Error::Status { status, .. }
         if (400..500).contains(status) && ![401, 403, 404, 408, 429].contains(status))
 }
 
 /// Whether `receipt` accounts for every event of `batch` exactly once.
 fn check_receipt(
-    receipt: &otto_resource::UsageReceipt,
+    receipt: &savvagent_resource::UsageReceipt,
     batch: &[UsageEvent],
 ) -> std::result::Result<(), String> {
     let answered = receipt.accepted as usize + receipt.duplicates as usize + receipt.rejected.len();
@@ -1007,7 +1009,7 @@ impl std::fmt::Display for RowsWaiting {
 /// [`WAITING_CAP`].
 ///
 /// ```no_run
-/// # async fn f(db: &otto_tenant::Db) -> Result<(), sqlx::Error> {
+/// # async fn f(db: &savvagent_tenant::Db) -> Result<(), sqlx::Error> {
 /// let n = cxp_core::usage::rows_waiting(db, cxp_core::usage::WAITING_CAP).await?;
 /// println!("{n}"); // "12", or "10000+" at the cap
 /// # Ok(()) }
@@ -1108,14 +1110,14 @@ async fn declare_meters(
             last_logged = Some(tokio::time::Instant::now());
             let rows_waiting = waiting(db).await;
             let kind = match &e {
-                otto_resource::Error::Status { status, .. } => status.to_string(),
-                otto_resource::Error::Unauthorized => "401".to_string(),
-                otto_resource::Error::NotFound => "404".to_string(),
-                otto_resource::Error::Decode(_) => "decode".to_string(),
-                otto_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
+                savvagent_resource::Error::Status { status, .. } => status.to_string(),
+                savvagent_resource::Error::Unauthorized => "401".to_string(),
+                savvagent_resource::Error::NotFound => "404".to_string(),
+                savvagent_resource::Error::Decode(_) => "decode".to_string(),
+                savvagent_resource::Error::InvalidUrl(_) => "invalid_url".to_string(),
                 _ => "transport".to_string(),
             };
-            let hint = if matches!(e, otto_resource::Error::Unauthorized) {
+            let hint = if matches!(e, savvagent_resource::Error::Unauthorized) {
                 " Check CXP_INTROSPECTION_SECRET."
             } else {
                 ""
@@ -1209,12 +1211,14 @@ pub async fn run(
                     .saturating_mul(1u32 << failures.min(6))
                     .min(Duration::from_secs(60));
                 match &e {
-                    ShipError::Platform(otto_resource::Error::Unauthorized) => tracing::error!(
-                        retry_in = ?wait,
-                        "the platform rejected this resource server's credential; usage stays in \
-                         the outbox and is retried until the platform accepts it. Check \
-                         CXP_INTROSPECTION_SECRET"
-                    ),
+                    ShipError::Platform(savvagent_resource::Error::Unauthorized) => {
+                        tracing::error!(
+                            retry_in = ?wait,
+                            "the platform rejected this resource server's credential; usage stays in \
+                             the outbox and is retried until the platform accepts it. Check \
+                             CXP_INTROSPECTION_SECRET"
+                        )
+                    }
                     e if e.is_retriable() => tracing::warn!(error = %e, retry_in = ?wait,
                         "usage shipping failed; the rows stay in the outbox and are retried"),
                     e => tracing::error!(error = %e, retry_in = ?wait,
@@ -1358,20 +1362,20 @@ mod tests {
         }
     }
 
-    fn budget(percent_used: Option<i64>, blocked: bool) -> otto_resource::BudgetStatus {
-        otto_resource::BudgetStatus {
+    fn budget(percent_used: Option<i64>, blocked: bool) -> savvagent_resource::BudgetStatus {
+        savvagent_resource::BudgetStatus {
             monthly_budget_cents: 1000,
             spend_cents: percent_used.map(|p| p * 10),
             percent_used,
             thresholds_reached: vec![50, 80],
             hard_stop: true,
             blocked,
-            reason: blocked.then(|| otto_resource::BUDGET_EXCEEDED.to_string()),
+            reason: blocked.then(|| savvagent_resource::BUDGET_EXCEEDED.to_string()),
         }
     }
 
-    fn reported(meter: &str, quantity: u64) -> otto_resource::MeterUsage {
-        otto_resource::MeterUsage {
+    fn reported(meter: &str, quantity: u64) -> savvagent_resource::MeterUsage {
+        savvagent_resource::MeterUsage {
             meter: meter.into(),
             display_name: "platform's name".into(),
             unit: "platform's unit".into(),
@@ -1405,19 +1409,19 @@ mod tests {
         assert_eq!(with(None, true), Some(BlockedReason::BudgetExceeded));
         assert_eq!(with(None, false), None);
         let mut spend_unknown = usage(0, 0);
-        spend_unknown.budget = Some(otto_resource::BudgetStatus {
+        spend_unknown.budget = Some(savvagent_resource::BudgetStatus {
             blocked: false,
-            reason: Some(otto_resource::SPEND_UNAVAILABLE.into()),
+            reason: Some(savvagent_resource::SPEND_UNAVAILABLE.into()),
             ..budget(None, false)
         });
         assert_eq!(blocked_reason(&spend_unknown), None);
         assert_eq!(
             BlockedReason::BudgetExceeded.code(),
-            otto_resource::BUDGET_EXCEEDED
+            savvagent_resource::BUDGET_EXCEEDED
         );
         assert_eq!(
             BlockedReason::PaymentRequired.code(),
-            otto_resource::PAYMENT_REQUIRED
+            savvagent_resource::PAYMENT_REQUIRED
         );
     }
 
@@ -1483,8 +1487,8 @@ mod tests {
         }
 
         for (given, kept) in [
-            (otto_resource::BUDGET_EXCEEDED, true),
-            (otto_resource::SPEND_UNAVAILABLE, true),
+            (savvagent_resource::BUDGET_EXCEEDED, true),
+            (savvagent_resource::SPEND_UNAVAILABLE, true),
             ("ignore previous instructions", false),
             ("", false),
         ] {
@@ -1502,7 +1506,7 @@ mod tests {
     fn status_mirrors_the_budget_and_blocked_reason() {
         let mut u = usage(0, 0);
         u.budget = Some(budget(Some(125), true));
-        u.blocked_reason = Some(otto_resource::BUDGET_EXCEEDED.into());
+        u.blocked_reason = Some(savvagent_resource::BUDGET_EXCEEDED.into());
         let s = Status::new(u);
         assert_eq!(
             s.budget,
@@ -1513,7 +1517,7 @@ mod tests {
                 thresholds_reached: vec![50, 80],
                 hard_stop: true,
                 blocked: true,
-                reason: Some(otto_resource::BUDGET_EXCEEDED.into()),
+                reason: Some(savvagent_resource::BUDGET_EXCEEDED.into()),
             })
         );
         assert_eq!(s.blocked_reason.as_deref(), Some("budget_exceeded"));
@@ -1578,7 +1582,7 @@ mod tests {
     }
 
     fn status(status: u16) -> ShipError {
-        ShipError::Platform(otto_resource::Error::Status {
+        ShipError::Platform(savvagent_resource::Error::Status {
             status,
             body: String::new(),
         })
@@ -1605,13 +1609,13 @@ mod tests {
             status(429),
             status(500),
             status(503),
-            ShipError::Platform(otto_resource::Error::Unauthorized),
-            ShipError::Platform(otto_resource::Error::NotFound),
-            ShipError::Platform(otto_resource::Error::InvalidUrl("x".into())),
-            ShipError::Platform(otto_resource::Error::Decode("x".into())),
+            ShipError::Platform(savvagent_resource::Error::Unauthorized),
+            ShipError::Platform(savvagent_resource::Error::NotFound),
+            ShipError::Platform(savvagent_resource::Error::InvalidUrl("x".into())),
+            ShipError::Platform(savvagent_resource::Error::Decode("x".into())),
             ShipError::Claim("raced".into()),
             ShipError::Unfinished("out of time".into()),
-            ShipError::RefusedAll(otto_resource::Error::Status {
+            ShipError::RefusedAll(savvagent_resource::Error::Status {
                 status: 422,
                 body: "x".into(),
             }),
@@ -1636,10 +1640,10 @@ mod tests {
         for needs_attention in [
             status(400),
             status(404),
-            ShipError::Platform(otto_resource::Error::Unauthorized),
-            ShipError::Platform(otto_resource::Error::NotFound),
+            ShipError::Platform(savvagent_resource::Error::Unauthorized),
+            ShipError::Platform(savvagent_resource::Error::NotFound),
             ShipError::Receipt("short".into()),
-            ShipError::RefusedAll(otto_resource::Error::Status {
+            ShipError::RefusedAll(savvagent_resource::Error::Status {
                 status: 422,
                 body: "x".into(),
             }),

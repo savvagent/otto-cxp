@@ -8,8 +8,8 @@ use cxp_core::chat::ChatExt;
 use cxp_core::knowledge::{ArticleUpdate, KnowledgeExt, NewArticle};
 use cxp_core::tickets::{NewTicket, TicketFilter, TicketUpdate, TicketsExt};
 use cxp_core::{Error, Page};
-use otto_tenant::ids::OrgId;
-use otto_tenant::Db;
+use savvagent_tenant::ids::OrgId;
+use savvagent_tenant::Db;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -770,7 +770,7 @@ async fn org_b_cannot_see_or_touch_org_a(pool: PgPool) {
 
 // ------------------------------------------------- search under RLS (#17)
 
-async fn seed_kb_corpus(tx: &mut otto_tenant::Tx<'_>, published_too: bool) {
+async fn seed_kb_corpus(tx: &mut savvagent_tenant::Tx<'_>, published_too: bool) {
     let articles: &[(&str, &str, bool)] = &[
         (
             "Reset your password",

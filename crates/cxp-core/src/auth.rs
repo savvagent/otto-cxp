@@ -14,7 +14,7 @@
 //!    opens a browser.
 //! 2. **Ask the platform whether the token is good for us** (RFC 7662
 //!    introspection). The platform enforces the audience, and
-//!    `otto_resource` checks it again: a token minted for any other resource
+//!    `savvagent_resource` checks it again: a token minted for any other resource
 //!    comes back inactive. The audience is configuration
 //!    (`CXP_RESOURCE_URI`), never derived from a request's `Host` header.
 //! 3. **Honor the platform's lifecycle webhooks** before its introspection
@@ -29,9 +29,9 @@
 //! but telling it to retry shortly would be a lie.
 
 use chrono::{DateTime, Utc};
-use otto_resource::{PlatformClient, Role, TokenClaims, TokenKind};
-use otto_tenant::ids::{OrgId, UserId};
-use otto_tenant::Db;
+use savvagent_resource::{PlatformClient, Role, TokenClaims, TokenKind};
+use savvagent_tenant::ids::{OrgId, UserId};
+use savvagent_tenant::Db;
 use serde::Serialize;
 use uuid::Uuid;
 

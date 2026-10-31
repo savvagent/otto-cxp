@@ -26,8 +26,8 @@
 mod common;
 
 use common::{db, org};
-use otto_tenant::ids::OrgId;
-use otto_tenant::Db;
+use savvagent_tenant::ids::OrgId;
+use savvagent_tenant::Db;
 use serde_json::Value;
 use sqlx::PgPool;
 

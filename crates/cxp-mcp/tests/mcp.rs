@@ -19,7 +19,7 @@ use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use cxp_mcp::{router, Config};
 use http::{Request, StatusCode};
-use otto_resource::{
+use savvagent_resource::{
     ClientConfig, IntrospectionResponse, MemberInfo, OrgInfo, PlatformClient, Role, TokenKind,
     UserInfo,
 };
@@ -153,8 +153,8 @@ async fn start_platform() -> (String, Shared) {
 
 /// Mint a well-formed token the stub platform introspects as given.
 fn token_for(p: &Shared, org: Uuid, scopes: &[&str], aud: &str) -> String {
-    let t = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
-    assert!(otto_resource::looks_like_token(&t), "{t}");
+    let t = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    assert!(savvagent_resource::looks_like_token(&t), "{t}");
     p.lock().unwrap().tokens.insert(
         t.clone(),
         (
@@ -340,7 +340,7 @@ async fn a_live_console_session_cookie_is_not_a_credential_on_mcp(pool: PgPool) 
     let cookie = "A".repeat(43);
     console_sessions::create(
         &cxp_core::tenant_db(h.pool.clone()),
-        &otto_tenant::crypto::Cipher::from_base64_key(
+        &savvagent_tenant::crypto::Cipher::from_base64_key(
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
         )
         .unwrap(),
@@ -377,7 +377,7 @@ async fn a_live_console_session_cookie_is_not_a_credential_on_mcp(pool: PgPool) 
 #[sqlx::test(migrator = "cxp_core::MIGRATOR")]
 async fn inactive_and_wrong_audience_tokens_are_401(pool: PgPool) {
     let h = harness(pool).await;
-    let unknown = format!("otto_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
+    let unknown = format!("sav_at_{}{}", "a".repeat(11), Uuid::new_v4().simple());
     let elsewhere = token_for(&h.platform, Uuid::new_v4(), WRITE, OTHER_RESOURCE);
     for t in [unknown, elsewhere] {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

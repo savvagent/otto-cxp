@@ -31,10 +31,10 @@ use axum::Router;
 use cxp_core::search::SearchLimiter;
 use cxp_core::usage::Meter;
 use http::StatusCode;
-use otto_resource::PlatformClient;
-use otto_tenant::Db;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use savvagent_resource::PlatformClient;
+use savvagent_tenant::Db;
 
 pub use server::Cxp;
 
