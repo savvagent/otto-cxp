@@ -46,7 +46,7 @@ kill_timeout = 30
   CXP_PUBLIC_URL = "https://otto-cxp.savvagent.com"
   # The token audience: exactly the resource_uri registered at the platform.
   CXP_RESOURCE_URI = "https://otto-cxp.savvagent.com/mcp"
-  CXP_PLATFORM_URL = "https://otto.savvagent.com"
+  CXP_PLATFORM_URL = "https://savvagent.com"
   # EXTRA hosts /mcp accepts; the CXP_PUBLIC_URL host is always allowed. The
   # fly.dev name still answers (health checks, debugging).
   CXP_ALLOWED_HOSTS = "otto-cxp.fly.dev"
